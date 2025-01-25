@@ -169,3 +169,14 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# spatial
+*.parquet
+*.pmtiles
+*.tiff
+*.tif
+*.geojson
+*.wal
+*.duckdb
+
