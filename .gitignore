@@ -181,3 +181,4 @@ cython_debug/
 *.duckdb
 
 tmp
+test.ipynb
