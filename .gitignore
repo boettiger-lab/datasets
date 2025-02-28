@@ -179,6 +179,8 @@ cython_debug/
 *.geojson
 *.wal
 *.duckdb
+*.json
 
 tmp
 test.ipynb
+*.db
