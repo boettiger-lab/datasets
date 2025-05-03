@@ -184,3 +184,4 @@ cython_debug/
 tmp
 test.ipynb
 *.db
+mobi.txt
