@@ -1,0 +1,198 @@
+---
+---
+
+## Basics: Cloud native data reads
+
+```{r}
+library(duckdbfs)
+library(dplyr)
+```
+
+```{r}
+# Load extensions -- now happens automatically (>= v0.1.1)
+
+#load_spatial()
+#load_h3()
+```
+
+Configure authentication for S3.  Authenticating allows us to access data in private buckets and supports write access.  We can access public buckets over S3 anonymously.  Unlike http URLs, accessing content over S3 supports operations such as listing objects, which is useful for partioned data.
+
+`duckdbfs` has a credential helper that will by default read the standard AWS environmental variables, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_S3_ENDPOINT`.  These should already be set on Cirrus and the Biodiversity NRP Jupyterhubs (pointing to their respective local S3 systems.)
+
+```{r}
+duckdb_secrets()
+```
+
+## H3 indices for spatial point data
+
+We are now ready to access the data. 
+
+```{r}
+gbif = open_dataset("s3://public-gbif/hex")
+```
+
+
+
+# H3 indices for polygons
+
+```{r}
+pad_us = open_dataset("s3://public-biodiversity/pad-us-4/pad-us-4.parquet", recursive = FALSE)
+```
+
+
+```{r}
+aoi <- pad_us |> filter(st_contains(geom, st_point(-119.5332, 37.7459))) 
+
+aoi |> select(Unit_Nm) |>  collect()
+```
+
+```{r}
+aoi |> mutate(h8 = h3_polygon_wkt_to_cells_string(geom, 8L))
+
+```
+
+
+## H3 indices from raster
+
+We can also convert rasters to corresponding h3 grid representations.  This is perhaps not advisable, there are more exact ways of handling 
+
+```bash
+gdal_warp -t_srs EPSG:4326 -of XYZ /vsicurl/https://data.source.coop/cboettig/mobi/species-richness-all/mobi-species-richness.tif mobi.txt
+```
+
+```{r}
+unlink("mobi.txt") # can't overwrite, must delete any previous file first
+
+# Use gdal to turn TIFF into XYZ and reproject to lat lng (much faster than R)
+sf::gdal_utils("warp", 
+               "/vsicurl/https://data.source.coop/cboettig/mobi/species-richness-all/mobi-species-richness.tif",
+               "mobi.txt",
+               options = c(
+                 "-t_srs", "EPSG:4326",
+                 "-of", "XYZ"
+               ))
+```
+
+
+A 990 m resolution is about zoom 8 (a little coarser)
+```{r}
+# requires duckdbfs >= v0.1.1 for parser_options
+mobi <- open_dataset("mobi.txt", parser_options = 
+                      c(delim = "' '", 
+                        columns = "{'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'INTEGER'}")
+                    ) |>
+        mutate(h8 = h3_latlng_to_cell_string(Y, X, 8L))
+
+```
+
+Let's use this to compute zonal statistics at scale: say, the mean richness of threatened species by county in the US.  First let us consider the standard zonal stats mechanism through exact_extract:
+
+```{r}
+tracts_z8 = open_dataset("s3://public-social-vulnerability/2022-tracts-h3-z8.parquet", recursive = FALSE) |>
+         #   filter(STATE == "Tennessee") |>
+            mutate(h8 = tolower(h8))
+
+tracts_mobi <- tracts_z8 |> inner_join(mobi)     
+
+tracts_mobi |> group_by(COUNTY) |> summarize(mean_Z = mean(Z))
+```
+
+
+## H3 Indices for polygon-polygon intersections
+
+
+We have also pre-processed the polygons in this dataset into [h3 spatial indices](https://h3geo.org) at various zooms. We access zoom level 8 (corresponding to hexagons whose edge lengths are approximately 500 meters, see [resolutions tables](https://h3geo.org/docs/core-library/restable#edge-lengths)). Later we will revisit this step.
+
+```{r}
+pad_z8 =  open_dataset("s3://public-biodiversity/pad-us-4/pad-h3-z8.parquet", recursive = FALSE)
+```
+
+We can filter this data by various aspects, such looking only at National Park Service (NPS) managed lands.  But what if we only those parks in a particular State or County?  
+
+```{r}
+pad =  pad_us |> 
+          filter(Mang_Name == "NPS") |>
+          inner_join(pad_z8) |>
+          select(h8)
+```
+
+What are all the protected areas in Arizona?  We can filter to census tracts in these two states, and then join the corresponding hexes with the hexes in protected area database:
+
+```{r}
+tracts_z8 = open_dataset("s3://public-social-vulnerability/2022-tracts-h3-z8.parquet", recursive = FALSE) |>
+            mutate(h8 = tolower(h8))
+```
+
+
+```{r}
+aoi = tracts |>
+  filter(STATE %in% c("Arizona")) |> 
+  inner_join(pad, by = "h8")
+```
+
+
+# Visualizing H3-based data
+
+There are a variety of ways we may want to approach visualization. 
+
+Our focus here will be on methods that can best scale to very large datasets and support interactive maps that can zoom, pan, and ideally support pitch for rendering 3d extrusions. `mapgl` bindings to the javascript `maplibre` library provide a nice way to do this. 
+
+
+## Visualizing hex cells directly
+
+There are at least two main ways we can attempt to visualize the hex cells themselves: we can transform each hex id to the corresponding polygon representation or try to leverage a library with built-in support for hex codes themselves.  
+
+```{r}
+aoi |> 
+  rename(h3id = h8) |> 
+  to_h3j("s3://public-data/cache/hexes-ex2.h3j")
+```
+
+```{r}
+library(mapgl)
+library(glue)
+endpoint <- Sys.getenv("AWS_S3_ENDPOINT")
+url = glue("https://{endpoint}/public-data/cache/hexes-ex2.h3j")
+
+maplibre(center=c(-110., 34.), zoom = 5) |>
+  add_h3j_source("h3j_testsource",
+                  url = url
+  )  |>
+  add_fill_layer(
+    id = "h3j_testlayer",
+    source = "h3j_testsource",
+    fill_color = "green",
+    fill_opacity = 0.5
+  )
+```
+
+These hex-versions of the PAD and census tracts contain only the
+
+```{r}
+# join hex version to the original pad_parquet that has all the columns 
+pad_full =  open_dataset("s3://public-biodiversity/pad-us-4/pad-us-4.parquet", recursive = TRUE)
+aoi_pad = aoi |> 
+inner_join(pad_full, "row_n") |> 
+filter(_.GAP_Sts %in% c("1", "2"))
+
+```
+
+
+```{r}
+## Not run: 
+url = "https://inspide.github.io/h3j-h3t/examples/h3j/sample.h3j"
+maplibre(center=c(-3.704, 40.417), zoom=15, pitch=30) |>
+  add_h3j_source("h3j_testsource",
+                  url = url
+  )  |>
+  add_fill_layer(
+    id = "h3j_testlayer",
+    source = "h3j_testsource",
+    fill_color = interpolate(
+      column = "value",
+      values = c(0, 21.864),
+      stops = c("#430254", "#f83c70")
+    ),
+    fill_opacity = 0.7
+  )
+```
