@@ -180,6 +180,20 @@ cython_debug/
 *.wal
 *.duckdb
 *.json
+*.shp
+*.xml
+*.sbn
+*.sbx
+*.shx
+*.gpkg
+*.prj
+*.cpg
+*.zip
+*.dbf
+
+*.pdf
+
+
 
 tmp
 test.ipynb
