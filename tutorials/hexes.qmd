@@ -63,6 +63,7 @@ gdal_warp -t_srs EPSG:4326 -of XYZ /vsicurl/https://data.source.coop/cboettig/mo
 ```{r}
 unlink("mobi.txt") # can't overwrite, must delete any previous file first
 
+bench::bench_time({
 # Use gdal to turn TIFF into XYZ and reproject to lat lng (much faster than R)
 sf::gdal_utils("warp", 
                "/vsicurl/https://data.source.coop/cboettig/mobi/species-richness-all/mobi-species-richness.tif",
@@ -71,6 +72,8 @@ sf::gdal_utils("warp",
                  "-t_srs", "EPSG:4326",
                  "-of", "XYZ"
                ))
+
+ })              
 ```
 
 
@@ -97,17 +100,45 @@ tracts_mobi <- tracts_z8 |> inner_join(mobi)
 tracts_mobi |> group_by(COUNTY) |> summarize(mean_Z = mean(Z))
 ```
 
+```{r}
+  tracts_mobi |> group_by(COUNTY) |> summarize(richness = mean(Z)) |> show_query()
+```
+
+
+```{r}
+library(bench)
+
+bench::bench_time({
+
+  tracts_mobi |> group_by(COUNTY) |> summarize(mean_Z = mean(Z)) |> write_dataset("test.parquet")
+
+})
+
+```
 
 ## H3 Indices for polygon-polygon intersections
 
-
-We have also pre-processed the polygons in this dataset into [h3 spatial indices](https://h3geo.org) at various zooms. We access zoom level 8 (corresponding to hexagons whose edge lengths are approximately 500 meters, see [resolutions tables](https://h3geo.org/docs/core-library/restable#edge-lengths)). Later we will revisit this step.
 
 ```{r}
 pad_z8 =  open_dataset("s3://public-biodiversity/pad-us-4/pad-h3-z8.parquet", recursive = FALSE)
 ```
 
-We can filter this data by various aspects, such looking only at National Park Service (NPS) managed lands.  But what if we only those parks in a particular State or County?  
+```{r}
+
+area_h8 = 737327.598	/ 10000
+
+tracts_z8 |> 
+  filter(STATE == "California") |> 
+  inner_join(pad_z8) |>
+  group_by(COUNTY) |>
+  summarise(area = n() * area_h8) |>
+  ungroup() |>
+  arrange(desc(area))
+
+
+```
+
+
 
 ```{r}
 pad =  pad_us |> 
