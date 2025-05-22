@@ -190,13 +190,12 @@ cython_debug/
 *.cpg
 *.zip
 *.dbf
-
+*.xyz
 *.pdf
 
 
 
 tmp
 test.ipynb
+
 *.db
-mobi.txt
-tutorials/mobi.xyz
