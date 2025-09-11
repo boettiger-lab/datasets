@@ -58,6 +58,11 @@ spec:
               value: "false"
             - name: AWS_VIRTUAL_HOSTING
               value: "FALSE"
+            # Ensure GDAL/PROJ can find data even if entrypoint changes
+            - name: GDAL_DATA
+              value: "/opt/conda/share/gdal"
+            - name: PROJ_LIB
+              value: "/opt/conda/share/proj"
           resources:
             requests:
               cpu: "8"
@@ -65,7 +70,7 @@ spec:
             limits:
               cpu: "8"
               memory: 32Gi
-          command: ["sh", "-lc", "python -m pip install -r requirements.txt && python carbon/job.py"]
+          args: ["bash", "-lc", "python -m pip install -r requirements.txt && python carbon/job.py"]
       volumes:
         - name: repo
           emptyDir: {}
