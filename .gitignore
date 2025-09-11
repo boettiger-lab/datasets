@@ -199,3 +199,5 @@ tmp
 test.ipynb
 
 *.db
+# pixi environments
+.pixi
