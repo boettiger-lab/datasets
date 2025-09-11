@@ -13,54 +13,61 @@ spec:
     spec:
       restartPolicy: Never
       initContainers:
-      - name: git-clone
-        image: alpine/git:2.45.2
-        imagePullPolicy: IfNotPresent
-        command:
-        - sh
-        - -lc
-        - |
-          git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
-        volumeMounts:
-        - name: repo
-          mountPath: /workspace
+        - name: git-clone
+          image: alpine/git:2.45.2
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          command:
+            - sh
+            - -lc
+            - |
+              git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
+          volumeMounts:
+            - name: repo
+              mountPath: /workspace
       containers:
-  - name: python-job
-        image: ghcr.io/rocker-org/ml
-        imagePullPolicy: Always
-        workingDir: /workspace/datasets
-        volumeMounts:
-        - name: repo
-          mountPath: /workspace
-        env:
-        - name: AWS_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef:
-              name: aws
-              key: AWS_ACCESS_KEY_ID
-        - name: AWS_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef:
-              name: aws
-              key: AWS_SECRET_ACCESS_KEY
-        - name: AWS_S3_ENDPOINT
-          value: "rook-ceph-rgw-nautiluss3.rook"
-        - name: AWS_PUBLIC_ENDPOINT
-          value: "s3-west.nrp-nautilus.io"
-        - name: AWS_HTTPS
-          value: "false"
-        - name: AWS_VIRTUAL_HOSTING
-          value: "FALSE"
-        resources:
-          requests:
-            cpu: 8
-            memory: 32Gi
-          limits:
-            cpu: 8
-            memory: 32Gi
-        command: ["sh", "-lc", "python -m pip install -r requirements.txt && python carbon/job.py"]
+        - name: python-job
+          image: ghcr.io/rocker-org/ml-spatial
+          imagePullPolicy: Always
+          workingDir: /workspace/datasets
+          volumeMounts:
+            - name: repo
+              mountPath: /workspace
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_S3_ENDPOINT
+              value: "rook-ceph-rgw-nautiluss3.rook"
+            - name: AWS_PUBLIC_ENDPOINT
+              value: "s3-west.nrp-nautilus.io"
+            - name: AWS_HTTPS
+              value: "false"
+            - name: AWS_VIRTUAL_HOSTING
+              value: "FALSE"
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          command: ["sh", "-lc", "python -m pip install -r requirements.txt && python carbon/job.py"]
       volumes:
-      - name: repo
-        emptyDir: {}
+        - name: repo
+          emptyDir: {}
 
 

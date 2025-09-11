@@ -9,3 +9,7 @@ version = "0.1.0"
 
 [dependencies]
 ibis-framework = ">=10.8.0,<11"
+gdal = ">=3.11.3,<4"
+
+[pypi-dependencies]
+cng = { git = "https://github.com/boettiger-lab/cng-python" }
