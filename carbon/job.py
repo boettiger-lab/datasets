@@ -14,12 +14,19 @@ set_secrets(con)
 
 input_url = "/vsicurl/https://minio.carlboettiger.info/public-carbon/cogs/vulnerable_c_total_2018.tif"
 
+import ibis.expr.datatypes as dt
+@ibis.udf.scalar.builtin
+def ST_GeomFromText(geom) -> dt.geometry:
+    ...
+
 df = (con
       .read_parquet("s3://public-grids/hex/h0.parquet")
+      .mutate(geom = ST_GeomFromText(_.geom))
       .mutate(h0 = _.h0.lower())
       .execute()
       .set_crs("EPSG:4326")
 )
+
 
 zoom = 8
 
