@@ -13,7 +13,13 @@ con = ibis.duckdb.connect("/tmp/duck.db",extensions = ["spatial", "h3"])
 set_secrets(con)
 
 input_url = "/vsicurl/https://minio.carlboettiger.info/public-carbon/cogs/vulnerable_c_total_2018.tif"
-df = con.read_parquet("s3://public-grids/hex/h0.parquet").mutate(h0 = _.h0.lower()).execute()
+
+df = (con
+      .read_parquet("s3://public-grids/hex/h0.parquet")
+      .mutate(h0 = _.h0.lower())
+      .execute()
+      .set_crs("EPSG:4326")
+)
 
 zoom = 8
 
