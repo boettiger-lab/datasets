@@ -201,3 +201,4 @@ test.ipynb
 *.db
 # pixi environments
 .pixi
+scratch.py
