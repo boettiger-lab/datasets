@@ -10,7 +10,10 @@ from ibis import _
 gdal.DontUseExceptions()
 install_h3()
 con = ibis.duckdb.connect("/tmp/duck.db",extensions = ["spatial", "h3"])
-set_secrets(con)
+set_secrets(con, 
+            key = os.getenv("AWS_ACCESS_KEY_ID"), 
+            secret = os.getenv("AWS_SECRET_ACCESS_KEY"), 
+            endpoint = os.getenv("AWS_S3_ENDPOINT"))
 
 input_url = "/vsicurl/https://minio.carlboettiger.info/public-carbon/cogs/vulnerable_c_total_2018.tif"
 
@@ -36,23 +39,22 @@ for i in range(df.shape[0]):
     wkt = df.geom[i]
     h0 = df.h0[i]
     zoom = 8
-    print(h0)
-
+    print(f"i={i}: cropping raster to h0={h0}\n")
     try:
         gdal.Warp("/tmp/carbon.xyz", input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
-    
-        (con
-          .read_csv("/tmp/carbon.xyz", 
-                    delim = ' ', 
-                    columns = {'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'INTEGER'})
-          .mutate(h0 = h3_latlng_to_cell_string(_.Y, _.X, zoom),
-                  h8 = h3_latlng_to_cell_string(_.Y, _.X, zoom))
-          .mutate(Z = ibis.ifelse(_.Z == 65535, None, _.Z)) 
-          .to_parquet(f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet")
-        )
-        pathlib.Path("/tmp/carbon.xyz").unlink()
     except Exception as e:
         print(f"Error processing item {i}: {e}")
-    
+
+    print(f"i={i}: computing zoom {zoom} hexes:\n")
+    (con
+        .read_csv("/tmp/carbon.xyz", 
+                delim = ' ', 
+                columns = {'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'INTEGER'})
+        .mutate(h0 = h3_latlng_to_cell_string(_.Y, _.X, zoom),
+                h8 = h3_latlng_to_cell_string(_.Y, _.X, zoom))
+        .mutate(Z = ibis.ifelse(_.Z == 65535, None, _.Z)) 
+        .to_parquet(f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet")
+    )
+    pathlib.Path("/tmp/carbon.xyz").unlink()
 
 
