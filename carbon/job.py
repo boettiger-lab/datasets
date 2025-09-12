@@ -10,10 +10,13 @@ from ibis import _
 gdal.DontUseExceptions()
 install_h3()
 con = ibis.duckdb.connect("/tmp/duck.db",extensions = ["spatial", "h3"])
+
+# internal endpoint on NRP does not use ssl. 
 set_secrets(con, 
             key = os.getenv("AWS_ACCESS_KEY_ID"), 
             secret = os.getenv("AWS_SECRET_ACCESS_KEY"), 
-            endpoint = os.getenv("AWS_S3_ENDPOINT"))
+            endpoint = os.getenv("AWS_S3_ENDPOINT"),
+            use_ssl = "FALSE")
 
 input_url = "/vsicurl/https://minio.carlboettiger.info/public-carbon/cogs/vulnerable_c_total_2018.tif"
 
