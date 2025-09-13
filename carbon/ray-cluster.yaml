@@ -1,0 +1,124 @@
+apiVersion: ray.io/v1alpha1
+kind: RayCluster
+metadata:
+  name: carbon-processing-cluster
+spec:
+  rayVersion: '2.7.0'
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+    template:
+      spec:
+        containers:
+        - name: ray-head
+          image: ghcr.io/rocker-org/ml-spatial:latest
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: 2
+              memory: 8Gi
+            limits:
+              cpu: 4
+              memory: 16Gi
+          env:
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: aws
+                key: AWS_ACCESS_KEY_ID
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: aws
+                key: AWS_SECRET_ACCESS_KEY
+          - name: AWS_S3_ENDPOINT
+            value: "rook-ceph-rgw-nautiluss3.rook"
+          - name: AWS_PUBLIC_ENDPOINT
+            value: "s3-west.nrp-nautilus.io"
+          - name: AWS_HTTPS
+            value: "false"
+          - name: AWS_VIRTUAL_HOSTING
+            value: "FALSE"
+          - name: GDAL_DATA
+            value: "/opt/conda/share/gdal"
+          - name: PROJ_LIB
+            value: "/opt/conda/share/proj"
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+          command: ["/bin/bash", "-lc"]
+          args: 
+          - |
+            # Clone repo and install all dependencies including Ray
+            git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/datasets
+            cd /workspace/datasets
+            python -m pip install -r requirements.txt
+            # Start Ray head node
+            exec python -m ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --block
+          volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+        volumes:
+        - name: workspace
+          emptyDir: {}
+  workerGroupSpecs:
+  - replicas: 2
+    minReplicas: 1
+    maxReplicas: 5
+    groupName: worker-group
+    rayStartParams: {}
+    template:
+      spec:
+        containers:
+        - name: ray-worker
+          image: ghcr.io/rocker-org/ml-spatial:latest
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: 2
+              memory: 16Gi
+            limits:
+              cpu: 4
+              memory: 32Gi
+          env:
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: aws
+                key: AWS_ACCESS_KEY_ID
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: aws
+                key: AWS_SECRET_ACCESS_KEY
+          - name: AWS_S3_ENDPOINT
+            value: "rook-ceph-rgw-nautiluss3.rook"
+          - name: AWS_PUBLIC_ENDPOINT
+            value: "s3-west.nrp-nautilus.io"
+          - name: AWS_HTTPS
+            value: "false"
+          - name: AWS_VIRTUAL_HOSTING
+            value: "FALSE"
+          - name: GDAL_DATA
+            value: "/opt/conda/share/gdal"
+          - name: PROJ_LIB
+            value: "/opt/conda/share/proj"
+          command: ["/bin/bash", "-lc"]
+          args:
+          - |
+            # Clone repo and install all dependencies including Ray
+            git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/datasets
+            cd /workspace/datasets
+            python -m pip install -r requirements.txt
+            # Start Ray worker
+            exec python -m ray start --address=$RAY_HEAD_SERVICE_HOST:6379 --block
+          volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+        volumes:
+        - name: workspace
+          emptyDir: {}
