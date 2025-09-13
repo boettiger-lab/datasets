@@ -65,11 +65,11 @@ spec:
               value: "/opt/conda/share/proj"
           resources:
             requests:
-              cpu: "8"
-              memory: 32Gi
+              cpu: "4"
+              memory: 64Gi
             limits:
-              cpu: "8"
-              memory: 32Gi
+              cpu: "4"
+              memory: 64Gi
           args: ["bash", "-lc", "python -m pip install -r requirements.txt && python carbon/job.py"]
       volumes:
         - name: repo
