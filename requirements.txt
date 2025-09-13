@@ -1,2 +1,2 @@
 git+https://github.com/boettiger-lab/cng-python
-ray[default]==2.7.0
+ray[default]
