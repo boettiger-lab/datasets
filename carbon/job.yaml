@@ -11,6 +11,7 @@ spec:
       labels:
         k8s-app: python-job
     spec:
+      priorityClassName: opportunistic
       restartPolicy: Never
       initContainers:
         - name: git-clone
