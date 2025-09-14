@@ -13,6 +13,22 @@ spec:
         - name: ray-head
           image: ghcr.io/rocker-org/ml-spatial:latest
           imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              cd /tmp
+              git clone https://github.com/boettiger-lab/datasets.git
+              cd datasets  
+              pip install -r requirements.txt
+              python -c "import ray; print('Ray imported successfully')"
+              python -c "import ray; ray.start(head=True, port=6379, dashboard_host='0.0.0.0', num_cpus=2, block=True)"
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
           resources:
             requests:
               cpu: 2
@@ -43,22 +59,14 @@ spec:
             value: "/opt/conda/share/gdal"
           - name: PROJ_LIB
             value: "/opt/conda/share/proj"
-          ports:
-          - containerPort: 6379
-            name: gcs-server
-          - containerPort: 8265
-            name: dashboard
-          - containerPort: 10001
-            name: client
-          command: ["/bin/bash", "-lc"]
-          args: 
-          - |
-            # Clone repo and install all dependencies including Ray
-            git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/datasets
-            cd /workspace/datasets
-            python -m pip install -r requirements.txt
-            # Start Ray head node
-            exec python -m ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --block
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              cd /tmp &&
+              git clone https://github.com/boettiger-lab/datasets.git &&
+              cd datasets &&
+              pip install -r requirements.txt &&
+              ray start --head --port=6379 --redis-shard-ports=6380,6381 --object-manager-port=6378 --node-manager-port=6382 --dashboard-host=0.0.0.0 --num-cpus=$MY_CPU_REQUEST --block
           volumeMounts:
           - name: workspace
             mountPath: /workspace
@@ -70,7 +78,8 @@ spec:
     minReplicas: 1
     maxReplicas: 5
     groupName: worker-group
-    rayStartParams: {}
+    rayStartParams:
+      num-cpus: "2"
     template:
       spec:
         containers:
@@ -107,15 +116,14 @@ spec:
             value: "/opt/conda/share/gdal"
           - name: PROJ_LIB
             value: "/opt/conda/share/proj"
-          command: ["/bin/bash", "-lc"]
+          command: ["/bin/bash", "-c"]
           args:
           - |
-            # Clone repo and install all dependencies including Ray
-            git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/datasets
-            cd /workspace/datasets
-            python -m pip install -r requirements.txt
-            # Start Ray worker
-            exec python -m ray start --address=$RAY_HEAD_SERVICE_HOST:6379 --block
+            cd /tmp &&
+            git clone https://github.com/boettiger-lab/datasets.git &&
+            cd datasets &&
+            pip install -r requirements.txt &&
+            ray start --address=$RAY_HEAD_SERVICE_HOST:6379 --block
           volumeMounts:
           - name: workspace
             mountPath: /workspace
