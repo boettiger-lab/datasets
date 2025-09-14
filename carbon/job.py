@@ -9,7 +9,7 @@ from ibis import _
 
 gdal.DontUseExceptions()
 install_h3()
-con = ibis.duckdb.connect("/tmp/duck.db",extensions = ["spatial", "h3"])
+con = ibis.duckdb.connect(extensions = ["spatial", "h3"])
 
 # internal endpoint on NRP does not use ssl. 
 set_secrets(con, 
@@ -18,7 +18,7 @@ set_secrets(con,
             endpoint = os.getenv("AWS_S3_ENDPOINT"),
             use_ssl = "FALSE")
 
-input_url = "/vsicurl/https://minio.carlboettiger.info/public-carbon/cogs/vulnerable_c_total_2018.tif"
+input_url = "/vsis3/public-carbon/cogs/vulnerable_c_total_2018.tif"
 
 import ibis.expr.datatypes as dt
 @ibis.udf.scalar.builtin
@@ -40,10 +40,10 @@ for i in range(df.shape[0]):
     zoom = 8
     print(f"i={i}: cropping raster to h0={h0}\n")
     try:
-        gdal.Warp("/tmp/carbon.xyz", input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
+        gdal.Warp("/vsis3/public-carbon/carbon.xyz", input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
         print(f"i={i}: computing zoom {zoom} hexes:\n")
         (con
-            .read_csv("/tmp/carbon.xyz", 
+            .read_csv("s3://public-carbon/carbon.xyz", 
                     delim = ' ', 
                     columns = {'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'INTEGER'})
             .mutate(h0 = h3_latlng_to_cell_string(_.Y, _.X, zoom),
@@ -51,7 +51,6 @@ for i in range(df.shape[0]):
             .mutate(Z = ibis.ifelse(_.Z == 65535, None, _.Z)) 
             .to_parquet(f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet")
         )
-        pathlib.Path("/tmp/carbon.xyz").unlink()
 
     except Exception as e:
         print(f"Error processing item {i}: {e}")
