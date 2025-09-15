@@ -13,7 +13,7 @@ set -euo pipefail
 JOB_NAME="${JOB_NAME:-python-job}"
 JOB_FILE="${JOB_FILE:-}"  # if empty, will default relative to this script
 NAMESPACE="${NAMESPACE:-}"
-TIMEOUT="${TIMEOUT:-2h}"  # timeout for job completion wait
+TIMEOUT="${TIMEOUT:-2h}"  # timeout for job completion wait 
 
 # Derive JOB_FILE default relative to this script's directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

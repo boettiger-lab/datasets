@@ -1,6 +1,7 @@
 
 import os
 import pathlib
+import sys
 from osgeo import gdal
 import ibis
 from cng.utils import *
@@ -10,6 +11,7 @@ from ibis import _
 gdal.DontUseExceptions()
 install_h3()
 con = ibis.duckdb.connect(extensions = ["spatial", "h3"])
+print("Connected to DuckDB", flush=True)
 
 # internal endpoint on NRP does not use ssl. 
 set_secrets(con, 
@@ -17,14 +19,17 @@ set_secrets(con,
             secret = os.getenv("AWS_SECRET_ACCESS_KEY"), 
             endpoint = os.getenv("AWS_S3_ENDPOINT"),
             use_ssl = "FALSE")
+print("AWS secrets configured", flush=True)
 
 input_url = "/vsis3/public-carbon/cogs/vulnerable_c_total_2018.tif"
+print(f"Input URL: {input_url}", flush=True)
 
 import ibis.expr.datatypes as dt
 @ibis.udf.scalar.builtin
 def ST_GeomFromText(geom) -> dt.geometry:
     ...
 
+print("Loading h0 parquet file...", flush=True)
 df = (con
       .read_parquet("s3://public-grids/hex/h0.parquet")
       .mutate(geom = ST_GeomFromText(_.geom))
@@ -32,6 +37,7 @@ df = (con
       .execute()
       .set_crs("EPSG:4326")
 )
+print(f"Loaded h0 data with {df.shape[0]} rows", flush=True)
 
 zoom = 8
 #for i in range(df.shape[0]):

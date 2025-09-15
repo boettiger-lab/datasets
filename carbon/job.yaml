@@ -71,7 +71,7 @@ spec:
             limits:
               cpu: "4"
               memory: 64Gi
-          args: ["bash", "-lc", "python -m pip install -r requirements.txt && python carbon/job.py"]
+          args: ["bash", "-c", "python -u -m pip install -r requirements.txt && python -u carbon/job.py"]
       volumes:
         - name: repo
           emptyDir: {}
