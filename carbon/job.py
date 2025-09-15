@@ -28,11 +28,14 @@ import ibis.expr.datatypes as dt
 @ibis.udf.scalar.builtin
 def ST_GeomFromText(geom) -> dt.geometry:
     ...
+@ibis.udf.scalar.builtin
+def ST_MakeValid(geom) -> dt.geometry:
+    ...
 
 print("Loading h0 parquet file...", flush=True)
 df = (con
       .read_parquet("s3://public-grids/hex/h0.parquet")
-      .mutate(geom = ST_GeomFromText(_.geom))
+      .mutate(geom = ST_MakeValid(ST_GeomFromText(_.geom)))
       .mutate(h0 = _.h0.lower())
       .execute()
       .set_crs("EPSG:4326")
@@ -47,10 +50,10 @@ for i in range(df.shape[0]):
     zoom = 8
     print(f"i={i}: cropping raster to h0={h0}\n")
     try:
-        gdal.Warp("/vsis3/public-carbon/carbon.xyz", input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
+        gdal.Warp("/tmp/carbon.xyz", input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
         print(f"i={i}: computing zoom {zoom} hexes:\n")
         (con
-            .read_csv("s3://public-carbon/carbon.xyz", 
+            .read_csv("/tmp/carbon.xyz", 
                     delim = ' ', 
                     columns = {'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'INTEGER'})
             .mutate(h0 = h3_latlng_to_cell_string(_.Y, _.X, zoom),
