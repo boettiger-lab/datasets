@@ -11,6 +11,13 @@ from ibis import _
 gdal.DontUseExceptions()
 install_h3()
 con = ibis.duckdb.connect("/tmp/duck.db", extensions = ["spatial", "h3"])
+
+con.raw_sql("SET memory_limit = '44GB';")
+con.raw_sql('''
+SET temp_directory = '/tmp/duckdb_swap';
+SET max_temp_directory_size = '100GB';
+            ''')
+
 print("Connected to DuckDB", flush=True)
 
 # internal endpoint on NRP does not use ssl. 
