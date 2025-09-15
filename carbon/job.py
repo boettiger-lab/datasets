@@ -10,7 +10,7 @@ from ibis import _
 
 gdal.DontUseExceptions()
 install_h3()
-con = ibis.duckdb.connect(extensions = ["spatial", "h3"])
+con = ibis.duckdb.connect("/tmp/duck.db", extensions = ["spatial", "h3"])
 print("Connected to DuckDB", flush=True)
 
 # internal endpoint on NRP does not use ssl. 
