@@ -40,6 +40,10 @@ df = (con
 print(f"Loaded h0 data with {df.shape[0]} rows", flush=True)
 
 zoom = 8
+
+tmp_carbon = "/vsis3/public-carbon/carbon.xyz"
+tmp_carbon = "/tmp/carbon.xyz"
+
 #for i in range(df.shape[0]):
 
 i = 100
@@ -49,10 +53,10 @@ h0 = df.h0[i]
 zoom = 8
 print(f"i={i}: cropping raster to h0={h0}\n")
 try:
-    gdal.Warp("/vsis3/public-carbon/carbon.xyz", input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
+    gdal.Warp(tmp_carbon, input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
     print(f"i={i}: computing zoom {zoom} hexes:\n")
     (con
-        .read_csv("s3://public-carbon/carbon.xyz", 
+        .read_csv(tmp_carbon, 
                 delim = ' ', 
                 columns = {'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'INTEGER'})
         .mutate(h0 = h3_latlng_to_cell_string(_.Y, _.X, zoom),
