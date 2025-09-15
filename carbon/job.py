@@ -44,6 +44,10 @@ print(f"Loaded h0 data with {df.shape[0]} rows", flush=True)
 
 zoom = 8
 for i in range(df.shape[0]):
+    # Skip case where i=8
+    if i == 8:
+        print(f"Skipping i={i}")
+        continue
 
     wkt = df.geom[i]
     h0 = df.h0[i]
