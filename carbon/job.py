@@ -40,29 +40,27 @@ df = (con
 print(f"Loaded h0 data with {df.shape[0]} rows", flush=True)
 
 zoom = 8
-#for i in range(df.shape[0]):
+for i in range(df.shape[0]):
 
-i = 100
+    wkt = df.geom[i]
+    h0 = df.h0[i]
+    zoom = 8
+    print(f"i={i}: cropping raster to h0={h0}\n")
+    try:
+        gdal.Warp("/vsis3/public-carbon/carbon.xyz", input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
+        print(f"i={i}: computing zoom {zoom} hexes:\n")
+        (con
+            .read_csv("s3://public-carbon/carbon.xyz", 
+                    delim = ' ', 
+                    columns = {'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'INTEGER'})
+            .mutate(h0 = h3_latlng_to_cell_string(_.Y, _.X, zoom),
+                    h8 = h3_latlng_to_cell_string(_.Y, _.X, zoom))
+            .mutate(Z = ibis.ifelse(_.Z == 65535, None, _.Z)) 
+            .to_parquet(f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet")
+        )
 
-wkt = df.geom[i]
-h0 = df.h0[i]
-zoom = 8
-print(f"i={i}: cropping raster to h0={h0}\n")
-try:
-    gdal.Warp("/vsis3/public-carbon/carbon.xyz", input_url, dstSRS = 'EPSG:4326', cutlineWKT = wkt, cropToCutline = True)
-    print(f"i={i}: computing zoom {zoom} hexes:\n")
-    (con
-        .read_csv("s3://public-carbon/carbon.xyz", 
-                delim = ' ', 
-                columns = {'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'INTEGER'})
-        .mutate(h0 = h3_latlng_to_cell_string(_.Y, _.X, zoom),
-                h8 = h3_latlng_to_cell_string(_.Y, _.X, zoom))
-        .mutate(Z = ibis.ifelse(_.Z == 65535, None, _.Z)) 
-        .to_parquet(f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet")
-    )
-
-except Exception as e:
-    print(f"Error processing item {i}: {e}")
+    except Exception as e:
+        print(f"Error processing item {i}: {e}")
 
 
 
