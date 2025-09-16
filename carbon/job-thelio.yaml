@@ -64,10 +64,10 @@ spec:
           resources:
             requests:
               cpu: "8"
-              memory: 34Gi
+              memory: 80Gi
             limits:
               cpu: "8"
-              memory: 34Gi
+              memory: 80Gi
           args: ["bash", "-c", "python -u -m pip install -r requirements.txt && python -u carbon/job.py"]
       volumes:
         - name: repo
