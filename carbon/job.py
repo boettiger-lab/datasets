@@ -76,7 +76,7 @@ for i in range(df.shape[0]):
             .mutate(Z = ibis.ifelse(_.Z == 65535, None, _.Z)) 
             .to_parquet(f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet")
         )
-    con.close()
+        con.close()
     except Exception as e:
         print(f"Error processing item {i}: {e}")
 
