@@ -12,7 +12,7 @@ gdal.DontUseExceptions()
 install_h3()
 con = ibis.duckdb.connect("/tmp/duck.db", extensions = ["spatial", "h3"])
 
-con.raw_sql("SET memory_limit = '44GB';")
+con.raw_sql("SET memory_limit = '70GB';")
 con.raw_sql('''
 SET temp_directory = '/tmp/duckdb_swap';
 SET max_temp_directory_size = '100GB';
@@ -48,9 +48,17 @@ df = (con
       .set_crs("EPSG:4326")
 )
 print(f"Loaded h0 data with {df.shape[0]} rows", flush=True)
+con.close()
 
 zoom = 8
 for i in range(df.shape[0]):
+
+    con = ibis.duckdb.connect("/tmp/duck.db", extensions = ["spatial", "h3"])
+    con.raw_sql("SET memory_limit = '70GB';")
+    con.raw_sql('''
+    SET temp_directory = '/tmp/duckdb_swap';
+    SET max_temp_directory_size = '100GB';
+                ''')
 
     wkt = df.geom[i]
     h0 = df.h0[i]
@@ -68,7 +76,7 @@ for i in range(df.shape[0]):
             .mutate(Z = ibis.ifelse(_.Z == 65535, None, _.Z)) 
             .to_parquet(f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet")
         )
-
+    con.close()
     except Exception as e:
         print(f"Error processing item {i}: {e}")
 
