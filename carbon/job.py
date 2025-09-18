@@ -48,7 +48,7 @@ df = (con
       .set_crs("EPSG:4326")
 )
 print(f"Loaded h0 data with {df.shape[0]} rows", flush=True)
-con.close()
+con.disconnect()
 
 zoom = 8
 for i in range(df.shape[0]):
@@ -76,7 +76,7 @@ for i in range(df.shape[0]):
             .mutate(Z = ibis.ifelse(_.Z == 65535, None, _.Z)) 
             .to_parquet(f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet")
         )
-        con.close()
+        con.disconnect()
     except Exception as e:
         print(f"Error processing item {i}: {e}")
 
