@@ -53,12 +53,20 @@ con.disconnect()
 zoom = 8
 for i in range(df.shape[0]):
 
+    # reset connection each time
     con = ibis.duckdb.connect("/tmp/duck.db", extensions = ["spatial", "h3"])
     con.raw_sql("SET memory_limit = '70GB';")
     con.raw_sql('''
     SET temp_directory = '/tmp/duckdb_swap';
     SET max_temp_directory_size = '100GB';
                 ''')
+    set_secrets(con, 
+            key = os.getenv("AWS_ACCESS_KEY_ID"), 
+            secret = os.getenv("AWS_SECRET_ACCESS_KEY"), 
+            endpoint = os.getenv("AWS_S3_ENDPOINT"),
+            use_ssl = "FALSE")
+
+
 
     wkt = df.geom[i]
     h0 = df.h0[i]
