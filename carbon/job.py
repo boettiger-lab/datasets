@@ -47,7 +47,7 @@ def main():
 
   df = con.read_parquet("s3://public-grids/hex/h0-valid.parquet")
   wkt = df.filter(_.i == i).geom.execute().set_crs("EPSG:4326").to_wkt()[0]
-
+  h0 =  df.filter(_.i == i).h0.execute()[0]
   # Prefer https vsicurl to avoid needing AWS credentials for the public file
   input_url = args.input_url
   if input_url.startswith("/vsis3/"):
@@ -63,7 +63,6 @@ def main():
   )
 
   # compute h0 id for output path (from the polygon we just used)
-  h0 = i  # assuming i is already the h0 index
   (
     con.read_csv(
       "/tmp/carbon.xyz",
