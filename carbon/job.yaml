@@ -1,15 +1,19 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: python-job
+  name: carbon-job-array
   labels:
-    k8s-app: python-job
+    k8s-app: carbon-job
 spec:
+  # Run 122 indexed completions (i = 0..121)
+  completions: 122
+  parallelism: 16  # adjust concurrency as cluster capacity allows
+  completionMode: Indexed
   backoffLimit: 0
   template:
     metadata:
       labels:
-        k8s-app: python-job
+        k8s-app: carbon-job
     spec:
       priorityClassName: opportunistic
       restartPolicy: Never
@@ -33,7 +37,7 @@ spec:
             - name: repo
               mountPath: /workspace
       containers:
-        - name: python-job
+        - name: carbon-task
           image: ghcr.io/rocker-org/ml-spatial
           imagePullPolicy: Always
           workingDir: /workspace/datasets
@@ -59,19 +63,28 @@ spec:
               value: "false"
             - name: AWS_VIRTUAL_HOSTING
               value: "FALSE"
-            # Ensure GDAL/PROJ can find data even if entrypoint changes
             - name: GDAL_DATA
               value: "/opt/conda/share/gdal"
             - name: PROJ_LIB
               value: "/opt/conda/share/proj"
+            - name: INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
           resources:
             requests:
               cpu: "4"
-              memory: 64Gi
+              memory: 34Gi
             limits:
               cpu: "4"
-              memory: 64Gi
-          args: ["bash", "-c", "python -u -m pip install -r requirements.txt && python -u carbon/job.py"]
+              memory: 34Gi
+          # Use the indexed environment variable to pass --i
+          command:
+            - bash
+            - -lc
+            - |
+              echo "Running index ${INDEX}";
+              python -u carbon/job.py --i ${INDEX} --zoom 8
       volumes:
         - name: repo
           emptyDir: {}

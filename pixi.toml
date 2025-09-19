@@ -8,8 +8,29 @@ version = "0.1.0"
 [tasks]
 
 [dependencies]
+python = ">=3.11,<3.12"
 ibis-framework = ">=10.8.0,<11"
-gdal = ">=3.11.3,<4"
+duckdb = ">=1.0.0"
+ray-default = "*"
+pandas = "*"
+numpy = "*"
+jupyter = "*"
+ipykernel = "*"
+openai = "*"
+gdal = ">=3.11.4,<4"
+geopandas = ">=1.0.1"
+shapely = "*"
+pyproj = "*"
+pyogrio = "*"
 
 [pypi-dependencies]
 cng = { git = "https://github.com/boettiger-lab/cng-python" }
+
+[feature.dev.dependencies]
+pytest = "*"
+black = "*"
+ruff = "*"
+mypy = "*"
+
+[environments]
+default = ["dev"]
