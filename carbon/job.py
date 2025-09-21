@@ -69,13 +69,16 @@ def main():
       delim=" ",
       columns={"X": "FLOAT", "Y": "FLOAT", "Z": "INTEGER"},
     )
+    #.mutate(Z=ibis.ifelse(_.Z == 65535, None, _.Z))
+    .filter(_.Z != 65535)
     .mutate(
       h0=h3_latlng_to_cell_string(_.Y, _.X, 0),  # base
       h_zoom=h3_latlng_to_cell_string(_.Y, _.X, zoom),
     )
-    .mutate(Z=ibis.ifelse(_.Z == 65535, None, _.Z))
+    .select(_.Z, .h_zoom, _.h0)
+    .rename(f"h{zoom}" = _.h_zoom, carbon = _.Z)
     .to_parquet(
-      f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/vulnerable-total-carbon-2018-h{zoom}.parquet"
+      f"s3://public-carbon/hex2/vulnerable-carbon/h0={h0}/data_0.parquet"
     )
   )
   print("Finished writing parquet", flush=True)
