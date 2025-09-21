@@ -75,7 +75,7 @@ def main():
       h0=h3_latlng_to_cell_string(_.Y, _.X, 0),  # base
       h_zoom=h3_latlng_to_cell_string(_.Y, _.X, zoom),
     )
-    .select(_.Z, .h_zoom, _.h0)
+    .select(_.Z, _.h_zoom, _.h0)
     .rename(f"h{zoom}" = _.h_zoom, carbon = _.Z)
     .to_parquet(
       f"s3://public-carbon/hex2/vulnerable-carbon/h0={h0}/data_0.parquet"
