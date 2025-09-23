@@ -6,10 +6,12 @@ metadata:
     k8s-app: carbon-job
 spec:
   # Run 122 indexed completions (i = 0..121)
-  completions: 122
-  parallelism: 2  # adjust concurrency as cluster capacity allows
+  completions: 1
+  parallelism: 1  # adjust concurrency as cluster capacity allows
   completionMode: Indexed
-  backoffLimit: 2
+  backoffLimit: 0
+  # Keep failed pods for 1 hour (3600 seconds) for debugging
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels:
@@ -27,8 +29,9 @@ spec:
                 operator: NotIn
                 values:
                 - "true"
-      # Restart pod on failure once (paired with backoffLimit: 1 at job level)
-      restartPolicy: OnFailure
+      # Keep failed pods around for debugging (paired with ttlSecondsAfterFinished at job level)
+      # Never restart pod on failure - keep failed pods for debugging
+      restartPolicy: Never
       initContainers:
         - name: git-clone
           image: alpine/git:2.45.2

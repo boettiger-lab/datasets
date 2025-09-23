@@ -1,6 +1,8 @@
 import argparse
 import os
 import sys
+import psutil
+import time
 from osgeo import gdal
 import ibis
 from cng.utils import *  # noqa
@@ -13,6 +15,7 @@ def main():
   parser.add_argument("--i", type=int, required=True, help="Hex index i to process (matches column i in h0-valid.parquet)")
   parser.add_argument("--zoom", type=int, default=8, help="H3 resolution to aggregate to (default 8)")
   parser.add_argument("--input-url", default="/vsis3/public-carbon/cogs/vulnerable_c_total_2018.tif", help="Input raster URL")
+  parser.add_argument("--profile", action="store_true", help="Enable memory and runtime profiling")
   args = parser.parse_args()
 
   i = args.i
@@ -84,7 +87,10 @@ def main():
   )
   print("Finished writing parquet", flush=True)
 
+  if args.profile:
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    print(f"Maximum RAM used: {mem_info.rss / 1024**2:.2f} MiB", flush=True)
+    print(f"Total runtime: {end_time - start_time:.2f} seconds", flush=True)
 
 if __name__ == "__main__":
-  main()
-
