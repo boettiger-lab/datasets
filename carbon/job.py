@@ -94,3 +94,4 @@ def main():
     print(f"Total runtime: {end_time - start_time:.2f} seconds", flush=True)
 
 if __name__ == "__main__":
+    main()
