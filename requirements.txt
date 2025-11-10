@@ -1,2 +1,0 @@
-git+https://github.com/boettiger-lab/cng-python
-ray[default]
