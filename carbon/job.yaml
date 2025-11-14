@@ -6,8 +6,8 @@ metadata:
     k8s-app: carbon-job
 spec:
   # Run 122 indexed completions (i = 0..121)
-  completions: 1
-  parallelism: 1  # adjust concurrency as cluster capacity allows
+  completions: 122
+  parallelism: 16  # adjust concurrency as cluster capacity allows
   completionMode: Indexed
   backoffLimit: 0
   # Keep failed pods for 1 hour (3600 seconds) for debugging

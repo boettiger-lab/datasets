@@ -88,7 +88,7 @@ def main():
     .select(_.Z, _.h_zoom, _.h0)
     .rename({f"h{zoom}": "h_zoom"})
     .to_parquet(
-      f"{ouptut_url}/h0={h0}/data_0.parquet"
+      f"{output_url}/h0={h0}/data_0.parquet"
     )
   )
   print("Finished writing parquet", flush=True)
