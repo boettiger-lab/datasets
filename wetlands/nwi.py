@@ -94,7 +94,7 @@ def main():
     result = (
         geom_to_cell(chunk, zoom=8)
         .mutate(h8 = _.h3id.unnest())
-        .mutate(h0 = h3_cell_to_parent_string(_.h8, 0))
+        .mutate(h0 = h3_cell_to_parent(_.h8, 0))
         .drop('h3id')
     )
 
