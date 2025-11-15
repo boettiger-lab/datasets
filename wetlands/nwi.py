@@ -41,10 +41,10 @@ def geom_to_cell(df, zoom=8, keep_cols=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Process polygon file i to zoom z")
-    parser.add_argument("--i", type=int, default = 1, help="File index i to process")
+    parser.add_argument("--i", type=int, default=0, help="Chunk index to process (0-based)")
     parser.add_argument("--zoom", type=int, default=8, help="H3 resolution to aggregate to (default 8)")
     parser.add_argument("--input-url", default = "s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/**",  help="Input geoparquet")
-    parser.add_argument("--output-url", default = "s3://public-wetlands/nwi/chunks",  help="Output geoparquet bucket")
+    parser.add_argument("--output-url", default = "s3://public-wetlands/nwi/chunks/",  help="Output geoparquet bucket (ends with /)")
     args = parser.parse_args()
 
 
@@ -82,7 +82,11 @@ def main():
     print(f"Chunk size: {CHUNK_SIZE:,}")
     print(f"Number of chunks: {num_chunks}")
 
-    chunk_id = 0
+    # Use provided chunk index; guard against out-of-range
+    chunk_id = int(args.i)
+    if chunk_id < 0 or chunk_id >= num_chunks:
+        print(f"Index {chunk_id} out of range [0, {num_chunks - 1}]. Exiting successfully.")
+        return
     offset = chunk_id * CHUNK_SIZE
     print(f"\nProcessing chunk {chunk_id + 1}/{num_chunks} (rows {offset:,} to {min(offset + CHUNK_SIZE, total_rows):,})")
 
