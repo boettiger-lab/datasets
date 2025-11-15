@@ -2,7 +2,7 @@ import argparse
 
 import ibis
 from ibis import _
-from cng.utils import *
+from cng.utils import set_secrets
 from cng.h3 import * 
 import os
 
