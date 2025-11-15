@@ -91,7 +91,12 @@ def main():
     print(f"\nProcessing chunk {chunk_id + 1}/{num_chunks} (rows {offset:,} to {min(offset + CHUNK_SIZE, total_rows):,})")
 
     chunk = table.limit(CHUNK_SIZE, offset=offset)
-    result = geom_to_cell(chunk, zoom=8).mutate(h8 = _.h3id.unnest()).drop('h3id')
+    result = (
+        geom_to_cell(chunk, zoom=8)
+        .mutate(h8 = _.h3id.unnest())
+        .mutate(h0 = h3_cell_to_parent_string(_.h8, 0))
+        .drop('h3id')
+    )
 
     output_file = f"{args.output_url}chunks/chunk_{chunk_id:06d}.parquet"
     result.to_parquet(output_file)
