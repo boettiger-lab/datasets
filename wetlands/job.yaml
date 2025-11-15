@@ -5,9 +5,8 @@ metadata:
   labels:
     k8s-app: wetlands
 spec:
-  # Run 122 indexed completions (i = 0..121)
   completions: 18587
-  parallelism: 100  # adjust concurrency as cluster capacity allows
+  parallelism: 500  # adjust concurrency as cluster capacity allows
   completionMode: Indexed
   backoffLimit: 0
   # Keep failed pods for 1 hour (3600 seconds) for debugging
@@ -89,10 +88,10 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: 10Gi
+              memory: 15Gi
             limits:
               cpu: "4"
-              memory: 10Gi
+              memory: 15Gi
           # Use the indexed environment variable to pass --i
           command:
             - bash
