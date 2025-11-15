@@ -54,7 +54,8 @@ def main():
 
 
     con = ibis.duckdb.connect(extensions = ["spatial", "h3"])
-    install_h3()
+    con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
+
     # Must used scoped secrets with different names for the different endpoints
     set_secrets(con, name = "minio") # read/write using AWS env var credentials
     set_secrets(con, "", "", endpoint = "s3.amazonaws.com", region="us-west-2", name = "source", bucket = "us-west-2.opendata.source.coop")
