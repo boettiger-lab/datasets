@@ -40,13 +40,12 @@ def geom_to_cell(df, zoom=8, keep_cols=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Process polygon file i to zoom z")
-    parser.add_argument("--i", type=int, required=True, default = 1, help="File index i to process")
+    parser.add_argument("--i", type=int, default = 1, help="File index i to process")
     parser.add_argument("--zoom", type=int, default=8, help="H3 resolution to aggregate to (default 8)")
-    parser.add_argument("--input-url", default = "s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands",  help="Input geoparquet")
-    parser.add_argument("--output-url", default = "s3://public-wetlands/nwi/hex",  help="Output geoparquet bucket")
+    parser.add_argument("--input-url", default = "s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/**",  help="Input geoparquet")
+    parser.add_argument("--output-url", default = "s3://public-wetlands/nwi/chunks",  help="Output geoparquet bucket")
     args = parser.parse_args()
 
-    print(f"{args.output_url}")
 
     con = ibis.duckdb.connect("local.db", extensions = ["spatial", "h3"])
     install_h3()
@@ -55,9 +54,9 @@ def main():
     set_secrets(con, "", "", endpoint = "s3.amazonaws.com", region="us-west-2", name = "source", bucket = "us-west-2.opendata.source.coop")
 
 
-    SOURCE = "s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/**"
+    SOURCE = args.input_url
 
-    nwi =(con
+    table =(con
         .read_parquet(SOURCE, filename = True)
         .select('geometry', 'ATTRIBUTE', 'WETLAND_TYPE', 'filename')
         .rename(geom = "geometry")
@@ -67,7 +66,6 @@ def main():
     )
 
     # Read parquet file
-    table = con.read_parquet(f"{args.input_url}/{file}")
 
     CHUNK_SIZE = 2048
     #MEMORY_LIMIT='20GB'
@@ -89,7 +87,7 @@ def main():
     chunk = table.limit(CHUNK_SIZE, offset=offset)
     result = geom_to_cell(chunk, zoom=8).mutate(h8 = _.h3id.unnest()).drop('h3id')
 
-    output_file = f"{OUTPUT_PATH}chunks/chunk_{chunk_id:06d}.parquet"
+    output_file = f"{args.output_url}chunks/chunk_{chunk_id:06d}.parquet"
     result.to_parquet(output_file)
 
     print(f"  ✓ Chunk {chunk_id} written")

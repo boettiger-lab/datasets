@@ -6,8 +6,8 @@ metadata:
     k8s-app: wetlands
 spec:
   # Run 122 indexed completions (i = 0..121)
-  completions: 1
-  parallelism: 1  # adjust concurrency as cluster capacity allows
+  completions: 18587
+  parallelism: 100  # adjust concurrency as cluster capacity allows
   completionMode: Indexed
   backoffLimit: 0
   # Keep failed pods for 1 hour (3600 seconds) for debugging
@@ -89,17 +89,18 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: 34Gi
+              memory: 10Gi
             limits:
               cpu: "4"
-              memory: 34Gi
+              memory: 10Gi
           # Use the indexed environment variable to pass --i
           command:
             - bash
             - -lc
             - |
+              pip install git+https://github.com/boettiger-lab/cng-python && \
               echo "Running index ${INDEX}";
-              python -u wetlands/job.py --i ${INDEX} --zoom 8 --input-url https://minio.carlboettiger.info/public-wetlands/GLWD_v2_0/GLWD_v2_0_combined_classes/GLWD_v2_0_main_class.tif --output-url s3://public-wetlands/hex
+              python -u wetlands/nwi.py --i ${INDEX} --zoom 8 --input-url s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/** --output-url s3://public-wetlands/nwi/hex
       volumes:
         - name: repo
           emptyDir: {}
