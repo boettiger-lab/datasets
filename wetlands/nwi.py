@@ -47,7 +47,7 @@ def main():
     args = parser.parse_args()
 
 
-    con = ibis.duckdb.connect("local.db", extensions = ["spatial", "h3"])
+    con = ibis.duckdb.connect(extensions = ["spatial", "h3"])
     install_h3()
     # Must used scoped secrets with different names for the different endpoints
     set_secrets(con, name = "minio") # read/write using AWS env var credentials
