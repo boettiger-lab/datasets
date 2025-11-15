@@ -7,11 +7,6 @@ from cng.h3 import *
 import os
 
 
-@ibis.udf.scalar.builtin
-def h3_polygon_wkt_to_cells_string (geom, int) -> str:
-    ...
-
-
 def geom_to_cell(df, zoom=8, keep_cols=None):
     con = df.get_backend()
     
