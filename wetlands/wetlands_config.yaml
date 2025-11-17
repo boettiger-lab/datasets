@@ -1,0 +1,81 @@
+# Wetlands Processing Job Configuration
+
+# Kubernetes settings
+namespace: biodiversity
+job_name_prefix: wetlands
+total_indices: 18587
+
+# Container configuration
+container_image: ghcr.io/rocker-org/ml-spatial
+image_pull_policy: Always
+working_directory: /workspace/datasets
+
+# Resource tiers (memory will be doubled on each retry)
+resource_tiers:
+  - memory: "10Gi"
+    cpu: "1"
+  - memory: "20Gi"
+    cpu: "1"
+  - memory: "40Gi"
+    cpu: "2"
+  - memory: "80Gi"
+    cpu: "2"
+  - memory: "160Gi"
+    cpu: "4"
+
+# Job execution settings
+parallelism: 50  # Max concurrent pods
+max_retries_per_tier: 2  # Retries for transient failures before moving to next tier
+ttl_seconds_after_finished: 3600  # Keep completed jobs for 1 hour
+
+# Priority and scheduling
+priority_class: opportunistic
+avoid_gpu_nodes: true
+
+# Init container for git clone
+init_container:
+  enabled: true
+  image: alpine/git:2.45.2
+  repo_url: https://github.com/boettiger-lab/datasets.git
+  clone_depth: 1
+
+# Main container command
+# Available variables: $MAPPED_INDEX, $MEMORY_TIER, $JOB_COMPLETION_INDEX
+command:
+  - bash
+  - -lc
+  - >
+    MAPPED_INDEX=$(python3 -c "import json,os; mapping=json.loads(os.environ['INDEX_MAPPING']); print(mapping[int(os.environ['JOB_COMPLETION_INDEX'])])");
+    echo "Processing index $MAPPED_INDEX (tier $MEMORY_TIER)";
+    pip install git+https://github.com/boettiger-lab/cng-python;
+    python -u wetlands/nwi.py --i $MAPPED_INDEX --zoom 8 --input-url s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/** --output-url s3://public-wetlands/nwi/hex
+
+# Environment variables
+environment:
+  - name: AWS_ACCESS_KEY_ID
+    value_from:
+      secret:
+        name: aws
+        key: AWS_ACCESS_KEY_ID
+  - name: AWS_SECRET_ACCESS_KEY
+    value_from:
+      secret:
+        name: aws
+        key: AWS_SECRET_ACCESS_KEY
+  - name: AWS_S3_ENDPOINT
+    value: rook-ceph-rgw-nautiluss3.rook
+  - name: AWS_PUBLIC_ENDPOINT
+    value: s3-west.nrp-nautilus.io
+  - name: AWS_HTTPS
+    value: "false"
+  - name: AWS_VIRTUAL_HOSTING
+    value: "FALSE"
+  - name: GDAL_DATA
+    value: /opt/conda/share/gdal
+  - name: PROJ_LIB
+    value: /opt/conda/share/proj
+
+# Volumes
+volumes:
+  - name: repo
+    type: emptyDir
