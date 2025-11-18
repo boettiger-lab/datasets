@@ -5,6 +5,8 @@ from cng.utils import *
 con = ibis.duckdb.connect()
 set_secrets(con)
 
+con.raw_sql("SET threads TO 100")
+
 print("Re-paritioning....")
 (con
  .read_parquet("s3://public-wetlands/nwi/hexchunks/**")

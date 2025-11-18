@@ -88,10 +88,10 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: 34Gi
+              memory: 180Gi
             limits:
               cpu: "4"
-              memory: 34Gi
+              memory: 180Gi
           # Use the indexed environment variable to pass --i
           command:
             - bash
