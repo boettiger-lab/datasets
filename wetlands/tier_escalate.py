@@ -188,9 +188,9 @@ def create_next_tier_job(failed_indices: Set[int], current_tier: int,
     # Save manifest with literal block style for multi-line strings
     manifest_file = f"{job_name}.yaml"
     
-    # Custom representer to use literal block style (|) for multi-line strings
+    # Custom representer to use literal block style (|) only for long multi-line strings
     def str_representer(dumper, data):
-        if '\n' in data:
+        if '\n' in data and len(data) > 100:  # Only use literal style for long multi-line strings
             return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
         return dumper.represent_scalar('tag:yaml.org,2002:str', data)
     
