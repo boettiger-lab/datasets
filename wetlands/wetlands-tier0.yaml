@@ -8,7 +8,7 @@ metadata:
     tier: '0'
 spec:
   completions: 18587
-  parallelism: 50
+  parallelism: 100
   completionMode: Indexed
   backoffLimitPerIndex: 0
   podFailurePolicy:
