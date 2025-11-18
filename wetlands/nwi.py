@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--i", type=int, default=0, help="Chunk index to process (0-based)")
     parser.add_argument("--zoom", type=int, default=8, help="H3 resolution to aggregate to (default 8)")
     parser.add_argument("--input-url", default = "s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/**",  help="Input geoparquet")
-    parser.add_argument("--output-url", default = "s3://public-wetlands/nwi/chunks/",  help="Output geoparquet bucket (ends with /)")
+    parser.add_argument("--output-url", default = "s3://public-wetlands/nwi/chunks",  help="Output geoparquet bucket (ends with /)")
     args = parser.parse_args()
 
 
@@ -98,7 +98,7 @@ def main():
         .drop('h3id')
     )
 
-    output_file = f"{args.output_url}chunks/chunk_{chunk_id:06d}.parquet"
+    output_file = f"{args.output_url}/chunk_{chunk_id:06d}.parquet"
     result.to_parquet(output_file)
 
     print(f"  ✓ Chunk {chunk_id} written")

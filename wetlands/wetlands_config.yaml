@@ -48,7 +48,7 @@ command:
     MAPPED_INDEX=$(python3 -c "import json,os; mapping=json.loads(os.environ['INDEX_MAPPING']); print(mapping[int(os.environ['JOB_COMPLETION_INDEX'])])");
     echo "Processing index $MAPPED_INDEX (tier $MEMORY_TIER)";
     pip install git+https://github.com/boettiger-lab/cng-python;
-    python -u wetlands/nwi.py --i $MAPPED_INDEX --zoom 8 --input-url s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/** --output-url s3://public-wetlands/nwi/hex
+    python -u wetlands/nwi.py --i $MAPPED_INDEX --zoom 8 --input-url s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/** --output-url s3://public-wetlands/nwi/chunks
 
 # Environment variables
 environment:
