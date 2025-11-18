@@ -2,7 +2,7 @@
 import ibis
 from ibis import _
 from cng.utils import *
-con = ibis.duckdb.connect("local.db")
+con = ibis.duckdb.connect()
 set_secrets(con)
 
 print("Re-paritioning....")
