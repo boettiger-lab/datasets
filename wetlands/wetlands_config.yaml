@@ -40,15 +40,34 @@ init_container:
   clone_depth: 1
 
 # Main container command
-# Available variables: $MAPPED_INDEX, $MEMORY_TIER, $JOB_COMPLETION_INDEX
+# For retry tiers, INDEX_MAPPING contains the list of failed indices to retry
+# For Tier 0, INDEX_MAPPING is not set, so we use JOB_COMPLETION_INDEX directly
 command:
   - bash
-  - -lc
-  - >
-    MAPPED_INDEX=$(python3 -c "import json,os; mapping=json.loads(os.environ['INDEX_MAPPING']); print(mapping[int(os.environ['JOB_COMPLETION_INDEX'])])");
-    echo "Processing index $MAPPED_INDEX (tier $MEMORY_TIER)";
-    pip install git+https://github.com/boettiger-lab/cng-python;
-    python -u wetlands/nwi.py --i $MAPPED_INDEX --zoom 8 --input-url s3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/** --output-url s3://public-wetlands/nwi/chunks
+  - -c
+  - |
+    set -euo pipefail
+    
+    # Determine which index to process
+    if [ -n "${INDEX_MAPPING:-}" ]; then
+      # Retry tier: map completion index to failed index
+      INDEX=$(python3 -c "import json, os; print(json.loads(os.environ['INDEX_MAPPING'])[int(os.environ['JOB_COMPLETION_INDEX'])])")
+    else
+      # Initial tier: use completion index directly
+      INDEX=$JOB_COMPLETION_INDEX
+    fi
+    
+    echo "Processing wetlands index $INDEX at tier $MEMORY_TIER"
+    
+    # Install dependencies
+    pip install -q git+https://github.com/boettiger-lab/cng-python
+    
+    # Process the wetlands data
+    python -u wetlands/nwi.py \
+      --i "$INDEX" \
+      --zoom 8 \
+      --input-url 's3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/**' \
+      --output-url 's3://public-wetlands/nwi/chunks'
 
 # Environment variables
 environment:

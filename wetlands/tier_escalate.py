@@ -85,11 +85,19 @@ def create_next_tier_job(failed_indices: Set[int], current_tier: int,
         return None
     
     tier = config["resource_tiers"][next_tier]
-    job_name = f"{config['job_name_prefix']}-tier{next_tier}-manual"
+    job_name = f"{config['job_name_prefix']}-tier{next_tier}"
+    
+    # Check if this is a full range (Tier 0)
+    is_full_range = (current_tier == -1)
     
     print(f"\n🚀 Creating Tier {next_tier} job: {job_name}")
     print(f"   Memory: {tier['memory']}, CPU: {tier['cpu']}")
-    print(f"   Indices to retry: {len(failed_indices)}")
+    print(f"   Indices to process: {len(failed_indices)}")
+    if is_full_range:
+        print(f"   Using direct index mapping (0-{len(failed_indices)-1})")
+    
+    # Build environment variables
+    env_vars, use_direct = _build_env_vars(failed_indices, next_tier, config, is_full_range)
     
     # Build job manifest
     manifest = {
@@ -107,16 +115,17 @@ def create_next_tier_job(failed_indices: Set[int], current_tier: int,
             "completions": len(failed_indices),
             "parallelism": min(len(failed_indices), config.get("parallelism", 50)),
             "completionMode": "Indexed",
-            "backoffLimit": len(failed_indices),
-            "backoffLimitPerIndex": 0,
+            "backoffLimitPerIndex": 0,  # Don't retry individual indices
             "podFailurePolicy": {
-                "rules": [{
-                    "action": "FailIndex",
-                    "onExitCodes": {
-                        "operator": "In",
-                        "values": list(range(1, 256))
+                "rules": [
+                    {
+                        "action": "Ignore",  # Ignore pod disruptions (evictions, preemptions)
+                        "onPodConditions": [
+                            {"type": "DisruptionTarget"}
+                        ]
                     }
-                }]
+                    # All other failures automatically trigger FailIndex with backoffLimitPerIndex: 0
+                ]
             },
             "ttlSecondsAfterFinished": config.get("ttl_seconds_after_finished", 3600),
             "template": {
@@ -136,7 +145,7 @@ def create_next_tier_job(failed_indices: Set[int], current_tier: int,
                         "workingDir": config.get("working_directory", "/workspace/datasets"),
                         "command": config["command"],
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}] if config.get("init_container", {}).get("enabled") else [],
-                        "env": _build_env_vars(failed_indices, next_tier, config),
+                        "env": env_vars,
                         "resources": {
                             "requests": {"memory": tier["memory"], "cpu": tier["cpu"]},
                             "limits": {"memory": tier["memory"], "cpu": tier["cpu"]}
@@ -176,18 +185,38 @@ def create_next_tier_job(failed_indices: Set[int], current_tier: int,
             }
         }
     
-    # Save manifest
+    # Save manifest with literal block style for multi-line strings
     manifest_file = f"{job_name}.yaml"
+    
+    # Custom representer to use literal block style (|) for multi-line strings
+    def str_representer(dumper, data):
+        if '\n' in data:
+            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+    
+    yaml.add_representer(str, str_representer)
+    
     with open(manifest_file, "w") as f:
-        yaml.dump(manifest, f, default_flow_style=False)
+        yaml.dump(manifest, f, default_flow_style=False, sort_keys=False)
     
     print(f"   Saved manifest to: {manifest_file}")
     
     return manifest_file
 
 
-def _build_env_vars(indices: Set[int], tier_level: int, config: dict) -> List[dict]:
-    """Build environment variables."""
+def _build_env_vars(indices: Set[int], tier_level: int, config: dict, is_full_range: bool = False) -> List[dict]:
+    """Build environment variables.
+    
+    Args:
+        indices: Set of indices to process
+        tier_level: Current tier level
+        config: Configuration dict
+        is_full_range: If True and indices are 0..N-1, use simpler direct mapping
+    """
+    # Check if this is a simple 0..N-1 range
+    sorted_indices = sorted(list(indices))
+    use_direct_index = is_full_range and sorted_indices == list(range(len(sorted_indices)))
+    
     env_vars = [
         {
             "name": "JOB_COMPLETION_INDEX",
@@ -198,14 +227,17 @@ def _build_env_vars(indices: Set[int], tier_level: int, config: dict) -> List[di
             }
         },
         {
-            "name": "INDEX_MAPPING",
-            "value": json.dumps(sorted(list(indices)))
-        },
-        {
             "name": "MEMORY_TIER",
             "value": str(tier_level)
         }
     ]
+    
+    # Only add INDEX_MAPPING if needed
+    if not use_direct_index:
+        env_vars.append({
+            "name": "INDEX_MAPPING",
+            "value": json.dumps(sorted_indices)
+        })
     
     for env in config.get("environment", []):
         if "value_from" in env:
@@ -219,13 +251,42 @@ def _build_env_vars(indices: Set[int], tier_level: int, config: dict) -> List[di
         else:
             env_vars.append({"name": env["name"], "value": env["value"]})
     
-    return env_vars
+    return env_vars, use_direct_index
 
 
 def main():
+    # Check for --init flag to create Tier 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "--init":
+        config_file = sys.argv[2]
+        namespace = sys.argv[3] if len(sys.argv) > 3 else "biodiversity"
+        
+        print("=" * 60)
+        print("Creating Initial Tier 0 Job")
+        print("=" * 60)
+        
+        # Load config to get total indices
+        with open(config_file) as f:
+            config = yaml.safe_load(f)
+        
+        all_indices = set(range(config["total_indices"]))
+        print(f"\n📊 Total indices: {len(all_indices)}")
+        
+        # Create Tier 0 job
+        manifest_file = create_next_tier_job(all_indices, -1, config_file, namespace)
+        
+        if manifest_file:
+            print(f"\n📋 To launch Tier 0, run:")
+            print(f"   kubectl apply -f {manifest_file}")
+        
+        return 0
+    
     if len(sys.argv) < 4:
-        print("Usage: python3 tier_escalate.py <completed_job_name> <current_tier> <config.yaml>")
-        print("Example: python3 tier_escalate.py wetlands-tier0-batch0 0 wetlands_config.yaml")
+        print("Usage:")
+        print("  Create Tier 0:    python3 tier_escalate.py --init <config.yaml> [namespace]")
+        print("  Escalate failed:  python3 tier_escalate.py <completed_job_name> <current_tier> <config.yaml>")
+        print("\nExamples:")
+        print("  python3 tier_escalate.py --init wetlands_config.yaml")
+        print("  python3 tier_escalate.py wetlands-tier0 0 wetlands_config.yaml")
         sys.exit(1)
     
     job_name = sys.argv[1]

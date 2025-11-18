@@ -4,11 +4,22 @@ Process 18,587 wetlands indices using Kubernetes indexed jobs with automatic res
 
 ## Quick Start
 
-```bash
-# Check status of current Tier 1 job
-kubectl get job wetlands-tier1 -n biodiversity -w
+**First time? Start with Tier 0:**
 
-# After completion, escalate to Tier 2 if needed
+```bash
+# Generate and launch Tier 0 (all 18,587 indices at 10Gi)
+python3 tier_escalate.py --init wetlands_config.yaml
+kubectl apply -f wetlands-tier0.yaml
+```
+
+**After Tier 0 completes:**
+
+```bash
+# Escalate failed indices to Tier 1
+python3 tier_escalate.py wetlands-tier0 0 wetlands_config.yaml
+kubectl apply -f wetlands-tier1.yaml
+
+# Continue for Tier 2, 3, 4 as needed
 python3 tier_escalate.py wetlands-tier1 1 wetlands_config.yaml
 kubectl apply -f wetlands-tier2.yaml
 ```
