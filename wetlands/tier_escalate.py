@@ -46,28 +46,22 @@ def get_failed_indices(job_name: str, namespace: str) -> Set[int]:
         elif part:
             failed_completion_indices.add(int(part))
     
-    # Get the INDEX_MAPPING from job env to map back to original indices
-    pods_result = subprocess.run(
-        ["kubectl", "get", "pods", "-n", namespace, "-l", f"job-name={job_name}",
-         "-o", "json", "--limit=1"],
-        capture_output=True,
-        text=True
-    )
+    # Get the INDEX_MAPPING from job spec to map back to original indices
+    job_status_full = json.loads(result.stdout)
+    containers = job_status_full.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
     
-    if pods_result.returncode == 0:
-        pods = json.loads(pods_result.stdout)
-        for pod in pods.get("items", []):
-            for container in pod["spec"]["containers"]:
-                for env in container.get("env", []):
-                    if env["name"] == "INDEX_MAPPING":
-                        index_mapping = json.loads(env["value"])
-                        failed_original = {index_mapping[i] for i in failed_completion_indices 
-                                         if i < len(index_mapping)}
-                        print(f"Failed indices: {sorted(list(failed_original))}")
-                        return failed_original
+    for container in containers:
+        for env in container.get("env", []):
+            if env["name"] == "INDEX_MAPPING":
+                index_mapping = json.loads(env["value"])
+                failed_original = {index_mapping[i] for i in failed_completion_indices 
+                                 if i < len(index_mapping)}
+                print(f"Mapped {len(failed_completion_indices)} completion indices to {len(failed_original)} original indices")
+                print(f"Failed indices: {sorted(list(failed_original))}")
+                return failed_original
     
-    # Fallback: assume identity mapping
-    print(f"⚠️  Warning: Could not get INDEX_MAPPING, assuming identity mapping")
+    # Fallback: assume identity mapping (for tier 0 where there's no INDEX_MAPPING)
+    print(f"⚠️  No INDEX_MAPPING found (tier 0?), using completion indices directly")
     print(f"Failed completion indices: {sorted(list(failed_completion_indices))}")
     return failed_completion_indices
 

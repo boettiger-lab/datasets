@@ -22,11 +22,13 @@ resource_tiers:
     cpu: "2"
   - memory: "160Gi"
     cpu: "4"
+  - memory: "320Gi"
+    cpu: "1"
 
 # Job execution settings
 parallelism: 50  # Max concurrent pods
 max_retries_per_tier: 2  # Retries for transient failures before moving to next tier
-ttl_seconds_after_finished: 3600  # Keep completed jobs for 1 hour
+ttl_seconds_after_finished: 28800  # Keep completed jobs for 8 hours
 
 # Priority and scheduling
 priority_class: opportunistic
