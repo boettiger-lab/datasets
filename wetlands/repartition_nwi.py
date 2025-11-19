@@ -2,10 +2,10 @@
 import ibis
 from ibis import _
 from cng.utils import *
-con = ibis.duckdb.connect()
+con = ibis.duckdb.connect("/tmp/duck.db")
 set_secrets(con)
 
-con.raw_sql("SET threads TO 100")
+#con.raw_sql("SET threads TO 100")
 
 print("Re-paritioning....")
 (con
