@@ -10,7 +10,7 @@ set_secrets(con)
 print("Re-paritioning....")
 (con
  .read_parquet("s3://public-wetlands/nwi/chunks/**")
- .to_parquet("s3://public-wetlands/nwi/hex/", partition_by="h0")
+ .to_parquet("s3://public-wetlands/nwi/hex/", partition_by="h0", overwrite = True)
 )
 print("Done!")
 

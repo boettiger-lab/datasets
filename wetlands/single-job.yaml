@@ -9,8 +9,8 @@ spec:
   parallelism: 1  # adjust concurrency as cluster capacity allows
   completionMode: Indexed
   backoffLimit: 0
-  # Keep failed pods for 1 hour (3600 seconds) for debugging
-  ttlSecondsAfterFinished: 3600
+  # Keep failed pods (seconds) for debugging
+  ttlSecondsAfterFinished: 36000
   template:
     metadata:
       labels:
@@ -87,11 +87,11 @@ spec:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
           resources:
             requests:
-              cpu: "4"
-              memory: 180Gi
+              cpu: "2"
+              memory: 480Gi
             limits:
-              cpu: "4"
-              memory: 180Gi
+              cpu: "2"
+              memory: 480Gi
           # Use the indexed environment variable to pass --i
           command:
             - bash
