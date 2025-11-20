@@ -11,5 +11,5 @@ set_secrets(con)
 #con.raw_sql("SET threads TO 100")
 con.raw_sql("SET preserve_insertion_order=false") # saves RAM
 
-con.raw_sql("create table wetlands from scan_parquet('s3://public-wetlands/nwi/chunks/**')")
-con.raw_sql("copy wetlands to s3://public-wetlands/nwi/nwi_h8.parquet")
+con.raw_sql("create table wetlands as select * from read_parquet('s3://public-wetlands/nwi/chunks/**')")
+con.raw_sql("copy wetlands to 's3://public-wetlands/nwi/hex' (FORMAT PARQUET, PARTITION_BY (h1))")
