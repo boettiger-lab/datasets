@@ -16,8 +16,12 @@ set_secrets(con)
 con.raw_sql("SET preserve_insertion_order=false") # saves RAM
 
 # Configure S3 client for listing files
+endpoint = os.getenv("AWS_S3_ENDPOINT")
+if endpoint and not endpoint.startswith("http"):
+    endpoint = f"http://{endpoint}"
+
 s3 = boto3.client('s3', 
-    endpoint_url=os.getenv("AWS_S3_ENDPOINT"),
+    endpoint_url=endpoint,
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
 )

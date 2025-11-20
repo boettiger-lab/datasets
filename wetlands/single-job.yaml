@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: data-job
+  name: slow-data-job
   labels:
     k8s-app: data-job
 spec:
@@ -69,6 +69,21 @@ spec:
                 secretKeyRef:
                   name: aws
                   key: AWS_SECRET_ACCESS_KEY
+            - name: MINIO_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nvme
+                  key: MINIO_KEY
+            - name: MINIO_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nvme
+                  key: MINIO_SECRET
+            - name: MINIO_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: nvme
+                  key: MINIO_ENDPOINT
             - name: AWS_S3_ENDPOINT
               value: "rook-ceph-rgw-nautiluss3.rook"
             - name: AWS_PUBLIC_ENDPOINT
@@ -88,10 +103,10 @@ spec:
           resources:
             requests:
               cpu: "2"
-              memory: 480Gi
+              memory: 380Gi
             limits:
               cpu: "2"
-              memory: 480Gi
+              memory: 380Gi
           # Use the indexed environment variable to pass --i
           command:
             - bash
