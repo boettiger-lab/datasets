@@ -11,5 +11,16 @@ set_secrets(con)
 #con.raw_sql("SET threads TO 100")
 con.raw_sql("SET preserve_insertion_order=false") # saves RAM
 
-con.raw_sql("create table wetlands as select * from read_parquet('s3://public-wetlands/nwi/chunks/**')")
-con.raw_sql("copy wetlands to 's3://public-wetlands/nwi/hex' (FORMAT PARQUET, PARTITION_BY (h1))")
+#con.raw_sql("create table wetlands as select * from read_parquet('s3://public-wetlands/nwi/chunks/**')")
+#con.raw_sql("copy wetlands to 's3://public-wetlands/nwi/hex' (FORMAT PARQUET, PARTITION_BY (h1))")
+
+
+chunks = con.read_parquet("s3://public-wetlands/nwi/chunks/**")
+chunks_h1 = chunks.mutate(h1 = h3_cell_to_parent(_.h8, 1))
+h1 = chunks_h1.select("h1").distinct().execute()["h1"].tolist()
+
+print("writing partitions:")
+for h in h1:
+    print(h)
+    chunks.filter(h3_cell_to_parent(_.h8, 1) == h).to_parquet(f"s3://public-wetlands/nwi/hex/h1={h}/data_0.parquet")
+
