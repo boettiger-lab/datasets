@@ -4,7 +4,7 @@ from ibis import _
 from cng.utils import *
 from cng.h3 import * 
 con = ibis.duckdb.connect("/tmp/duck.db", extensions = ["spatial", "h3"])
-install_h3()
+con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
 
 set_secrets(con)
 
