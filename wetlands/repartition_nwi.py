@@ -3,6 +3,10 @@ import ibis
 from ibis import _
 from cng.utils import *
 from cng.h3 import * 
+import os
+
+os.makedirs("/tmp/hex", exist_ok=True)
+
 con = ibis.duckdb.connect("/tmp/duck.db", extensions = ["spatial", "h3"])
 con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
 
