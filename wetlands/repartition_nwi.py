@@ -6,6 +6,9 @@ from cng.h3 import *
 import os
 import boto3
 import math
+import concurrent.futures
+import shutil
+from botocore.config import Config
 
 os.makedirs("/tmp/hex", exist_ok=True)
 
@@ -23,7 +26,8 @@ if endpoint and not endpoint.startswith("http"):
 s3 = boto3.client('s3', 
     endpoint_url=endpoint,
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    config=Config(max_pool_connections=50)
 )
 
 BUCKET = "public-wetlands"
@@ -51,9 +55,24 @@ for i in range(num_batches):
     batch_files = files[i*BATCH_SIZE : (i+1)*BATCH_SIZE]
     print(f"Processing batch {i+1}/{num_batches} ({len(batch_files)} files)...")
     
+    local_dir = f"/tmp/batch_{i}"
+    os.makedirs(local_dir, exist_ok=True)
+    
     try:
+        # Download files in parallel
+        print("  Downloading files...")
+        def download_one(s3_path):
+            key = s3_path.replace(f"s3://{BUCKET}/", "")
+            fname = os.path.basename(key)
+            local_path = os.path.join(local_dir, fname)
+            s3.download_file(BUCKET, key, local_path)
+            return local_path
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            local_files = list(executor.map(download_one, batch_files))
+
         # Construct SQL list string for read_parquet
-        file_list_str = ", ".join([f"'{f}'" for f in batch_files])
+        file_list_str = ", ".join([f"'{f}'" for f in local_files])
         
         # Load batch into a temp table, computing h1
         # Materializing to a temp table isolates the S3 read phase
@@ -84,6 +103,10 @@ for i in range(num_batches):
         
     except Exception as e:
         print(f"  Error in batch {i+1}: {e}")
+        
+    finally:
+        if os.path.exists(local_dir):
+            shutil.rmtree(local_dir)
 
 print("Done!")
 
