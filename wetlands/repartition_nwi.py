@@ -13,7 +13,7 @@ con.raw_sql("SET preserve_insertion_order=false") # saves RAM
 
 print("Re-paritioning....")
 (con
- .read_parquet("s3://public-wetlands/nwi/chunks/**").
+ .read_parquet("s3://public-wetlands/nwi/chunks/**")
  .mutate(h1 = h3_cell_to_parent(_.h8, 1))
  .to_parquet("s3://public-wetlands/nwi/hex/", partition_by="h1")
 )
