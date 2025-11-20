@@ -26,8 +26,12 @@ chunks = con.read_parquet("s3://public-wetlands/nwi/chunks/**")
 chunks_h1 = chunks.mutate(h1 = h3_cell_to_parent(_.h8, 1))
 h1 = chunks_h1.select("h1").distinct().execute()["h1"].tolist()
 
+
 print("writing partitions:")
 for h in h1:
     print(h)
-    chunks.filter(h3_cell_to_parent(_.h8, 1) == h).to_parquet(f"s3://public-wetlands/nwi/hex/h1={h}/data_0.parquet")
+    chunks.filter(h3_cell_to_parent(_.h8, 1) == h).to_parquet(f"/tmp/hex/h1={h}/data_0.parquet")
+
+
+con.open_parquet("/tmp/hex").to_parquet("s3://public-wetlands/nwi/hex/", partition_by = "h1")
 
