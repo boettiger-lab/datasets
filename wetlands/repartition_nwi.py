@@ -102,20 +102,35 @@ for i in range(num_batches):
             return local_path
 
         # Reduce parallel downloads to limit memory spikes
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             local_files = list(executor.map(download_one, batch_files))
 
-        # Construct SQL list string for read_parquet
-        file_list_str = ", ".join([f"'{f}'" for f in local_files])
+        print(f"  Downloaded {len(local_files)} files, total size: {sum(os.path.getsize(f) for f in local_files) / (1024**3):.2f} GB")
         
-        # Load batch into a temp table, computing h1
-        # Materializing to a temp table isolates the S3 read phase
-        con.raw_sql(f"""
-            CREATE OR REPLACE TABLE batch_temp AS 
-            SELECT *, h3_cell_to_parent(h8, 1) as h1 
-            FROM read_parquet([{file_list_str}])
-        """)
+        print("  Loading files into DuckDB in chunks...")
+        # Process files in smaller chunks to avoid OOM when loading into DuckDB
+        CHUNK_SIZE = 25
+        for chunk_idx in range(0, len(local_files), CHUNK_SIZE):
+            chunk_files = local_files[chunk_idx:chunk_idx + CHUNK_SIZE]
+            file_list_str = ", ".join([f"'{f}'" for f in chunk_files])
+            
+            if chunk_idx == 0:
+                # First chunk: create table
+                con.raw_sql(f"""
+                    CREATE OR REPLACE TABLE batch_temp AS 
+                    SELECT *, h3_cell_to_parent(h8, 1) as h1 
+                    FROM read_parquet([{file_list_str}])
+                """)
+            else:
+                # Subsequent chunks: append
+                con.raw_sql(f"""
+                    INSERT INTO batch_temp 
+                    SELECT *, h3_cell_to_parent(h8, 1) as h1 
+                    FROM read_parquet([{file_list_str}])
+                """)
+            print(f"    Loaded chunk {chunk_idx//CHUNK_SIZE + 1}/{(len(local_files) + CHUNK_SIZE - 1)//CHUNK_SIZE}")
         
+        print("  Computing distinct h1 values...")
         # Get distinct h1s in this batch
         h1_values = con.table("batch_temp").select("h1").distinct().execute()["h1"].tolist()
         
@@ -156,8 +171,10 @@ for i in range(num_batches):
                 return False
 
         # Reduce parallel uploads to limit memory spikes
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(upload_one, local_files_to_upload))
+        
+        print(f"  Uploads complete.")
             
         failed_count = results.count(False)
         if failed_count > 0:
