@@ -104,9 +104,11 @@ spec:
             requests:
               cpu: "2"
               memory: 380Gi
+              ephemeral-storage: "100Gi"
             limits:
               cpu: "2"
               memory: 380Gi
+              ephemeral-storage: "200Gi"
           # Use the indexed environment variable to pass --i
           command:
             - bash

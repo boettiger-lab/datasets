@@ -48,14 +48,18 @@ for page in pages:
 print(f"Found {len(files)} files.")
 
 # Process in batches to avoid S3 timeouts and memory issues
-BATCH_SIZE = 500
+BATCH_SIZE = 50
 num_batches = math.ceil(len(files) / BATCH_SIZE)
+
+# Use workspace for temp files if available (k8s volume), else /tmp
+TEMP_BASE = "/workspace/tmp" if os.path.exists("/workspace") else "/tmp"
+os.makedirs(TEMP_BASE, exist_ok=True)
 
 for i in range(num_batches):
     batch_files = files[i*BATCH_SIZE : (i+1)*BATCH_SIZE]
     print(f"Processing batch {i+1}/{num_batches} ({len(batch_files)} files)...")
     
-    local_dir = f"/tmp/batch_{i}"
+    local_dir = f"{TEMP_BASE}/batch_{i}"
     os.makedirs(local_dir, exist_ok=True)
     
     try:
@@ -85,7 +89,7 @@ for i in range(num_batches):
         # Get distinct h1s in this batch
         h1_values = con.table("batch_temp").select("h1").distinct().execute()["h1"].tolist()
         
-        local_out_dir = f"/tmp/batch_{i}_out"
+        local_out_dir = f"{TEMP_BASE}/batch_{i}_out"
         os.makedirs(local_out_dir, exist_ok=True)
 
         print(f"  Writing {len(h1_values)} partitions locally...")
