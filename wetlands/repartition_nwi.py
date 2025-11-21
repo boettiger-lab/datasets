@@ -89,9 +89,6 @@ for i in range(num_batches):
     con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
     con.raw_sql(f"SET temp_directory='{TEMP_BASE}/duck_temp_{i}.tmp'")
     set_secrets(con)
-    con.raw_sql("SET s3_max_connections=8")
-    con.raw_sql("SET http_retries=20")
-    con.raw_sql("SET http_retry_wait_ms=5000")
     con.raw_sql("SET preserve_insertion_order=false")
     
     try:
