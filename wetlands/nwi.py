@@ -71,7 +71,7 @@ def main():
 
     # Read parquet file
 
-    CHUNK_SIZE = 2048
+    CHUNK_SIZE = 100000
     #MEMORY_LIMIT='20GB'
     #con.raw_sql(f"SET memory_limit='{MEMORY_LIMIT}';")
     OUTPUT_PATH="s3://public-wetlands/nwi/"
@@ -95,6 +95,7 @@ def main():
     chunk = table.limit(CHUNK_SIZE, offset=offset)
     result = (
         geom_to_cell(chunk, zoom=8)
+        .drop('geom')  # very important to drop large geom before unnest!  
         .mutate(h8 = _.h3id.unnest())
         .mutate(h0 = h3_cell_to_parent(_.h8, 0))
         .drop('h3id')
