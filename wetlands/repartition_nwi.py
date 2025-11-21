@@ -42,7 +42,7 @@ for page in pages:
 print(f"Found {len(files)} files.")
 
 # Process in batches to avoid S3 timeouts and memory issues
-BATCH_SIZE = 500
+BATCH_SIZE = 100
 num_batches = math.ceil(len(files) / BATCH_SIZE)
 
 # Use workspace for temp files if available (k8s volume), else /tmp
