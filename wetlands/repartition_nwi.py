@@ -12,12 +12,6 @@ from botocore.config import Config
 
 os.makedirs("/tmp/hex", exist_ok=True)
 
-con = ibis.duckdb.connect("/tmp/duck.db", extensions = ["spatial", "h3"])
-con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
-
-set_secrets(con)
-con.raw_sql("SET preserve_insertion_order=false") # saves RAM
-
 # Configure S3 client for listing files
 endpoint = os.getenv("AWS_S3_ENDPOINT")
 if endpoint and not endpoint.startswith("http"):
@@ -48,7 +42,7 @@ for page in pages:
 print(f"Found {len(files)} files.")
 
 # Process in batches to avoid S3 timeouts and memory issues
-BATCH_SIZE = 50
+BATCH_SIZE = 20
 num_batches = math.ceil(len(files) / BATCH_SIZE)
 
 # Use workspace for temp files if available (k8s volume), else /tmp
@@ -61,6 +55,14 @@ for i in range(num_batches):
     
     local_dir = f"{TEMP_BASE}/batch_{i}"
     os.makedirs(local_dir, exist_ok=True)
+    
+    # Initialize DuckDB for this batch to ensure clean state and no temp file leakage
+    db_path = f"{TEMP_BASE}/duck_{i}.db"
+    con = ibis.duckdb.connect(db_path, extensions = ["spatial", "h3"])
+    con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
+    con.raw_sql(f"SET temp_directory='{TEMP_BASE}/duck_temp_{i}.tmp'")
+    set_secrets(con)
+    con.raw_sql("SET preserve_insertion_order=false")
     
     try:
         # Download files in parallel
@@ -134,11 +136,21 @@ for i in range(num_batches):
         
         # Clean up
         con.raw_sql("DROP TABLE batch_temp")
+        con.disconnect() # Close connection
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        if os.path.exists(f"{TEMP_BASE}/duck_temp_{i}.tmp"):
+            shutil.rmtree(f"{TEMP_BASE}/duck_temp_{i}.tmp")
+            
         if os.path.exists(local_out_dir):
             shutil.rmtree(local_out_dir)
         
     except Exception as e:
         print(f"  Error in batch {i+1}: {e}")
+        try:
+            con.disconnect()
+        except:
+            pass
         
     finally:
         if os.path.exists(local_dir):
