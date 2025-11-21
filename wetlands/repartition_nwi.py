@@ -85,21 +85,53 @@ for i in range(num_batches):
         # Get distinct h1s in this batch
         h1_values = con.table("batch_temp").select("h1").distinct().execute()["h1"].tolist()
         
-        print(f"  Writing {len(h1_values)} partitions...")
+        local_out_dir = f"/tmp/batch_{i}_out"
+        os.makedirs(local_out_dir, exist_ok=True)
+
+        print(f"  Writing {len(h1_values)} partitions locally...")
+        local_files_to_upload = []
+
         for h in h1_values:
-            # Write partition file for this batch
-            # Using a unique filename (part_{i}.parquet) prevents overwrites between batches
-            target_path = f"{OUTPUT_BASE}/h1={h}/part_{i}.parquet"
+            # Local path
+            local_partition_dir = os.path.join(local_out_dir, f"h1={h}")
+            os.makedirs(local_partition_dir, exist_ok=True)
+            local_file_path = os.path.join(local_partition_dir, f"part_{i}.parquet")
+            
+            # S3 Key (OUTPUT_BASE is s3://public-wetlands/nwi/hex)
+            # We want nwi/hex/h1={h}/part_{i}.parquet
+            s3_key = f"nwi/hex/h1={h}/part_{i}.parquet"
             
             con.raw_sql(f"""
                 COPY (SELECT * EXCLUDE(h1) FROM batch_temp WHERE h1 = '{h}') 
-                TO '{target_path}' (FORMAT PARQUET)
+                TO '{local_file_path}' (FORMAT PARQUET)
             """)
+            
+            local_files_to_upload.append((local_file_path, s3_key))
+
+        print(f"  Uploading {len(local_files_to_upload)} partitions to S3...")
+        
+        def upload_one(args):
+            local_path, key = args
+            try:
+                s3.upload_file(local_path, BUCKET, key)
+                return True
+            except Exception as e:
+                print(f"Failed to upload {key}: {e}")
+                return False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            results = list(executor.map(upload_one, local_files_to_upload))
+            
+        failed_count = results.count(False)
+        if failed_count > 0:
+             raise Exception(f"{failed_count} uploads failed")
             
         print(f"  Batch {i+1} completed.")
         
         # Clean up
         con.raw_sql("DROP TABLE batch_temp")
+        if os.path.exists(local_out_dir):
+            shutil.rmtree(local_out_dir)
         
     except Exception as e:
         print(f"  Error in batch {i+1}: {e}")
