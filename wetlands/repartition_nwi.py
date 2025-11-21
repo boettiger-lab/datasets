@@ -45,11 +45,38 @@ print(f"Found {len(files)} files.")
 BATCH_SIZE = 100
 num_batches = math.ceil(len(files) / BATCH_SIZE)
 
+# Check which batches are already complete by checking for output files
+print("Checking for completed batches...")
+completed_batches = set()
+try:
+    # List existing output files to determine which batches completed
+    output_paginator = s3.get_paginator('list_objects_v2')
+    output_pages = output_paginator.paginate(Bucket=BUCKET, Prefix="nwi/hex/")
+    for page in output_pages:
+        if 'Contents' in page:
+            for obj in page['Contents']:
+                key = obj['Key']
+                # Extract batch number from part_{i}.parquet
+                if 'part_' in key:
+                    try:
+                        batch_num = int(key.split('part_')[1].split('.')[0])
+                        completed_batches.add(batch_num)
+                    except (IndexError, ValueError):
+                        pass
+    print(f"Found {len(completed_batches)} completed batches: {sorted(completed_batches)[:10]}{'...' if len(completed_batches) > 10 else ''}")
+except Exception as e:
+    print(f"Warning: Could not check completed batches: {e}")
+
 # Use workspace for temp files if available (k8s volume), else /tmp
 TEMP_BASE = "/workspace/tmp" if os.path.exists("/workspace") else "/tmp"
 os.makedirs(TEMP_BASE, exist_ok=True)
 
 for i in range(num_batches):
+    # Skip already completed batches
+    if i in completed_batches:
+        print(f"Skipping batch {i+1}/{num_batches} (already completed)")
+        continue
+        
     batch_files = files[i*BATCH_SIZE : (i+1)*BATCH_SIZE]
     print(f"Processing batch {i+1}/{num_batches} ({len(batch_files)} files)...")
     
@@ -62,6 +89,9 @@ for i in range(num_batches):
     con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
     con.raw_sql(f"SET temp_directory='{TEMP_BASE}/duck_temp_{i}.tmp'")
     set_secrets(con)
+    con.raw_sql("SET s3_max_connections=8")
+    con.raw_sql("SET http_retries=20")
+    con.raw_sql("SET http_retry_wait_ms=5000")
     con.raw_sql("SET preserve_insertion_order=false")
     
     try:
@@ -74,7 +104,8 @@ for i in range(num_batches):
             s3.download_file(BUCKET, key, local_path)
             return local_path
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        # Reduce parallel downloads to limit memory spikes
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             local_files = list(executor.map(download_one, batch_files))
 
         # Construct SQL list string for read_parquet
@@ -97,7 +128,9 @@ for i in range(num_batches):
         print(f"  Writing {len(h1_values)} partitions locally...")
         local_files_to_upload = []
 
-        for h in h1_values:
+        for j, h in enumerate(h1_values):
+            if j % 10 == 0:
+                print(f"    Processing partition {j+1}/{len(h1_values)}...")
             # Local path
             local_partition_dir = os.path.join(local_out_dir, f"h1={h}")
             os.makedirs(local_partition_dir, exist_ok=True)
@@ -125,7 +158,8 @@ for i in range(num_batches):
                 print(f"Failed to upload {key}: {e}")
                 return False
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        # Reduce parallel uploads to limit memory spikes
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             results = list(executor.map(upload_one, local_files_to_upload))
             
         failed_count = results.count(False)

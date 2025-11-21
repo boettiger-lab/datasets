@@ -50,6 +50,9 @@ def main():
 
     con = ibis.duckdb.connect(extensions = ["spatial", "h3"])
     con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
+    con.raw_sql("SET s3_max_connections=8")
+    con.raw_sql("SET http_retries=20")
+    con.raw_sql("SET http_retry_wait_ms=5000")
 
     # Must used scoped secrets with different names for the different endpoints
     set_secrets(con, name = "minio") # read/write using AWS env var credentials
