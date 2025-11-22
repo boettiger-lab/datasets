@@ -21,7 +21,10 @@ os.makedirs(local_dir, exist_ok=True)
 )
 
 # Upload from local directory to S3
-con.raw_sql(f"COPY FROM '{local_dir}/*' TO 's3://public-wetlands/nwi/hex/' (FORMAT PARQUET)")
+(con
+    .read_parquet(f"{local_dir}/**/*.parquet")
+    .to_parquet("s3://public-wetlands/nwi/hex/", partition_by = "h0")
+)
 
 # Clean up local directory
 shutil.rmtree(local_dir)
