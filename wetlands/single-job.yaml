@@ -1,15 +1,20 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: slow-data-job
+  name: data-job
   labels:
     k8s-app: data-job
 spec:
-  completions: 1
-  parallelism: 1  # adjust concurrency as cluster capacity allows
+  completions: 381
+  parallelism: 100  # adjust concurrency as cluster capacity allows
   completionMode: Indexed
-  backoffLimit: 0
-  # Keep failed pods (seconds) for debugging
+  backoffLimitPerIndex: 0
+  podFailurePolicy:
+    rules:
+    - action: Ignore
+      onPodConditions:
+      - type: DisruptionTarget
+    # Keep failed pods (seconds) for debugging
   ttlSecondsAfterFinished: 36000
   template:
     metadata:
@@ -103,18 +108,23 @@ spec:
           resources:
             requests:
               cpu: "2"
-              memory: 380Gi
-              ephemeral-storage: "100Gi"
+              memory: 30Gi
+#              ephemeral-storage: "800Gi"
             limits:
               cpu: "2"
-              memory: 380Gi
-              ephemeral-storage: "200Gi"
+              memory: 30Gi
+#              ephemeral-storage: "800Gi"
           # Use the indexed environment variable to pass --i
           command:
             - bash
             - -lc
             - |
-              python -u wetlands/repartition_nwi.py
+              # Process the wetlands data
+              python -u wetlands/nwi.py \
+                --i "$INDEX" \
+                --zoom 8 \
+                --input-url 's3://us-west-2.opendata.source.coop/giswqs/nwi/wetlands/**' \
+                --output-url 's3://public-wetlands/nwi/bigchunks'      
       volumes:
         - name: repo
           emptyDir: {}
