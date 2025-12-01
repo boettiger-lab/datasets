@@ -58,8 +58,8 @@ def main():
                 ''')
     con.raw_sql("SET preserve_insertion_order = false;")
     # Must used scoped secrets with different names for the different endpoints
-    set_secrets(con, name = "minio") # read/write using AWS env var credentials
-   #  set_secrets(con, "", "", endpoint = "s3.amazonaws.com", region="us-west-2", name = "source", bucket = "us-west-2.opendata.source.coop")
+    set_secrets(con) # read/write using AWS env var credentials
+
 
 
     SOURCE = args.input_url
