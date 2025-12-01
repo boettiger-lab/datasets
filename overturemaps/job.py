@@ -85,20 +85,24 @@ def main():
     print(f"Chunk size: {CHUNK_SIZE:,}")
     print(f"Number of chunks: {num_chunks}")
 
-    # print names currently working on
-    names = table.name.execute().tolist()
-    print(f"names: {names}")
-
-
     # Use provided chunk index; guard against out-of-range
     chunk_id = int(args.i)
+
+
     if chunk_id < 0 or chunk_id >= num_chunks:
         print(f"Index {chunk_id} out of range [0, {num_chunks - 1}]. Exiting successfully.")
         return
     offset = chunk_id * CHUNK_SIZE
     print(f"\nProcessing chunk {chunk_id + 1}/{num_chunks} (rows {offset:,} to {min(offset + CHUNK_SIZE, total_rows):,})")
 
+
+
     chunk = table.limit(CHUNK_SIZE, offset=offset)
+
+    # print names currently working on (NOT GENERIC)
+    names = chunk.name.execute().tolist()
+    print(f"names: {names}")
+
     result = (
         geom_to_cell(chunk, zoom=8)
         .drop('geom')  # very important to drop large geom before unnest!  
