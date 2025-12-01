@@ -43,8 +43,9 @@ def main():
     parser = argparse.ArgumentParser(description="Process polygon file i to zoom z")
     parser.add_argument("--i", type=int, default=0, help="Chunk index to process (0-based)")
     parser.add_argument("--zoom", type=int, default=8, help="H3 resolution to aggregate to (default 8)")
-    parser.add_argument("--input-url", default = "s3://public-overturemaps/countries.parquet",  help="Input geoparquet")
-    parser.add_argument("--output-url", default = "s3://public-overturemaps/chunks",  help="Output geoparquet bucket (ends with /)")
+    parser.add_argument("--input-url", default = "s3://public-overturemaps/regions.parquet",  help="Input geoparquet")
+    parser.add_argument("--output-url", default = "s3://public-overturemaps/chunks/regions/",  help="Output geoparquet bucket (ends with /)")
+    parser.add_argument("--chunk-size", type=int, default=20, help="Number of rows per chunk (default 20)")
     args = parser.parse_args()
 
 
@@ -69,12 +70,12 @@ def main():
     .mutate(
         name =  ibis.coalesce(_.names['common']['en'], _.names['primary'])
     )
-    .select('geometry', 'id', 'country', 'name')
+    .select('geometry', 'id', 'country', 'region', 'name')
     .rename(geom = "geometry")
     )
    
     # Read parquet file
-    CHUNK_SIZE = 1
+    CHUNK_SIZE = args.chunk_size
 
 
     # Get total row count and calculate chunks
