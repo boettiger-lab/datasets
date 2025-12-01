@@ -202,3 +202,5 @@ test.ipynb
 # pixi environments
 .pixi
 scratch.py
+.tmp/*
+
