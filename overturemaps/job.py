@@ -85,6 +85,11 @@ def main():
     print(f"Chunk size: {CHUNK_SIZE:,}")
     print(f"Number of chunks: {num_chunks}")
 
+    # print names currently working on
+    names = table.name.execute().tolist()
+    print(f"names: {names}")
+
+
     # Use provided chunk index; guard against out-of-range
     chunk_id = int(args.i)
     if chunk_id < 0 or chunk_id >= num_chunks:
