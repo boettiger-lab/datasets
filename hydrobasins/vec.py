@@ -63,11 +63,8 @@ def main():
 
     table = (con
         .read_parquet(SOURCE)
-        .mutate(
-            name = ibis.coalesce(_.names['common']['en'], _.names['primary'])
-        )
-        .select('geometry', 'id', 'country', 'name')
-        .rename(geom = "geometry")
+        .select('geometry', 'HYBAS_ID', 'PFAF_ID', 'UP_AREA', 'SUB_AREA', 'MAIN_BAS')
+        .rename(geom = "geometry", id = "HYBAS_ID")
     )
 
     # Read parquet file
