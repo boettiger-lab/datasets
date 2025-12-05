@@ -56,8 +56,7 @@ def main():
     con.raw_sql("SET http_retry_wait_ms=5000")
 
     # Must used scoped secrets with different names for the different endpoints
-    set_secrets(con, name = "minio") # read/write using AWS env var credentials
-    set_secrets(con, "", "", endpoint = "s3.amazonaws.com", region="us-west-2", name = "source", bucket = "us-west-2.opendata.source.coop")
+    set_secrets(con) # read/write using AWS env var credentials (nrp alias)
 
 
     SOURCE = f"{args.input_url}/level_{args.level:02d}.parquet"
