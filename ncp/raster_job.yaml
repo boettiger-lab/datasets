@@ -1,25 +1,21 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: regions-job
+  name: wetlands2
   labels:
-    k8s-app: data-job
+    k8s-app: wetlands
 spec:
-  completions: 196
-  parallelism: 50  # adjust concurrency as cluster capacity allows
+  # Run 122 indexed completions (i = 0..121)
+  completions: 122
+  parallelism: 61  # adjust concurrency as cluster capacity allows
   completionMode: Indexed
-  backoffLimitPerIndex: 3
-  podFailurePolicy:
-    rules:
-    - action: Ignore
-      onPodConditions:
-      - type: DisruptionTarget
-    # Keep failed pods (seconds) for debugging
-  ttlSecondsAfterFinished: 36000
+  backoffLimit: 0
+  # Keep failed pods for 1 hour (3600 seconds) for debugging
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels:
-        k8s-app: data-job
+        k8s-app: wetlands
     spec:
       # allow others to pre-empt the pods, required for large CPU jobs
       priorityClassName: opportunistic
@@ -56,7 +52,7 @@ spec:
             - name: repo
               mountPath: /workspace
       containers:
-        - name: data-task
+        - name: carbon-task
           image: ghcr.io/rocker-org/ml-spatial
           imagePullPolicy: Always
           workingDir: /workspace/datasets
@@ -74,21 +70,6 @@ spec:
                 secretKeyRef:
                   name: aws
                   key: AWS_SECRET_ACCESS_KEY
-            - name: MINIO_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_KEY
-            - name: MINIO_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_SECRET
-            - name: MINIO_ENDPOINT
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_ENDPOINT
             - name: AWS_S3_ENDPOINT
               value: "rook-ceph-rgw-nautiluss3.rook"
             - name: AWS_PUBLIC_ENDPOINT
@@ -107,26 +88,19 @@ spec:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
           resources:
             requests:
-              cpu: "2"
-              memory: 32Gi
-#              ephemeral-storage: "800Gi"
+              cpu: "4"
+              memory: 34Gi
             limits:
-              cpu: "2"
-              memory: 32Gi
-#              ephemeral-storage: "800Gi"
+              cpu: "4"
+              memory: 34Gi
           # Use the indexed environment variable to pass --i
           command:
             - bash
             - -lc
             - |
-              # Process the wetlands data
-              python -u overturemaps/job.py \
-                --i "$INDEX" \
-                --zoom 8 \
-                --input-url s3://public-overturemaps/regions.parquet \
-                --output-url s3://public-overturemaps/chunks/regions/ \
-                --chunk-size 20
-
+              echo "Running index ${INDEX}";
+              python -u ncp/raster.py --i ${INDEX} --zoom 8 --input-url https://minio.carlboettiger.info/public-ncp/NCP_biod_nathab_cog.tif --output-url s3://public-ncp/hex/ncp_biod_nathab
+              # python -u ncp/raster.py --i ${INDEX} --zoom 8 --input-url https://minio.carlboettiger.info/public-ncp/NCP_only_cog.tif --output-url s3://public-ncp/hex/ncp_only
       volumes:
         - name: repo
           emptyDir: {}
