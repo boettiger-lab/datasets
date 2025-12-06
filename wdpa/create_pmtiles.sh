@@ -3,19 +3,20 @@
 
 set -e
 
-echo "Converting GeoParquet to FlatGeobuf for tippecanoe..."
+echo "Converting GeoParquet to GeoJSONSeq for tippecanoe..."
 
-# Convert parquet to FlatGeobuf (which tippecanoe can read)
+# Convert parquet to GeoJSONSeq (which tippecanoe can read)
+# Use GeoJSONSeq for streaming large files
 ogr2ogr \
-  -f FlatGeobuf \
-  /tmp/WDPA_Dec2025.fgb \
+  -f GeoJSONSeq \
+  /tmp/WDPA_Dec2025.geojsonl \
   /vsis3/public-wdpa/WDPA_Dec2025.parquet \
   -progress
 
-echo "FlatGeobuf created successfully!"
+echo "GeoJSONSeq created successfully!"
 
-# Generate PMTiles from the FlatGeobuf
-echo "Generating PMTiles from FlatGeobuf..."
+# Generate PMTiles from the GeoJSONSeq
+echo "Generating PMTiles from GeoJSONSeq..."
 
 tippecanoe \
   -o /tmp/WDPA_Dec2025.pmtiles \
@@ -23,7 +24,7 @@ tippecanoe \
   --drop-densest-as-needed \
   --extend-zooms-if-still-dropping \
   --force \
-  /tmp/WDPA_Dec2025.fgb
+  /tmp/WDPA_Dec2025.geojsonl
 
 echo "PMTiles created successfully!"
 
