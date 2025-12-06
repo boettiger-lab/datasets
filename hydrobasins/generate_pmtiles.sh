@@ -36,8 +36,7 @@ echo "  Zoom 6:     level_03"
 echo "  Zoom 7:     level_04"
 echo "  Zoom 8:     level_05"
 echo "  Zoom 9:     level_06"
-echo "  Zoom 10:    level_07"
-echo "  Zoom 11:    level_08"
+echo "  Zoom 10:    level_07 (max zoom)"
 echo ""
 
 for var_name in AWS_S3_ENDPOINT MINIO_KEY MINIO_SECRET; do
@@ -68,7 +67,7 @@ TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
 # Convert each level to GeoJSON with zoom range metadata
-for level in {01..08}; do
+for level in {01..07}; do
     LAYER="level_$level"
     echo "Extracting $LAYER..."
     ogr2ogr -f GeoJSON "$TEMP_DIR/${LAYER}.geojson" "$GPKG" "$LAYER"
@@ -122,12 +121,6 @@ tippecanoe -o "$OUTPUT_DIR/z10.pmtiles" -Z10 -z10 -l hydrobasins --force \
     "$TEMP_DIR/level_07.geojson"
 upload_pmtiles "$OUTPUT_DIR/z10.pmtiles"
 
-echo "Creating zoom 11 tiles from level_08..."
-tippecanoe -o "$OUTPUT_DIR/z11.pmtiles" -Z11 -z11 -l hydrobasins --force \
-    --no-tile-size-limit --drop-densest-as-needed \
-    "$TEMP_DIR/level_08.geojson"
-upload_pmtiles "$OUTPUT_DIR/z11.pmtiles"
-
 echo "Merging all zoom levels into single PMTiles..."
 tile-join -o "$OUTPUT" --force \
     "$OUTPUT_DIR/z0-4.pmtiles" \
@@ -136,8 +129,7 @@ tile-join -o "$OUTPUT" --force \
     "$OUTPUT_DIR/z7.pmtiles" \
     "$OUTPUT_DIR/z8.pmtiles" \
     "$OUTPUT_DIR/z9.pmtiles" \
-    "$OUTPUT_DIR/z10.pmtiles" \
-    "$OUTPUT_DIR/z11.pmtiles"
+    "$OUTPUT_DIR/z10.pmtiles"
 upload_pmtiles "$OUTPUT"
 
 # Get file size for reporting
