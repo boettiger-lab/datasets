@@ -60,10 +60,19 @@ def main():
 
     SOURCE = args.input_url
 
-    table = (con
-        .read_parquet(SOURCE)
-        .rename(geom="geometry")
-    )
+    table = con.read_parquet(SOURCE)
+    
+    # Find the geometry column (could be 'geometry', 'SHAPE', 'geom', etc.)
+    geom_col = None
+    for col in table.columns:
+        if col.upper() in ['SHAPE', 'GEOMETRY', 'GEOM']:
+            geom_col = col
+            break
+    
+    if geom_col is None:
+        raise ValueError(f"No geometry column found. Available columns: {table.columns}")
+    
+    table = table.rename(geom=geom_col)
     
     # Get column names to keep (all except geom)
     keep_cols = [col for col in table.columns if col != 'geom']
