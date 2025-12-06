@@ -15,6 +15,11 @@ ogr2ogr \
 
 echo "GeoParquet created successfully!"
 
+# Download the GeoParquet locally for tippecanoe
+echo "Downloading GeoParquet for PMTiles generation..."
+aws s3 cp s3://public-wdpa/WDPA_Dec2025.parquet /tmp/WDPA_Dec2025.parquet \
+  --endpoint-url https://s3-west.nrp-nautilus.io
+
 # Generate PMTiles from the GeoParquet
 echo "Generating PMTiles from GeoParquet..."
 
@@ -24,7 +29,7 @@ tippecanoe \
   --drop-densest-as-needed \
   --extend-zooms-if-still-dropping \
   --force \
-  /vsis3/public-wdpa/WDPA_Dec2025.parquet
+  /tmp/WDPA_Dec2025.parquet
 
 echo "PMTiles created successfully!"
 
