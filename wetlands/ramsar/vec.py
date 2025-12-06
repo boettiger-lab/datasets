@@ -53,6 +53,8 @@ def main():
     con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
     con.raw_sql("SET http_retries=20")
     con.raw_sql("SET http_retry_wait_ms=5000")
+    # Handle invalid UTF-8 in parquet files
+    con.raw_sql("SET invalid_utf8='REPLACE'")
 
     # Must use scoped secrets with different names for the different endpoints
     set_secrets(con)  # read/write using AWS env var credentials (nrp alias)
