@@ -3,20 +3,27 @@
 
 set -e
 
-echo "Converting Ramsar shapefile to GeoParquet..."
+echo "Converting Ramsar shapefile to GeoParquet with UTF-8 cleanup..."
 
-# Convert shapefile to GeoParquet
-# Use RECODING to force proper UTF-8 encoding from shapefile
-export SHAPE_ENCODING="UTF-8"
-export CPL_DEBUG=ON
+# Use a Python script to read and clean the data
+python3 << 'EOPYTHON'
+import duckdb
 
-ogr2ogr \
-  -f Parquet \
-  /vsis3/public-wetlands/ramsar/ramsar_wetlands.parquet \
-  /vsicurl/https://minio.carlboettiger.info/public-wetlands/ramsar/features_publishedPolygon.shp \
-  -lco ENCODING=UTF-8 \
-  --config SHAPE_ENCODING UTF-8 \
-  --config OGR_FORCE_ASCII NO \
-  -progress
+con = duckdb.connect()
+con.install_extension("spatial")
+con.load_extension("spatial")
 
-echo "GeoParquet created successfully!"
+# Read shapefile with invalid UTF-8 replacement
+con.execute("SET invalid_utf8='REPLACE'")
+
+# Read shapefile
+con.execute("""
+    COPY (
+        SELECT * 
+        FROM ST_Read('/vsicurl/https://minio.carlboettiger.info/public-wetlands/ramsar/features_publishedPolygon.shp')
+    ) TO '/vsis3/public-wetlands/ramsar/ramsar_wetlands.parquet' 
+    (FORMAT PARQUET)
+""")
+
+print("GeoParquet created successfully with UTF-8 cleanup!")
+EOPYTHON
