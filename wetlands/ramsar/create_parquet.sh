@@ -3,27 +3,31 @@
 
 set -e
 
-echo "Converting Ramsar shapefile to GeoParquet with UTF-8 cleanup..."
+echo "Converting Ramsar shapefile to GeoParquet..."
 
-# Use a Python script to read and clean the data
+# Use geopandas with encoding handling to clean and convert
 python3 << 'EOPYTHON'
-import duckdb
+import geopandas as gpd
+import warnings
+warnings.filterwarnings('ignore')
 
-con = duckdb.connect()
-con.install_extension("spatial")
-con.load_extension("spatial")
+# Read shapefile with Latin-1 encoding (common for shapefiles with special chars)
+# Then write to parquet which will be UTF-8
+gdf = gpd.read_file(
+    'https://minio.carlboettiger.info/public-wetlands/ramsar/features_publishedPolygon.shp',
+    encoding='latin1'
+)
 
-# Read shapefile with invalid UTF-8 replacement
-con.execute("SET invalid_utf8='REPLACE'")
+# Clean string columns - replace any invalid UTF-8
+for col in gdf.select_dtypes(include=['object']):
+    if col != 'geometry':
+        gdf[col] = gdf[col].apply(lambda x: x.encode('utf-8', errors='replace').decode('utf-8') if isinstance(x, str) else x)
 
-# Read shapefile
-con.execute("""
-    COPY (
-        SELECT * 
-        FROM ST_Read('/vsicurl/https://minio.carlboettiger.info/public-wetlands/ramsar/features_publishedPolygon.shp')
-    ) TO '/vsis3/public-wetlands/ramsar/ramsar_wetlands.parquet' 
-    (FORMAT PARQUET)
-""")
+# Write to S3 as parquet
+gdf.to_parquet(
+    's3://public-wetlands/ramsar/ramsar_wetlands.parquet',
+    compression='snappy'
+)
 
-print("GeoParquet created successfully with UTF-8 cleanup!")
+print("GeoParquet created successfully!")
 EOPYTHON
