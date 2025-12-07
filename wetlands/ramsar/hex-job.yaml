@@ -6,7 +6,7 @@ metadata:
     k8s-app: ramsar-hex
 spec:
   completions: 150
-  parallelism: 30
+  parallelism: 50
   completionMode: Indexed
   backoffLimitPerIndex: 3
   podFailurePolicy:
