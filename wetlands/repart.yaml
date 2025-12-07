@@ -5,7 +5,7 @@ metadata:
   labels:
     k8s-app: data-job
 spec:
-  ttlSecondsAfterFinished: 36000
+  ttlSecondsAfterFinished: 10800
   template:
     metadata:
       labels:

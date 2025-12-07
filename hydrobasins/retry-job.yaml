@@ -15,7 +15,7 @@ spec:
       onPodConditions:
       - type: DisruptionTarget
   # Keep failed pods (seconds) for debugging
-  ttlSecondsAfterFinished: 36000
+  ttlSecondsAfterFinished: 10800
   template:
     metadata:
       labels:

@@ -14,7 +14,7 @@ spec:
     - action: Ignore
       onPodConditions:
       - type: DisruptionTarget
-  ttlSecondsAfterFinished: 36000
+  ttlSecondsAfterFinished: 10800
   template:
     metadata:
       labels:
