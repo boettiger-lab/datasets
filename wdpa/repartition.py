@@ -3,6 +3,7 @@ from ibis import _
 from cng.utils import *
 import os
 import shutil
+import subprocess
 
 con = ibis.duckdb.connect()
 set_secrets(con)
@@ -33,3 +34,36 @@ print("Cleaning up local directory...")
 shutil.rmtree(local_dir)
 
 print("✓ Repartitioning complete!")
+
+# Only clean up chunks directory if repartitioning was successful
+print("Removing chunks directory from S3...")
+try:
+    # Try using mc (minio client) first
+    result = subprocess.run(
+        ["mc", "rm", "--recursive", "--force", "s3/public-wdpa/chunks/"],
+        capture_output=True,
+        text=True,
+        timeout=300
+    )
+    if result.returncode == 0:
+        print("✓ Chunks directory removed successfully")
+    else:
+        print(f"⚠ mc cleanup failed: {result.stderr}")
+        # Try aws cli as fallback
+        result = subprocess.run(
+            ["aws", "s3", "rm", "s3://public-wdpa/chunks/", "--recursive",
+             "--endpoint-url", os.environ.get("AWS_PUBLIC_ENDPOINT", "https://s3-west.nrp-nautilus.io")],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        if result.returncode == 0:
+            print("✓ Chunks directory removed successfully (aws cli)")
+        else:
+            print(f"⚠ aws cleanup failed: {result.stderr}")
+            print("Note: Chunks directory may need manual cleanup")
+except Exception as e:
+    print(f"⚠ Error during cleanup: {e}")
+    print("Note: Chunks directory may need manual cleanup")
+
+print("✓ All done!")
