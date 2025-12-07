@@ -31,7 +31,9 @@ echo "PMTiles created successfully!"
 # Upload PMTiles to S3
 echo "Uploading PMTiles to S3..."
 
-aws s3 cp /tmp/WDPA_Dec2025.pmtiles s3://public-wdpa/WDPA_Dec2025.pmtiles \
-  --endpoint-url https://s3-west.nrp-nautilus.io
+# Configure mc alias if not already configured
+mc alias set s3 https://${AWS_PUBLIC_ENDPOINT} ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY}
+
+mc cp /tmp/WDPA_Dec2025.pmtiles s3/public-wdpa/WDPA_Dec2025.pmtiles
 
 echo "PMTiles uploaded successfully!"
