@@ -18,21 +18,18 @@ ogr2ogr \
 
 echo "GeoParquet created successfully!"
 
-# Download the GeoParquet locally for tippecanoe
-echo "Downloading GeoParquet for PMTiles generation..."
-aws s3 cp s3://public-wdpa/WDPA_Dec2025.parquet /tmp/WDPA_Dec2025.parquet \
-  --endpoint-url https://s3-west.nrp-nautilus.io
+# Generate PMTiles directly from GDB using ogr2ogr pipe to tippecanoe
+echo "Generating PMTiles from GDB..."
 
-# Generate PMTiles from the GeoParquet
-echo "Generating PMTiles from GeoParquet..."
-
-tippecanoe \
+ogr2ogr -f GeoJSONSeq /vsistdout/ \
+  /vsis3/public-wdpa/WDPA_Dec2025_Public.gdb \
+  WDPA_poly_Dec2025 \
+  | tippecanoe \
   -o /tmp/WDPA_Dec2025.pmtiles \
   -l wdpa \
   --drop-densest-as-needed \
   --extend-zooms-if-still-dropping \
-  --force \
-  /tmp/WDPA_Dec2025.parquet
+  --force
 
 echo "PMTiles created successfully!"
 
