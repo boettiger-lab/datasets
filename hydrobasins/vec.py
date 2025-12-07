@@ -54,6 +54,8 @@ def main():
     con.raw_sql("INSTALL h3 FROM community; LOAD h3;")
     con.raw_sql("SET http_retries=20")
     con.raw_sql("SET http_retry_wait_ms=5000")
+    con.raw_sql("SET temp_directory='/tmp'")
+    con.raw_sql("SET preserve_insertion_order=false")
 
     # Must used scoped secrets with different names for the different endpoints
     set_secrets(con) # read/write using AWS env var credentials (nrp alias)

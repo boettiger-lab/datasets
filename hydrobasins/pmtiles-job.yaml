@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: pmtiles-job
+  name: pmtiles-big
   labels:
     k8s-app: data-job
 spec:
@@ -108,12 +108,12 @@ spec:
           resources:
             requests:
               cpu: "2"
-              memory: 120Gi
-#              ephemeral-storage: "800Gi"
+              memory: 42Gi
+              #ephemeral-storage: "800Gi"
             limits:
               cpu: "2"
-              memory: 120Gi
-#              ephemeral-storage: "800Gi"
+              memory: 42Gi
+              #ephemeral-storage: "800Gi"
           # Use the indexed environment variable to pass --i
           command:
             - bash
