@@ -42,7 +42,7 @@ def geom_to_cell(df, zoom=8, keep_cols=None):
 def main():
     parser = argparse.ArgumentParser(description="Process Ramsar wetland polygons into H3 hexes")
     parser.add_argument("--i", type=int, default=0, help="Chunk index to process (0-based)")
-    parser.add_argument("--zoom", type=int, default=8, help="H3 resolution to aggregate to (default 8)")
+    parser.add_argument("--zoom", type=int, default=9, help="H3 resolution to aggregate to (default 9)")
     parser.add_argument("--chunk-size", type=int, default=50, help="Number of rows per chunk")
     parser.add_argument("--input-url", default="s3://public-wetlands/ramsar/ramsar_wetlands.parquet", help="Input geoparquet file")
     parser.add_argument("--output-url", default="s3://public-wetlands/ramsar/chunks", help="Output geoparquet bucket")
@@ -99,8 +99,9 @@ def main():
     result = (
         geom_to_cell(chunk, zoom=args.zoom, keep_cols=keep_cols)
         .drop('geom')  # very important to drop large geom before unnest!  
-        .mutate(h8=_.h3id.unnest())
-        .mutate(h0=h3_cell_to_parent(_.h8, 0))
+        .mutate(h9=_.h3id.unnest())
+        .mutate(h8=h3_cell_to_parent(_.h9, 8))
+        .mutate(h0=h3_cell_to_parent(_.h9, 0))
         .drop('h3id')
     )
 
