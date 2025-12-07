@@ -5,6 +5,10 @@ metadata:
   labels:
     k8s-app: ramsar-hex
 spec:
+  # IMPORTANT: Before deploying, run calculate_completions.py to determine this value:
+  # python wetlands/ramsar/calculate_completions.py \
+  #   --input-url s3://public-wetlands/ramsar/ramsar_wetlands.parquet \
+  #   --chunk-size 50
   completions: 150
   parallelism: 50
   completionMode: Indexed
@@ -113,11 +117,12 @@ spec:
             - bash
             - -lc
             - |
-              # 7,401 features / 50 per chunk = ~148 chunks
-              # Using INDEX directly as chunk ID
+              # 7,401 features / 50 per chunk = 148.02 chunks (need 149 chunks: 0-148)
+              # Set completions to 150 to safely cover all rows
+              # VERIFY: Run vec.py once to confirm total_rows and num_chunks match expectations
               python -u wetlands/ramsar/vec.py \
                 --i "$INDEX" \
-                --zoom 8 \
+                --zoom 9 \
                 --chunk-size 50 \
                 --input-url s3://public-wetlands/ramsar/ramsar_wetlands.parquet \
                 --output-url s3://public-wetlands/ramsar/chunks

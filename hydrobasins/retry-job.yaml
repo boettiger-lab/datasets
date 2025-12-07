@@ -1,0 +1,181 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-job-retry
+  labels:
+    k8s-app: data-job-retry
+spec:
+  completions: 15
+  parallelism: 3
+  completionMode: Indexed
+  backoffLimitPerIndex: 3
+  podFailurePolicy:
+    rules:
+    - action: Ignore
+      onPodConditions:
+      - type: DisruptionTarget
+  # Keep failed pods (seconds) for debugging
+  ttlSecondsAfterFinished: 36000
+  template:
+    metadata:
+      labels:
+        k8s-app: data-job-retry
+    spec:
+      # allow others to pre-empt the pods, required for large CPU jobs
+      priorityClassName: opportunistic
+      # Avoid GPU nodes which can hit trouble.  also recommended for large CPU-only jobs.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: feature.node.kubernetes.io/pci-10de.present
+                operator: NotIn
+                values:
+                - "true"
+      # Keep failed pods around for debugging (paired with ttlSecondsAfterFinished at job level)
+      # Never restart pod on failure - keep failed pods for debugging
+      restartPolicy: Never
+      initContainers:
+        - name: git-clone
+          image: alpine/git:2.45.2
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          command:
+            - sh
+            - -lc
+            - |
+              git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
+          volumeMounts:
+            - name: repo
+              mountPath: /workspace
+      containers:
+        - name: data-task
+          image: ghcr.io/rocker-org/ml-spatial
+          imagePullPolicy: Always
+          workingDir: /workspace/datasets
+          volumeMounts:
+            - name: repo
+              mountPath: /workspace
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: MINIO_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nvme
+                  key: MINIO_KEY
+            - name: MINIO_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nvme
+                  key: MINIO_SECRET
+            - name: MINIO_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: nvme
+                  key: MINIO_ENDPOINT
+            - name: AWS_S3_ENDPOINT
+              value: "rook-ceph-rgw-nautiluss3.rook"
+            - name: AWS_PUBLIC_ENDPOINT
+              value: "s3-west.nrp-nautilus.io"
+            - name: AWS_HTTPS
+              value: "false"
+            - name: AWS_VIRTUAL_HOSTING
+              value: "FALSE"
+            - name: GDAL_DATA
+              value: "/opt/conda/share/gdal"
+            - name: PROJ_LIB
+              value: "/opt/conda/share/proj"
+            - name: TMPDIR
+              value: "/tmp"
+            - name: INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          resources:
+            requests:
+              cpu: "4"
+              memory: 64Gi
+            limits:
+              cpu: "4"
+              memory: 64Gi
+          # Retry failed indices with much smaller chunk sizes to handle huge geometries
+          # Level 01 (10 features - continent-sized): 5 chunks of 2 features each
+          #   INDEX 0-4: chunk_size=2
+          # Level 02 (62 features - large basins): 4 chunks of ~15 features each
+          #   INDEX 5-8: chunk_size=15 or 17
+          # Level 03 (292 features): 6 chunks of ~50 features each
+          #   INDEX 9-14: chunk_size=50
+          command:
+            - bash
+            - -lc
+            - |
+              # Map INDEX to level, chunk_id, and chunk_size
+              INDEX_NUM=$INDEX
+              
+              # Level 1: 10 features, split into 5 chunks of 2 features
+              if [ $INDEX_NUM -eq 0 ]; then
+                LEVEL=1; CHUNK_ID=0; CHUNK_SIZE=2
+              elif [ $INDEX_NUM -eq 1 ]; then
+                LEVEL=1; CHUNK_ID=1; CHUNK_SIZE=2
+              elif [ $INDEX_NUM -eq 2 ]; then
+                LEVEL=1; CHUNK_ID=2; CHUNK_SIZE=2
+              elif [ $INDEX_NUM -eq 3 ]; then
+                LEVEL=1; CHUNK_ID=3; CHUNK_SIZE=2
+              elif [ $INDEX_NUM -eq 4 ]; then
+                LEVEL=1; CHUNK_ID=4; CHUNK_SIZE=2
+              # Level 2: 62 features, split into 4 chunks of ~15 features
+              elif [ $INDEX_NUM -eq 5 ]; then
+                LEVEL=2; CHUNK_ID=0; CHUNK_SIZE=15
+              elif [ $INDEX_NUM -eq 6 ]; then
+                LEVEL=2; CHUNK_ID=1; CHUNK_SIZE=15
+              elif [ $INDEX_NUM -eq 7 ]; then
+                LEVEL=2; CHUNK_ID=2; CHUNK_SIZE=15
+              elif [ $INDEX_NUM -eq 8 ]; then
+                LEVEL=2; CHUNK_ID=3; CHUNK_SIZE=17
+              # Level 3: 292 features, split into 6 chunks of ~50 features
+              elif [ $INDEX_NUM -eq 9 ]; then
+                LEVEL=3; CHUNK_ID=0; CHUNK_SIZE=50
+              elif [ $INDEX_NUM -eq 10 ]; then
+                LEVEL=3; CHUNK_ID=1; CHUNK_SIZE=50
+              elif [ $INDEX_NUM -eq 11 ]; then
+                LEVEL=3; CHUNK_ID=2; CHUNK_SIZE=50
+              elif [ $INDEX_NUM -eq 12 ]; then
+                LEVEL=3; CHUNK_ID=3; CHUNK_SIZE=50
+              elif [ $INDEX_NUM -eq 13 ]; then
+                LEVEL=3; CHUNK_ID=4; CHUNK_SIZE=50
+              elif [ $INDEX_NUM -eq 14 ]; then
+                LEVEL=3; CHUNK_ID=5; CHUNK_SIZE=50
+              else
+                echo "INDEX $INDEX_NUM out of range"; exit 0
+              fi
+              
+              echo "Processing Level $LEVEL, Chunk $CHUNK_ID (INDEX=$INDEX_NUM, chunk_size=$CHUNK_SIZE)"
+              
+              # Process the data
+              python -u hydrobasins/vec.py \
+                --i "$CHUNK_ID" \
+                --level "$LEVEL" \
+                --zoom 8 \
+                --input-url s3://public-hydrobasins \
+                --output-url s3://public-hydrobasins/chunks \
+                --chunk-size "$CHUNK_SIZE"
+
+      volumes:
+        - name: repo
+          emptyDir: {}

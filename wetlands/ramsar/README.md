@@ -40,12 +40,25 @@ kubectl apply -f wetlands/ramsar/pmtiles-job.yaml
 
 ### 3. H3 Hexagon Processing
 
-Process polygons into H3 resolution 8 hexagons:
+Process polygons into H3 hexagons at multiple resolutions.
 
 **Script:** `vec.py`  
+**Helper:** `calculate_completions.py`  
 **Job:** `hex-job.yaml`
 
-Processes the data in 150 indexed chunks (50 features per chunk) with 30 parallel workers.
+#### Before deploying, calculate required completions:
+
+```bash
+python wetlands/ramsar/calculate_completions.py \
+  --input-url s3://public-wetlands/ramsar/ramsar_wetlands.parquet \
+  --chunk-size 50
+```
+
+This tells you the exact number of completions needed in `hex-job.yaml`.
+
+#### Update and deploy:
+
+Edit `hex-job.yaml` and set the `completions` field, then:
 
 ```bash
 kubectl apply -f wetlands/ramsar/hex-job.yaml

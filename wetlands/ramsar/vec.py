@@ -7,7 +7,7 @@ from cng.h3 import *
 import os
 
 
-def geom_to_cell(df, zoom=8, keep_cols=None):
+def geom_to_cell(df, zoom=10, keep_cols=None):
     con = df.get_backend()
     
     # Default to keeping all columns except geom if not specified
@@ -86,6 +86,7 @@ def main():
     print(f"Total rows: {total_rows:,}")
     print(f"Chunk size: {CHUNK_SIZE:,}")
     print(f"Number of chunks: {num_chunks}")
+    print(f"IMPORTANT: Ensure k8s job completions >= {num_chunks} to process all rows!")
 
     # Use provided chunk index; guard against out-of-range
     chunk_id = int(args.i)
@@ -96,14 +97,19 @@ def main():
     print(f"\nProcessing chunk {chunk_id + 1}/{num_chunks} (rows {offset:,} to {min(offset + CHUNK_SIZE, total_rows):,})")
 
     chunk = table.limit(CHUNK_SIZE, offset=offset)
+    
+    # Start with the base zoom level
+    zoom = args.zoom
     result = (
-        geom_to_cell(chunk, zoom=args.zoom, keep_cols=keep_cols)
+        geom_to_cell(chunk, zoom=zoom, keep_cols=keep_cols)
         .drop('geom')  # very important to drop large geom before unnest!  
-        .mutate(h9=_.h3id.unnest())
-        .mutate(h8=h3_cell_to_parent(_.h9, 8))
-        .mutate(h0=h3_cell_to_parent(_.h9, 0))
+        .mutate(**{f'h{zoom}': _.h3id.unnest()})
         .drop('h3id')
     )
+    
+    # Add parent resolutions from zoom-1 down to 0
+    for parent_res in range(zoom - 1, -1, -1):
+        result = result.mutate(**{f'h{parent_res}': h3_cell_to_parent(result[f'h{zoom}'], parent_res)})
 
     output_file = f"{args.output_url}/chunk_{chunk_id:06d}.parquet"
     result.to_parquet(output_file)

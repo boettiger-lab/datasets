@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>HydroBasins PMTiles Viewer</title>
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
+    <script src="https://unpkg.com/maplibre-gl@4.1.1/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@4.1.1/dist/maplibre-gl.css" rel="stylesheet">
+    <script src="https://unpkg.com/pmtiles@3.0.7/dist/pmtiles.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+
+        .info-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            max-width: 300px;
+            z-index: 1;
+        }
+
+        .info-panel h3 {
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+
+        .info-panel p {
+            margin: 5px 0;
+        }
+
+        .zoom-info {
+            position: absolute;
+            bottom: 30px;
+            left: 10px;
+            background: white;
+            padding: 8px 12px;
+            border-radius: 3px;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+            font-family: monospace;
+            font-size: 11px;
+            z-index: 1;
+        }
+
+        .layer-controls {
+            position: absolute;
+            top: 80px;
+            left: 10px;
+            background: white;
+            padding: 12px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            z-index: 1;
+        }
+
+        .layer-controls h4 {
+            margin: 0 0 8px 0;
+            font-size: 13px;
+            font-weight: bold;
+        }
+
+        .layer-controls label {
+            display: block;
+            margin: 6px 0;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .layer-controls input[type="checkbox"] {
+            margin-right: 6px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <div class="layer-controls">
+        <h4>Layers</h4>
+        <label>
+            <input type="checkbox" id="toggle-basemap" checked>
+            Carto Light Basemap
+        </label>
+        <label>
+            <input type="checkbox" id="toggle-hydrobasins" checked>
+            HydroBasins Watersheds
+        </label>
+    </div>
+    <div class="info-panel">
+        <h3>🌊 HydroBasins PMTiles</h3>
+        <p><strong>Data:</strong> HydroSHEDS/HydroBasins</p>
+        <p><strong>Detail Levels:</strong> 1-8 (1:1 zoom mapping)</p>
+        <p><strong>Map Zoom:</strong> 0-14</p>
+        <p style="margin-top: 10px; font-size: 11px; color: #666;">
+            Zoom in to see finer watershed divisions. Click on any watershed to see properties.
+        </p>
+    </div>
+    <div class="zoom-info" id="zoom-info">Zoom: 0</div>
+
+    <script type="text/javascript">
+        // Add PMTiles protocol
+        let protocol = new pmtiles.Protocol();
+        maplibregl.addProtocol("pmtiles", protocol.tile);
+
+        // Initialize map
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: {
+                version: 8,
+                sources: {
+                    'carto-light': {
+                        type: 'raster',
+                        tiles: [
+                            'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+                            'https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+                            'https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'
+                        ],
+                        tileSize: 256,
+                        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+                    }
+                },
+                layers: [
+                    {
+                        id: 'carto-light-layer',
+                        type: 'raster',
+                        source: 'carto-light',
+                        minzoom: 0,
+                        maxzoom: 22
+                    }
+                ]
+            },
+            center: [-98, 38],
+            zoom: 3
+        });
+
+        // Add navigation controls
+        map.addControl(new maplibregl.NavigationControl(), 'top-left');
+
+        // Add HydroBasins PMTiles after map loads
+        map.on('load', () => {
+            console.log('Map style loaded, adding PMTiles sources...');
+
+            // Define all available PMTiles sources
+            const pmtilesFiles = [
+                { name: 'z0' },
+                { name: 'z1' },
+                { name: 'z2' },
+                { name: 'z3' },
+                { name: 'z4' },
+                { name: 'z5' },
+                { name: 'z6' },
+                { name: 'z7' }
+            ];
+
+            // Add sources and layers for each zoom level
+            pmtilesFiles.forEach(file => {
+                const sourceId = `hydrobasins-${file.name}`;
+
+                map.addSource(sourceId, {
+                    type: 'vector',
+                    url: `pmtiles://https://s3-west.nrp-nautilus.io/public-hydrobasins/${file.name}.pmtiles`,
+                    attribution: '<a href="https://www.hydrosheds.org/">HydroSHEDS</a>'
+                });
+
+                map.addLayer({
+                    id: `${sourceId}-fill`,
+                    type: 'fill',
+                    source: sourceId,
+                    'source-layer': 'hydrobasins',
+                    paint: {
+                        'fill-color': '#0080ff',
+                        'fill-opacity': 0.2
+                    }
+                });
+
+                map.addLayer({
+                    id: `${sourceId}-line`,
+                    type: 'line',
+                    source: sourceId,
+                    'source-layer': 'hydrobasins',
+                    paint: {
+                        'line-color': '#0066cc',
+                        'line-width': 1.5,
+                        'line-opacity': 0.8
+                    }
+                });
+
+                console.log(`Added ${file.name} source and layers`);
+            });
+
+            console.log('All PMTiles sources loaded successfully');
+
+            // Log available layers after a short delay
+            setTimeout(() => {
+                console.log('Map layers:', map.getStyle().layers.map(l => l.id));
+                console.log('Map sources:', Object.keys(map.getStyle().sources));
+            }, 1000);
+        });
+
+        // Layer toggle controls
+        document.getElementById('toggle-basemap').addEventListener('change', (e) => {
+            const visibility = e.target.checked ? 'visible' : 'none';
+            if (map.getLayer('carto-light-layer')) {
+                map.setLayoutProperty('carto-light-layer', 'visibility', visibility);
+            }
+        });
+
+        document.getElementById('toggle-hydrobasins').addEventListener('change', (e) => {
+            const visibility = e.target.checked ? 'visible' : 'none';
+            // Toggle all hydrobasins layers
+            const layers = map.getStyle().layers;
+            layers.forEach(layer => {
+                if (layer.id.startsWith('hydrobasins-')) {
+                    map.setLayoutProperty(layer.id, 'visibility', visibility);
+                }
+            });
+        });
+
+        // Update zoom display
+        map.on('zoom', () => {
+            document.getElementById('zoom-info').textContent =
+                `Zoom: ${map.getZoom().toFixed(2)}`;
+        });
+
+        // Add click interaction to show basin properties (use first hydrobasins layer)
+        map.on('click', (e) => {
+            // Check all hydrobasins fill layers
+            const layers = map.getStyle().layers.filter(l => l.id.includes('hydrobasins') && l.id.includes('fill'));
+            const features = map.queryRenderedFeatures(e.point, { layers: layers.map(l => l.id) });
+
+            if (features.length > 0) {
+                const props = features[0].properties;
+                let html = '<h3>Watershed Properties</h3>';
+
+                // Display all properties
+                for (let key in props) {
+                    html += `<p><strong>${key}:</strong> ${props[key]}</p>`;
+                }
+
+                new maplibregl.Popup()
+                    .setLngLat(e.lngLat)
+                    .setHTML(html)
+                    .addTo(map);
+            }
+        });
+
+        // Change cursor on hover for any hydrobasins layer
+        const hydrobasinsFillLayers = ['hydrobasins-z0-fill', 'hydrobasins-z1-fill', 'hydrobasins-z2-fill',
+            'hydrobasins-z3-fill', 'hydrobasins-z4-fill', 'hydrobasins-z5-fill',
+            'hydrobasins-z6-fill', 'hydrobasins-z7-fill']; hydrobasinsFillLayers.forEach(layerId => {
+                map.on('mouseenter', layerId, () => {
+                    map.getCanvas().style.cursor = 'pointer';
+                });
+
+                map.on('mouseleave', layerId, () => {
+                    map.getCanvas().style.cursor = '';
+                });
+            });
+
+        // Log any errors
+        map.on('error', (e) => {
+            console.error('Map error:', e);
+        });
+    </script>
+</body>
+
+</html>
