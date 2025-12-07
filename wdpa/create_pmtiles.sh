@@ -1,16 +1,18 @@
 #!/bin/bash
-# Create PMTiles from WDPA GeoParquet
+# Create PMTiles from WDPA GDB
 
 set -e
 
-echo "Converting GeoParquet to GeoJSONSeq for tippecanoe..."
+echo "Converting WDPA GDB to GeoJSONSeq for tippecanoe..."
 
-# Convert parquet to GeoJSONSeq (which tippecanoe can read)
+# Convert GDB directly to GeoJSONSeq (which tippecanoe can read)
 # Use GeoJSONSeq for streaming large files
+# Read directly from the GDB to avoid waiting for parquet generation
 ogr2ogr \
   -f GeoJSONSeq \
   /tmp/WDPA_Dec2025.geojsonl \
-  /vsis3/public-wdpa/WDPA_Dec2025.parquet \
+  /vsis3/public-wdpa/WDPA_Dec2025_Public.gdb \
+  WDPA_poly_Dec2025 \
   -progress
 
 echo "GeoJSONSeq created successfully!"
