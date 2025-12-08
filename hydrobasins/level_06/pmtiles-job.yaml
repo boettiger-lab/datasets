@@ -104,6 +104,7 @@ spec:
             - -lc
             - |
               set -e
+              git config --global url."https://".insteadOf git://
               bash hydrobasins/level_06/create_pmtiles.sh
       volumes:
         - name: repo

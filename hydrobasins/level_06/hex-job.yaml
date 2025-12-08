@@ -110,6 +110,7 @@ spec:
             - -lc
             - |
               set -e
+              git config --global url."https://".insteadOf git://
               pip install -q git+https://github.com/boettiger-lab/cng.git
               python hydrobasins/level_06/vec.py --i ${JOB_COMPLETION_INDEX} --chunk-size 100
       volumes:
