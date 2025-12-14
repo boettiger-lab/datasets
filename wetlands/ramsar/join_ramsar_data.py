@@ -395,7 +395,14 @@ def main():
         FROM ramsar_complete
         
         UNION ALL
-        tmp/ramsar_summary.parquet"
+        
+        SELECT 
+            'Total geometries in final dataset',
+            COUNT(*)::VARCHAR
+        FROM ramsar_complete;
+    """)
+    
+    report_path = "/tmp/ramsar_summary.parquet"
     conn.execute(f"""
         COPY summary_report TO '{report_path}' (FORMAT PARQUET);
     """)
@@ -405,14 +412,7 @@ def main():
     conn.execute("""
         COPY summary_report TO 's3://public-wetlands/ramsar/ramsar_summary.parquet' (FORMAT PARQUET);
     """)
-    print("Uploaded summary to s3://public-wetlands/ramsar/ramsar_summary.parquet
-    """)
-    
-    report_path = "/data/ramsar_summary.parquet"
-    conn.execute(f"""
-        COPY summary_report TO '{report_path}' (FORMAT PARQUET);
-    """)
-    print(f"Exported summary report to {report_path}")
+    print("Uploaded summary to s3://public-wetlands/ramsar/ramsar_summary.parquet")
     
     # Display final report
     print("\n" + "="*60)
