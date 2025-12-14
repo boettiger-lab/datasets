@@ -11,7 +11,9 @@ import os
 from datetime import datetime
 
 # S3 endpoint configuration
+# Use internal endpoint in k8s, public endpoint elsewhere
 S3_ENDPOINT = os.environ.get('AWS_S3_ENDPOINT', 'minio.carlboettiger.info')
+USE_SSL = 'true' if 'minio.carlboettiger.info' in S3_ENDPOINT else 'false'
 
 def setup_duckdb():
     """Configure DuckDB with S3 and spatial extensions"""
@@ -25,8 +27,8 @@ def setup_duckdb():
     print(f"Configuring S3 endpoint: {S3_ENDPOINT}")
     conn.execute(f"SET s3_endpoint='{S3_ENDPOINT}';")
     conn.execute("SET s3_url_style='path';")
-    conn.execute("SET s3_use_ssl=true;")
-    print("DuckDB configured successfully")
+    conn.execute(f"SET s3_use_ssl={USE_SSL};")
+    print(f"DuckDB configured successfully (use_ssl={USE_SSL})")
     return conn
 
 def main():
