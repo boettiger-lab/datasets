@@ -60,7 +60,7 @@ Process polygons into H3 hexagons at multiple resolutions. Uses the combined dat
 
 ```bash
 python wetlands/ramsar/calculate_completions.py \
-  --input-url s3://public-wetlands/ramsar/ramsar_complete.parquet \
+  --input-url s3://public-wetlands/ramsar/ramsar_wetlands.parquet \
   --chunk-size 50
 ```
 
