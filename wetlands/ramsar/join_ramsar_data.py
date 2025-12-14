@@ -15,14 +15,18 @@ S3_ENDPOINT = os.environ.get('AWS_S3_ENDPOINT', 'minio.carlboettiger.info')
 
 def setup_duckdb():
     """Configure DuckDB with S3 and spatial extensions"""
+    print("Connecting to DuckDB...")
     conn = duckdb.connect(database=':memory:')
+    print("Installing extensions...")
     conn.execute("INSTALL httpfs;")
     conn.execute("LOAD httpfs;")
     conn.execute("INSTALL spatial;")
     conn.execute("LOAD spatial;")
+    print(f"Configuring S3 endpoint: {S3_ENDPOINT}")
     conn.execute(f"SET s3_endpoint='{S3_ENDPOINT}';")
     conn.execute("SET s3_url_style='path';")
     conn.execute("SET s3_use_ssl=true;")
+    print("DuckDB configured successfully")
     return conn
 
 def main():
