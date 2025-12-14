@@ -10,11 +10,6 @@ import duckdb
 import os
 from datetime import datetime
 
-# S3 endpoint configuration
-# Use internal endpoint in k8s, public endpoint elsewhere
-S3_ENDPOINT = os.environ.get('AWS_S3_ENDPOINT', 'minio.carlboettiger.info')
-USE_SSL = 'true' if 'minio.carlboettiger.info' in S3_ENDPOINT else 'false'
-
 def setup_duckdb():
     """Configure DuckDB with S3 and spatial extensions"""
     print("Connecting to DuckDB...")
@@ -24,11 +19,23 @@ def setup_duckdb():
     conn.execute("LOAD httpfs;")
     conn.execute("INSTALL spatial;")
     conn.execute("LOAD spatial;")
-    print(f"Configuring S3 endpoint: {S3_ENDPOINT}")
-    conn.execute(f"SET s3_endpoint='{S3_ENDPOINT}';")
-    conn.execute("SET s3_url_style='path';")
-    conn.execute(f"SET s3_use_ssl={USE_SSL};")
-    print(f"DuckDB configured successfully (use_ssl={USE_SSL})")
+    
+    # Configure S3 credentials using DuckDB secret manager
+    print("Configuring S3 credentials...")
+    endpoint = os.environ.get('AWS_S3_ENDPOINT', 'minio.carlboettiger.info')
+    use_ssl = 'false' if 'rook' in endpoint else 'true'
+    
+    conn.execute(f"""
+        CREATE SECRET s3 (
+            TYPE S3,
+            KEY_ID '{os.environ.get("AWS_ACCESS_KEY_ID", "")}',
+            SECRET '{os.environ.get("AWS_SECRET_ACCESS_KEY", "")}',
+            ENDPOINT '{endpoint}',
+            URL_STYLE 'path',
+            USE_SSL {use_ssl}
+        );
+    """)
+    print(f"DuckDB configured successfully (endpoint={endpoint}, use_ssl={use_ssl})")
     return conn
 
 def main():
