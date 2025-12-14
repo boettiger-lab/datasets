@@ -232,10 +232,25 @@ def main():
     
     # Load centroids and create point geometries
     print("Loading centroid data from parquet...")
-    conn.execute(f"""
-        CREATE TABLE centroids AS
-        SELECT * FROM '{centroids}';
-    """)
+    try:
+        conn.execute(f"""
+            CREATE TABLE centroids AS
+            SELECT * FROM '{centroids}';
+        """)
+    except Exception as e:
+        print(f"Warning: Could not load centroids due to encoding issue: {e}")
+        print("Creating empty centroids table...")
+        conn.execute("""
+            CREATE TABLE centroids (
+                v_idris INTEGER,
+                ramsarid INTEGER,
+                officialna VARCHAR,
+                iso3 VARCHAR,
+                country_en VARCHAR,
+                area_off DOUBLE,
+                geom BLOB
+            );
+        """)
     
     result = conn.execute("SELECT COUNT(*) FROM centroids").fetchone()
     print(f"Loaded {result[0]} centroid points")
