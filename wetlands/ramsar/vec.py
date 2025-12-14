@@ -14,8 +14,8 @@ def geom_to_cell(df, zoom=10, keep_cols=None):
     if keep_cols is None:
         keep_cols = [col for col in df.columns if col != 'geom']
     
-    # Build column list for SELECT statements
-    col_list = ', '.join(keep_cols)
+    # Build column list for SELECT statements, quoting column names to handle spaces
+    col_list = ', '.join([f'"{col}"' for col in keep_cols])
     
     # all types must be multi-polygons
     cases = ibis.cases(
