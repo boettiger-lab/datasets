@@ -37,6 +37,6 @@ echo "Uploading PMTiles to S3..."
 # Configure mc alias if not already configured
 mc alias set s3 https://${AWS_PUBLIC_ENDPOINT} ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY}
 
-mc cp /tmp/ramsar_complete.pmtiles s3/public-wetlands/ramsar/ramsar_complete.pmtiles
+mc cp /tmp/ramsar_complete.pmtiles s3/public-wetlands/ramsar/ramsar_wetlands.pmtiles
 
 echo "PMTiles uploaded successfully!"

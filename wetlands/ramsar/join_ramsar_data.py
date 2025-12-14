@@ -381,9 +381,9 @@ def main():
     # Upload to S3
     print("Uploading to S3...")
     conn.execute("""
-        COPY ramsar_complete TO 's3://public-wetlands/ramsar/ramsar_complete.parquet' (FORMAT PARQUET);
+        COPY ramsar_complete TO 's3://public-wetlands/ramsar/ramsar_wetlands.parquet' (FORMAT PARQUET);
     """)
-    print("Uploaded to s3://public-wetlands/ramsar/ramsar_complete.parquet")
+    print("Uploaded to s3://public-wetlands/ramsar/ramsar_wetlands.parquet")
     
     # Also create a summary report
     print("\n=== Creating summary report ===")
