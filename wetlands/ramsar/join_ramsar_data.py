@@ -39,7 +39,7 @@ def main():
     ramsar_polygons = "s3://public-wetlands/ramsar/ramsar_wetlands.parquet"
     site_details = "s3://public-wetlands/ramsar/site-details.parquet"
     wdpa = "s3://public-wdpa/WDPA_Dec2025.parquet"
-    centroids = "s3://public-wetlands/ramsar/raw/features_centroid_publishedPoint.shp"
+    centroids = "s3://public-wetlands/ramsar/raw/features_centroid_publishedPoint.parquet"
     
     print("\n=== Step 1: Join existing ramsar polygons with site details ===")
     conn.execute(f"""
@@ -231,10 +231,10 @@ def main():
     print(f"Still missing {result[0]} sites after WDPA matching")
     
     # Load centroids and create point geometries
-    print("Loading centroid data from shapefile...")
+    print("Loading centroid data from parquet...")
     conn.execute(f"""
         CREATE TABLE centroids AS
-        SELECT * FROM ST_Read('{centroids}');
+        SELECT * FROM '{centroids}';
     """)
     
     result = conn.execute("SELECT COUNT(*) FROM centroids").fetchone()
