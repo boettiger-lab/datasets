@@ -267,7 +267,7 @@ def main():
         CREATE TABLE centroid_additions AS
         SELECT 
             ms.ramsarid,
-            c.geom as geometry,
+            c.geometry as geometry,
             ms."Site name",
             ms.Region,
             ms.Country,
