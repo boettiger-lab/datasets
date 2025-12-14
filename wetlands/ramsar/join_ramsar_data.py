@@ -387,12 +387,12 @@ def main():
     
     # Also create a summary report
     print("\n=== Creating summary report ===")
-    conn.execute("""
+    conn.execute(f"""
         CREATE TABLE summary_report AS
         SELECT 
             'Total sites in site-details' as metric,
             COUNT(*)::VARCHAR as value
-        FROM site_details
+        FROM '{site_details}'
         
         UNION ALL
         
