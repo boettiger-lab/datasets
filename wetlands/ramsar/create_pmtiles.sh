@@ -9,8 +9,8 @@ echo "Converting GeoParquet to GeoJSONSeq for tippecanoe..."
 # Set encoding options to handle UTF-8 properly
 ogr2ogr \
   -f GeoJSONSeq \
-  /tmp/ramsar_wetlands.geojsonl \
-  /vsis3/public-wetlands/ramsar/ramsar_wetlands.parquet \
+  /tmp/ramsar_complete.geojsonl \
+  /vsis3/public-wetlands/ramsar/ramsar_complete.parquet \
   -lco ENCODING=UTF-8 \
   -progress
 
@@ -21,13 +21,13 @@ echo "Generating PMTiles from GeoJSONSeq..."
 
 # Use --read-parallel to handle encoding issues more gracefully
 tippecanoe \
-  -o /tmp/ramsar_wetlands.pmtiles \
+  -o /tmp/ramsar_complete.pmtiles \
   -l ramsar \
   --drop-densest-as-needed \
   --extend-zooms-if-still-dropping \
   --force \
-  --attribute-type=officialna:string \
-  /tmp/ramsar_wetlands.geojsonl
+  --attribute-type="Site name":string \
+  /tmp/ramsar_complete.geojsonl
 
 echo "PMTiles created successfully!"
 
@@ -37,6 +37,6 @@ echo "Uploading PMTiles to S3..."
 # Configure mc alias if not already configured
 mc alias set s3 https://${AWS_PUBLIC_ENDPOINT} ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY}
 
-mc cp /tmp/ramsar_wetlands.pmtiles s3/public-wetlands/ramsar/ramsar_wetlands.pmtiles
+mc cp /tmp/ramsar_complete.pmtiles s3/public-wetlands/ramsar/ramsar_complete.pmtiles
 
 echo "PMTiles uploaded successfully!"
