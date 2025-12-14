@@ -1,9 +1,9 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ramsar-parquet
+  name: ramsar-join
   labels:
-    k8s-app: ramsar-parquet
+    k8s-app: ramsar-join
 spec:
   completions: 1
   parallelism: 1
@@ -12,7 +12,7 @@ spec:
   template:
     metadata:
       labels:
-        k8s-app: ramsar-parquet
+        k8s-app: ramsar-join
     spec:
       priorityClassName: opportunistic
       affinity:
@@ -94,16 +94,22 @@ spec:
               value: "/tmp"
           resources:
             requests:
-              cpu: "2"
-              memory: 16Gi
+              cpu: "4"
+              memory: 32Gi
             limits:
-              cpu: "2"
-              memory: 16Gi
+              cpu: "4"
+              memory: 32Gi
           command:
             - bash
             - -lc
             - |
-              bash wetlands/ramsar/create_parquet.sh
+              echo "Installing Python dependencies..."
+              pip install duckdb
+              
+              echo "Running Ramsar data join script..."
+              python wetlands/ramsar/join_ramsar_data.py
+              
+              echo "Job completed successfully!"
       volumes:
         - name: repo
           emptyDir: {}
