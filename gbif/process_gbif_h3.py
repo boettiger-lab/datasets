@@ -23,8 +23,12 @@ def setup_duckdb():
     con.execute("INSTALL h3 FROM community;")
     con.execute("LOAD h3;")
     
-    # Configure AWS credentials for source bucket (standard AWS)
+    # Configure for reading from public GBIF bucket (no auth required)
     con.execute("SET s3_region='us-east-1';")
+    
+    # GBIF bucket is public, so we don't need credentials for it
+    # But we need to ensure we're not using the custom endpoint for GBIF
+    con.execute("SET s3_endpoint='';")  # Use default AWS endpoints
     
     # Configure DuckDB secret for writing to public-gbif bucket
     # This uses the custom S3 endpoint from the k8s environment
@@ -33,7 +37,7 @@ def setup_duckdb():
     s3_endpoint = os.environ.get('AWS_S3_ENDPOINT', 'rook-ceph-rgw-nautiluss3.rook')
     use_ssl = os.environ.get('AWS_HTTPS', 'false').lower() == 'true'
     
-    # Create secret for public-gbif bucket
+    # Create secret for public-gbif bucket (our output bucket)
     con.execute(f"""
         CREATE SECRET IF NOT EXISTS public_gbif (
             TYPE S3,
@@ -48,6 +52,7 @@ def setup_duckdb():
     """)
     
     print(f"  ✓ Configured S3 secret for public-gbif bucket (endpoint: {s3_endpoint})")
+    print(f"  ✓ GBIF source bucket will use public access (no auth)")
     
     return con
 
