@@ -48,12 +48,7 @@ def setup_duckdb():
     con.execute("""
         CREATE SECRET IF NOT EXISTS gbif_public (
             TYPE S3,
-            PROVIDER CREDENTIAL_CHAIN,
-            CHAIN 'none',
             REGION 'us-east-1',
-            ENDPOINT '',
-            USE_SSL true,
-            URL_STYLE 'path',
             SCOPE 's3://gbif-open-data-us-east-1'
         );
     """)
