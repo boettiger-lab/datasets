@@ -48,6 +48,8 @@ def setup_duckdb():
     con.execute("""
         CREATE SECRET IF NOT EXISTS gbif_public (
             TYPE S3,
+            KEY_ID '',
+            SECRET '',
             REGION 'us-east-1',
             SCOPE 's3://gbif-open-data-us-east-1'
         );
