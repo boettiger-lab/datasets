@@ -49,13 +49,12 @@ def setup_duckdb():
 
 def list_h0_partitions(bucket, prefix):
     """List all h0 partition directories in S3."""
-    # Use internal S3 endpoint with credentials from environment
+    # Use external NRP endpoint for listing (supports CommonPrefixes)
     aws_key = os.environ.get('AWS_ACCESS_KEY_ID', '')
     aws_secret = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
-    s3_endpoint = os.environ.get('AWS_S3_ENDPOINT', 'rook-ceph-rgw-nautiluss3.rook')
-    use_ssl = os.environ.get('AWS_HTTPS', 'false').lower() == 'true'
     
-    endpoint_url = f"{'https' if use_ssl else 'http'}://{s3_endpoint}"
+    # Use external endpoint with HTTPS for listing
+    endpoint_url = 'https://s3-west.nrp-nautilus.io'
     
     s3_client = boto3.client('s3',
                              aws_access_key_id=aws_key,
@@ -64,18 +63,21 @@ def list_h0_partitions(bucket, prefix):
                              region_name='us-east-1',
                              config=Config(signature_version='s3v4'))
     
-    # Use CommonPrefixes to list directories
+    # List objects and extract h0 partitions from keys
+    # Some S3 implementations don't support CommonPrefixes well, so we extract from actual keys
     paginator = s3_client.get_paginator('list_objects_v2')
     h0_partitions = set()
     
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/'):
-        if 'CommonPrefixes' in page:
-            for prefix_obj in page['CommonPrefixes']:
-                # Extract h0 value from path like "2025-06/chunks/h0=8001fffffffffff/"
-                prefix_path = prefix_obj['Prefix']
-                if 'h0=' in prefix_path:
-                    h0_dir = prefix_path.rstrip('/').split('/')[-1]
-                    h0_partitions.add(h0_dir)
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            # Extract h0 from path like "2025-06/chunks/h0=8001fffffffffff/file.parquet"
+            key = obj['Key']
+            if 'h0=' in key:
+                parts = key.split('/')
+                for part in parts:
+                    if part.startswith('h0='):
+                        h0_partitions.add(part)
+                        break
     
     return sorted(h0_partitions)
 
@@ -213,8 +215,16 @@ def main():
     
     # List all h0 partitions
     print("\n[2/3] Discovering h0 partitions...")
-    h0_partitions = list_h0_partitions(bucket, base_prefix)
-    print(f"  ✓ Found {len(h0_partitions)} h0 partitions")
+    try:
+        h0_partitions = list_h0_partitions(bucket, base_prefix)
+        print(f"  ✓ Found {len(h0_partitions)} h0 partitions")
+    except Exception as e:
+        print(f"  ✗ Error listing h0 partitions: {e}")
+        import traceback
+        traceback.print_exc()
+        con.close()
+        import sys
+        sys.exit(1)
     
     if job_index >= len(h0_partitions):
         print(f"  ! Job index {job_index} is beyond partition range (only {len(h0_partitions)} partitions)")
