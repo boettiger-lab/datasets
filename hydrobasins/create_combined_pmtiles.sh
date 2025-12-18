@@ -49,29 +49,60 @@ echo "✓ All GeoJSONSeq files created successfully!"
 echo ""
 
 # Generate unified PMTiles with zoom-based layers
-# tippecanoe will combine these and automatically handle the zoom levels
-echo "Step 5/5: Generating unified PMTiles with zoom-based detail..."
+# We'll create separate tilesets and then merge them
+echo "Step 5/5: Generating PMTiles with zoom-based detail..."
 echo ""
 
+# Level 3: Zoom 0-1
+echo "  - Creating Level 3 tiles (zoom 0-1)..."
 tippecanoe \
-  -o /tmp/hydrobasins_unified.pmtiles \
+  -o /tmp/level_03.pmtiles \
+  -l hydrobasins \
+  --drop-densest-as-needed \
+  --force \
+  -Z 0 -z 1 \
+  /tmp/level_03.geojsonl
+
+# Level 4: Zoom 2
+echo "  - Creating Level 4 tiles (zoom 2)..."
+tippecanoe \
+  -o /tmp/level_04.pmtiles \
+  -l hydrobasins \
+  --drop-densest-as-needed \
+  --force \
+  -Z 2 -z 2 \
+  /tmp/level_04.geojsonl
+
+# Level 5: Zoom 3-4
+echo "  - Creating Level 5 tiles (zoom 3-4)..."
+tippecanoe \
+  -o /tmp/level_05.pmtiles \
+  -l hydrobasins \
+  --drop-densest-as-needed \
+  --force \
+  -Z 3 -z 4 \
+  /tmp/level_05.geojsonl
+
+# Level 6: Zoom 5+
+echo "  - Creating Level 6 tiles (zoom 5+)..."
+tippecanoe \
+  -o /tmp/level_06.pmtiles \
   -l hydrobasins \
   --drop-densest-as-needed \
   --extend-zooms-if-still-dropping \
   --force \
-  -Z 0 -z 12 \
-  -L level_03:/tmp/level_03.geojsonl \
-  -L level_04:/tmp/level_04.geojsonl \
-  -L level_05:/tmp/level_05.geojsonl \
-  -L level_06:/tmp/level_06.geojsonl \
-  --maximum-zoom-at-zero-density=1:3 \
-  --maximum-zoom-at-zero-density=2:4 \
-  --maximum-zoom-at-zero-density=3:5 \
-  --maximum-zoom-at-zero-density=4:5 \
-  --minimum-zoom=1:0 \
-  --minimum-zoom=2:2 \
-  --minimum-zoom=3:3 \
-  --minimum-zoom=4:5
+  -Z 5 -z 12 \
+  /tmp/level_06.geojsonl
+
+# Merge all PMTiles into a unified tileset
+echo "  - Merging all levels into unified tileset..."
+tile-join \
+  -o /tmp/hydrobasins_unified.pmtiles \
+  --force \
+  /tmp/level_03.pmtiles \
+  /tmp/level_04.pmtiles \
+  /tmp/level_05.pmtiles \
+  /tmp/level_06.pmtiles
 
 echo ""
 echo "✓ Unified PMTiles created successfully!"
@@ -95,6 +126,10 @@ rm -f /tmp/level_03.geojsonl \
       /tmp/level_04.geojsonl \
       /tmp/level_05.geojsonl \
       /tmp/level_06.geojsonl \
+      /tmp/level_03.pmtiles \
+      /tmp/level_04.pmtiles \
+      /tmp/level_05.pmtiles \
+      /tmp/level_06.pmtiles \
       /tmp/hydrobasins_unified.pmtiles
 
 echo ""
