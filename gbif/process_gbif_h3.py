@@ -12,6 +12,9 @@ This script:
 import duckdb
 import os
 from pathlib import Path
+import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
 
 def setup_duckdb():
     """Initialize DuckDB connection with required extensions."""
@@ -188,23 +191,39 @@ def main():
     con = setup_duckdb()
     print("  ✓ Extensions loaded: httpfs, h3")
     
-    # Get list of ALL files to process
+    # Get list of ALL files to process using boto3 (much faster than DuckDB)
     print("\n[2/4] Discovering all source files...")
     
-    # Process using glob pattern to handle all files
-    source_glob = f"{source_path}/**"
-    
-    # Get complete file list
     try:
-        file_query = f"""
-        SELECT DISTINCT filename 
-        FROM read_parquet('{source_glob}', filename=true)
-        ORDER BY filename
-        """
-        all_files = [f[0] for f in con.execute(file_query).fetchall()]
+        # Parse S3 path
+        bucket = 'gbif-open-data-us-east-1'
+        prefix = 'occurrence/2025-06-01/occurrence.parquet/'
+        
+        # Create anonymous S3 client for public bucket
+        s3_client = boto3.client('s3', 
+                                 region_name='us-east-1',
+                                 config=Config(signature_version=UNSIGNED))
+        
+        # List all objects in the bucket with the prefix
+        all_files = []
+        paginator = s3_client.get_paginator('list_objects_v2')
+        
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    # Skip directories and only include actual files
+                    if not obj['Key'].endswith('/'):
+                        # Build full S3 path
+                        full_path = f"s3://{bucket}/{obj['Key']}"
+                        all_files.append(full_path)
+        
+        all_files.sort()
         print(f"  ✓ Found {len(all_files)} total files")
+        
     except Exception as e:
         print(f"  ! Error listing files: {e}")
+        import traceback
+        traceback.print_exc()
         import sys
         sys.exit(1)
     
