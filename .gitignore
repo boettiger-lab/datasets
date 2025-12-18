@@ -204,3 +204,9 @@ test.ipynb
 scratch.py
 .tmp/*
 
+fishbase/2025-04-01/fbapp.7z
+fishbase/2025-04-01/fbapp.sql
+.gitignore
+.gitignore
+fishbase/2025-04-01/slbapp.7z
+fishbase/2025-04-01/slbapp.sql
