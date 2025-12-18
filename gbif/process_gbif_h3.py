@@ -25,7 +25,7 @@ def setup_duckdb():
     con.execute("LOAD httpfs;")
     con.execute("INSTALL h3 FROM community;")
     con.execute("LOAD h3;")
-    con.execute("SET THREADS=20;") # I/O bound
+    con.execute("SET THREADS=40;") # I/O bound
 
     
     # Configure DuckDB secret for writing to public-gbif bucket
@@ -80,7 +80,7 @@ def get_source_files(con, source_path):
         print(f"Error accessing source: {e}")
         return None
 
-def process_gbif_chunk(con, source_files, output_base):
+def process_gbif_chunk(con, source_files, output_base, job_index):
     """
     Process multiple GBIF parquet files and write to output bucket partitioned by h0.
     
@@ -88,6 +88,7 @@ def process_gbif_chunk(con, source_files, output_base):
         con: DuckDB connection
         source_files: List of paths to source parquet files
         output_base: Base path for output (s3://public-gbif/2025-06/chunks)
+        job_index: Job completion index for unique filenames
     """
     
     print(f"Processing {len(source_files)} files")
@@ -133,10 +134,9 @@ def process_gbif_chunk(con, source_files, output_base):
         
         print(f"  Writing h0={h0_hex} to {output_path}")
         
-        # Write this h0 partition
-        # Using CREATE OR REPLACE would overwrite, so we write to unique filenames
-        import time
-        timestamp = int(time.time() * 1000)
+        # Use deterministic filename: job_index + h0_hex
+        # This prevents duplicates across runs and makes output idempotent
+        filename = f"job{job_index:04d}_h0{h0_hex}.parquet"
         
         write_query = f"""
         COPY (
@@ -159,7 +159,7 @@ def process_gbif_chunk(con, source_files, output_base):
               AND decimallatitude BETWEEN -90 AND 90
               AND decimallongitude BETWEEN -180 AND 180
               AND h3_latlng_to_cell(decimallatitude, decimallongitude, 0) = ?
-        ) TO '{output_path}/chunk_{timestamp}.parquet'
+        ) TO '{output_path}/{filename}'
         (FORMAT 'parquet', COMPRESSION 'snappy')
         """
         con.execute(write_query, [source_files, h0_val])
@@ -248,7 +248,7 @@ def main():
     # Process this chunk of files
     print(f"\n[4/4] Processing chunk {job_index}...")
     try:
-        process_gbif_chunk(con, files_to_process, output_base)
+        process_gbif_chunk(con, files_to_process, output_base, job_index)
         print(f"  ✓ Chunk {job_index} completed successfully")
     except Exception as e:
         error_msg = f"Error processing chunk {job_index}: {e}"
