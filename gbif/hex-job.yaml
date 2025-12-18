@@ -6,7 +6,7 @@ metadata:
     k8s-app: gbif-h3-process
 spec:
   completions: 200
-  parallelism: 50
+  parallelism: 200
   completionMode: Indexed
   backoffLimitPerIndex: 3
   podFailurePolicy:
@@ -105,10 +105,10 @@ spec:
           resources:
             requests:
               cpu: "8"
-              memory: 64Gi
+              memory: 32Gi
             limits:
               cpu: "8"
-              memory: 64Gi
+              memory: 32Gi
           command:
             - bash
             - -lc
