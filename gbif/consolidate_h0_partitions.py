@@ -80,19 +80,21 @@ def list_h0_partitions(bucket, prefix):
     
     return sorted(h0_partitions)
 
-def consolidate_h0_partition(con, bucket, base_prefix, h0_partition):
+def consolidate_h0_partition(con, bucket, input_prefix, output_prefix, h0_partition):
     """
     Consolidate all parquet files in an h0 partition into optimized files.
     
     Args:
         con: DuckDB connection
         bucket: S3 bucket name
-        base_prefix: Base prefix (e.g., '2025-06/chunks')
+        input_prefix: Input prefix to read from (e.g., '2025-06/chunks')
+        output_prefix: Output prefix to write to (e.g., '2025-06/hex')
         h0_partition: h0 partition name (e.g., 'h0=8001fffffffffff')
     """
     
     h0_value = h0_partition.split('=')[1]
-    partition_path = f"s3://{bucket}/{base_prefix}/{h0_partition}"
+    input_path = f"s3://{bucket}/{input_prefix}/{h0_partition}"
+    output_path = f"s3://{bucket}/{output_prefix}/{h0_partition}"
     
     print(f"\n{'='*80}")
     print(f"Processing partition: {h0_partition}")
@@ -114,7 +116,7 @@ def consolidate_h0_partition(con, bucket, base_prefix, h0_partition):
                              endpoint_url=endpoint_url,
                              config=Config(signature_version='s3v4'))
     
-    prefix = f"{base_prefix}/{h0_partition}/"
+    prefix = f"{input_prefix}/{h0_partition}/"
     files = []
     paginator = s3_client.get_paginator('list_objects_v2')
     
@@ -156,7 +158,8 @@ def consolidate_h0_partition(con, bucket, base_prefix, h0_partition):
     
     # Read all files, sort by spatial indexes for locality, and write
     # Sorting by h1, h2, h3 creates spatial clustering within the partition
-    output_pattern = f"{partition_path}/optimized_{h0_value}_{{i}}.parquet"
+    # Use FILE_SIZE_BYTES to automatically create ~256MB files
+    output_pattern = f"{output_path}/part"
     
     consolidate_query = f"""
     COPY (
@@ -168,23 +171,14 @@ def consolidate_h0_partition(con, bucket, base_prefix, h0_partition):
         FORMAT 'parquet',
         COMPRESSION 'zstd',
         ROW_GROUP_SIZE 1000000,
+        FILE_SIZE_BYTES 268435456,
         OVERWRITE_OR_IGNORE true
     )
     """
     
     con.execute(consolidate_query)
-    print(f"  ✓ Created optimized files")
+    print(f"  ✓ Created optimized files in {output_path}")
     
-    # Clean up original fragmented files
-    print("  [4/4] Removing original fragmented files...")
-    for file_path in files:
-        key = file_path.replace(f"s3://{bucket}/", "")
-        try:
-            s3_client.delete_object(Bucket=bucket, Key=key)
-        except Exception as e:
-            print(f"  ! Warning: Could not delete {key}: {e}")
-    
-    print(f"  ✓ Cleaned up {len(files)} original files")
     print(f"{'='*80}")
     print(f"Partition {h0_partition} consolidation complete!")
     print(f"{'='*80}\n")
@@ -194,7 +188,8 @@ def main():
     
     # Configuration
     bucket = "public-gbif"
-    base_prefix = "2025-06/chunks"
+    input_prefix = "2025-06/chunks"  # Read fragmented files from here
+    output_prefix = "2025-06/hex"    # Write consolidated files here
     
     # Get the job completion index from environment (0-based index)
     job_index = int(os.environ.get('JOB_COMPLETION_INDEX', '0'))
@@ -202,7 +197,8 @@ def main():
     print("=" * 80)
     print("GBIF H3 Partition Consolidation")
     print("=" * 80)
-    print(f"Bucket: s3://{bucket}/{base_prefix}")
+    print(f"Input:  s3://{bucket}/{input_prefix}")
+    print(f"Output: s3://{bucket}/{output_prefix}")
     print(f"Job Index: {job_index}")
     print("=" * 80)
     
@@ -214,7 +210,7 @@ def main():
     # List all h0 partitions
     print("\n[2/3] Discovering h0 partitions...")
     try:
-        h0_partitions = list_h0_partitions(bucket, base_prefix)
+        h0_partitions = list_h0_partitions(bucket, input_prefix)
         print(f"  ✓ Found {len(h0_partitions)} h0 partitions")
     except Exception as e:
         print(f"  ✗ Error listing h0 partitions: {e}")
@@ -236,7 +232,7 @@ def main():
     
     print("\n[3/3] Consolidating partition...")
     try:
-        consolidate_h0_partition(con, bucket, base_prefix, h0_partition)
+        consolidate_h0_partition(con, bucket, input_prefix, output_prefix, h0_partition)
         print(f"  ✓ Successfully consolidated {h0_partition}")
     except Exception as e:
         print(f"  ✗ Error consolidating {h0_partition}: {e}")
