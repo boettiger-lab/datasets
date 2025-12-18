@@ -60,7 +60,6 @@ def list_h0_partitions(bucket, prefix):
                              aws_access_key_id=aws_key,
                              aws_secret_access_key=aws_secret,
                              endpoint_url=endpoint_url,
-                             region_name='us-east-1',
                              config=Config(signature_version='s3v4'))
     
     # List objects and extract h0 partitions from keys
@@ -113,7 +112,6 @@ def consolidate_h0_partition(con, bucket, base_prefix, h0_partition):
                              aws_access_key_id=aws_key,
                              aws_secret_access_key=aws_secret,
                              endpoint_url=endpoint_url,
-                             region_name='us-east-1',
                              config=Config(signature_version='s3v4'))
     
     prefix = f"{base_prefix}/{h0_partition}/"
