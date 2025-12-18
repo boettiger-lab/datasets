@@ -25,6 +25,8 @@ def setup_duckdb():
     con.execute("LOAD httpfs;")
     con.execute("INSTALL h3 FROM community;")
     con.execute("LOAD h3;")
+    con.execute("SET THREADS=20;") # I/O bound
+
     
     # Configure DuckDB secret for writing to public-gbif bucket
     # This uses the custom S3 endpoint from the k8s environment
