@@ -17,7 +17,7 @@ from botocore.config import Config
 
 def setup_duckdb():
     """Initialize DuckDB connection with required extensions."""
-    con = duckdb.connect()
+    con = duckdb.connect("/tmp/duck.db")
     
     # Install and load required extensions
     con.execute("INSTALL httpfs;")
