@@ -49,9 +49,20 @@ def setup_duckdb():
 
 def list_h0_partitions(bucket, prefix):
     """List all h0 partition directories in S3."""
+    # Use internal S3 endpoint with credentials from environment
+    aws_key = os.environ.get('AWS_ACCESS_KEY_ID', '')
+    aws_secret = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+    s3_endpoint = os.environ.get('AWS_S3_ENDPOINT', 'rook-ceph-rgw-nautiluss3.rook')
+    use_ssl = os.environ.get('AWS_HTTPS', 'false').lower() == 'true'
+    
+    endpoint_url = f"{'https' if use_ssl else 'http'}://{s3_endpoint}"
+    
     s3_client = boto3.client('s3',
+                             aws_access_key_id=aws_key,
+                             aws_secret_access_key=aws_secret,
+                             endpoint_url=endpoint_url,
                              region_name='us-east-1',
-                             config=Config(signature_version='v4'))
+                             config=Config(signature_version='s3v4'))
     
     # Use CommonPrefixes to list directories
     paginator = s3_client.get_paginator('list_objects_v2')
@@ -88,9 +99,20 @@ def consolidate_h0_partition(con, bucket, base_prefix, h0_partition):
     
     # List all files in this partition
     print("  [1/4] Listing files in partition...")
+    
+    # Use internal S3 endpoint with credentials
+    aws_key = os.environ.get('AWS_ACCESS_KEY_ID', '')
+    aws_secret = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+    s3_endpoint = os.environ.get('AWS_S3_ENDPOINT', 'rook-ceph-rgw-nautiluss3.rook')
+    use_ssl = os.environ.get('AWS_HTTPS', 'false').lower() == 'true'
+    endpoint_url = f"{'https' if use_ssl else 'http'}://{s3_endpoint}"
+    
     s3_client = boto3.client('s3',
+                             aws_access_key_id=aws_key,
+                             aws_secret_access_key=aws_secret,
+                             endpoint_url=endpoint_url,
                              region_name='us-east-1',
-                             config=Config(signature_version='v4'))
+                             config=Config(signature_version='s3v4'))
     
     prefix = f"{base_prefix}/{h0_partition}/"
     files = []

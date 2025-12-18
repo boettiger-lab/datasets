@@ -8,7 +8,7 @@ spec:
   completions: 200
   parallelism: 200
   completionMode: Indexed
-  backoffLimitPerIndex: 3
+  backoffLimitPerIndex: 5
   podFailurePolicy:
     rules:
     - action: Ignore
@@ -113,8 +113,8 @@ spec:
             - bash
             - -lc
             - |
-              # Install DuckDB if not available
-              pip install -q duckdb
+              # Install dependencies
+              pip install -q duckdb boto3
               
               # Run the GBIF H3 processing script
               python -u gbif/process_gbif_h3.py
