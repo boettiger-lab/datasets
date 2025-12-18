@@ -75,20 +75,24 @@ def get_source_files(con, source_path):
         print(f"Error accessing source: {e}")
         return None
 
-def process_gbif_chunk(con, source_file, output_base):
+def process_gbif_chunk(con, source_files, output_base):
     """
-    Process a single GBIF parquet file and write to output bucket partitioned by h0.
+    Process multiple GBIF parquet files and write to output bucket partitioned by h0.
     
     Args:
         con: DuckDB connection
-        source_file: Path to source parquet file(s) 
+        source_files: List of paths to source parquet files
         output_base: Base path for output (s3://public-gbif/2025-06/chunks)
     """
     
-    print(f"Processing files from: {source_file}")
+    print(f"Processing {len(source_files)} files")
+    print(f"  First file: {source_files[0]}")
+    if len(source_files) > 1:
+        print(f"  Last file: {source_files[-1]}")
     
     # Query to add H3 columns and partition by h0
     # We'll process each h0 partition separately to avoid overwriting
+    # DuckDB's read_parquet accepts a list of files as a parameter
     query = """
     WITH data_with_h3 AS (
         SELECT 
@@ -112,9 +116,8 @@ def process_gbif_chunk(con, source_file, output_base):
     )
     SELECT DISTINCT h0 FROM data_with_h3
     """
-    
     # First, get all unique h0 values in this chunk
-    h0_values = con.execute(query, [source_file]).fetchall()
+    h0_values = con.execute(query, [source_files]).fetchall()
     
     print(f"Found {len(h0_values)} unique h0 partitions in this chunk")
     
@@ -154,8 +157,7 @@ def process_gbif_chunk(con, source_file, output_base):
         ) TO '{output_path}/chunk_{timestamp}.parquet'
         (FORMAT 'parquet', COMPRESSION 'snappy')
         """
-        
-        con.execute(write_query, [source_file, h0_val])
+        con.execute(write_query, [source_files, h0_val])
         print(f"    ✓ Completed h0={h0_hex}")
 
 def main():
@@ -165,53 +167,83 @@ def main():
     source_path = "s3://gbif-open-data-us-east-1/occurrence/2025-06-01/occurrence.parquet"
     output_base = "s3://public-gbif/2025-06/chunks"
     
+    # Get the job completion index from environment (0-based index)
+    job_index = int(os.environ.get('JOB_COMPLETION_INDEX', '0'))
+    
+    # Configuration for chunking
+    target_completions = 200  # Target number of jobs
+    files_per_chunk = 25      # Files per job
+    
     print("=" * 80)
-    print("GBIF H3 Processing")
+    print("GBIF H3 Processing (Chunked)")
     print("=" * 80)
     print(f"Source: {source_path}")
     print(f"Output: {output_base}")
+    print(f"Job Index: {job_index}")
+    print(f"Files per chunk: {files_per_chunk}")
     print("=" * 80)
     
     # Initialize DuckDB
-    print("\n[1/3] Initializing DuckDB with extensions...")
+    print("\n[1/4] Initializing DuckDB with extensions...")
     con = setup_duckdb()
     print("  ✓ Extensions loaded: httpfs, h3")
     
-    # Get list of files to process
-    print("\n[2/3] Discovering source files...")
+    # Get list of ALL files to process
+    print("\n[2/4] Discovering all source files...")
     
     # Process using glob pattern to handle all files
-    source_glob = f"{source_path}/**/*.parquet"
+    source_glob = f"{source_path}/**"
     
-    # Get file list
+    # Get complete file list
     try:
         file_query = f"""
         SELECT DISTINCT filename 
         FROM read_parquet('{source_glob}', filename=true)
+        ORDER BY filename
         """
-        files = con.execute(file_query).fetchall()
-        print(f"  ✓ Found {len(files)} files to process")
+        all_files = [f[0] for f in con.execute(file_query).fetchall()]
+        print(f"  ✓ Found {len(all_files)} total files")
     except Exception as e:
-        print(f"  ! Could not list files, will process with glob pattern: {e}")
-        files = [(source_glob,)]
+        print(f"  ! Error listing files: {e}")
+        import sys
+        sys.exit(1)
     
-    # Process each file
-    print("\n[3/3] Processing files...")
-    for idx, (file_path,) in enumerate(files, 1):
-        print(f"\n--- File {idx}/{len(files)} ---")
-        try:
-            process_gbif_chunk(con, file_path, output_base)
-            print(f"  ✓ File {idx} completed successfully")
-        except Exception as e:
-            print(f"  ✗ Error processing file {idx}: {e}")
-            continue
+    # Determine which chunk of files this job should process
+    print(f"\n[3/4] Determining file chunk for job index {job_index}...")
+    start_idx = job_index * files_per_chunk
+    end_idx = min(start_idx + files_per_chunk, len(all_files))
     
-    print("\n" + "=" * 80)
-    print("Processing complete!")
-    print("=" * 80)
+    if start_idx >= len(all_files):
+        print(f"  ! Job index {job_index} is beyond file range (only {len(all_files)} files)")
+        print("  ✓ No files to process for this job index - exiting successfully")
+        con.close()
+        return
+    
+    files_to_process = all_files[start_idx:end_idx]
+    print(f"  ✓ Processing files {start_idx} to {end_idx-1} ({len(files_to_process)} files)")
+    print(f"    First file: {files_to_process[0]}")
+    print(f"    Last file: {files_to_process[-1]}")
+    
+    # Process this chunk of files
+    print(f"\n[4/4] Processing chunk {job_index}...")
+    try:
+        process_gbif_chunk(con, files_to_process, output_base)
+        print(f"  ✓ Chunk {job_index} completed successfully")
+    except Exception as e:
+        error_msg = f"Error processing chunk {job_index}: {e}"
+        print(f"  ✗ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        con.close()
+        import sys
+        sys.exit(1)
     
     # Close connection
     con.close()
+    
+    print("\n" + "=" * 80)
+    print(f"Chunk {job_index} completed successfully!")
+    print("=" * 80)
 
 if __name__ == "__main__":
     main()
