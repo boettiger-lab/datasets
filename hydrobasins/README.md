@@ -54,8 +54,6 @@ A single multi-layer GeoPackage containing all 12 hierarchical levels:
 | level_11   | 1,031,785    | Near-finest resolution |
 | level_12   | 1,034,083    | Finest resolution - detailed sub-basins |
 
-**File Size:** 7.7 GB
-
 ### GeoParquet Files (level_*.parquet)
 
 Individual GeoParquet files for each hierarchical level, optimized for cloud-native spatial data access:
@@ -77,26 +75,41 @@ Individual GeoParquet files for each hierarchical level, optimized for cloud-nat
 
 **Total GeoParquet Size:** ~3.8 GB (compressed)
 
-### PMTiles Files (level_*.pmtiles)
+### H3 Hexagon Versions (Levels 03-06)
 
-Individual PMTiles files for each hierarchical level, optimized for web mapping and tile serving:
+Processed H3 resolution 8 hexagon versions are available for levels 03-06, enabling efficient spatial analysis and web-based visualization. These datasets are stored in the cloud and can be accessed via the MinIO (mc) endpoint.
 
-| File Name           | Zoom Range | Feature Count | Use Case |
-|---------------------|------------|---------------|----------|
-| level_01.pmtiles    | 0-4        | 10            | Global/continental web maps |
-| level_02.pmtiles    | 0-5        | 62            | Continental basin visualization |
-| level_03.pmtiles    | 0-6        | 292           | Large regional web maps |
-| level_04.pmtiles    | 0-7        | 1,342         | Regional web mapping |
-| level_05.pmtiles    | 0-8        | 4,734         | Sub-regional web maps |
-| level_06.pmtiles    | 0-9        | 16,397        | Watershed web visualization |
-| level_07.pmtiles    | 0-10       | 57,646        | Detailed web maps |
-| level_08.pmtiles    | 0-11       | 190,675       | High-detail web mapping |
-| level_09.pmtiles    | 0-12       | 508,190       | Very detailed web maps |
-| level_10.pmtiles    | 0-13       | 941,012       | Maximum detail web maps |
-| level_11.pmtiles    | 0-14       | 1,031,785     | Ultra-high resolution web maps |
-| level_12.pmtiles    | 0-14       | 1,034,083     | Finest resolution web maps |
+**Storage Location:** `nrp/public-hydrobasins/`
 
-PMTiles is a cloud-native archive format for tiled map data, enabling efficient serverless map tile hosting.
+| Level | H3 Hexagons | PMTiles | Source Features | Description |
+|-------|-------------|---------|-----------------|-------------|
+| level_03 | `nrp/public-hydrobasins/level_03/` | `level_03.pmtiles` | 292 | Large regional basins hexed at H3 resolution 8 |
+| level_04 | `nrp/public-hydrobasins/level_04/` | `level_04.pmtiles` | 1,342 | Regional basins hexed at H3 resolution 8 |
+| level_05 | `nrp/public-hydrobasins/level_05/` | `level_05.pmtiles` | 4,734 | Sub-regional basins hexed at H3 resolution 8 |
+| level_06 | `nrp/public-hydrobasins/level_06/` | `level_06.pmtiles` | 16,397 | Major watersheds hexed at H3 resolution 8 |
+
+**H3 Hex Data Structure:**
+- Partitioned by H3 resolution 0 cells for efficient spatial querying
+- Format: Parquet files organized by `h0` prefix
+- Preserved attributes from source: `HYBAS_ID` (as `id`), `PFAF_ID`, `UP_AREA`, `SUB_AREA`, `MAIN_BAS`
+- Each hex includes H3 cell identifier and associated basin attributes
+
+**PMTiles:**
+- Vector tile format optimized for web mapping
+- Can be served directly from cloud storage without a tile server
+- Includes all basin attributes for interactive visualization
+
+**Access via MinIO Client:**
+```bash
+# List available levels
+mc ls nrp/public-hydrobasins/
+
+# List H3 hexagons for a specific level
+mc ls nrp/public-hydrobasins/level_03/
+
+# Download PMTiles for visualization
+mc cp nrp/public-hydrobasins/level_03.pmtiles .
+```
 
 ### Source Shapefiles
 
@@ -155,93 +168,32 @@ December 2, 2025
 - `geopandas` (Python) - GeoParquet generation
 - `pyarrow` - Parquet file writing
 
-## Usage Examples
+### H3 Hexagon Processing (Levels 03-06)
 
-### Load GeoPackage in Python
-```python
-import geopandas as gpd
+The H3 hexagon versions are created through a parallel processing pipeline:
 
-# Read a specific level
-basins = gpd.read_file('combined_hydrobasins.gpkg', layer='level_06')
+1. **Hex Generation:** Basin polygons are converted to H3 resolution 8 hexagons using parallel Kubernetes jobs
+   - Script: `vec.py` in each level directory
+   - Chunk processing for parallelization (100 features per chunk)
+   - Typical parallelism: 50 workers
+   
+2. **Repartitioning:** Hexagons are reorganized by H3 resolution 0 cells for optimal spatial queries
+   - Script: `repartition.py` in each level directory
+   - Groups hexagons by h0 prefix
+   - Outputs Parquet files organized by spatial proximity
 
-# List all layers
-import fiona
-with fiona.open('combined_hydrobasins.gpkg') as src:
-    print(src.listlayers())
-```
+3. **PMTiles Generation:** Vector tiles created for web visualization
+   - Script: `create_pmtiles.sh` in each level directory
+   - Uses `tippecanoe` for tile generation
+   - Outputs single PMTiles file per level
 
-### Load GeoParquet in Python
-```python
-import geopandas as gpd
+**Processing Infrastructure:**
+- Kubernetes cluster with distributed processing
+- Cloud storage (S3-compatible) for input/output
+- DuckDB for efficient spatial queries
+- H3 library for hexagonal indexing
 
-# Read a specific level (faster than GeoPackage)
-basins = gpd.read_parquet('level_06.parquet')
-```
-
-### Load in R
-```r
-library(sf)
-
-# Read from GeoPackage
-basins <- st_read("combined_hydrobasins.gpkg", layer = "level_06")
-
-# Read from GeoParquet
-library(arrow)
-basins <- read_parquet("level_06.parquet") %>% st_as_sf()
-```
-
-### Display PMTiles in Web Map
-```html
-<!-- Using MapLibre GL JS -->
-<script src="https://unpkg.com/maplibre-gl@3/dist/maplibre-gl.js"></script>
-<script src="https://unpkg.com/pmtiles@3/dist/pmtiles.js"></script>
-
-<script>
-let protocol = new pmtiles.Protocol();
-maplibregl.addProtocol("pmtiles", protocol.tile);
-
-const map = new maplibregl.Map({
-  container: 'map',
-  style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
-  center: [0, 20],
-  zoom: 2
-});
-
-map.on('load', () => {
-  map.addSource('hydrobasins', {
-    type: 'vector',
-    url: 'pmtiles://https://your-domain.com/level_06.pmtiles'
-  });
-  
-  map.addLayer({
-    id: 'basins',
-    type: 'line',
-    source: 'hydrobasins',
-    'source-layer': 'level_06',
-    paint: {
-      'line-color': '#0080ff',
-      'line-width': 1
-    }
-  });
-});
-</script>
-```
-
-### Query with DuckDB
-```sql
--- Query GeoParquet directly
-SELECT HYBAS_ID, SUB_AREA, UP_AREA, PFAF_ID 
-FROM read_parquet('level_08.parquet')
-WHERE UP_AREA > 10000
-ORDER BY UP_AREA DESC;
-```
-
-## Choosing the Right Level
-
-- **Levels 1-3:** Global to continental-scale analysis, biogeographic studies
-- **Levels 4-6:** Regional watershed analysis, large-scale hydrological modeling
-- **Levels 7-9:** Watershed-scale ecosystem analysis, medium-resolution modeling
-- **Levels 10-12:** Detailed sub-basin analysis, high-resolution hydrological studies
+See individual level directories (`level_03/`, `level_04/`, `level_05/`, `level_06/`) for detailed processing configurations and job definitions.
 
 ## Citations
 

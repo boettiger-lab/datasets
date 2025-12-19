@@ -82,7 +82,7 @@ def main():
     .rename({f"h{zoom}": "h_zoom"})
     .rename(carbon = "Z")
     .to_parquet(
-      f"s3://public-carbon/hex2/vulnerable-carbon/h0={h0}/data_0.parquet"
+      f"s3://public-carbon/hex/vulnerable-carbon/h0={h0}/data_0.parquet"
     )
   )
   print("Finished writing parquet", flush=True)
