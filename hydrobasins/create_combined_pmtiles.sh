@@ -56,13 +56,48 @@ echo ""
 # Add level metadata and zoom range controls to each feature
 echo "  - Adding level metadata and zoom controls..."
 # Level 3: Zoom 0-1 only
-cat /tmp/level_03.geojsonl | jq -c '. + {properties: (.properties + {level: 3, "tippecanoe:minzoom": 0, "tippecanoe:maxzoom": 1})}' > /tmp/level_03_tagged.geojsonl
+python3 -c "
+import json
+import sys
+for line in open('/tmp/level_03.geojsonl'):
+    feature = json.loads(line)
+    feature['tippecanoe'] = {'minzoom': 0, 'maxzoom': 1}
+    feature['properties']['level'] = 3
+    print(json.dumps(feature, separators=(',', ':')))
+" > /tmp/level_03_tagged.geojsonl
+
 # Level 4: Zoom 2 only
-cat /tmp/level_04.geojsonl | jq -c '. + {properties: (.properties + {level: 4, "tippecanoe:minzoom": 2, "tippecanoe:maxzoom": 2})}' > /tmp/level_04_tagged.geojsonl
+python3 -c "
+import json
+import sys
+for line in open('/tmp/level_04.geojsonl'):
+    feature = json.loads(line)
+    feature['tippecanoe'] = {'minzoom': 2, 'maxzoom': 2}
+    feature['properties']['level'] = 4
+    print(json.dumps(feature, separators=(',', ':')))
+" > /tmp/level_04_tagged.geojsonl
+
 # Level 5: Zoom 3-4
-cat /tmp/level_05.geojsonl | jq -c '. + {properties: (.properties + {level: 5, "tippecanoe:minzoom": 3, "tippecanoe:maxzoom": 4})}' > /tmp/level_05_tagged.geojsonl
+python3 -c "
+import json
+import sys
+for line in open('/tmp/level_05.geojsonl'):
+    feature = json.loads(line)
+    feature['tippecanoe'] = {'minzoom': 3, 'maxzoom': 4}
+    feature['properties']['level'] = 5
+    print(json.dumps(feature, separators=(',', ':')))
+" > /tmp/level_05_tagged.geojsonl
+
 # Level 6: Zoom 5+
-cat /tmp/level_06.geojsonl | jq -c '. + {properties: (.properties + {level: 6, "tippecanoe:minzoom": 5, "tippecanoe:maxzoom": 12})}' > /tmp/level_06_tagged.geojsonl
+python3 -c "
+import json
+import sys
+for line in open('/tmp/level_06.geojsonl'):
+    feature = json.loads(line)
+    feature['tippecanoe'] = {'minzoom': 5, 'maxzoom': 12}
+    feature['properties']['level'] = 6
+    print(json.dumps(feature, separators=(',', ':')))
+" > /tmp/level_06_tagged.geojsonl
 
 echo "  - Concatenating all levels..."
 cat /tmp/level_03_tagged.geojsonl \
