@@ -61,7 +61,7 @@ tippecanoe \
   --drop-densest-as-needed \
   --force \
   -Z 0 -z 1 \
-  /tmp/level_03.geojsonl
+  /tmp/level_03.geojsonl 2>/dev/null
 
 # Level 4: Zoom 2
 echo "  - Creating Level 4 tiles (zoom 2)..."
@@ -71,7 +71,7 @@ tippecanoe \
   --drop-densest-as-needed \
   --force \
   -Z 2 -z 2 \
-  /tmp/level_04.geojsonl
+  /tmp/level_04.geojsonl 2>/dev/null
 
 # Level 5: Zoom 3-4
 echo "  - Creating Level 5 tiles (zoom 3-4)..."
@@ -81,7 +81,7 @@ tippecanoe \
   --drop-densest-as-needed \
   --force \
   -Z 3 -z 4 \
-  /tmp/level_05.geojsonl
+  /tmp/level_05.geojsonl 2>/dev/null
 
 # Level 6: Zoom 5+
 echo "  - Creating Level 6 tiles (zoom 5+)..."
@@ -92,7 +92,7 @@ tippecanoe \
   --extend-zooms-if-still-dropping \
   --force \
   -Z 5 -z 12 \
-  /tmp/level_06.geojsonl
+  /tmp/level_06.geojsonl 2>/dev/null
 
 # Merge all PMTiles into a unified tileset
 echo "  - Merging all levels into unified tileset..."
@@ -102,7 +102,7 @@ tile-join \
   /tmp/level_03.pmtiles \
   /tmp/level_04.pmtiles \
   /tmp/level_05.pmtiles \
-  /tmp/level_06.pmtiles
+  /tmp/level_06.pmtiles 2>/dev/null
 
 echo ""
 echo "✓ Unified PMTiles created successfully!"
