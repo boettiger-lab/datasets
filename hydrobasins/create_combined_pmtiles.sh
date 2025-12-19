@@ -48,61 +48,35 @@ echo ""
 echo "✓ All GeoJSONSeq files created successfully!"
 echo ""
 
-# Generate unified PMTiles with zoom-based layers
-# We'll create separate tilesets and then merge them
-echo "Step 5/5: Generating PMTiles with zoom-based detail..."
+# Concatenate all GeoJSONSeq files and create unified PMTiles in one pass
+# This avoids the memory-intensive tile-join merge operation
+echo "Step 5/5: Generating unified PMTiles from all levels..."
 echo ""
 
-# Level 3: Zoom 0-1
-echo "  - Creating Level 3 tiles (zoom 0-1)..."
-tippecanoe \
-  -o /tmp/level_03.pmtiles \
-  -l hydrobasins \
-  --drop-densest-as-needed \
-  --force \
-  -Z 0 -z 1 \
-  /tmp/level_03.geojsonl 2>/dev/null
-
-# Level 4: Zoom 2
-echo "  - Creating Level 4 tiles (zoom 2)..."
-tippecanoe \
-  -o /tmp/level_04.pmtiles \
-  -l hydrobasins \
-  --drop-densest-as-needed \
-  --force \
-  -Z 2 -z 2 \
-  /tmp/level_04.geojsonl 2>/dev/null
-
+# Add level metadata and zoom range controls to each feature
+echo "  - Adding level metadata and zoom controls..."
+# Level 3: Zoom 0-1 only
+cat /tmp/level_03.geojsonl | jq -c '. + {properties: (.properties + {level: 3, "tippecanoe:minzoom": 0, "tippecanoe:maxzoom": 1})}' > /tmp/level_03_tagged.geojsonl
+# Level 4: Zoom 2 only
+cat /tmp/level_04.geojsonl | jq -c '. + {properties: (.properties + {level: 4, "tippecanoe:minzoom": 2, "tippecanoe:maxzoom": 2})}' > /tmp/level_04_tagged.geojsonl
 # Level 5: Zoom 3-4
-echo "  - Creating Level 5 tiles (zoom 3-4)..."
-tippecanoe \
-  -o /tmp/level_05.pmtiles \
-  -l hydrobasins \
-  --drop-densest-as-needed \
-  --force \
-  -Z 3 -z 4 \
-  /tmp/level_05.geojsonl 2>/dev/null
-
+cat /tmp/level_05.geojsonl | jq -c '. + {properties: (.properties + {level: 5, "tippecanoe:minzoom": 3, "tippecanoe:maxzoom": 4})}' > /tmp/level_05_tagged.geojsonl
 # Level 6: Zoom 5+
-echo "  - Creating Level 6 tiles (zoom 5+)..."
-tippecanoe \
-  -o /tmp/level_06.pmtiles \
-  -l hydrobasins \
-  --drop-densest-as-needed \
-  --extend-zooms-if-still-dropping \
-  --force \
-  -Z 5 -z 12 \
-  /tmp/level_06.geojsonl 2>/dev/null
+cat /tmp/level_06.geojsonl | jq -c '. + {properties: (.properties + {level: 6, "tippecanoe:minzoom": 5, "tippecanoe:maxzoom": 12})}' > /tmp/level_06_tagged.geojsonl
 
-# Merge all PMTiles into a unified tileset
-echo "  - Merging all levels into unified tileset..."
-tile-join \
+echo "  - Concatenating all levels..."
+cat /tmp/level_03_tagged.geojsonl \
+    /tmp/level_04_tagged.geojsonl \
+    /tmp/level_05_tagged.geojsonl \
+    /tmp/level_06_tagged.geojsonl > /tmp/hydrobasins_all.geojsonl
+
+echo "  - Creating unified PMTiles with zoom-controlled detail..."
+tippecanoe \
   -o /tmp/hydrobasins_unified.pmtiles \
+  -l hydrobasins \
   --force \
-  /tmp/level_03.pmtiles \
-  /tmp/level_04.pmtiles \
-  /tmp/level_05.pmtiles \
-  /tmp/level_06.pmtiles 2>/dev/null
+  -Z 0 -z 12 \
+  /tmp/hydrobasins_all.geojsonl
 
 echo ""
 echo "✓ Unified PMTiles created successfully!"
@@ -126,10 +100,11 @@ rm -f /tmp/level_03.geojsonl \
       /tmp/level_04.geojsonl \
       /tmp/level_05.geojsonl \
       /tmp/level_06.geojsonl \
-      /tmp/level_03.pmtiles \
-      /tmp/level_04.pmtiles \
-      /tmp/level_05.pmtiles \
-      /tmp/level_06.pmtiles \
+      /tmp/level_03_tagged.geojsonl \
+      /tmp/level_04_tagged.geojsonl \
+      /tmp/level_05_tagged.geojsonl \
+      /tmp/level_06_tagged.geojsonl \
+      /tmp/hydrobasins_all.geojsonl \
       /tmp/hydrobasins_unified.pmtiles
 
 echo ""
@@ -137,9 +112,7 @@ echo "=========================================="
 echo "✓ Unified PMTiles generation complete!"
 echo "=========================================="
 echo ""
-echo "Zoom levels:"
-echo "  0-1: Level 3 (major sub-continental watersheds)"
-echo "  2:   Level 4"
-echo "  3-4: Level 5"
-echo "  5+:  Level 6 (finest detail)"
+echo "All HydroBasins levels 3-6 combined into a single PMTiles file"
+echo "with automatic detail optimization by zoom level."
+echo "Features include a 'level' property (3-6) for filtering/styling."
 echo ""
