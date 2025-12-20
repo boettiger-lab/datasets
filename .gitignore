@@ -210,3 +210,4 @@ fishbase/2025-04-01/fbapp.sql
 .gitignore
 fishbase/2025-04-01/slbapp.7z
 fishbase/2025-04-01/slbapp.sql
+rclone.conf
