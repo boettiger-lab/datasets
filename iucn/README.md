@@ -219,3 +219,71 @@ Each partition contains:
 - **Layers per job**: 14 richness layers
 - **Total operations**: 122 × 14 = 1,708 layer-hex combinations
 - **Estimated time**: ~1-2 hours with 61-way parallelism (depending on cluster resources)
+
+## Post-Processing: Removing Zero Values
+
+After the initial hexing process, many cells contain 0 richness values (areas with no species). These can be removed to reduce storage and improve query performance.
+
+### Post-Processing Workflow
+
+The `post_process.py` script filters out 0 values and writes cleaned datasets:
+
+**Input:** `s3://public-iucn/hex/{layer_name}/**`
+**Output:** `s3://public-iucn/richness/hex/{layer_name}/**` (partitioned by h0)
+
+### Running Post-Processing
+
+Deploy the post-processing job:
+```bash
+kubectl apply -f iucn/post_process_job.yaml
+```
+
+Monitor progress:
+```bash
+kubectl get jobs -l k8s-app=iucn-post-process
+kubectl logs -l k8s-app=iucn-post-process -f
+```
+
+The job processes all 14 layers sequentially, removing cells where richness = 0.
+
+### Single Layer Post-Processing
+
+Process one layer locally:
+```bash
+python post_process.py \
+  --layer-name reptiles_thr_sr \
+  --value-column reptiles_thr_sr
+```
+
+**Job configuration:**
+- Resources: 8 CPU cores, 64 GiB RAM
+- Processing: Sequential (all layers in one job)
+- Priority: Opportunistic
+
+## Cloud-Optimized GeoTIFFs (COGs)
+
+The original IUCN richness rasters are available as Cloud-Optimized GeoTIFFs for direct web-based visualization and analysis:
+
+**Location:** `s3://public-iucn/raw/richness/`
+
+**Public URL:** `https://minio.carlboettiger.info/public-iucn/raw/richness/`
+
+These COGs can be accessed directly in QGIS, ArcGIS, web mapping applications, or any COG-compatible tool without downloading the entire file. The internal tiling and overviews enable efficient streaming and visualization at multiple zoom levels.
+
+### COG Workflow
+
+Original GeoTIFFs were converted to COGs using `cog_job.yaml`:
+
+1. Downloads source TIFFs to local storage
+2. Applies `gdal_translate` with COG driver and optimal settings:
+   - Compression: LZW
+   - Tiling: 512×512
+   - Overviews: Generated automatically
+   - Predictor: Horizontal differencing for better compression
+3. Uploads COGs to S3 with public read access
+4. Validates COG format using `rio cogeo validate`
+
+Deploy COG conversion:
+```bash
+kubectl apply -f iucn/cog_job.yaml
+```
