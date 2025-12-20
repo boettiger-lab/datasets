@@ -1,3 +1,14 @@
+# Accessing the processed data
+
+```r
+library(duckdbfs)
+duckdb_secrets("", "", "s3-west.nrp-nautilus.io")
+open_dataset("s3://public-gbif/2025-06/hex/**")
+
+```
+
+
+
 # GBIF H3 Processing Pipeline
 
 This directory contains a two-stage pipeline for processing GBIF occurrence data with H3 geospatial indexes and optimizing it for efficient remote access.
