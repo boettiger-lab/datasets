@@ -57,12 +57,12 @@ H3 is a hierarchical hexagonal grid system that provides:
 **Completions**: 122 (one per h0 partition)
 
 #### What it does:
-1. Lists all h0 partitions
+1. Lists all h0 partitions from chunks/
 2. For each h0 partition:
-   - Reads all ~200 fragmented files in that partition
+   - Reads all ~200 fragmented files in that partition from chunks/
    - Sorts by h1, h2, h3, h4, h5 for spatial locality
-   - Writes optimized files with proper row groups
-   - Deletes original fragmented files
+   - Writes optimized files to hex/ subdirectory with proper row groups
+   - Deletes original fragmented files from chunks/
 
 #### Optimization Strategy:
 
@@ -135,7 +135,7 @@ Wait for all 122 completions (one per h0 partition).
 ## Final Output Structure
 
 ```
-s3://public-gbif/2025-06/chunks/
+s3://public-gbif/2025-06/hex/
 ├── h0=8001fffffffffff/
 │   ├── optimized_8001fffffffffff_0.parquet
 │   ├── optimized_8001fffffffffff_1.parquet
@@ -158,7 +158,7 @@ con.execute("INSTALL httpfs; LOAD httpfs;")
 # Query specific h0 partition(s)
 result = con.execute("""
     SELECT species, COUNT(*) as count
-    FROM read_parquet('s3://public-gbif/2025-06/chunks/h0=8001fffffffffff/*.parquet')
+    FROM read_parquet('s3://public-gbif/2025-06/hex/h0=8001fffffffffff/*.parquet')
     WHERE h3 = 633564256014688256  -- specific h3 cell at resolution 3
     GROUP BY species
     ORDER BY count DESC
@@ -172,7 +172,7 @@ result = con.execute("""
 import polars as pl
 
 # Spatial query leveraging partitioning and sorting
-df = pl.scan_parquet('s3://public-gbif/2025-06/chunks/h0=80*/optimized_*.parquet')
+df = pl.scan_parquet('s3://public-gbif/2025-06/hex/h0=80*/optimized_*.parquet')
 result = (df
     .filter(pl.col('h2') == 592370033168572416)
     .select(['species', 'decimallatitude', 'decimallongitude', 'h3'])

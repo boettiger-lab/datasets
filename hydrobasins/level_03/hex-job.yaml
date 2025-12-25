@@ -110,7 +110,7 @@ spec:
             - -lc
             - |
               set -e
-              python hydrobasins/level_03/vec.py --i ${JOB_COMPLETION_INDEX} --chunk-size 100
+              python hydrobasins/vec.py --level 3 --i ${JOB_COMPLETION_INDEX} --chunk-size 100
       volumes:
         - name: repo
           emptyDir: {}

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: sync-gbif-aws
+  name: sync-iucn
 spec:
   # Clean up the pod automatically 6000 seconds after completion
   backoffLimit: 1  # Allow a few retries
@@ -11,7 +11,9 @@ spec:
       containers:
       - name: rclone
         image: rclone/rclone:latest
-        command: ["rclone", "sync", "nrp:public-gbif/2025-06", "source:us-west-2.opendata.source.coop/cboettig/gbif/2025-06"]
+        command: ["rclone", "sync", "nrp:public-iucn", "minio:public-iucn"]
+#        command: ["rclone", "sync", "nrp:public-gbif/2025-06", "source:us-west-2.opendata.source.coop/cboettig/gbif/2025-06"]
+#        command: ["rclone", "sync", "nrp:public-gbif/2025-06", "minio:public-gbif/2025-06"]
         # The Ceph-safe performance flags
         args:
           - "--transfers=2"       # 8 parallel file transfers (keeps Ceph happy)

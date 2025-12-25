@@ -1,24 +1,18 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: hydrobasins-level4-hex
+  name: hydrobasins-rename-column
   labels:
-    k8s-app: hydrobasins-level4-hex
+    k8s-app: hydrobasins-rename-column
 spec:
-  completions: 200
-  parallelism: 50
-  completionMode: Indexed
-  backoffLimitPerIndex: 3
-  podFailurePolicy:
-    rules:
-    - action: Ignore
-      onPodConditions:
-      - type: DisruptionTarget
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
   ttlSecondsAfterFinished: 10800
   template:
     metadata:
       labels:
-        k8s-app: hydrobasins-level4-hex
+        k8s-app: hydrobasins-rename-column
     spec:
       priorityClassName: opportunistic
       affinity:
@@ -51,7 +45,7 @@ spec:
             - name: repo
               mountPath: /workspace
       containers:
-        - name: hex-task
+        - name: rename-task
           image: ghcr.io/rocker-org/ml-spatial
           imagePullPolicy: Always
           workingDir: /workspace/datasets
@@ -92,25 +86,25 @@ spec:
               value: "false"
             - name: AWS_VIRTUAL_HOSTING
               value: "FALSE"
-            - name: GDAL_DATA
-              value: "/opt/conda/share/gdal"
-            - name: PROJ_LIB
-              value: "/opt/conda/share/proj"
             - name: TMPDIR
               value: "/tmp"
           resources:
             requests:
-              cpu: "2"
-              memory: 24Gi
+              cpu: "4"
+              memory: 64Gi
             limits:
-              cpu: "2"
-              memory: 24Gi
+              cpu: "4"
+              memory: 64Gi
           command:
             - bash
             - -lc
             - |
               set -e
-              python hydrobasins/vec.py --level 4 --i ${JOB_COMPLETION_INDEX} --chunk-size 100
+              # Process levels 5, 4, and 3
+              for LEVEL in 5 4 3; do
+                echo "Processing level ${LEVEL}..."
+                python hydrobasins/rename_column.py --level ${LEVEL} --use-local-cache
+              done
       volumes:
         - name: repo
           emptyDir: {}

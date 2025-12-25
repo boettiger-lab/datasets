@@ -83,16 +83,16 @@ Processed H3 resolution 8 hexagon versions are available for levels 03-06, enabl
 
 | Level | H3 Hexagons | PMTiles | Source Features | Description |
 |-------|-------------|---------|-----------------|-------------|
-| level_03 | `nrp/public-hydrobasins/level_03/` | `level_03.pmtiles` | 292 | Large regional basins hexed at H3 resolution 8 |
-| level_04 | `nrp/public-hydrobasins/level_04/` | `level_04.pmtiles` | 1,342 | Regional basins hexed at H3 resolution 8 |
-| level_05 | `nrp/public-hydrobasins/level_05/` | `level_05.pmtiles` | 4,734 | Sub-regional basins hexed at H3 resolution 8 |
-| level_06 | `nrp/public-hydrobasins/level_06/` | `level_06.pmtiles` | 16,397 | Major watersheds hexed at H3 resolution 8 |
+| L3 | `nrp/public-hydrobasins/L3/` | `L3.pmtiles` | 292 | Large regional basins hexed at H3 resolution 8 |
+| L4 | `nrp/public-hydrobasins/L4/` | `L4.pmtiles` | 1,342 | Regional basins hexed at H3 resolution 8 |
+| L5 | `nrp/public-hydrobasins/L5/` | `L5.pmtiles` | 4,734 | Sub-regional basins hexed at H3 resolution 8 |
+| L6 | `nrp/public-hydrobasins/L6/` | `L6.pmtiles` | 16,397 | Major watersheds hexed at H3 resolution 8 |
 
 **H3 Hex Data Structure:**
 - Partitioned by H3 resolution 0 cells for efficient spatial querying
 - Format: Parquet files organized by `h0` prefix
-- Preserved attributes from source: `HYBAS_ID` (as `id`), `PFAF_ID`, `UP_AREA`, `SUB_AREA`, `MAIN_BAS`
-- Each hex includes H3 cell identifier and associated basin attributes
+- Preserved attributes from source: `HYBAS_ID`, `PFAF_ID`, `UP_AREA`, `SUB_AREA`, `MAIN_BAS`
+- Each hex includes H3 cell identifier (`h8`) and associated basin attributes
 
 **PMTiles:**
 - Vector tile format optimized for web mapping
@@ -105,10 +105,13 @@ Processed H3 resolution 8 hexagon versions are available for levels 03-06, enabl
 mc ls nrp/public-hydrobasins/
 
 # List H3 hexagons for a specific level
-mc ls nrp/public-hydrobasins/level_03/
+mc ls nrp/public-hydrobasins/L3/
 
 # Download PMTiles for visualization
-mc cp nrp/public-hydrobasins/level_03.pmtiles .
+mc cp nrp/public-hydrobasins/L3.pmtiles .
+
+# Example: Read data with DuckDB
+duckdb -c "SELECT * FROM read_parquet('s3://public-hydrobasins/L6/**/*.parquet') LIMIT 10"
 ```
 
 ### Source Shapefiles
