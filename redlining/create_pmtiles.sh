@@ -9,13 +9,20 @@ echo "Downloading Redlining GPKG..."
 curl -L -o /tmp/mappinginequality.gpkg \
   "https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg"
 
-echo "Converting GPKG to GeoJSONSeq for tippecanoe..."
+echo "Cleaning data..."
 
-# Convert GPKG to GeoJSONSeq (which tippecanoe can read)
+# Clean the data first
+python redlining/clean_data.py \
+  --input /tmp/mappinginequality.gpkg \
+  --output /tmp/mappinginequality_clean.parquet
+
+echo "Converting cleaned data to GeoJSONSeq for tippecanoe..."
+
+# Convert cleaned parquet to GeoJSONSeq
 ogr2ogr \
   -f GeoJSONSeq \
   /tmp/mappinginequality.geojsonl \
-  /tmp/mappinginequality.gpkg \
+  /tmp/mappinginequality_clean.parquet \
   -progress
 
 echo "GeoJSONSeq created successfully!"
@@ -43,6 +50,7 @@ mc cp /tmp/mappinginequality.pmtiles s3/public-redlining/mappinginequality.pmtil
 
 echo "Cleaning up local files..."
 rm /tmp/mappinginequality.gpkg
+rm /tmp/mappinginequality_clean.parquet
 rm /tmp/mappinginequality.geojsonl
 rm /tmp/mappinginequality.pmtiles
 
