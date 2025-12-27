@@ -1,0 +1,25 @@
+
+
+```{r}
+library(dplyr)
+library(duckdbfs)
+duckdb_secrets("", "", "s3-west.nrp-nautilus.io")
+
+gbif <- open_dataset("s3://public-gbif/2025-06/hex") |>
+    filter(
+        `class` == "Aves",
+        providers %in% c("CLO", "iNaturalist")
+    )
+    # Keep h10 as UINT64
+
+redlining <- open_dataset("s3://public-redlining/hex") |>
+    mutate(h10 = ('x' || h10)::UINT64)  # Convert hex string to UINT64
+
+dt <- redlining |> left_join(gbif, by = c("h0", "h10"))
+
+dt |>
+    group_by(grade) |>
+    summarise(n = n())
+
+```
+
