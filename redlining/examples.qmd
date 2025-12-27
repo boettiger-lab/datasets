@@ -21,7 +21,6 @@ hex_area <- redlining |>
     group_by(area_id) |>
     summarise(area = n() * 0.015047502)
 
-# Here we go: GBIF birds
 dt <- redlining |> left_join(gbif, by = c("h0", "h10"))
 
 ```
@@ -30,11 +29,13 @@ dt <- redlining |> left_join(gbif, by = c("h0", "h10"))
 Density: hex counts, hex areas:
 
 ```{r}
+system.time({
 dt |>
     count(area_id, grade, year, institutioncode) |>
     inner_join(hex_area) |>
     mutate(count_density = n / area) |>
     write_dataset("count_density_km2.parquet")
+    })
 ```
 
 
@@ -79,7 +80,10 @@ polys <- open_dataset("s3://public-redlining/mappinginequality.parquet", recursi
    mutate(geom = ST_Transform(ST_FlipCoordinates(st_MakeValid(geometry)), 'EPSG:4326', 'EPSG:5070')) |> # lots are lost
    mutate(area = st_area(geom) / 1000000.0) |>
    select(area_id, city, area)
+```
 
+```{r}
+# check our area math
 area_approx = hex_area |> 
   rename(hex_area = area) |>
   inner_join(polys) |>
@@ -89,4 +93,24 @@ area_approx = hex_area |>
 area_approx |> pull(ratio) |> hist()
 ```
 
-We could do st_contains instead of the hex joins above, might be a bit slow...
+
+We can of course do a proper spatial polygon-contains-points join instead of the hex joins above, presumably a bit slower...
+
+```{r}
+
+gbif_pts <- gbif |> mutate(geom = st_point(decimallongitude, decimallatitude))
+red_polys <- open_dataset("s3://public-redlining/mappinginequality.parquet", recursive = FALSE) |> rename(geom = geometry)
+
+dt_spatial <- red_polys |> spatial_join(gbif_pts, by = "st_intersects")
+
+# here we go
+system.time({
+dt_spatial |>
+    count(area_id, grade, year, institutioncode) |>
+    inner_join(polys) |> # exact areas
+    mutate(count_density = n / area) |>
+    write_dataset("count_density_exact.parquet")
+
+})
+```
+
