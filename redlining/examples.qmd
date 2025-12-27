@@ -5,21 +5,100 @@ library(dplyr)
 library(duckdbfs)
 duckdb_secrets("", "", "s3-west.nrp-nautilus.io")
 
-gbif <- open_dataset("s3://public-gbif/2025-06/hex") |>
+gbif <- open_dataset("s3://public-gbif/hex") |>
     filter(
         `class` == "Aves",
-        providers %in% c("CLO", "iNaturalist")
+        institutioncode %in% c("CLO", "iNaturalist")
     )
-    # Keep h10 as UINT64
 
-redlining <- open_dataset("s3://public-redlining/hex") |>
-    mutate(h10 = ('x' || h10)::UINT64)  # Convert hex string to UINT64
+# polygons -- for area
+polys <- open_dataset("s3://public-redlining/mappinginequality.parquet", recursive = FALSE) |>
+    mutate(area = st_area(geometry)) |>
+    select(area_id, city, area, geometry)
+
+# hexes
+redlining <- open_dataset("s3://public-redlining/hex") # |>  mutate(h10 = sql("('0x' || h10)::UBIGINT"))
+
+hex_area <- redlining |>
+    group_by(area_id) |>
+    summarise(area = n() * 0.015047502)
+
 
 dt <- redlining |> left_join(gbif, by = c("h0", "h10"))
 
-dt |>
-    group_by(grade) |>
-    summarise(n = n())
-
 ```
 
+
+```{r}
+open_dataset("s3://public-gbif/hex") |>
+    filter(
+        `class` == "Aves",
+        institutioncode %in% c("CLO", "iNaturalist"),
+        coordinateuncertaintyinmeters < 100
+    ) |>
+    count()
+```
+
+
+```{r}
+open_dataset("s3://public-gbif/2025-06/hex") |>
+    filter(
+        `class` == "Aves",
+        institutioncode %in% c("CLO", "iNaturalist"),
+        coordinateuncertaintyinmeters < 100
+    ) |>
+    count()
+```
+
+Density: hex counts, hex areas 
+
+```{r}
+dt |>
+    count(area_id, grade, year, institutioncode) |>
+    inner_join(hex_area) |>
+    mutate(count_density = n / area) |>
+    write_dataset("count_density_km2.parquet")
+```
+
+
+
+
+
+```{r}
+dt |>
+    count(area_id, grade, year, institutioncode) |>
+    inner_join(polys) |>
+    mutate(count_density = n / area) |>
+    write_dataset("count_density.parquet")
+```
+
+Counts
+
+```{r}
+dt |>
+    count(area_id, grade, year, institutioncode) |>
+    inner_join(polys) |>
+    mutate(count_density = n / area) |>
+    write_dataset("count_density.parquet")
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+trend <- open_dataset("count_density_km2.parquet") |>
+    filter(!is.na(year)) |>
+    filter(grade %in% c("A", "B", "C", "D")) |>
+    filter(year > 2007) |>
+    group_by(grade, year, ) |>
+    summarise(mean = mean(count_density)) |>
+    arrange(desc(mean))
+
+
+trend |>
+    ggplot(aes(year, mean, col = grade)) +
+    geom_line(lwd = 1) +
+    # geom_col(pos = "dodge") +
+    theme_bw() +
+    scale_colour_manual(values = c("A" = "#76b583", "B" = "#6eb6c5", "C" = "#ffe56d", "D" = "#e07856"))
+```
