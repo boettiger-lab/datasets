@@ -41,9 +41,6 @@ This generates all required Kubernetes job configurations:
 # First-time setup: create RBAC permissions
 kubectl apply -f workflow-rbac.yaml
 
-# Create ConfigMap with job specifications
-kubectl create configmap mappinginequality-jobs --from-file=. -n biodiversity
-
 # Run the complete automated workflow (K8s orchestrator)
 kubectl apply -f workflow.yaml -n biodiversity
 

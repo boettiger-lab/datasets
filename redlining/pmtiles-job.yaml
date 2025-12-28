@@ -28,7 +28,27 @@ spec:
         - -c
         - 'set -e
 
-          ./redlining/create_pmtiles.sh'
+          # Convert GPKG to GeoJSONSeq for tippecanoe (read directly via vsicurl)
+
+          ogr2ogr -f GeoJSONSeq /tmp/mappinginequality.geojsonl /vsicurl/https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg
+          -progress
+
+
+          # Generate PMTiles from GeoJSONSeq
+
+          tippecanoe -o /tmp/mappinginequality.pmtiles -l redlining --drop-densest-as-needed
+          --extend-zooms-if-still-dropping --force /tmp/mappinginequality.geojsonl
+
+
+          # Upload to S3
+
+          mc alias set s3 https://$AWS_PUBLIC_ENDPOINT $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY
+
+          mc cp /tmp/mappinginequality.pmtiles s3/public-mappinginequality/mappinginequality.pmtiles
+
+          rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
+
+          '
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
@@ -56,6 +76,8 @@ spec:
           value: /tmp
         - name: BUCKET
           value: public-mappinginequality
+        - name: SOURCE_URL
+          value: https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg
         image: ghcr.io/rocker-org/ml-spatial
         imagePullPolicy: Always
         name: pmtiles-task

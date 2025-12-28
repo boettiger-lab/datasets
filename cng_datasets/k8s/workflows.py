@@ -206,9 +206,21 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
                             {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
                             {"name": "TMPDIR", "value": "/tmp"},
-                            {"name": "BUCKET", "value": bucket}
+                            {"name": "BUCKET", "value": bucket},
+                            {"name": "SOURCE_URL", "value": source_url}
                         ],
-                        "command": ["bash", "-c", f"set -e\n./{output_path.name}/create_pmtiles.sh"],
+                        "command": ["bash", "-c", f"""set -e
+# Convert GPKG to GeoJSONSeq for tippecanoe (read directly via vsicurl)
+ogr2ogr -f GeoJSONSeq /tmp/mappinginequality.geojsonl /vsicurl/{source_url} -progress
+
+# Generate PMTiles from GeoJSONSeq
+tippecanoe -o /tmp/mappinginequality.pmtiles -l redlining --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/mappinginequality.geojsonl
+
+# Upload to S3
+mc alias set s3 https://$AWS_PUBLIC_ENDPOINT $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY
+mc cp /tmp/mappinginequality.pmtiles s3/{bucket}/mappinginequality.pmtiles
+rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
+"""],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "8", "memory": "16Gi"}
