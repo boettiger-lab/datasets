@@ -28,8 +28,6 @@ spec:
         - -c
         - 'set -e
 
-          chmod +x redlining/create_pmtiles.sh
-
           ./redlining/create_pmtiles.sh'
         env:
         - name: AWS_ACCESS_KEY_ID

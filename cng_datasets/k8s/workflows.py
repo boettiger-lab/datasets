@@ -132,7 +132,7 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
                             {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"}
                         ],
-                        "command": ["bash", "-c", f"set -e\nchmod +x {output_path.name}/convert_gpkg_to_parquet.sh\n./{output_path.name}/convert_gpkg_to_parquet.sh"],
+                        "command": ["bash", "-c", f"set -e\n./{output_path.name}/convert_gpkg_to_parquet.sh"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "8", "memory": "16Gi"}
@@ -205,7 +205,7 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
                             {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"}
                         ],
-                        "command": ["bash", "-c", f"set -e\nchmod +x {output_path.name}/create_pmtiles.sh\n./{output_path.name}/create_pmtiles.sh"],
+                        "command": ["bash", "-c", f"set -e\n./{output_path.name}/create_pmtiles.sh"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "8", "memory": "16Gi"}
