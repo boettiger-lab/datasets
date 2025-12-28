@@ -13,7 +13,7 @@ This workflow processes historical redlining data into cloud-native formats:
 2. **PMTiles** - Vector tiles for web mapping
 3. **H3-indexed Parquet** - Hexagonal tiling at resolution 10 with parent hexes (h9, h8, h0)
 
-All processing uses the `cng_datasets` Python package for standardized, reusable data processing.
+All processing uses the `cng_datasets` Python package for standardized, reusable data processing. The package and its dependencies are installed on-the-fly in each job using the standard `python:3.12-slim` image.
 
 ## Quick Start
 
