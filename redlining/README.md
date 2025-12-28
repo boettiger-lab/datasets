@@ -32,7 +32,7 @@ This generates all required Kubernetes job configurations:
 - `pmtiles-job.yaml` - PMTiles vector tile generation
 - `hex-job.yaml` - H3 hexagonal tiling (50 chunks, 20 parallel workers)
 - `repartition-job.yaml` - Consolidate chunks by h0 partition
-- `workflow.yaml` - Automated workflow orchestration
+- `run-workflow.sh` - Automated workflow script
 - `workflow-rbac.yaml` - Kubernetes RBAC permissions
 
 ### 2. Run the Workflow
@@ -42,10 +42,13 @@ This generates all required Kubernetes job configurations:
 kubectl apply -f workflow-rbac.yaml
 
 # Run the complete automated workflow
-kubectl apply -f workflow.yaml -n biodiversity
+./run-workflow.sh
 
-# Monitor progress
-kubectl logs -f job/mappinginequality-workflow -n biodiversity
+# Or run jobs individually:
+kubectl apply -f convert-job.yaml -n biodiversity
+kubectl apply -f pmtiles-job.yaml -n biodiversity
+kubectl apply -f hex-job.yaml -n biodiversity
+kubectl apply -f repartition-job.yaml -n biodiversity
 ```
 
 The workflow automatically:

@@ -65,10 +65,10 @@ def generate_dataset_workflow(
     print(f"  - hex-job.yaml")
     print(f"  - repartition-job.yaml")
     print(f"  - workflow-rbac.yaml")
-    print(f"  - workflow.yaml")
+    print(f"  - run-workflow.sh")
     print(f"\nTo run:")
     print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
-    print(f"  kubectl apply -f {output_dir}/workflow.yaml -n {namespace}")
+    print(f"  cd {output_dir} && ./run-workflow.sh")
 
 
 def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path):
@@ -253,66 +253,48 @@ def _generate_workflow_rbac(dataset_name, namespace, output_path):
 
 
 def _generate_argo_workflow(manager, dataset_name, namespace, output_path):
-    """Generate Argo workflow orchestration."""
+    """Generate simple workflow script."""
     import yaml
     
-    workflow = {
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": {
-            "name": f"{dataset_name}-workflow",
-            "namespace": namespace
-        },
-        "spec": {
-            "template": {
-                "spec": {
-                    "serviceAccountName": f"{dataset_name}-workflow",
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "orchestrator",
-                        "image": "bitnami/kubectl:latest",
-                        "command": ["bash", "-c"],
-                        "args": [f"""
+    # Instead of a complex orchestrator, just create a simple shell script
+    workflow_script = f"""#!/bin/bash
+# Workflow for {dataset_name}
 set -e
+
 echo "Starting {dataset_name} workflow..."
+echo "Make sure you've already applied workflow-rbac.yaml!"
+echo ""
 
 # Run convert and pmtiles in parallel
-kubectl apply -f /config/convert-job.yaml -n {namespace}
-kubectl apply -f /config/pmtiles-job.yaml -n {namespace}
+echo "Step 1: Converting to GeoParquet and PMTiles (parallel)..."
+kubectl apply -f convert-job.yaml -n {namespace}
+kubectl apply -f pmtiles-job.yaml -n {namespace}
 
+echo "Waiting for conversion jobs to complete..."
 kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-convert -n {namespace}
 kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-pmtiles -n {namespace}
 
-# Run hex tiling
-kubectl apply -f /config/hex-job.yaml -n {namespace}
+echo "Step 2: H3 hexagonal tiling (50 chunks, 20 parallel)..."
+kubectl apply -f hex-job.yaml -n {namespace}
+
+echo "Waiting for hex tiling to complete..."
 kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
 
-# Run repartitioning
-kubectl apply -f /config/repartition-job.yaml -n {namespace}
+echo "Step 3: Repartitioning by h0..."
+kubectl apply -f repartition-job.yaml -n {namespace}
+
+echo "Waiting for repartition to complete..."
 kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-repartition -n {namespace}
 
 echo "✓ Workflow complete!"
-"""],
-                        "volumeMounts": [{"name": "config", "mountPath": "/config"}],
-                        "resources": {
-                            "requests": {
-                                "cpu": "500m",
-                                "memory": "512Mi"
-                            },
-                            "limits": {
-                                "cpu": "500m",
-                                "memory": "512Mi"
-                            }
-                        }
-                    }],
-                    "volumes": [{
-                        "name": "config",
-                        "configMap": {"name": f"{dataset_name}-workflow-config"}
-                    }]
-                }
-            }
-        }
-    }
+echo ""
+echo "Clean up jobs with:"
+echo "  kubectl delete jobs {dataset_name}-convert {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition -n {namespace}"
+"""
     
-    with open(output_path / "workflow.yaml", "w") as f:
-        yaml.dump(workflow, f, default_flow_style=False)
+    with open(output_path / "run-workflow.sh", "w") as f:
+        f.write(workflow_script)
+    
+    # Make it executable
+    import os
+    os.chmod(output_path / "run-workflow.sh", 0o755)

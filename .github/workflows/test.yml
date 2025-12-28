@@ -1,0 +1,105 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install pytest pytest-cov pyyaml
+    
+    - name: Run tests
+      run: |
+        pytest tests/ -v --cov=cng_datasets --cov-report=xml --cov-report=term
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      if: matrix.python-version == '3.12'
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install ruff
+    
+    - name: Lint with ruff
+      run: |
+        ruff check cng_datasets/ --select E,F,W --ignore E501
+      continue-on-error: true
+
+  cli-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    
+    - name: Install package
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+    
+    - name: Test CLI commands
+      run: |
+        # Test help commands
+        cng-datasets --help
+        cng-datasets workflow --help
+        cng-datasets k8s --help
+        
+        # Test workflow generation
+        mkdir -p /tmp/test-workflow
+        cng-datasets workflow \
+          --dataset test-dataset \
+          --source-url https://example.com/data.gpkg \
+          --bucket test-bucket \
+          --output-dir /tmp/test-workflow
+        
+        # Verify files were created
+        ls -la /tmp/test-workflow/
+        test -f /tmp/test-workflow/convert-job.yaml
+        test -f /tmp/test-workflow/workflow.yaml
+        echo "✓ CLI tests passed"
