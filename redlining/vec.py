@@ -31,7 +31,7 @@ def geom_to_cell(df, zoom=10, keep_cols=None):
             SELECT {col_list}, UNNEST(ST_Dump(ST_GeomFromWKB(geom))).geom AS geom 
             FROM ({sql})
         ) 
-        SELECT *, h3_polygon_wkt_to_cells_string(geom, {zoom}) AS h3id FROM t1
+        SELECT *, h3_polygon_wkt_to_cells(geom, {zoom}) AS h3id FROM t1
     '''
 
     out = con.sql(expr)
