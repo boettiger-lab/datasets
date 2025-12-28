@@ -6,8 +6,9 @@ import pytest
 import duckdb
 import tempfile
 from pathlib import Path
+import os
 
-from cng_datasets.vector.h3_tiling import geom_to_h3_cells, setup_duckdb_connection
+from cng_datasets.vector.h3_tiling import geom_to_h3_cells, setup_duckdb_connection, H3VectorProcessor
 
 
 class TestH3Functions:
@@ -110,10 +111,121 @@ class TestH3Functions:
 class TestVectorProcessing:
     """Test complete vector processing workflows."""
     
+    def test_h3_vector_processor_init(self):
+        """Test H3VectorProcessor initialization without credentials."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create test geoparquet file
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            con.execute(f"""
+                CREATE TABLE test_data AS 
+                SELECT 
+                    1 as id,
+                    'feature1' as name,
+                    ST_GeomFromText('POLYGON((-122.5 37.7, -122.4 37.7, -122.4 37.8, -122.5 37.8, -122.5 37.7))') as geom
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+            
+            # Test initialization with empty credentials (for read-only public access)
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                chunk_size=100
+            )
+            
+            assert processor.input_url == test_parquet
+            assert processor.output_url == tmpdir
+            assert processor.h3_resolution == 8
+            assert processor.chunk_size == 100
+            
+            processor.con.close()
+    
+    def test_h3_vector_processor_process_chunk(self):
+        """Test processing a single chunk of vector data."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create test geoparquet file with multiple features
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            con.execute(f"""
+                CREATE TABLE test_data AS 
+                SELECT 
+                    ROW_NUMBER() OVER () as id,
+                    'feature' || ROW_NUMBER() OVER () as name,
+                    ST_GeomFromText('POLYGON((-122.5 37.7, -122.4 37.7, -122.4 37.8, -122.5 37.8, -122.5 37.7))') as geom
+                FROM range(5)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+            
+            # Test processing with empty credentials
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                parent_resolutions=[0],
+                chunk_size=5
+            )
+            
+            # Process chunk 0
+            output_file = processor.process_chunk(0)
+            
+            assert output_file is not None
+            assert Path(output_file).exists()
+            assert output_file == f"{tmpdir}/chunk_000000.parquet"
+            
+            # Verify output has expected columns
+            result_con = setup_duckdb_connection()
+            result = result_con.execute(f"SELECT * FROM read_parquet('{output_file}')").fetchdf()
+            
+            assert 'h8' in result.columns
+            assert 'h0' in result.columns
+            assert 'id' in result.columns
+            assert 'name' in result.columns
+            assert len(result) > 0
+            
+            result_con.close()
+            processor.con.close()
+    
+    def test_h3_vector_processor_out_of_range(self):
+        """Test that out of range chunk_id returns None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            con.execute(f"""
+                CREATE TABLE test_data AS 
+                SELECT 
+                    1 as id,
+                    ST_GeomFromText('POINT(-122.4194 37.7749)') as geom
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+            
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                chunk_size=5
+            )
+            
+            # Try chunk 100 which doesn't exist
+            output_file = processor.process_chunk(100)
+            assert output_file is None
+            
+            processor.con.close()
+    
     @pytest.mark.skip(reason="Requires S3 access and takes time")
-    def test_process_vector_chunks_local(self):
-        """Test processing vector data to chunks (requires test data)."""
-        # This would need test data setup
+    def test_process_vector_chunks_s3(self):
+        """Test processing vector data from S3 (requires credentials)."""
         pass
 
 
