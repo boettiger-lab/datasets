@@ -76,3 +76,55 @@ The h0 partitioning enables efficient spatial queries by limiting reads to relev
 - `s3://public-redlining/mappinginequality.parquet` - GeoParquet
 - `s3://public-redlining/mappinginequality.pmtiles` - PMTiles
 - `s3://public-redlining/hex/` - H3-indexed parquet (partitioned by h0)
+
+## Cleanup and Reset
+
+### Delete All Jobs
+```bash
+# Delete all redlining jobs
+kubectl delete job mappinginequality-convert mappinginequality-pmtiles mappinginequality-hex mappinginequality-repartition mappinginequality-workflow -n biodiversity --ignore-not-found=true
+```
+
+### Delete Data from Bucket
+```bash
+# Delete all generated data (using mc CLI)
+mc rm --recursive --force nrp/public-mappinginequality/
+
+# Or delete specific outputs:
+mc rm nrp/public-mappinginequality/mappinginequality.parquet
+mc rm nrp/public-mappinginequality/mappinginequality.pmtiles
+mc rm --recursive --force nrp/public-mappinginequality/hex/
+```
+
+### Complete Reset
+To completely reset and rerun from scratch:
+```bash
+# 1. Delete all jobs
+kubectl delete job mappinginequality-convert mappinginequality-pmtiles mappinginequality-hex mappinginequality-repartition mappinginequality-workflow -n biodiversity --ignore-not-found=true
+
+# 2. Delete all data
+mc rm --recursive --force nrp/public-mappinginequality/
+
+# 3. Recreate bucket (if deleted)
+mc mb nrp/public-mappinginequality
+mc anonymous set download nrp/public-mappinginequality
+
+# 4. Rerun workflow
+kubectl apply -f workflow.yaml -n biodiversity
+```
+
+### Check Job Status
+```bash
+# List all jobs
+kubectl get jobs -n biodiversity | grep mappinginequality
+
+# Check specific job status
+kubectl describe job mappinginequality-hex -n biodiversity
+
+# View logs
+kubectl logs job/mappinginequality-convert -n biodiversity
+kubectl logs job/mappinginequality-hex-0-xxxxx -n biodiversity  # specific pod
+
+# List all pods for a job
+kubectl get pods -n biodiversity | grep mappinginequality-hex
+```

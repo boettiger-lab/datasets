@@ -11,6 +11,43 @@ import os
 from cng_datasets.vector.h3_tiling import geom_to_h3_cells, setup_duckdb_connection, H3VectorProcessor
 
 
+class TestS3Connection:
+    """Test S3 connection and credential configuration."""
+    
+    def test_s3_public_read(self):
+        """Test reading from public S3 bucket without credentials."""
+        # Clear any existing AWS env vars to test anonymous access
+        old_key = os.environ.get("AWS_ACCESS_KEY_ID")
+        old_secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        
+        try:
+            os.environ["AWS_ACCESS_KEY_ID"] = ""
+            os.environ["AWS_SECRET_ACCESS_KEY"] = ""
+            os.environ["AWS_S3_ENDPOINT"] = "s3-west.nrp-nautilus.io"
+            os.environ["AWS_HTTPS"] = "TRUE"
+            
+            processor = H3VectorProcessor(
+                input_url="s3://public-mappinginequality/mappinginequality.parquet",
+                output_url="/tmp/test_output",
+                h3_resolution=10,
+                chunk_size=10
+            )
+            
+            # Should be able to read metadata without errors
+            result = processor.con.execute(
+                "SELECT COUNT(*) as cnt FROM read_parquet('s3://public-mappinginequality/mappinginequality.parquet')"
+            ).fetchone()
+            
+            assert result[0] > 0, "Should be able to read from public bucket"
+            
+        finally:
+            # Restore original env vars
+            if old_key is not None:
+                os.environ["AWS_ACCESS_KEY_ID"] = old_key
+            if old_secret is not None:
+                os.environ["AWS_SECRET_ACCESS_KEY"] = old_secret
+
+
 class TestH3Functions:
     """Test H3 utility functions."""
     
