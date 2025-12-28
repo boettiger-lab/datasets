@@ -34,7 +34,9 @@ spec:
         - -c
         - 'set -e
 
-          python redlining/vec.py --i ${JOB_COMPLETION_INDEX} --zoom 10'
+          cng-datasets vector --input /vsis3/public-mappinginequality/mappinginequality.parquet
+          --output /vsis3/public-mappinginequality/hex --chunk-id ${JOB_COMPLETION_INDEX}
+          --resolution 10'
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
@@ -60,10 +62,10 @@ spec:
           value: /opt/conda/share/proj
         - name: TMPDIR
           value: /tmp
-        - name: ZOOM
-          value: '10'
         - name: BUCKET
           value: public-mappinginequality
+        - name: DATASET
+          value: mappinginequality
         image: ghcr.io/rocker-org/ml-spatial
         imagePullPolicy: Always
         name: hex-task

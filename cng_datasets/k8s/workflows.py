@@ -300,10 +300,10 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo):
                             {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
                             {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
                             {"name": "TMPDIR", "value": "/tmp"},
-                            {"name": "ZOOM", "value": "10"},
-                            {"name": "BUCKET", "value": bucket}
+                            {"name": "BUCKET", "value": bucket},
+                            {"name": "DATASET", "value": dataset_name}
                         ],
-                        "command": ["bash", "-c", f"set -e\npython {output_path.name}/vec.py --i ${{JOB_COMPLETION_INDEX}} --zoom 10"],
+                        "command": ["bash", "-c", f"set -e\ncng-datasets vector --input /vsis3/{bucket}/{dataset_name}.parquet --output /vsis3/{bucket}/hex --chunk-id ${{JOB_COMPLETION_INDEX}} --resolution 10"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "8", "memory": "16Gi"}
