@@ -14,7 +14,7 @@ echo "Converting GPKG to GeoParquet..."
 # Convert GPKG to GeoParquet
 ogr2ogr \
   -f Parquet \
-  /vsis3/public-redlining/mappinginequality.parquet \
+  /vsis3/${BUCKET}/mappinginequality.parquet \
   /tmp/mappinginequality.gpkg \
   -progress
 

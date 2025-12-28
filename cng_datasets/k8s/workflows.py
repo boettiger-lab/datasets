@@ -284,7 +284,9 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo):
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
                             {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
                             {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
-                            {"name": "TMPDIR", "value": "/tmp"}
+                            {"name": "TMPDIR", "value": "/tmp"},
+                            {"name": "ZOOM", "value": "10"},
+                            {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"set -e\npython {output_path.name}/vec.py --i ${{JOB_COMPLETION_INDEX}} --zoom 10"],
                         "resources": {
@@ -357,7 +359,9 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
                             {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"}
+                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
+                            {"name": "TMPDIR", "value": "/tmp"},
+                            {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"set -e\npython {dataset_name}/repartition.py"],
                         "resources": {

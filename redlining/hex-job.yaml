@@ -60,6 +60,10 @@ spec:
           value: /opt/conda/share/proj
         - name: TMPDIR
           value: /tmp
+        - name: ZOOM
+          value: '10'
+        - name: BUCKET
+          value: public-mappinginequality
         image: ghcr.io/rocker-org/ml-spatial
         imagePullPolicy: Always
         name: hex-task

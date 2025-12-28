@@ -39,7 +39,7 @@ echo "Uploading PMTiles to S3..."
 # Configure mc alias if not already configured
 mc alias set s3 https://${AWS_PUBLIC_ENDPOINT} ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY}
 
-mc cp /tmp/mappinginequality.pmtiles s3/public-redlining/mappinginequality.pmtiles
+mc cp /tmp/mappinginequality.pmtiles s3/${BUCKET}/mappinginequality.pmtiles
 
 echo "Cleaning up local files..."
 rm /tmp/mappinginequality.gpkg
