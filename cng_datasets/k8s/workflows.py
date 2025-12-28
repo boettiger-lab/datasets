@@ -69,7 +69,6 @@ def generate_dataset_workflow(
     print(f"  - workflow.yaml")
     print(f"\nTo run:")
     print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
-    print(f"  kubectl create configmap {dataset_name}-jobs --from-file={output_dir} -n {namespace}")
     print(f"  kubectl apply -f {output_dir}/workflow.yaml")
 
 
@@ -443,13 +442,20 @@ def _generate_argo_workflow(dataset_name, namespace, output_path):
                 "spec": {
                     "serviceAccountName": f"{dataset_name}-workflow",
                     "restartPolicy": "OnFailure",
+                    "initContainers": [{
+                        "name": "git-clone",
+                        "image": "alpine/git:2.45.2",
+                        "command": ["sh", "-c"],
+                        "args": ["git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/datasets"],
+                        "volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}]
+                    }],
                     "containers": [{
                         "name": "workflow",
                         "image": "bitnami/kubectl:latest",
                         "command": ["bash", "-c"],
                         "args": [f"""
 set -e
-cd /workspace
+cd /workspace/datasets/redlining
 
 echo "Starting {dataset_name} workflow..."
 
@@ -484,13 +490,13 @@ echo "  kubectl delete jobs {dataset_name}-convert {dataset_name}-pmtiles {datas
                             "limits": {"cpu": "500m", "memory": "512Mi"}
                         },
                         "volumeMounts": [{
-                            "name": "jobs",
+                            "name": "workspace",
                             "mountPath": "/workspace"
                         }]
                     }],
                     "volumes": [{
-                        "name": "jobs",
-                        "configMap": {"name": f"{dataset_name}-jobs"}
+                        "name": "workspace",
+                        "emptyDir": {}
                     }]
                 }
             },
