@@ -130,7 +130,8 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
                             {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"}
+                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
+                            {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"set -e\n./{output_path.name}/convert_gpkg_to_parquet.sh"],
                         "resources": {
@@ -203,7 +204,9 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
                             {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"}
+                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
+                            {"name": "TMPDIR", "value": "/tmp"},
+                            {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"set -e\n./{output_path.name}/create_pmtiles.sh"],
                         "resources": {

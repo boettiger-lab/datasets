@@ -52,6 +52,8 @@ spec:
           value: /opt/conda/share/gdal
         - name: PROJ_LIB
           value: /opt/conda/share/proj
+        - name: BUCKET
+          value: public-mappinginequality
         image: ghcr.io/rocker-org/ml-spatial
         imagePullPolicy: Always
         name: convert-task
