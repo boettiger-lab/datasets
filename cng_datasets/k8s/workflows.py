@@ -16,7 +16,8 @@ def generate_dataset_workflow(
     bucket: str,
     output_dir: str = ".",
     namespace: str = "biodiversity",
-    image: str = "ghcr.io/boettiger-lab/cng-datasets:latest",
+    image: str = "python:3.12-slim",
+    package_install: str = "pip install geopandas pyarrow duckdb h3 boto3",
 ):
     """
     Generate complete workflow for a dataset.
@@ -41,22 +42,22 @@ def generate_dataset_workflow(
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Generate conversion job
-    _generate_convert_job(manager, dataset_name, source_url, bucket, output_path)
+    _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, package_install)
     
     # Generate pmtiles job
-    _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path)
+    _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, package_install)
     
     # Generate hex tiling job
-    _generate_hex_job(manager, dataset_name, bucket, output_path)
+    _generate_hex_job(manager, dataset_name, bucket, output_path, package_install)
     
     # Generate repartition job
-    _generate_repartition_job(manager, dataset_name, bucket, output_path)
+    _generate_repartition_job(manager, dataset_name, bucket, output_path, package_install)
     
     # Generate workflow RBAC
     _generate_workflow_rbac(dataset_name, namespace, output_path)
     
     # Generate Argo workflow
-    _generate_argo_workflow(manager, dataset_name, namespace, output_path)
+    _generate_argo_workflow(dataset_name, namespace, output_path)
     
     print(f"\n✓ Generated complete workflow for {dataset_name}")
     print(f"\nFiles created in {output_dir}:")
@@ -65,41 +66,45 @@ def generate_dataset_workflow(
     print(f"  - hex-job.yaml")
     print(f"  - repartition-job.yaml")
     print(f"  - workflow-rbac.yaml")
-    print(f"  - run-workflow.sh")
+    print(f"  - workflow.yaml")
     print(f"\nTo run:")
     print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
-    print(f"  cd {output_dir} && ./run-workflow.sh")
+    print(f"  kubectl create configmap {dataset_name}-jobs --from-file={output_dir} -n {namespace}")
+    print(f"  kubectl apply -f {output_dir}/workflow.yaml")
 
 
-def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path):
+def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, package_install):
     """Generate GeoParquet conversion job."""
     job_spec = manager.generate_job_yaml(
         job_name=f"{dataset_name}-convert",
-        command=["python", "-c"],
+        command=["bash", "-c"],
         args=[f"""
+apt-get update && apt-get install -y gdal-bin && {package_install}
+python -c '
 import geopandas as gpd
 import urllib.request
 
-print('Downloading source data...')
-urllib.request.urlretrieve('{source_url}', '/tmp/input.gpkg')
+print("Downloading source data...")
+urllib.request.urlretrieve("{source_url}", "/tmp/input.gpkg")
 
-print('Reading and cleaning data...')
-gdf = gpd.read_file('/tmp/input.gpkg')
+print("Reading and cleaning data...")
+gdf = gpd.read_file("/tmp/input.gpkg")
 
 # Basic cleaning
 for col in gdf.columns:
-    if col.strip().lower() == 'grade' and col != 'grade':
-        gdf = gdf.rename(columns={{col: 'grade'}})
-        gdf['grade'] = gdf['grade'].astype(str).str.strip().replace(['', 'nan'], None)
+    if col.strip().lower() == "grade" and col != "grade":
+        gdf = gdf.rename(columns={{col: "grade"}})
+        gdf["grade"] = gdf["grade"].astype(str).str.strip().replace(["", "nan"], None)
 
 if gdf.geometry.isna().any():
     gdf = gdf[~gdf.geometry.isna()]
 if not gdf.geometry.is_valid.all():
     gdf.geometry = gdf.geometry.buffer(0)
 
-print('Writing to S3...')
-gdf.to_parquet('s3://{bucket}/{dataset_name}.parquet')
-print('✓ Conversion complete!')
+print("Writing to S3...")
+gdf.to_parquet("s3://{bucket}/{dataset_name}.parquet")
+print("✓ Conversion complete!")
+'
 """],
         cpu="2",
         memory="8Gi",
@@ -108,14 +113,14 @@ print('✓ Conversion complete!')
     manager.save_job_yaml(job_spec, str(output_path / "convert-job.yaml"))
 
 
-def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path):
+def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, package_install):
     """Generate PMTiles job."""
     job_spec = manager.generate_job_yaml(
         job_name=f"{dataset_name}-pmtiles",
         command=["bash", "-c"],
         args=[f"""
 set -e
-pip install geopandas pyarrow
+apt-get update && apt-get install -y curl gdal-bin && {package_install}
 curl -L -o /tmp/input.gpkg {source_url}
 ogr2ogr -f GeoJSONSeq /tmp/input.geojsonl /tmp/input.gpkg -progress
 tippecanoe -o /tmp/output.pmtiles -l {dataset_name} --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/input.geojsonl
@@ -130,7 +135,7 @@ echo "✓ PMTiles complete!"
     manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, package_install):
     """Generate H3 hex tiling job."""
     job_spec = manager.generate_chunked_job(
         job_name=f"{dataset_name}-hex",
@@ -151,7 +156,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path):
     manager.save_job_yaml(job_spec, str(output_path / "hex-job.yaml"))
 
 
-def _generate_repartition_job(manager, dataset_name, bucket, output_path):
+def _generate_repartition_job(manager, dataset_name, bucket, output_path, package_install):
     """Generate repartition job."""
     job_spec = manager.generate_job_yaml(
         job_name=f"{dataset_name}-repartition",
@@ -242,7 +247,7 @@ def _generate_workflow_rbac(dataset_name, namespace, output_path):
                 "kind": "Role",
                 "metadata": {"name": f"{dataset_name}-workflow", "namespace": namespace},
                 "rules": [
-                    {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get", "list", "create", "delete"]},
+                    {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get", "list", "watch", "create", "delete"]},
                     {"apiGroups": [""], "resources": ["pods", "pods/log"], "verbs": ["get", "list"]}
                 ]
             },
@@ -256,18 +261,31 @@ def _generate_workflow_rbac(dataset_name, namespace, output_path):
         ], f, default_flow_style=False)
 
 
-def _generate_argo_workflow(manager, dataset_name, namespace, output_path):
-    """Generate simple workflow script."""
+def _generate_argo_workflow(dataset_name, namespace, output_path):
+    """Generate K8s Job that orchestrates the workflow."""
     import yaml
     
-    # Instead of a complex orchestrator, just create a simple shell script
-    workflow_script = f"""#!/bin/bash
-# Workflow for {dataset_name}
+    workflow_job = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": f"{dataset_name}-workflow",
+            "namespace": namespace
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "serviceAccountName": f"{dataset_name}-workflow",
+                    "restartPolicy": "OnFailure",
+                    "containers": [{
+                        "name": "workflow",
+                        "image": "bitnami/kubectl:latest",
+                        "command": ["bash", "-c"],
+                        "args": [f"""
 set -e
+cd /workspace
 
 echo "Starting {dataset_name} workflow..."
-echo "Make sure you've already applied workflow-rbac.yaml!"
-echo ""
 
 # Run convert and pmtiles in parallel
 echo "Step 1: Converting to GeoParquet and PMTiles (parallel)..."
@@ -294,11 +312,25 @@ echo "✓ Workflow complete!"
 echo ""
 echo "Clean up jobs with:"
 echo "  kubectl delete jobs {dataset_name}-convert {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition -n {namespace}"
-"""
+"""],
+                        "resources": {
+                            "requests": {"cpu": "500m", "memory": "512Mi"},
+                            "limits": {"cpu": "500m", "memory": "512Mi"}
+                        },
+                        "volumeMounts": [{
+                            "name": "jobs",
+                            "mountPath": "/workspace"
+                        }]
+                    }],
+                    "volumes": [{
+                        "name": "jobs",
+                        "configMap": {"name": f"{dataset_name}-jobs"}
+                    }]
+                }
+            },
+            "ttlSecondsAfterFinished": 10800
+        }
+    }
     
-    with open(output_path / "run-workflow.sh", "w") as f:
-        f.write(workflow_script)
-    
-    # Make it executable
-    import os
-    os.chmod(output_path / "run-workflow.sh", 0o755)
+    with open(output_path / "workflow.yaml", "w") as f:
+        yaml.dump(workflow_job, f, default_flow_style=False)

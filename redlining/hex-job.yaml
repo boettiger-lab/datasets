@@ -53,7 +53,7 @@ spec:
           value: rook-ceph-rgw-nautiluss3.rook
         - name: AWS_PUBLIC_ENDPOINT
           value: s3-west.nrp-nautilus.io
-        image: ghcr.io/boettiger-lab/cng-datasets:latest
+        image: python:3.12-slim
         name: processor
         resources:
           limits:

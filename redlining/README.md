@@ -32,7 +32,7 @@ This generates all required Kubernetes job configurations:
 - `pmtiles-job.yaml` - PMTiles vector tile generation
 - `hex-job.yaml` - H3 hexagonal tiling (50 chunks, 20 parallel workers)
 - `repartition-job.yaml` - Consolidate chunks by h0 partition
-- `run-workflow.sh` - Automated workflow script
+- `workflow.yaml` - K8s Job orchestrator (runs in cluster)
 - `workflow-rbac.yaml` - Kubernetes RBAC permissions
 
 ### 2. Run the Workflow
@@ -41,8 +41,14 @@ This generates all required Kubernetes job configurations:
 # First-time setup: create RBAC permissions
 kubectl apply -f workflow-rbac.yaml
 
-# Run the complete automated workflow
-./run-workflow.sh
+# Create ConfigMap with job specifications
+kubectl create configmap mappinginequality-jobs --from-file=. -n biodiversity
+
+# Run the complete automated workflow (K8s orchestrator)
+kubectl apply -f workflow.yaml -n biodiversity
+
+# Monitor progress
+kubectl logs -f job/mappinginequality-workflow -n biodiversity
 
 # Or run jobs individually:
 kubectl apply -f convert-job.yaml -n biodiversity
@@ -55,7 +61,7 @@ The workflow automatically:
 1. Converts GPKG to GeoParquet and PMTiles (parallel)
 2. Processes into H3 hexagons at resolution 10 with parent resolutions
 3. Repartitions by h0 for efficient querying
-4. Cleans up temporary files
+4. Runs entirely in K8s (laptop can disconnect)
 
 ## Data Structure
 

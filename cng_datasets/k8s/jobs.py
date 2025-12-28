@@ -20,7 +20,7 @@ class K8sJobManager:
     def __init__(
         self,
         namespace: str = "biodiversity",
-        image: str = "ghcr.io/boettiger-lab/datasets:latest",
+        image: str = "python:3.12-slim",
         service_account: Optional[str] = None,
         secrets: Optional[List[str]] = None,
     ):
