@@ -72,7 +72,7 @@ def setup_duckdb_connection(
     Set up a DuckDB connection with required extensions.
     
     Args:
-        extensions: List of DuckDB extensions to load. Defaults to ["spatial", "h3"]
+        extensions: List of DuckDB extensions to load. Defaults to ["spatial"]
         http_retries: Number of HTTP retries for remote files
         http_retry_wait_ms: Wait time between retries in milliseconds
         
@@ -80,7 +80,7 @@ def setup_duckdb_connection(
         Configured DuckDB connection
     """
     if extensions is None:
-        extensions = ["spatial", "h3"]
+        extensions = ["spatial"]
     
     con = duckdb.connect()
     
@@ -89,7 +89,7 @@ def setup_duckdb_connection(
         con.execute(f"INSTALL {ext}")
         con.execute(f"LOAD {ext}")
     
-    # Install h3 from community
+    # Install h3 from community repository
     con.execute("INSTALL h3 FROM community")
     con.execute("LOAD h3")
     
