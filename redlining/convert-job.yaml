@@ -19,8 +19,8 @@ spec:
                 - 'true'
       containers:
       - args:
-        - "\napt-get update && apt-get install -y gdal-bin && pip install geopandas\
-          \ pyarrow duckdb h3 boto3\npython -c '\nimport geopandas as gpd\nimport\
+        - "\nset -e\napt-get update && apt-get install -y gdal-bin\npip install geopandas\
+          \ pyarrow duckdb h3 boto3\n\npython -c '\nimport geopandas as gpd\nimport\
           \ urllib.request\n\nprint(\"Downloading source data...\")\nurllib.request.urlretrieve(\"\
           https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg\"\
           , \"/tmp/input.gpkg\")\n\nprint(\"Reading and cleaning data...\")\ngdf =\

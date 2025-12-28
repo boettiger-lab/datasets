@@ -21,23 +21,23 @@ spec:
                 - 'true'
       containers:
       - args:
-        - --input
-        - s3://public-mappinginequality/mappinginequality.parquet
-        - --output
-        - s3://public-mappinginequality/chunks
-        - --resolution
-        - '10'
-        - --parent-resolutions
-        - '9'
-        - '8'
-        - '0'
-        - --chunk-size
-        - '500'
-        - --i
-        - $(INDEX)
+        - '
+
+          set -e
+
+          apt-get update
+
+          pip install geopandas pyarrow duckdb h3 boto3
+
+
+          cng-datasets vector   --input s3://public-mappinginequality/mappinginequality.parquet   --output
+          s3://public-mappinginequality/chunks   --resolution 10   --chunk-size 500   --chunk-id
+          $JOB_COMPLETION_INDEX
+
+          '
         command:
-        - python
-        - /app/process-hex.py
+        - bash
+        - -c
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:

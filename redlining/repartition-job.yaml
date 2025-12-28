@@ -19,18 +19,19 @@ spec:
                 - 'true'
       containers:
       - args:
-        - "\nimport duckdb\nfrom cng.utils import set_secrets\nimport shutil\n\ncon\
-          \ = duckdb.connect()\nset_secrets(con)\ncon.execute(\"SET preserve_insertion_order=false\"\
-          )\ncon.execute(\"SET http_timeout=1200\")\ncon.execute(\"SET http_retries=30\"\
-          )\n\nprint('Repartitioning by h0...')\ncon.execute(\"\"\"\n    COPY (SELECT\
-          \ * FROM read_parquet('s3://public-mappinginequality/chunks/*.parquet'))\n\
+        - "\nset -e\napt-get update\npip install geopandas pyarrow duckdb h3 boto3\n\
+          \npython -c '\nimport duckdb\nfrom cng.utils import set_secrets\nimport\
+          \ shutil\n\ncon = duckdb.connect()\nset_secrets(con)\ncon.execute(\"SET\
+          \ preserve_insertion_order=false\")\ncon.execute(\"SET http_timeout=1200\"\
+          )\ncon.execute(\"SET http_retries=30\")\n\nprint(\"Repartitioning by h0...\"\
+          )\ncon.execute(\"\"\"\n    COPY (SELECT * FROM read_parquet('s3://public-mappinginequality/chunks/*.parquet'))\n\
           \    TO '/tmp/hex' (FORMAT PARQUET, PARTITION_BY h0)\n\"\"\")\n\ncon.execute(\"\
           \"\"\n    COPY (SELECT * FROM read_parquet('/tmp/hex/**/*.parquet'))\n \
           \   TO 's3://public-mappinginequality/hex/' (FORMAT PARQUET, PARTITION_BY\
           \ h0)\n\"\"\")\n\nshutil.rmtree('/tmp/hex')\nprint('\u2713 Repartitioning\
           \ complete!')\n"
         command:
-        - python
+        - bash
         - -c
         env:
         - name: AWS_ACCESS_KEY_ID

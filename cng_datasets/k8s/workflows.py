@@ -79,7 +79,10 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
         job_name=f"{dataset_name}-convert",
         command=["bash", "-c"],
         args=[f"""
-apt-get update && apt-get install -y gdal-bin && {package_install}
+set -e
+apt-get update && apt-get install -y gdal-bin
+{package_install}
+
 python -c '
 import geopandas as gpd
 import urllib.request
@@ -120,10 +123,16 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
         command=["bash", "-c"],
         args=[f"""
 set -e
-apt-get update && apt-get install -y curl gdal-bin && {package_install}
+apt-get update && apt-get install -y curl gdal-bin
+{package_install}
+
+curl -L -o /usr/local/bin/tippecanoe https://github.com/felt/tippecanoe/releases/download/2.17.0/tippecanoe-linux-amd64 && chmod +x /usr/local/bin/tippecanoe
+curl -L -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /usr/local/bin/mc
+
 curl -L -o /tmp/input.gpkg {source_url}
 ogr2ogr -f GeoJSONSeq /tmp/input.geojsonl /tmp/input.gpkg -progress
 tippecanoe -o /tmp/output.pmtiles -l {dataset_name} --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/input.geojsonl
+
 mc alias set s3 https://${{AWS_PUBLIC_ENDPOINT}} ${{AWS_ACCESS_KEY_ID}} ${{AWS_SECRET_ACCESS_KEY}}
 mc cp /tmp/output.pmtiles s3/{bucket}/{dataset_name}.pmtiles
 echo "✓ PMTiles complete!"
@@ -137,21 +146,30 @@ echo "✓ PMTiles complete!"
 
 def _generate_hex_job(manager, dataset_name, bucket, output_path, package_install):
     """Generate H3 hex tiling job."""
-    job_spec = manager.generate_chunked_job(
+    job_spec = manager.generate_job_yaml(
         job_name=f"{dataset_name}-hex",
-        script_path="/app/process-hex.py",
-        num_chunks=50,
-        base_args=[
-            "--input", f"s3://{bucket}/{dataset_name}.parquet",
-            "--output", f"s3://{bucket}/chunks",
-            "--resolution", "10",
-            "--parent-resolutions", "9", "8", "0",
-            "--chunk-size", "500",
-        ],
+        command=["bash", "-c"],
+        args=[f"""
+set -e
+apt-get update
+{package_install}
+
+cng-datasets vector \
+  --input s3://{bucket}/{dataset_name}.parquet \
+  --output s3://{bucket}/chunks \
+  --resolution 10 \
+  --chunk-size 500 \
+  --chunk-id $JOB_COMPLETION_INDEX
+"""],
         cpu="1",
         memory="4Gi",
+        completions=50,
         parallelism=20,
     )
+    
+    # Make it an indexed job for parallel chunk processing
+    job_spec["spec"]["completionMode"] = "Indexed"
+    
     _add_common_config(job_spec)
     manager.save_job_yaml(job_spec, str(output_path / "hex-job.yaml"))
 
@@ -160,8 +178,13 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, packag
     """Generate repartition job."""
     job_spec = manager.generate_job_yaml(
         job_name=f"{dataset_name}-repartition",
-        command=["python", "-c"],
+        command=["bash", "-c"],
         args=[f"""
+set -e
+apt-get update
+{package_install}
+
+python -c '
 import duckdb
 from cng.utils import set_secrets
 import shutil
@@ -172,7 +195,7 @@ con.execute("SET preserve_insertion_order=false")
 con.execute("SET http_timeout=1200")
 con.execute("SET http_retries=30")
 
-print('Repartitioning by h0...')
+print("Repartitioning by h0...")
 con.execute(\"\"\"
     COPY (SELECT * FROM read_parquet('s3://{bucket}/chunks/*.parquet'))
     TO '/tmp/hex' (FORMAT PARQUET, PARTITION_BY h0)
