@@ -257,6 +257,9 @@ class H3VectorProcessor:
             FROM ({h3_sql})
         """
         
+        # Generate output file path
+        output_file = f"{self.output_url}/chunk_{chunk_id:06d}.parquet"
+        
         self.con.execute(f"COPY ({final_sql}) TO '{output_file}' (FORMAT PARQUET)")
         
         print(f"  ✓ Chunk {chunk_id} written to {output_file}")
