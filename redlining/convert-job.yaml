@@ -28,9 +28,9 @@ spec:
         - -c
         - 'set -e
 
-          chmod +x mappinginequality/convert_gpkg_to_parquet.sh
+          chmod +x redlining/convert_gpkg_to_parquet.sh
 
-          ./mappinginequality/convert_gpkg_to_parquet.sh'
+          ./redlining/convert_gpkg_to_parquet.sh'
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:

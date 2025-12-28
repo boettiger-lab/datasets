@@ -28,9 +28,9 @@ spec:
         - -c
         - 'set -e
 
-          chmod +x mappinginequality/create_pmtiles.sh
+          chmod +x redlining/create_pmtiles.sh
 
-          ./mappinginequality/create_pmtiles.sh'
+          ./redlining/create_pmtiles.sh'
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:

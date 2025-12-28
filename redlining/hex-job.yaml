@@ -34,7 +34,7 @@ spec:
         - -c
         - 'set -e
 
-          python mappinginequality/vec.py --i ${JOB_COMPLETION_INDEX} --zoom 10'
+          python redlining/vec.py --i ${JOB_COMPLETION_INDEX} --zoom 10'
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
