@@ -211,3 +211,9 @@ fishbase/2025-04-01/fbapp.sql
 fishbase/2025-04-01/slbapp.7z
 fishbase/2025-04-01/slbapp.sql
 rclone.conf
+
+# Generated Kubernetes job files
+redlining/*-job.yaml
+
+# Generated workflow files
+redlining/*.yaml

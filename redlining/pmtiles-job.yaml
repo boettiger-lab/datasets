@@ -1,20 +1,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: redlining-pmtiles
-  labels:
-    k8s-app: redlining-pmtiles
+  name: mappinginequality-pmtiles
+  namespace: biodiversity
 spec:
+  backoffLimitPerIndex: 3
   completions: 1
   parallelism: 1
-  backoffLimit: 1
-  ttlSecondsAfterFinished: 10800
   template:
-    metadata:
-      labels:
-        k8s-app: redlining-pmtiles
     spec:
-      priorityClassName: opportunistic
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -23,87 +17,43 @@ spec:
               - key: feature.node.kubernetes.io/pci-10de.present
                 operator: NotIn
                 values:
-                - "true"
-      restartPolicy: Never
-      initContainers:
-        - name: git-clone
-          image: alpine/git:2.45.2
-          imagePullPolicy: IfNotPresent
-          resources:
-            requests:
-              cpu: "1"
-              memory: 1Gi
-            limits:
-              cpu: "1"
-              memory: 1Gi
-          command:
-            - sh
-            - -lc
-            - |
-              git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
-          volumeMounts:
-            - name: repo
-              mountPath: /workspace
+                - 'true'
       containers:
-        - name: pmtiles-task
-          image: ghcr.io/rocker-org/ml-spatial
-          imagePullPolicy: Always
-          workingDir: /workspace/datasets
-          volumeMounts:
-            - name: repo
-              mountPath: /workspace
-          env:
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: aws
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: aws
-                  key: AWS_SECRET_ACCESS_KEY
-            - name: MINIO_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_KEY
-            - name: MINIO_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_SECRET
-            - name: MINIO_ENDPOINT
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_ENDPOINT
-            - name: AWS_S3_ENDPOINT
-              value: "rook-ceph-rgw-nautiluss3.rook"
-            - name: AWS_PUBLIC_ENDPOINT
-              value: "s3-west.nrp-nautilus.io"
-            - name: AWS_HTTPS
-              value: "false"
-            - name: AWS_VIRTUAL_HOSTING
-              value: "FALSE"
-            - name: GDAL_DATA
-              value: "/opt/conda/share/gdal"
-            - name: PROJ_LIB
-              value: "/opt/conda/share/proj"
-          command:
-            - bash
-            - -c
-            - |
-              set -e
-              chmod +x redlining/create_pmtiles.sh
-              ./redlining/create_pmtiles.sh
-          resources:
-            requests:
-              cpu: "4"
-              memory: "8Gi"
-            limits:
-              cpu: "8"
-              memory: "16Gi"
-      volumes:
-        - name: repo
-          emptyDir: {}
+      - args:
+        - "\nset -e\npip install geopandas pyarrow\ncurl -L -o /tmp/input.gpkg https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg\n\
+          ogr2ogr -f GeoJSONSeq /tmp/input.geojsonl /tmp/input.gpkg -progress\ntippecanoe\
+          \ -o /tmp/output.pmtiles -l mappinginequality --drop-densest-as-needed --extend-zooms-if-still-dropping\
+          \ --force /tmp/input.geojsonl\nmc alias set s3 https://${AWS_PUBLIC_ENDPOINT}\
+          \ ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY}\nmc cp /tmp/output.pmtiles\
+          \ s3/public-mappinginequality/mappinginequality.pmtiles\necho \"\u2713 PMTiles\
+          \ complete!\"\n"
+        command:
+        - bash
+        - -c
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              key: AWS_ACCESS_KEY_ID
+              name: aws
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              key: AWS_SECRET_ACCESS_KEY
+              name: aws
+        - name: AWS_S3_ENDPOINT
+          value: rook-ceph-rgw-nautiluss3.rook
+        - name: AWS_PUBLIC_ENDPOINT
+          value: s3-west.nrp-nautilus.io
+        image: ghcr.io/boettiger-lab/cng-datasets:latest
+        name: processor
+        resources:
+          limits:
+            cpu: '2'
+            memory: 8Gi
+          requests:
+            cpu: '2'
+            memory: 8Gi
+      priorityClassName: opportunistic
+      restartPolicy: OnFailure
+  ttlSecondsAfterFinished: 10800

@@ -1,26 +1,15 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: redlining-hex
-  labels:
-    k8s-app: redlining-hex
+  name: mappinginequality-hex
+  namespace: biodiversity
 spec:
+  backoffLimitPerIndex: 3
+  completionMode: Indexed
   completions: 50
   parallelism: 20
-  completionMode: Indexed
-  backoffLimitPerIndex: 3
-  podFailurePolicy:
-    rules:
-    - action: Ignore
-      onPodConditions:
-      - type: DisruptionTarget
-  ttlSecondsAfterFinished: 10800
   template:
-    metadata:
-      labels:
-        k8s-app: redlining-hex
     spec:
-      priorityClassName: opportunistic
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -29,88 +18,50 @@ spec:
               - key: feature.node.kubernetes.io/pci-10de.present
                 operator: NotIn
                 values:
-                - "true"
-      restartPolicy: Never
-      initContainers:
-        - name: git-clone
-          image: alpine/git:2.45.2
-          imagePullPolicy: IfNotPresent
-          resources:
-            requests:
-              cpu: "1"
-              memory: 1Gi
-            limits:
-              cpu: "1"
-              memory: 1Gi
-          command:
-            - sh
-            - -lc
-            - |
-              git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
-          volumeMounts:
-            - name: repo
-              mountPath: /workspace
+                - 'true'
       containers:
-        - name: hex-task
-          image: ghcr.io/rocker-org/ml-spatial
-          imagePullPolicy: Always
-          workingDir: /workspace/datasets
-          volumeMounts:
-            - name: repo
-              mountPath: /workspace
-          env:
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: aws
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: aws
-                  key: AWS_SECRET_ACCESS_KEY
-            - name: MINIO_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_KEY
-            - name: MINIO_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_SECRET
-            - name: MINIO_ENDPOINT
-              valueFrom:
-                secretKeyRef:
-                  name: nvme
-                  key: MINIO_ENDPOINT
-            - name: AWS_S3_ENDPOINT
-              value: "rook-ceph-rgw-nautiluss3.rook"
-            - name: AWS_PUBLIC_ENDPOINT
-              value: "s3-west.nrp-nautilus.io"
-            - name: AWS_HTTPS
-              value: "false"
-            - name: AWS_VIRTUAL_HOSTING
-              value: "FALSE"
-            - name: GDAL_DATA
-              value: "/opt/conda/share/gdal"
-            - name: PROJ_LIB
-              value: "/opt/conda/share/proj"
-            - name: TMPDIR
-              value: "/tmp"
-          command:
-            - bash
-            - -c
-            - |
-              set -e
-              python redlining/vec.py --i ${JOB_COMPLETION_INDEX} --zoom 10
-          resources:
-            requests:
-              cpu: "4"
-              memory: "8Gi"
-            limits:
-              cpu: "8"
-              memory: "16Gi"
-      volumes:
-        - name: repo
-          emptyDir: {}
+      - args:
+        - --input
+        - s3://public-mappinginequality/mappinginequality.parquet
+        - --output
+        - s3://public-mappinginequality/chunks
+        - --resolution
+        - '10'
+        - --parent-resolutions
+        - '9'
+        - '8'
+        - '0'
+        - --chunk-size
+        - '500'
+        - --i
+        - $(INDEX)
+        command:
+        - python
+        - /app/process-hex.py
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              key: AWS_ACCESS_KEY_ID
+              name: aws
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              key: AWS_SECRET_ACCESS_KEY
+              name: aws
+        - name: AWS_S3_ENDPOINT
+          value: rook-ceph-rgw-nautiluss3.rook
+        - name: AWS_PUBLIC_ENDPOINT
+          value: s3-west.nrp-nautilus.io
+        image: ghcr.io/boettiger-lab/cng-datasets:latest
+        name: processor
+        resources:
+          limits:
+            cpu: '1'
+            memory: 4Gi
+          requests:
+            cpu: '1'
+            memory: 4Gi
+      priorityClassName: opportunistic
+      restartPolicy: OnFailure
+  ttlSecondsAfterFinished: 10800
