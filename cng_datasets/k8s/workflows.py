@@ -302,7 +302,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo):
                             {"name": "BUCKET", "value": bucket},
                             {"name": "DATASET", "value": dataset_name}
                         ],
-                        "command": ["bash", "-c", f"set -e\npip install -e /workspace/datasets\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/hex --chunk-id ${{JOB_COMPLETION_INDEX}} --resolution 10"],
+                        "command": ["bash", "-c", f"set -e\npip install --user -e /workspace/datasets\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/hex --chunk-id ${{JOB_COMPLETION_INDEX}} --resolution 10"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "8", "memory": "16Gi"}
