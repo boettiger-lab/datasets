@@ -34,6 +34,8 @@ spec:
         - -c
         - 'set -e
 
+          pip install -e /workspace/datasets
+
           cng-datasets vector --input s3://public-mappinginequality/mappinginequality.parquet
           --output s3://public-mappinginequality/hex --chunk-id ${JOB_COMPLETION_INDEX}
           --resolution 10'
