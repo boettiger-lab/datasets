@@ -4,7 +4,6 @@ metadata:
   name: mappinginequality-convert
   namespace: biodiversity
 spec:
-  backoffLimitPerIndex: 3
   completions: 1
   parallelism: 1
   template:

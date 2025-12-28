@@ -213,7 +213,11 @@ def _add_common_config(job_spec):
     }
     
     job_spec["spec"]["template"]["spec"]["priorityClassName"] = "opportunistic"
-    job_spec["spec"]["backoffLimitPerIndex"] = 3
+    
+    # Only add backoffLimitPerIndex for indexed jobs
+    if "completionMode" in job_spec["spec"] and job_spec["spec"]["completionMode"] == "Indexed":
+        job_spec["spec"]["backoffLimitPerIndex"] = 3
+    
     job_spec["spec"]["ttlSecondsAfterFinished"] = 10800
 
 
