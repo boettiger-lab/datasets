@@ -16,8 +16,8 @@ def generate_dataset_workflow(
     bucket: str,
     output_dir: str = ".",
     namespace: str = "biodiversity",
-    image: str = "python:3.12-slim",
-    package_install: str = "pip install geopandas pyarrow duckdb h3 boto3",
+    image: str = "ghcr.io/rocker-org/ml-spatial",
+    git_repo: str = "https://github.com/boettiger-lab/datasets.git",
 ):
     """
     Generate complete workflow for a dataset.
@@ -42,16 +42,16 @@ def generate_dataset_workflow(
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Generate conversion job
-    _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, package_install)
+    _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo)
     
     # Generate pmtiles job
-    _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, package_install)
+    _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo)
     
     # Generate hex tiling job
-    _generate_hex_job(manager, dataset_name, bucket, output_path, package_install)
+    _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo)
     
     # Generate repartition job
-    _generate_repartition_job(manager, dataset_name, bucket, output_path, package_install)
+    _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo)
     
     # Generate workflow RBAC
     _generate_workflow_rbac(dataset_name, namespace, output_path)
@@ -73,180 +73,304 @@ def generate_dataset_workflow(
     print(f"  kubectl apply -f {output_dir}/workflow.yaml")
 
 
-def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, package_install):
+def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
     """Generate GeoParquet conversion job."""
-    job_spec = manager.generate_job_yaml(
-        job_name=f"{dataset_name}-convert",
-        command=["bash", "-c"],
-        args=[f"""
-set -e
-apt-get update && apt-get install -y gdal-bin
-{package_install}
-
-python -c '
-import geopandas as gpd
-import urllib.request
-
-print("Downloading source data...")
-urllib.request.urlretrieve("{source_url}", "/tmp/input.gpkg")
-
-print("Reading and cleaning data...")
-gdf = gpd.read_file("/tmp/input.gpkg")
-
-# Basic cleaning
-for col in gdf.columns:
-    if col.strip().lower() == "grade" and col != "grade":
-        gdf = gdf.rename(columns={{col: "grade"}})
-        gdf["grade"] = gdf["grade"].astype(str).str.strip().replace(["", "nan"], None)
-
-if gdf.geometry.isna().any():
-    gdf = gdf[~gdf.geometry.isna()]
-if not gdf.geometry.is_valid.all():
-    gdf.geometry = gdf.geometry.buffer(0)
-
-print("Writing to S3...")
-gdf.to_parquet("s3://{bucket}/{dataset_name}.parquet")
-print("✓ Conversion complete!")
-'
-"""],
-        cpu="2",
-        memory="8Gi",
-    )
-    _add_common_config(job_spec)
-    manager.save_job_yaml(job_spec, str(output_path / "convert-job.yaml"))
-
-
-def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, package_install):
-    """Generate PMTiles job."""
-    job_spec = manager.generate_job_yaml(
-        job_name=f"{dataset_name}-pmtiles",
-        command=["bash", "-c"],
-        args=[f"""
-set -e
-apt-get update && apt-get install -y curl gdal-bin
-{package_install}
-
-curl -L -o /usr/local/bin/tippecanoe https://github.com/felt/tippecanoe/releases/download/2.17.0/tippecanoe-linux-amd64 && chmod +x /usr/local/bin/tippecanoe
-curl -L -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /usr/local/bin/mc
-
-curl -L -o /tmp/input.gpkg {source_url}
-ogr2ogr -f GeoJSONSeq /tmp/input.geojsonl /tmp/input.gpkg -progress
-tippecanoe -o /tmp/output.pmtiles -l {dataset_name} --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/input.geojsonl
-
-mc alias set s3 https://${{AWS_PUBLIC_ENDPOINT}} ${{AWS_ACCESS_KEY_ID}} ${{AWS_SECRET_ACCESS_KEY}}
-mc cp /tmp/output.pmtiles s3/{bucket}/{dataset_name}.pmtiles
-echo "✓ PMTiles complete!"
-"""],
-        cpu="2",
-        memory="8Gi",
-    )
-    _add_common_config(job_spec)
-    manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
-
-
-def _generate_hex_job(manager, dataset_name, bucket, output_path, package_install):
-    """Generate H3 hex tiling job."""
-    job_spec = manager.generate_job_yaml(
-        job_name=f"{dataset_name}-hex",
-        command=["bash", "-c"],
-        args=[f"""
-set -e
-apt-get update
-{package_install}
-
-cng-datasets vector \
-  --input s3://{bucket}/{dataset_name}.parquet \
-  --output s3://{bucket}/chunks \
-  --resolution 10 \
-  --chunk-size 500 \
-  --chunk-id $JOB_COMPLETION_INDEX
-"""],
-        cpu="1",
-        memory="4Gi",
-        completions=50,
-        parallelism=20,
-    )
-    
-    # Make it an indexed job for parallel chunk processing
-    job_spec["spec"]["completionMode"] = "Indexed"
-    
-    _add_common_config(job_spec)
-    manager.save_job_yaml(job_spec, str(output_path / "hex-job.yaml"))
-
-
-def _generate_repartition_job(manager, dataset_name, bucket, output_path, package_install):
-    """Generate repartition job."""
-    job_spec = manager.generate_job_yaml(
-        job_name=f"{dataset_name}-repartition",
-        command=["bash", "-c"],
-        args=[f"""
-set -e
-apt-get update
-{package_install}
-
-python -c '
-import duckdb
-from cng.utils import set_secrets
-import shutil
-
-con = duckdb.connect()
-set_secrets(con)
-con.execute("SET preserve_insertion_order=false")
-con.execute("SET http_timeout=1200")
-con.execute("SET http_retries=30")
-
-print("Repartitioning by h0...")
-con.execute(\"\"\"
-    COPY (SELECT * FROM read_parquet('s3://{bucket}/chunks/*.parquet'))
-    TO '/tmp/hex' (FORMAT PARQUET, PARTITION_BY h0)
-\"\"\")
-
-con.execute(\"\"\"
-    COPY (SELECT * FROM read_parquet('/tmp/hex/**/*.parquet'))
-    TO 's3://{bucket}/hex/' (FORMAT PARQUET, PARTITION_BY h0)
-\"\"\")
-
-shutil.rmtree('/tmp/hex')
-print('✓ Repartitioning complete!')
-"""],
-        cpu="2",
-        memory="8Gi",
-    )
-    _add_common_config(job_spec)
-    manager.save_job_yaml(job_spec, str(output_path / "repartition-job.yaml"))
-
-
-def _add_common_config(job_spec):
-    """Add common configuration to all jobs."""
-    container = job_spec["spec"]["template"]["spec"]["containers"][0]
-    container["env"] = [
-        {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
-        {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
-        {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
-        {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
-    ]
-    
-    job_spec["spec"]["template"]["spec"]["affinity"] = {
-        "nodeAffinity": {
-            "requiredDuringSchedulingIgnoredDuringExecution": {
-                "nodeSelectorTerms": [{
-                    "matchExpressions": [{
-                        "key": "feature.node.kubernetes.io/pci-10de.present",
-                        "operator": "NotIn",
-                        "values": ["true"]
-                    }]
-                }]
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": f"{dataset_name}-convert",
+            "labels": {"k8s-app": f"{dataset_name}-convert"}
+        },
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 1,
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-convert"}},
+                "spec": {
+                    "priorityClassName": "opportunistic",
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [{
+                                    "matchExpressions": [{
+                                        "key": "feature.node.kubernetes.io/pci-10de.present",
+                                        "operator": "NotIn",
+                                        "values": ["true"]
+                                    }]
+                                }]
+                            }
+                        }
+                    },
+                    "restartPolicy": "Never",
+                    "initContainers": [{
+                        "name": "git-clone",
+                        "image": "alpine/git:2.45.2",
+                        "imagePullPolicy": "IfNotPresent",
+                        "resources": {
+                            "requests": {"cpu": "1", "memory": "1Gi"},
+                            "limits": {"cpu": "1", "memory": "1Gi"}
+                        },
+                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/datasets"],
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
+                    }],
+                    "containers": [{
+                        "name": "convert-task",
+                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "imagePullPolicy": "Always",
+                        "workingDir": "/workspace/datasets",
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
+                        "env": [
+                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
+                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
+                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
+                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
+                            {"name": "AWS_HTTPS", "value": "false"},
+                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
+                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
+                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"}
+                        ],
+                        "command": ["bash", "-c", f"set -e\nchmod +x {dataset_name}/convert_gpkg_to_parquet.sh\n./{dataset_name}/convert_gpkg_to_parquet.sh"],
+                        "resources": {
+                            "requests": {"cpu": "4", "memory": "8Gi"},
+                            "limits": {"cpu": "8", "memory": "16Gi"}
+                        }
+                    }],
+                    "volumes": [{"name": "repo", "emptyDir": {}}]
+                }
             }
         }
     }
-    
-    job_spec["spec"]["template"]["spec"]["priorityClassName"] = "opportunistic"
-    
-    # Only add backoffLimitPerIndex for indexed jobs
-    if "completionMode" in job_spec["spec"] and job_spec["spec"]["completionMode"] == "Indexed":
-        job_spec["spec"]["backoffLimitPerIndex"] = 3
-    
-    job_spec["spec"]["ttlSecondsAfterFinished"] = 10800
+    manager.save_job_yaml(job_spec, str(output_path / "convert-job.yaml"))
+
+
+def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
+    """Generate PMTiles job."""
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": f"{dataset_name}-pmtiles",
+            "labels": {"k8s-app": f"{dataset_name}-pmtiles"}
+        },
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 1,
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-pmtiles"}},
+                "spec": {
+                    "priorityClassName": "opportunistic",
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [{
+                                    "matchExpressions": [{
+                                        "key": "feature.node.kubernetes.io/pci-10de.present",
+                                        "operator": "NotIn",
+                                        "values": ["true"]
+                                    }]
+                                }]
+                            }
+                        }
+                    },
+                    "restartPolicy": "Never",
+                    "initContainers": [{
+                        "name": "git-clone",
+                        "image": "alpine/git:2.45.2",
+                        "imagePullPolicy": "IfNotPresent",
+                        "resources": {
+                            "requests": {"cpu": "1", "memory": "1Gi"},
+                            "limits": {"cpu": "1", "memory": "1Gi"}
+                        },
+                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/datasets"],
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
+                    }],
+                    "containers": [{
+                        "name": "pmtiles-task",
+                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "imagePullPolicy": "Always",
+                        "workingDir": "/workspace/datasets",
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
+                        "env": [
+                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
+                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
+                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
+                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
+                            {"name": "AWS_HTTPS", "value": "false"},
+                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
+                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
+                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"}
+                        ],
+                        "command": ["bash", "-c", f"set -e\nchmod +x {dataset_name}/create_pmtiles.sh\n./{dataset_name}/create_pmtiles.sh"],
+                        "resources": {
+                            "requests": {"cpu": "4", "memory": "8Gi"},
+                            "limits": {"cpu": "8", "memory": "16Gi"}
+                        }
+                    }],
+                    "volumes": [{"name": "repo", "emptyDir": {}}]
+                }
+            }
+        }
+    }
+    manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
+
+
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo):
+    """Generate H3 hex tiling job."""
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": f"{dataset_name}-hex",
+            "labels": {"k8s-app": f"{dataset_name}-hex"}
+        },
+        "spec": {
+            "completions": 50,
+            "parallelism": 20,
+            "completionMode": "Indexed",
+            "backoffLimitPerIndex": 3,
+            "podFailurePolicy": {
+                "rules": [{
+                    "action": "Ignore",
+                    "onPodConditions": [{"type": "DisruptionTarget"}]
+                }]
+            },
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-hex"}},
+                "spec": {
+                    "priorityClassName": "opportunistic",
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [{
+                                    "matchExpressions": [{
+                                        "key": "feature.node.kubernetes.io/pci-10de.present",
+                                        "operator": "NotIn",
+                                        "values": ["true"]
+                                    }]
+                                }]
+                            }
+                        }
+                    },
+                    "restartPolicy": "Never",
+                    "initContainers": [{
+                        "name": "git-clone",
+                        "image": "alpine/git:2.45.2",
+                        "imagePullPolicy": "IfNotPresent",
+                        "resources": {
+                            "requests": {"cpu": "1", "memory": "1Gi"},
+                            "limits": {"cpu": "1", "memory": "1Gi"}
+                        },
+                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/datasets"],
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
+                    }],
+                    "containers": [{
+                        "name": "hex-task",
+                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "imagePullPolicy": "Always",
+                        "workingDir": "/workspace/datasets",
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
+                        "env": [
+                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
+                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
+                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
+                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
+                            {"name": "AWS_HTTPS", "value": "false"},
+                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
+                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
+                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
+                            {"name": "TMPDIR", "value": "/tmp"}
+                        ],
+                        "command": ["bash", "-c", f"set -e\npython {dataset_name}/vec.py --i ${{JOB_COMPLETION_INDEX}} --zoom 10"],
+                        "resources": {
+                            "requests": {"cpu": "4", "memory": "8Gi"},
+                            "limits": {"cpu": "8", "memory": "16Gi"}
+                        }
+                    }],
+                    "volumes": [{"name": "repo", "emptyDir": {}}]
+                }
+            }
+        }
+    }
+    manager.save_job_yaml(job_spec, str(output_path / "hex-job.yaml"))
+
+
+def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo):
+    """Generate repartition job."""
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": f"{dataset_name}-repartition",
+            "labels": {"k8s-app": f"{dataset_name}-repartition"}
+        },
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 1,
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-repartition"}},
+                "spec": {
+                    "priorityClassName": "opportunistic",
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [{
+                                    "matchExpressions": [{
+                                        "key": "feature.node.kubernetes.io/pci-10de.present",
+                                        "operator": "NotIn",
+                                        "values": ["true"]
+                                    }]
+                                }]
+                            }
+                        }
+                    },
+                    "restartPolicy": "Never",
+                    "initContainers": [{
+                        "name": "git-clone",
+                        "image": "alpine/git:2.45.2",
+                        "imagePullPolicy": "IfNotPresent",
+                        "resources": {
+                            "requests": {"cpu": "1", "memory": "1Gi"},
+                            "limits": {"cpu": "1", "memory": "1Gi"}
+                        },
+                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/datasets"],
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
+                    }],
+                    "containers": [{
+                        "name": "repartition-task",
+                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "imagePullPolicy": "Always",
+                        "workingDir": "/workspace/datasets",
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
+                        "env": [
+                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
+                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
+                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
+                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
+                            {"name": "AWS_HTTPS", "value": "false"},
+                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
+                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
+                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"}
+                        ],
+                        "command": ["bash", "-c", f"set -e\npython {dataset_name}/repartition.py"],
+                        "resources": {
+                            "requests": {"cpu": "4", "memory": "8Gi"},
+                            "limits": {"cpu": "8", "memory": "16Gi"}
+                        }
+                    }],
+                    "volumes": [{"name": "repo", "emptyDir": {}}]
+                }
+            }
+        }
+    }
+    manager.save_job_yaml(job_spec, str(output_path / "repartition-job.yaml"))
 
 
 def _generate_workflow_rbac(dataset_name, namespace, output_path):

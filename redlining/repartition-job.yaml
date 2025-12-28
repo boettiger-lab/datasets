@@ -1,12 +1,17 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
+  labels:
+    k8s-app: mappinginequality-repartition
   name: mappinginequality-repartition
-  namespace: biodiversity
 spec:
+  backoffLimit: 1
   completions: 1
   parallelism: 1
   template:
+    metadata:
+      labels:
+        k8s-app: mappinginequality-repartition
     spec:
       affinity:
         nodeAffinity:
@@ -18,21 +23,12 @@ spec:
                 values:
                 - 'true'
       containers:
-      - args:
-        - "\nset -e\napt-get update\npip install geopandas pyarrow duckdb h3 boto3\n\
-          \npython -c '\nimport duckdb\nfrom cng.utils import set_secrets\nimport\
-          \ shutil\n\ncon = duckdb.connect()\nset_secrets(con)\ncon.execute(\"SET\
-          \ preserve_insertion_order=false\")\ncon.execute(\"SET http_timeout=1200\"\
-          )\ncon.execute(\"SET http_retries=30\")\n\nprint(\"Repartitioning by h0...\"\
-          )\ncon.execute(\"\"\"\n    COPY (SELECT * FROM read_parquet('s3://public-mappinginequality/chunks/*.parquet'))\n\
-          \    TO '/tmp/hex' (FORMAT PARQUET, PARTITION_BY h0)\n\"\"\")\n\ncon.execute(\"\
-          \"\"\n    COPY (SELECT * FROM read_parquet('/tmp/hex/**/*.parquet'))\n \
-          \   TO 's3://public-mappinginequality/hex/' (FORMAT PARQUET, PARTITION_BY\
-          \ h0)\n\"\"\")\n\nshutil.rmtree('/tmp/hex')\nprint('\u2713 Repartitioning\
-          \ complete!')\n"
-        command:
+      - command:
         - bash
         - -c
+        - 'set -e
+
+          python mappinginequality/repartition.py'
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
@@ -48,15 +44,49 @@ spec:
           value: rook-ceph-rgw-nautiluss3.rook
         - name: AWS_PUBLIC_ENDPOINT
           value: s3-west.nrp-nautilus.io
-        image: python:3.12-slim
-        name: processor
+        - name: AWS_HTTPS
+          value: 'false'
+        - name: AWS_VIRTUAL_HOSTING
+          value: 'FALSE'
+        - name: GDAL_DATA
+          value: /opt/conda/share/gdal
+        - name: PROJ_LIB
+          value: /opt/conda/share/proj
+        image: ghcr.io/rocker-org/ml-spatial
+        imagePullPolicy: Always
+        name: repartition-task
         resources:
           limits:
-            cpu: '2'
-            memory: 8Gi
+            cpu: '8'
+            memory: 16Gi
           requests:
-            cpu: '2'
+            cpu: '4'
             memory: 8Gi
+        volumeMounts:
+        - mountPath: /workspace
+          name: repo
+        workingDir: /workspace/datasets
+      initContainers:
+      - command:
+        - sh
+        - -lc
+        - git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
+        image: alpine/git:2.45.2
+        imagePullPolicy: IfNotPresent
+        name: git-clone
+        resources:
+          limits:
+            cpu: '1'
+            memory: 1Gi
+          requests:
+            cpu: '1'
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /workspace
+          name: repo
       priorityClassName: opportunistic
-      restartPolicy: OnFailure
+      restartPolicy: Never
+      volumes:
+      - emptyDir: {}
+        name: repo
   ttlSecondsAfterFinished: 10800
