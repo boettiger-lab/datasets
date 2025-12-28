@@ -38,6 +38,8 @@ spec:
 
           pip install --user -e /tmp/datasets
 
+          export PATH=$HOME/.local/bin:$PATH
+
           cng-datasets vector --input s3://public-mappinginequality/mappinginequality.parquet
           --output s3://public-mappinginequality/hex --chunk-id ${JOB_COMPLETION_INDEX}
           --resolution 10'
