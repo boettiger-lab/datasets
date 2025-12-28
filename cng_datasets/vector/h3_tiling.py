@@ -8,6 +8,7 @@ chunked processing of large datasets.
 
 from typing import Optional, List, Dict, Any
 import duckdb
+import os
 
 
 def geom_to_h3_cells(
@@ -142,36 +143,30 @@ class H3VectorProcessor:
         self._configure_credentials()
         
     def _configure_credentials(self):
-        """Configure S3 credentials for DuckDB."""
-        try:
-            from cng.utils import set_secrets
-            set_secrets(self.con)
-        except ImportError:
-            # Fallback to manual credential configuration
-            if self.read_credentials:
-                self._set_s3_credentials("read", self.read_credentials)
-            if self.write_credentials:
-                self._set_s3_credentials("write", self.write_credentials)
-    
-    def _set_s3_credentials(self, scope: str, credentials: Dict[str, str]):
-        """Set S3 credentials for a specific scope."""
-        key = credentials.get("key")
-        secret = credentials.get("secret")
-        region = credentials.get("region", "us-west-2")
-        endpoint = credentials.get("endpoint")
+        """Configure S3 credentials for DuckDB using environment variables."""
+        key = os.getenv("AWS_ACCESS_KEY_ID", "")
+        secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+        endpoint = os.getenv("AWS_S3_ENDPOINT", "s3.amazonaws.com")
+        region = os.getenv("AWS_REGION", "us-east-1")
+        use_ssl = os.getenv("AWS_HTTPS", "TRUE")
+        
+        # Determine URL style based on endpoint
+        url_style = "vhost" if "amazonaws.com" in endpoint else "path"
         
         if key and secret:
-            sql = f"""
-            CREATE OR REPLACE SECRET {scope}_s3 (
+            query = f"""
+            CREATE OR REPLACE SECRET s3_secret (
                 TYPE S3,
                 KEY_ID '{key}',
                 SECRET '{secret}',
-                REGION '{region}'
+                ENDPOINT '{endpoint}',
+                REGION '{region}',
+                URL_COMPATIBILITY_MODE true,
+                USE_SSL {use_ssl},
+                URL_STYLE '{url_style}'
+            );
             """
-            if endpoint:
-                sql += f", ENDPOINT '{endpoint}'"
-            sql += ");"
-            self.con.execute(sql)
+            self.con.execute(query)
     
     def _find_geometry_column(self, table_name: str) -> str:
         """Find the geometry column in the table."""
