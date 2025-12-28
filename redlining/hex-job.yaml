@@ -34,7 +34,9 @@ spec:
         - -c
         - 'set -e
 
-          pip install --user -e /workspace/datasets
+          cp -r /workspace/datasets /tmp/datasets
+
+          pip install --user -e /tmp/datasets
 
           cng-datasets vector --input s3://public-mappinginequality/mappinginequality.parquet
           --output s3://public-mappinginequality/hex --chunk-id ${JOB_COMPLETION_INDEX}
