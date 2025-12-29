@@ -42,7 +42,7 @@ spec:
 
           cng-datasets vector --input s3://public-mappinginequality/mappinginequality.parquet
           --output s3://public-mappinginequality/chunks --chunk-id ${JOB_COMPLETION_INDEX}
-          --chunk-size 51 --resolution 10'
+          --chunk-size 51 --resolution 10 --parent-resolutions 9,8,0'
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:

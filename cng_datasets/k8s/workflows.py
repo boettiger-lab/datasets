@@ -5,7 +5,7 @@ Functions for creating complete dataset processing workflows with
 multiple coordinated Kubernetes jobs.
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 import math
 from .jobs import K8sJobManager
@@ -76,6 +76,8 @@ def generate_dataset_workflow(
     namespace: str = "biodiversity",
     image: str = "ghcr.io/rocker-org/ml-spatial",
     git_repo: str = "https://github.com/boettiger-lab/datasets.git",
+    h3_resolution: int = 10,
+    parent_resolutions: Optional[List[int]] = None
 ):
     """
     Generate complete workflow for a dataset.
@@ -94,10 +96,17 @@ def generate_dataset_workflow(
         output_dir: Directory to write YAML files
         namespace: Kubernetes namespace
         image: Container image to use
+        git_repo: Git repository URL for package source
+        h3_resolution: Target H3 resolution for tiling (default: 10)
+        parent_resolutions: List of parent H3 resolutions to include (default: [9, 8, 0])
     """
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Set defaults for parent resolutions if not provided
+    if parent_resolutions is None:
+        parent_resolutions = [9, 8, 0]
     
     # Generate conversion job
     _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo)
@@ -122,8 +131,11 @@ def generate_dataset_workflow(
         chunk_size, completions, parallelism = _calculate_chunking(total_rows)
         print(f"  Using defaults: chunk_size={chunk_size}, completions={completions}, parallelism={parallelism}")
     
+    print(f"  H3 resolution: {h3_resolution}")
+    print(f"  Parent resolutions: {parent_resolutions}")
+    
     # Generate hex tiling job
-    _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism)
+    _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions)
     
     # Generate repartition job
     _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo)
@@ -317,8 +329,24 @@ rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism):
-    """Generate H3 hex tiling job."""
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions):
+    """Generate H3 hex tiling job.
+    
+    Args:
+        manager: K8sJobManager instance
+        dataset_name: Name of the dataset
+        bucket: S3 bucket name
+        output_path: Path to write YAML files
+        git_repo: Git repository URL
+        chunk_size: Number of rows per chunk
+        completions: Number of job completions
+        parallelism: Number of parallel jobs
+        h3_resolution: Target H3 resolution (e.g., 10)
+        parent_resolutions: List of parent resolutions (e.g., [9, 8, 0])
+    """
+    # Format parent resolutions as comma-separated string
+    parent_res_str = ','.join(map(str, parent_resolutions))
+    
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -386,7 +414,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                             {"name": "BUCKET", "value": bucket},
                             {"name": "DATASET", "value": dataset_name}
                         ],
-                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/datasets /tmp/datasets\npip install --user -e /tmp/datasets\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution 10"],
+                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/datasets /tmp/datasets\npip install --user -e /tmp/datasets\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}

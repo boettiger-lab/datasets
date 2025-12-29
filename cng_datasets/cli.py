@@ -22,6 +22,7 @@ def main():
     vector_parser.add_argument("--resolution", type=int, default=10, help="H3 resolution")
     vector_parser.add_argument("--chunk-size", type=int, default=500, help="Chunk size")
     vector_parser.add_argument("--chunk-id", type=int, help="Process specific chunk")
+    vector_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
     
     # Raster processing command
     raster_parser = subparsers.add_parser("raster", help="Process raster datasets")
@@ -51,6 +52,8 @@ def main():
     workflow_parser.add_argument("--bucket", required=True, help="S3 bucket for outputs")
     workflow_parser.add_argument("--output-dir", default=".", help="Output directory for YAML files")
     workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
+    workflow_parser.add_argument("--h3-resolution", type=int, default=10, help="Target H3 resolution (default: 10)")
+    workflow_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
     
     # Storage management command
     storage_parser = subparsers.add_parser("storage", help="Manage cloud storage")
@@ -69,11 +72,14 @@ def main():
     
     if args.command == "vector":
         from .vector import process_vector_chunks
+        # Parse parent resolutions from comma-separated string
+        parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
         process_vector_chunks(
             input_url=args.input,
             output_url=args.output,
             chunk_id=args.chunk_id,
             h3_resolution=args.resolution,
+            parent_resolutions=parent_res,
             chunk_size=args.chunk_size,
         )
     
@@ -115,12 +121,16 @@ def main():
     
     elif args.command == "workflow":
         from .k8s import generate_dataset_workflow
+        # Parse parent resolutions from comma-separated string
+        parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
         generate_dataset_workflow(
             dataset_name=args.dataset,
             source_url=args.source_url,
             bucket=args.bucket,
             output_dir=args.output_dir,
             namespace=args.namespace,
+            h3_resolution=args.h3_resolution,
+            parent_resolutions=parent_res,
         )
     
     elif args.command == "storage":

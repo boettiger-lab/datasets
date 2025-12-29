@@ -15,6 +15,27 @@ This workflow processes historical redlining data into cloud-native formats:
 
 All processing uses the `cng_datasets` Python package for standardized, reusable data processing. Jobs use the `ghcr.io/rocker-org/ml-spatial` image with all dependencies pre-installed, and clone the repository via an initContainer for fast execution.
 
+### H3 Resolution Configuration
+
+The workflow generates H3 hexagons at **resolution 10** (h10) and includes parent hexagons at resolutions **h9, h8, and h0**. These resolutions can be configured during workflow generation:
+
+```bash
+cng-datasets workflow \
+  --dataset mappinginequality \
+  --source-url https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg \
+  --bucket public-mappinginequality \
+  --h3-resolution 10 \              # Target resolution (default: 10)
+  --parent-resolutions "9,8,0"      # Parent resolutions (default: "9,8,0")
+```
+
+**Resolution Guide:**
+- **h10** (~15m hexagons) - Fine-grained analysis, optimal for urban features
+- **h9** (~50m hexagons) - Intermediate scale
+- **h8** (~175m hexagons) - Neighborhood scale  
+- **h0** (continent scale) - Used for efficient partitioning
+
+Other datasets may use different resolutions based on their spatial scale (e.g., h8 for regional data, h12 for detailed local data).
+
 ### Processing Workflow
 
 The H3 hexagonal tiling follows a **two-pass approach** (matching wdpa/):
@@ -31,14 +52,16 @@ This approach enables efficient parallel processing of large datasets while ensu
 cng-datasets workflow \
   --dataset mappinginequality \
   --source-url https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg \
-  --bucket public-mappinginequality
+  --bucket public-mappinginequality \
+  --h3-resolution 10 \
+  --parent-resolutions "9,8,0"
   # --namespace defaults to "biodiversity"
 ```
 
 This generates all required Kubernetes job configurations:
 - `convert-job.yaml` - GPKG → GeoParquet conversion
 - `pmtiles-job.yaml` - PMTiles vector tile generation
-- `hex-job.yaml` - H3 hexagonal tiling (50 chunks, 20 parallel workers)
+- `hex-job.yaml` - H3 hexagonal tiling (automatic chunking based on dataset size)
 - `repartition-job.yaml` - Consolidate chunks by h0 partition
 - `workflow.yaml` - K8s Job orchestrator (runs in cluster)
 - `workflow-rbac.yaml` - Kubernetes RBAC permissions
