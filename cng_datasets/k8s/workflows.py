@@ -153,6 +153,9 @@ def generate_dataset_workflow(
     # Generate workflow RBAC (generic for all cng-datasets workflows)
     _generate_workflow_rbac(namespace, output_path)
     
+    # Generate ConfigMap YAML from job files
+    _generate_configmap(k8s_name, namespace, output_path)
+    
     # Generate Argo workflow with ConfigMap-based approach
     _generate_argo_workflow(k8s_name, namespace, output_path, output_dir)
     
@@ -163,21 +166,22 @@ def generate_dataset_workflow(
     print(f"  - hex-job.yaml")
     print(f"  - repartition-job.yaml")
     print(f"  - workflow-rbac.yaml (generic, reusable)")
+    print(f"  - configmap.yaml (job configs)")
     print(f"  - workflow.yaml (orchestrator)")
     print(f"\nTo run:")
     print(f"  # One-time RBAC setup")
     print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
     print(f"")
-    print(f"  # Create ConfigMap from job YAMLs and run workflow")
-    print(f"  kubectl create configmap {k8s_name}-yamls \\")
-    print(f"    --from-file={output_dir}/convert-job.yaml \\")
-    print(f"    --from-file={output_dir}/pmtiles-job.yaml \\")
-    print(f"    --from-file={output_dir}/hex-job.yaml \\")
-    print(f"    --from-file={output_dir}/repartition-job.yaml")
+    print(f"  # Apply all workflow files (safe to re-run)")
+    print(f"  kubectl apply -f {output_dir}/configmap.yaml")
     print(f"  kubectl apply -f {output_dir}/workflow.yaml")
     print(f"")
     print(f"  # Monitor progress")
     print(f"  kubectl logs -f job/{k8s_name}-workflow")
+    print(f"")
+    print(f"  # Clean up")
+    print(f"  kubectl delete -f {output_dir}/workflow.yaml")
+    print(f"  kubectl delete -f {output_dir}/configmap.yaml")
 
 
 def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
@@ -508,6 +512,40 @@ def _generate_workflow_rbac(namespace, output_path):
                 "roleRef": {"kind": "Role", "name": "cng-datasets-workflow", "apiGroup": "rbac.authorization.k8s.io"}
             }
         ], f, default_flow_style=False)
+
+
+def _generate_configmap(dataset_name, namespace, output_path):
+    """Generate ConfigMap YAML containing all job definitions.
+    
+    Args:
+        dataset_name: Sanitized k8s-compatible dataset name
+        namespace: Kubernetes namespace  
+        output_path: Path object where YAML files are written
+    """
+    import yaml
+    
+    # Read all job YAML files
+    job_files = ["convert-job.yaml", "pmtiles-job.yaml", "hex-job.yaml", "repartition-job.yaml"]
+    data = {}
+    
+    for job_file in job_files:
+        file_path = output_path / job_file
+        if file_path.exists():
+            with open(file_path, 'r') as f:
+                data[job_file] = f.read()
+    
+    configmap = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": f"{dataset_name}-yamls",
+            "namespace": namespace
+        },
+        "data": data
+    }
+    
+    with open(output_path / "configmap.yaml", "w") as f:
+        yaml.dump(configmap, f, default_flow_style=False)
 
 
 def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir):
