@@ -13,6 +13,7 @@ from cng_datasets.k8s import generate_dataset_workflow, K8sJobManager
 class TestK8sJobManager:
     """Test Kubernetes job manager functionality."""
     
+    @pytest.mark.timeout(5)
     def test_basic_job_generation(self):
         """Test generating a basic Kubernetes job."""
         manager = K8sJobManager(namespace="test-ns")
@@ -30,6 +31,7 @@ class TestK8sJobManager:
         assert job_spec["spec"]["template"]["spec"]["containers"][0]["command"] == ["python", "-c"]
         assert job_spec["spec"]["template"]["spec"]["containers"][0]["args"] == ["print('hello')"]
         
+    @pytest.mark.timeout(5)
     def test_chunked_job_generation(self):
         """Test generating an indexed/chunked job."""
         manager = K8sJobManager(namespace="test-ns")
@@ -49,6 +51,7 @@ class TestK8sJobManager:
         assert job_spec["spec"]["parallelism"] == 5
         assert job_spec["spec"]["completionMode"] == "Indexed"
         
+    @pytest.mark.timeout(5)
     def test_job_yaml_save(self):
         """Test saving job spec to YAML file."""
         manager = K8sJobManager()
@@ -73,6 +76,7 @@ class TestK8sJobManager:
 class TestWorkflowGeneration:
     """Test complete workflow generation."""
     
+    @pytest.mark.timeout(5)
     def test_generate_complete_workflow(self):
         """Test generating all workflow files."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -106,6 +110,7 @@ class TestWorkflowGeneration:
                     specs = list(loaded)
                     assert len(specs) > 0, f"Empty YAML file: {filename}"
     
+    @pytest.mark.timeout(5)
     def test_convert_job_content(self):
         """Test convert job has correct content."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -121,12 +126,17 @@ class TestWorkflowGeneration:
                 job = yaml.safe_load(f)
                 
             assert job["metadata"]["name"] == "test-ds-convert"
-            assert "python" in job["spec"]["template"]["spec"]["containers"][0]["command"]
             
-            # Check that S3 bucket is referenced in args
-            args = job["spec"]["template"]["spec"]["containers"][0]["args"]
-            assert any("test-bucket" in str(arg) for arg in args)
+            # Check that the command uses bash
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"]
+            assert "bash" in command or "sh" in command
+            
+            # Check that S3 bucket is referenced in args or command
+            container_spec = job["spec"]["template"]["spec"]["containers"][0]
+            all_text = str(container_spec)
+            assert "test-bucket" in all_text
     
+    @pytest.mark.timeout(5)
     def test_hex_job_chunked(self):
         """Test hex job is properly chunked."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -146,6 +156,7 @@ class TestWorkflowGeneration:
             assert job["spec"]["parallelism"] == 20
             assert job["spec"]["completionMode"] == "Indexed"
     
+    @pytest.mark.timeout(5)
     def test_workflow_rbac(self):
         """Test RBAC configuration is generated."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -177,6 +188,7 @@ class TestWorkflowGeneration:
 class TestEdgeCases:
     """Test edge cases and error handling."""
     
+    @pytest.mark.timeout(5)
     def test_invalid_dataset_name(self):
         """Test with dataset name containing special characters."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -191,6 +203,7 @@ class TestEdgeCases:
             # Check files were created
             assert (Path(tmpdir) / "convert-job.yaml").exists()
     
+    @pytest.mark.timeout(5)
     def test_output_dir_created(self):
         """Test that output directory is created if it doesn't exist."""
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -14,6 +14,7 @@ from cng_datasets.cli import main
 class TestCLI:
     """Test command-line interface."""
     
+    @pytest.mark.timeout(5)
     def test_workflow_command(self):
         """Test workflow generation via CLI."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -36,6 +37,7 @@ class TestCLI:
             assert (output_path / "convert-job.yaml").exists()
             assert (output_path / "workflow.yaml").exists()
     
+    @pytest.mark.timeout(5)
     def test_k8s_job_command(self):
         """Test single k8s job generation via CLI."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -56,6 +58,7 @@ class TestCLI:
                 
             assert output_file.exists()
     
+    @pytest.mark.timeout(5)
     def test_chunked_k8s_job(self):
         """Test chunked k8s job generation via CLI."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -82,6 +85,7 @@ class TestCLI:
                 assert job["spec"]["completions"] == 10
                 assert job["spec"]["completionMode"] == "Indexed"
     
+    @pytest.mark.timeout(5)
     def test_no_command_shows_help(self):
         """Test that running with no command shows help."""
         test_args = ["cng-datasets"]
@@ -90,6 +94,7 @@ class TestCLI:
             with pytest.raises(SystemExit):
                 main()
     
+    @pytest.mark.timeout(5)
     def test_workflow_default_values(self):
         """Test workflow command with default values."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -118,6 +123,7 @@ class TestCLI:
 class TestCLIValidation:
     """Test CLI input validation."""
     
+    @pytest.mark.timeout(5)
     def test_workflow_missing_required(self):
         """Test workflow command with missing required arguments."""
         test_args = [
@@ -131,6 +137,7 @@ class TestCLIValidation:
             with pytest.raises(SystemExit):
                 main()
     
+    @pytest.mark.timeout(5)
     def test_k8s_missing_required(self):
         """Test k8s command with missing required arguments."""
         test_args = [

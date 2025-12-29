@@ -5,7 +5,7 @@ Comprehensive unit tests for the cng_datasets package.
 ## Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (with 10-second timeout per test)
 pytest tests/ -v
 
 # Run specific test file
@@ -16,6 +16,9 @@ pytest tests/test_cli.py::TestCLI::test_workflow_command -v
 
 # Run with coverage
 pytest tests/ --cov=cng_datasets --cov-report=html
+
+# Run only fast tests (exclude slow/integration tests)
+pytest tests/ -v -m "not slow and not integration"
 ```
 
 ## Test Structure
@@ -35,17 +38,27 @@ Tests Kubernetes workflow generation including:
 - Edge cases (special characters, directory creation)
 
 ### test_vector.py
-Tests vector data processing including:
+Unit tests for vector data processing including:
 - DuckDB connection setup with H3 extension
 - Geometry to H3 cell conversion
 - H3 parent resolution calculation
 - Polygon and point handling
+- H3VectorProcessor initialization and chunk processing
+
+**Note:** All S3/network integration tests have been removed or mocked to keep tests fast and reliable.
+
+## Test Timeouts
+
+All tests have a 10-second timeout configured globally in `pyproject.toml`. Tests that hang or take too long will automatically fail with a timeout error. Individual tests can override this with the `@pytest.mark.timeout()` decorator.
 
 ## Test Coverage
 
-Currently: **20/21 tests passing** (95%+ coverage of core functionality)
+Currently: **All unit tests passing** with proper timeout protection.
 
-The skipped test (`test_process_vector_chunks_local`) requires S3 access and test data.
+Tests focus on:
+- Core functionality with fast in-memory operations
+- Mocked external dependencies (S3, network calls)
+- Proper error handling and edge cases
 
 ## Dependencies
 
