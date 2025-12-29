@@ -2,8 +2,8 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   labels:
-    k8s-app: cpad_2025b_holdings-hex
-  name: cpad_2025b_holdings-hex
+    k8s-app: cpad-2025b-holdings-hex
+  name: cpad-2025b-holdings-hex
 spec:
   backoffLimitPerIndex: 3
   completionMode: Indexed
@@ -17,7 +17,7 @@ spec:
   template:
     metadata:
       labels:
-        k8s-app: cpad_2025b_holdings-hex
+        k8s-app: cpad-2025b-holdings-hex
     spec:
       affinity:
         nodeAffinity:
@@ -40,7 +40,7 @@ spec:
 
           export PATH=$HOME/.local/bin:$PATH
 
-          cng-datasets vector --input s3://public-cpad/cpad_2025b_holdings.parquet
+          cng-datasets vector --input s3://public-cpad/cpad-2025b-holdings.parquet
           --output s3://public-cpad/chunks --chunk-id ${JOB_COMPLETION_INDEX} --chunk-size
           803 --resolution 10 --parent-resolutions 9,8,0'
         env:
@@ -71,7 +71,7 @@ spec:
         - name: BUCKET
           value: public-cpad
         - name: DATASET
-          value: cpad_2025b_holdings
+          value: cpad-2025b-holdings
         image: ghcr.io/rocker-org/ml-spatial
         imagePullPolicy: Always
         name: hex-task

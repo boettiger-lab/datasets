@@ -112,12 +112,15 @@ def generate_dataset_workflow(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
+    # Sanitize dataset name for Kubernetes (replace underscores with hyphens)
+    k8s_name = dataset_name.replace('_', '-').lower()
+    
     # Set defaults for parent resolutions if not provided
     if parent_resolutions is None:
         parent_resolutions = [9, 8, 0]
     
     # Generate conversion job
-    _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo)
+    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
     
     # Generate pmtiles job
     _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo)
@@ -142,16 +145,16 @@ def generate_dataset_workflow(
     print(f"  Parent resolutions: {parent_resolutions}")
     
     # Generate hex tiling job
-    _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions)
     
     # Generate repartition job
-    _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo)
+    _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo)
     
-    # Generate workflow RBAC
-    _generate_workflow_rbac(dataset_name, namespace, output_path)
+    # Generate workflow RBAC (generic for all cng-datasets workflows)
+    _generate_workflow_rbac(namespace, output_path)
     
     # Generate Argo workflow
-    _generate_argo_workflow(dataset_name, namespace, output_path)
+    _generate_argo_workflow(k8s_name, namespace, output_path)
     
     print(f"\n✓ Generated complete workflow for {dataset_name}")
     print(f"\nFiles created in {output_dir}:")
@@ -516,15 +519,15 @@ cng-datasets repartition --chunks-dir s3://{bucket}/chunks --output-dir s3://{bu
     manager.save_job_yaml(job_spec, str(output_path / "repartition-job.yaml"))
 
 
-def _generate_workflow_rbac(dataset_name, namespace, output_path):
-    """Generate workflow RBAC configuration."""
+def _generate_workflow_rbac(namespace, output_path):
+    """Generate generic workflow RBAC configuration for cng-datasets package."""
     import yaml
     
     rbac = {
         "apiVersion": "v1",
         "kind": "ServiceAccount",
         "metadata": {
-            "name": f"{dataset_name}-workflow",
+            "name": "cng-datasets-workflow",
             "namespace": namespace
         }
     }
@@ -535,7 +538,7 @@ def _generate_workflow_rbac(dataset_name, namespace, output_path):
             {
                 "apiVersion": "rbac.authorization.k8s.io/v1",
                 "kind": "Role",
-                "metadata": {"name": f"{dataset_name}-workflow", "namespace": namespace},
+                "metadata": {"name": "cng-datasets-workflow", "namespace": namespace},
                 "rules": [
                     {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get", "list", "watch", "create", "delete"]},
                     {"apiGroups": [""], "resources": ["pods", "pods/log"], "verbs": ["get", "list"]}
@@ -544,9 +547,9 @@ def _generate_workflow_rbac(dataset_name, namespace, output_path):
             {
                 "apiVersion": "rbac.authorization.k8s.io/v1",
                 "kind": "RoleBinding",
-                "metadata": {"name": f"{dataset_name}-workflow", "namespace": namespace},
-                "subjects": [{"kind": "ServiceAccount", "name": f"{dataset_name}-workflow"}],
-                "roleRef": {"kind": "Role", "name": f"{dataset_name}-workflow", "apiGroup": "rbac.authorization.k8s.io"}
+                "metadata": {"name": "cng-datasets-workflow", "namespace": namespace},
+                "subjects": [{"kind": "ServiceAccount", "name": "cng-datasets-workflow"}],
+                "roleRef": {"kind": "Role", "name": "cng-datasets-workflow", "apiGroup": "rbac.authorization.k8s.io"}
             }
         ], f, default_flow_style=False)
 
@@ -565,7 +568,7 @@ def _generate_argo_workflow(dataset_name, namespace, output_path):
         "spec": {
             "template": {
                 "spec": {
-                    "serviceAccountName": f"{dataset_name}-workflow",
+                    "serviceAccountName": "cng-datasets-workflow",
                     "restartPolicy": "OnFailure",
                     "initContainers": [{
                         "name": "git-clone",

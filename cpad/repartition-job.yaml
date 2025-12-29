@@ -2,8 +2,8 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   labels:
-    k8s-app: cpad_2025b_holdings-repartition
-  name: cpad_2025b_holdings-repartition
+    k8s-app: cpad-2025b-holdings-repartition
+  name: cpad-2025b-holdings-repartition
 spec:
   backoffLimit: 1
   completions: 1
@@ -11,7 +11,7 @@ spec:
   template:
     metadata:
       labels:
-        k8s-app: cpad_2025b_holdings-repartition
+        k8s-app: cpad-2025b-holdings-repartition
     spec:
       affinity:
         nodeAffinity:

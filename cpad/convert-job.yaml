@@ -2,8 +2,8 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   labels:
-    k8s-app: cpad_2025b_holdings-convert
-  name: cpad_2025b_holdings-convert
+    k8s-app: cpad-2025b-holdings-convert
+  name: cpad-2025b-holdings-convert
 spec:
   backoffLimit: 1
   completions: 1
@@ -11,7 +11,7 @@ spec:
   template:
     metadata:
       labels:
-        k8s-app: cpad_2025b_holdings-convert
+        k8s-app: cpad-2025b-holdings-convert
     spec:
       affinity:
         nodeAffinity:
@@ -41,7 +41,7 @@ spec:
 
           # Convert to GeoParquet
 
-          ogr2ogr -f Parquet /vsis3/public-cpad/cpad_2025b_holdings.parquet /vsicurl/https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Holdings/CPAD_2025b_Holdings.shp
+          ogr2ogr -f Parquet /vsis3/public-cpad/cpad-2025b-holdings.parquet /vsicurl/https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Holdings/CPAD_2025b_Holdings.shp
           -progress
 
           '
