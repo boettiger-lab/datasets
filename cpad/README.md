@@ -15,7 +15,25 @@ cng-datasets workflow \
   --source-url https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Holdings/CPAD_2025b_Holdings.shp \
   --bucket public-cpad \
   --h3-resolution 10 \
-  --parent-resolutions "9,8,0"
+  --parent-resolutions "9,8,0" \
+  --namespace gpn \
+  --output-dir .
+```
+
+Then run the jobs:
+```bash
+# Optional: Create RBAC once (only needed first time)
+kubectl apply -f workflow-rbac.yaml
+
+# Run jobs in sequence:
+kubectl apply -f convert-job.yaml
+kubectl wait --for=condition=complete --timeout=3600s job/cpad-2025b-holdings-convert -n gpn
+
+kubectl apply -f hex-job.yaml  
+kubectl wait --for=condition=complete --timeout=7200s job/cpad-2025b-holdings-hex -n gpn
+
+kubectl apply -f repartition-job.yaml
+kubectl wait --for=condition=complete --timeout=3600s job/cpad-2025b-holdings-repartition -n gpn
 ```
 
 
