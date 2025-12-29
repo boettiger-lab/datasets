@@ -1,0 +1,112 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    k8s-app: cpad_2025b_holdings-hex
+  name: cpad_2025b_holdings-hex
+spec:
+  backoffLimitPerIndex: 3
+  completionMode: Indexed
+  completions: 200
+  parallelism: 50
+  podFailurePolicy:
+    rules:
+    - action: Ignore
+      onPodConditions:
+      - type: DisruptionTarget
+  template:
+    metadata:
+      labels:
+        k8s-app: cpad_2025b_holdings-hex
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: feature.node.kubernetes.io/pci-10de.present
+                operator: NotIn
+                values:
+                - 'true'
+      containers:
+      - command:
+        - bash
+        - -c
+        - 'set -e
+
+          cp -r /workspace/datasets /tmp/datasets
+
+          pip install --user -e /tmp/datasets
+
+          export PATH=$HOME/.local/bin:$PATH
+
+          cng-datasets vector --input s3://public-cpad/cpad_2025b_holdings.parquet
+          --output s3://public-cpad/chunks --chunk-id ${JOB_COMPLETION_INDEX} --chunk-size
+          803 --resolution 10 --parent-resolutions 9,8,0'
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              key: AWS_ACCESS_KEY_ID
+              name: aws
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              key: AWS_SECRET_ACCESS_KEY
+              name: aws
+        - name: AWS_S3_ENDPOINT
+          value: rook-ceph-rgw-nautiluss3.rook
+        - name: AWS_PUBLIC_ENDPOINT
+          value: s3-west.nrp-nautilus.io
+        - name: AWS_HTTPS
+          value: 'false'
+        - name: AWS_VIRTUAL_HOSTING
+          value: 'FALSE'
+        - name: GDAL_DATA
+          value: /opt/conda/share/gdal
+        - name: PROJ_LIB
+          value: /opt/conda/share/proj
+        - name: TMPDIR
+          value: /tmp
+        - name: BUCKET
+          value: public-cpad
+        - name: DATASET
+          value: cpad_2025b_holdings
+        image: ghcr.io/rocker-org/ml-spatial
+        imagePullPolicy: Always
+        name: hex-task
+        resources:
+          limits:
+            cpu: '4'
+            memory: 8Gi
+          requests:
+            cpu: '4'
+            memory: 8Gi
+        volumeMounts:
+        - mountPath: /workspace
+          name: repo
+        workingDir: /workspace/datasets
+      initContainers:
+      - command:
+        - sh
+        - -lc
+        - git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
+        image: alpine/git:2.45.2
+        imagePullPolicy: IfNotPresent
+        name: git-clone
+        resources:
+          limits:
+            cpu: '1'
+            memory: 1Gi
+          requests:
+            cpu: '1'
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /workspace
+          name: repo
+      priorityClassName: opportunistic
+      restartPolicy: Never
+      volumes:
+      - emptyDir: {}
+        name: repo
+  ttlSecondsAfterFinished: 10800

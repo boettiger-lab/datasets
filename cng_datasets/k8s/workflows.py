@@ -11,37 +11,45 @@ import math
 from .jobs import K8sJobManager
 
 
-def _count_parquet_rows(parquet_url: str, bucket: str = None) -> int:
+def _count_source_features(source_url: str) -> int:
     """
-    Count rows in a parquet file using DuckDB.
+    Count features in a source file (shapefile, geopackage, etc.) using GDAL with vsicurl.
     
     Args:
-        parquet_url: S3 URL or local path to parquet file
-        bucket: Optional bucket name for converting s3:// to https://
+        source_url: HTTP(S) or S3 URL to source vector file
         
     Returns:
-        Number of rows in the parquet file
+        Number of features in the source file
     """
-    import duckdb
-    import os
+    import subprocess
     
-    con = duckdb.connect()
+    # Convert s3:// URLs to https:// for vsicurl
+    if source_url.startswith('s3://'):
+        path = source_url.replace('s3://', '')
+        source_url = f"https://s3-west.nrp-nautilus.io/{path}"
     
-    # Install httpfs for remote file access
-    con.execute("INSTALL httpfs")
-    con.execute("LOAD httpfs")
+    # Use vsicurl prefix for remote files
+    if source_url.startswith('http://') or source_url.startswith('https://'):
+        gdal_path = f"/vsicurl/{source_url}"
+    else:
+        gdal_path = source_url
     
-    # For public s3:// URLs, convert to https://
-    if parquet_url.startswith('s3://'):
-        # Convert s3://bucket/path to https://endpoint/bucket/path  
-        path = parquet_url.replace('s3://', '')
-        https_url = f"https://s3-west.nrp-nautilus.io/{path}"
-        print(f"Using public HTTPS URL: {https_url}")
-        parquet_url = https_url
+    # Use ogrinfo to count features
+    # -so: summary only (faster), -al: all layers
+    result = subprocess.run(
+        ['ogrinfo', '-so', '-al', gdal_path],
+        capture_output=True,
+        text=True,
+        check=True
+    )
     
-    result = con.execute(f"SELECT COUNT(*) FROM read_parquet('{parquet_url}')").fetchone()
-    con.close()
-    return result[0]
+    # Parse output to find "Feature Count: XXXXX"
+    for line in result.stdout.split('\n'):
+        if 'Feature Count:' in line:
+            count_str = line.split(':')[1].strip()
+            return int(count_str)
+    
+    raise ValueError("Could not find feature count in ogrinfo output")
 
 
 def _calculate_chunking(total_rows: int, max_completions: int = 200, max_parallelism: int = 50) -> tuple[int, int, int]:
@@ -114,19 +122,18 @@ def generate_dataset_workflow(
     # Generate pmtiles job
     _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo)
     
-    # Count rows and calculate chunking parameters
-    parquet_url = f"s3://{bucket}/{dataset_name}.parquet"
-    print(f"Counting rows in {parquet_url}...")
+    # Count features in source file and calculate chunking parameters
+    print(f"Counting features in {source_url}...")
     try:
-        total_rows = _count_parquet_rows(parquet_url)
+        total_rows = _count_source_features(source_url)
         chunk_size, completions, parallelism = _calculate_chunking(total_rows)
-        print(f"  Total rows: {total_rows:,}")
+        print(f"  Total features: {total_rows:,}")
         print(f"  Chunk size: {chunk_size:,}")
         print(f"  Completions: {completions}")
         print(f"  Parallelism: {parallelism}")
     except Exception as e:
         # Fall back to default values if counting fails (e.g., in tests or if file doesn't exist yet)
-        print(f"  Warning: Could not count rows ({e}). Using default chunking parameters.")
+        print(f"  Warning: Could not count features ({e}). Using default chunking parameters.")
         total_rows = 10000  # Default assumption
         chunk_size, completions, parallelism = _calculate_chunking(total_rows)
         print(f"  Using defaults: chunk_size={chunk_size}, completions={completions}, parallelism={parallelism}")
