@@ -212,30 +212,6 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                         }
                     },
                     "restartPolicy": "Never",
-                    "initContainers": [
-                        {
-                            "name": "git-clone",
-                            "image": "alpine/git:2.45.2",
-                            "imagePullPolicy": "IfNotPresent",
-                            "resources": {
-                                "requests": {"cpu": "1", "memory": "1Gi"},
-                                "limits": {"cpu": "1", "memory": "1Gi"}
-                            },
-                            "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
-                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                        },
-                        {
-                            "name": "install-package",
-                            "image": "ghcr.io/rocker-org/ml-spatial",
-                            "imagePullPolicy": "Always",
-                            "resources": {
-                                "requests": {"cpu": "1", "memory": "2Gi"},
-                                "limits": {"cpu": "1", "memory": "2Gi"}
-                            },
-                            "command": ["bash", "-c", "cp -r /workspace/repo /tmp/repo && pip install --user -e /tmp/repo"],
-                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                        }
-                    ],
                     "containers": [{
                         "name": "convert-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
@@ -268,8 +244,7 @@ ogr2ogr -f Parquet /vsis3/{bucket}/{dataset_name}.parquet /vsicurl/{source_url} 
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
                         }
-                    }],
-                    "volumes": [{"name": "repo", "emptyDir": {}}]
+                    }]
                 }
             }
         }
@@ -405,30 +380,6 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                         }
                     },
                     "restartPolicy": "Never",
-                    "initContainers": [
-                        {
-                            "name": "git-clone",
-                            "image": "alpine/git:2.45.2",
-                            "imagePullPolicy": "IfNotPresent",
-                            "resources": {
-                                "requests": {"cpu": "1", "memory": "1Gi"},
-                                "limits": {"cpu": "1", "memory": "1Gi"}
-                            },
-                            "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
-                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                        },
-                        {
-                            "name": "install-package",
-                            "image": "ghcr.io/rocker-org/ml-spatial",
-                            "imagePullPolicy": "Always",
-                            "resources": {
-                                "requests": {"cpu": "1", "memory": "2Gi"},
-                                "limits": {"cpu": "1", "memory": "2Gi"}
-                            },
-                            "command": ["bash", "-c", "cp -r /workspace/repo /tmp/repo && pip install --user -e /tmp/repo"],
-                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                        }
-                    ],
                     "containers": [{
                         "name": "hex-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
