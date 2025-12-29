@@ -7,6 +7,44 @@ public dataset distribution.
 
 from typing import Optional, Dict, Any, List
 import json
+import os
+import duckdb
+
+
+def configure_s3_credentials(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Configure S3 credentials for DuckDB using environment variables.
+    
+    Args:
+        con: DuckDB connection to configure
+    """
+    # Install and load httpfs extension for S3/HTTP access FIRST
+    con.execute("INSTALL httpfs")
+    con.execute("LOAD httpfs")
+    
+    key = os.getenv("AWS_ACCESS_KEY_ID", "")
+    secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    endpoint = os.getenv("AWS_S3_ENDPOINT", "s3.amazonaws.com")
+    region = os.getenv("AWS_REGION", "us-east-1")
+    use_ssl = os.getenv("AWS_HTTPS", "TRUE")
+    
+    # Determine URL style based on endpoint
+    url_style = "vhost" if "amazonaws.com" in endpoint else "path"
+    
+    # Always create secret, even for anonymous/public access (empty key/secret)
+    # USE_SSL must be a string, not boolean!
+    query = f"""
+    CREATE OR REPLACE SECRET s3_secret (
+        TYPE S3,
+        KEY_ID '{key}',
+        SECRET '{secret}',
+        USE_SSL '{use_ssl}',
+        ENDPOINT '{endpoint}',
+        URL_STYLE '{url_style}',
+        REGION '{region}'
+    );
+    """
+    con.execute(query)
 
 
 class S3Manager:

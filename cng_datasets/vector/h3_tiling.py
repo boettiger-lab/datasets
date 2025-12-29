@@ -9,6 +9,7 @@ chunked processing of large datasets.
 from typing import Optional, List, Dict, Any
 import duckdb
 import os
+from cng_datasets.storage.s3 import configure_s3_credentials
 
 
 def geom_to_h3_cells(
@@ -144,30 +145,7 @@ class H3VectorProcessor:
         
     def _configure_credentials(self):
         """Configure S3 credentials for DuckDB using environment variables."""
-        key = os.getenv("AWS_ACCESS_KEY_ID", "")
-        secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        endpoint = os.getenv("AWS_S3_ENDPOINT", "s3.amazonaws.com")
-        region = os.getenv("AWS_REGION", "us-east-1")
-        use_ssl_str = os.getenv("AWS_HTTPS", "TRUE")
-        use_ssl = use_ssl_str.upper() in ["TRUE", "1", "YES"]
-        
-        # Determine URL style based on endpoint
-        url_style = "vhost" if "amazonaws.com" in endpoint else "path"
-        
-        # Always create secret, even for anonymous/public access (empty key/secret)
-        query = f"""
-        CREATE OR REPLACE SECRET s3_secret (
-            TYPE S3,
-            KEY_ID '{key}',
-            SECRET '{secret}',
-            ENDPOINT '{endpoint}',
-            REGION '{region}',
-            URL_COMPATIBILITY_MODE true,
-            USE_SSL {use_ssl},
-            URL_STYLE '{url_style}'
-        );
-        """
-        self.con.execute(query)
+        configure_s3_credentials(self.con)
     
     def _find_geometry_column(self, table_name: str) -> str:
         """Find the geometry column in the table."""

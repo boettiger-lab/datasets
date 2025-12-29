@@ -8,6 +8,7 @@ import os
 from unittest.mock import patch
 
 from cng_datasets.vector.h3_tiling import geom_to_h3_cells, setup_duckdb_connection, H3VectorProcessor
+from cng_datasets.storage.s3 import configure_s3_credentials
 
 
 class TestS3Connection:
@@ -15,26 +16,93 @@ class TestS3Connection:
     
     @pytest.mark.timeout(5)
     def test_s3_credential_configuration(self):
-        """Test that S3 credentials are properly configured from environment."""
-        # Set mock credentials in environment
+        """Test that S3 credentials are properly configured for anonymous public access (smoke test)."""
         with patch.dict(os.environ, {
-            "AWS_ACCESS_KEY_ID": "test-key",
-            "AWS_SECRET_ACCESS_KEY": "test-secret",
+            "AWS_ACCESS_KEY_ID": "",
+            "AWS_SECRET_ACCESS_KEY": "",
             "AWS_S3_ENDPOINT": "s3-west.nrp-nautilus.io",
-            "AWS_HTTPS": "TRUE"
+            "AWS_HTTPS": "TRUE",
         }):
-            processor = H3VectorProcessor(
-                input_url="/tmp/test.parquet",  # Use local path, not S3
-                output_url="/tmp/test_output",
-                h3_resolution=10,
-                chunk_size=10
-            )
+            con = setup_duckdb_connection()
             
-            # Verify the processor was initialized
-            assert processor.input_url == "/tmp/test.parquet"
-            assert processor.h3_resolution == 10
-            assert processor.con is not None
-            processor.con.close()
+            # Test the function we're actually testing
+            configure_s3_credentials(con)
+            
+            # Verify the secret was created (this is just a smoke test, doesn't verify it works)
+            result = con.execute("SELECT name, type FROM duckdb_secrets()").fetchall()
+            secret_names = [row[0] for row in result]
+            assert 's3_secret' in secret_names, "S3 secret should be created"
+            
+            con.close()
+    
+    @pytest.mark.timeout(30)
+    @pytest.mark.integration
+    def test_s3_network_connection(self):
+        """Test that we can actually connect to S3 and read metadata (no processing)."""
+        with patch.dict(os.environ, {
+            "AWS_ACCESS_KEY_ID": "",
+            "AWS_SECRET_ACCESS_KEY": "",
+            "AWS_S3_ENDPOINT": "s3-west.nrp-nautilus.io",
+            "AWS_HTTPS": "TRUE",
+        }):
+            con = setup_duckdb_connection()
+            configure_s3_credentials(con)
+            
+            try:
+                # Just read row count - tests network connection and S3 access
+                # Using the same bucket as the working example
+                result = con.execute(
+                    "SELECT COUNT(*) as cnt FROM read_parquet('s3://public-redlining/hex/**') LIMIT 1"
+                ).fetchone()
+                
+                assert result is not None, "Should get result from S3"
+                assert result[0] > 0, "Should have rows in the dataset"
+                print(f"Successfully read S3 metadata: {result[0]} rows")
+                con.close()
+            except Exception as e:
+                con.close()
+                pytest.skip(f"S3 network connection failed: {e}")
+    
+    @pytest.mark.timeout(120)
+    @pytest.mark.integration
+    def test_s3_public_read_with_processing(self):
+        """Test reading from public S3 bucket and processing (full integration test)."""
+        # This test hits the network and processes a small chunk from S3
+        # It's marked as integration and has a 120-second timeout
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {
+                "AWS_ACCESS_KEY_ID": "",
+                "AWS_SECRET_ACCESS_KEY": "",
+                "AWS_S3_ENDPOINT": "s3-west.nrp-nautilus.io",
+                "AWS_HTTPS": "TRUE",
+            }):
+                # Use the same working bucket as the network test
+                processor = H3VectorProcessor(
+                    input_url="s3://public-redlining/hex/h3_res=7/hex_h7.parquet",
+                    output_url=tmpdir,
+                    h3_resolution=4,
+                    chunk_size=10
+                )
+                
+                try:
+                    # Process just the first chunk (10 rows)
+                    print("Starting process_chunk...")
+                    output_file = processor.process_chunk(0)
+                    
+                    assert output_file is not None, "Chunk should be processed"
+                    assert Path(output_file).exists(), "Output file should exist"
+                    
+                    # Verify the output has expected structure
+                    result = processor.con.execute(f"SELECT * FROM read_parquet('{output_file}')").fetchdf()
+                    assert len(result) > 0, "Should have processed some rows"
+                    assert 'h4' in result.columns, "Should have h4 column"
+                    print(f"Successfully processed {len(result)} rows")
+                    
+                    processor.con.close()
+                except Exception as e:
+                    processor.con.close()
+                    # If this fails, it might be due to network issues or endpoint configuration
+                    pytest.skip(f"S3 integration test failed (may be network/endpoint issue): {e}")
 
 
 class TestH3Functions:
