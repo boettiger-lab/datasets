@@ -3,6 +3,8 @@
 ```{r}
 library(dplyr)
 library(duckdbfs)
+
+
 duckdb_secrets("", "", "s3-west.nrp-nautilus.io")
 
 # edit these filters as you like
@@ -13,13 +15,16 @@ gbif <- open_dataset("s3://public-gbif/2025-06/hex") |>
     )
 
 # hexes
-redlining <- open_dataset("s3://public-redlining/hex")
+redlining <- open_dataset("s3://public-mappinginequality/hex") |>
+    mutate(h0 = as.character(h0))
+
 # compute areas based on hex means
 hex_area <- redlining |>
     group_by(area_id) |>
     summarise(area = n() * 0.015047502)
 
 dt <- redlining |> left_join(gbif, by = c("h0", "h10"))
+
 
 ```
 
@@ -88,8 +93,8 @@ polys <- open_dataset(
     mutate(
         geom = ST_Transform(
             ST_FlipCoordinates(st_MakeValid(geometry)),
-            'EPSG:4326',
-            'EPSG:5070'
+            "EPSG:4326",
+            "EPSG:5070"
         )
     ) |> # lots are lost
     mutate(area = st_area(geom) / 1000000.0) |>
@@ -98,13 +103,15 @@ polys <- open_dataset(
 
 ```{r}
 # check our area math
-area_approx = hex_area |>
+area_approx <- hex_area |>
     rename(hex_area = area) |>
     inner_join(polys) |>
     mutate(ratio = area / hex_area) |>
     arrange(desc(ratio))
 
-area_approx |> pull(ratio) |> hist()
+area_approx |>
+    pull(ratio) |>
+    hist()
 ```
 
 
