@@ -11,23 +11,37 @@ import math
 from .jobs import K8sJobManager
 
 
-def _count_parquet_rows(parquet_url: str) -> int:
+def _count_parquet_rows(parquet_url: str, bucket: str = None) -> int:
     """
     Count rows in a parquet file using DuckDB.
     
     Args:
         parquet_url: S3 URL or local path to parquet file
+        bucket: Optional bucket name for converting s3:// to https://
         
     Returns:
         Number of rows in the parquet file
     """
     import duckdb
-    from ..storage.s3 import configure_s3_credentials
+    import os
     
     con = duckdb.connect()
-    configure_s3_credentials(con)
+    
+    # Install httpfs for remote file access
+    con.execute("INSTALL httpfs")
+    con.execute("LOAD httpfs")
+    
+    # For s3:// URLs without credentials, try public HTTPS URL
+    if parquet_url.startswith('s3://') and not os.getenv("AWS_ACCESS_KEY_ID"):
+        # Convert s3://bucket/path to https://endpoint/bucket/path  
+        path = parquet_url.replace('s3://', '')
+        parquet_url = f"https://s3-west.nrp-nautilus.io/{path}"
+    elif parquet_url.startswith('s3://'):
+        from ..storage.s3 import configure_s3_credentials
+        configure_s3_credentials(con)
     
     result = con.execute(f"SELECT COUNT(*) FROM read_parquet('{parquet_url}')").fetchone()
+    con.close()
     return result[0]
 
 
