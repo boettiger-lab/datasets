@@ -11,16 +11,23 @@ import os
 import duckdb
 
 
-def configure_s3_credentials(con: duckdb.DuckDBPyConnection) -> None:
+def configure_s3_credentials(con) -> None:
     """
     Configure S3 credentials for DuckDB using environment variables.
     
     Args:
-        con: DuckDB connection to configure
+        con: DuckDB connection (raw or ibis) to configure
     """
     # Install and load httpfs extension for S3/HTTP access FIRST
-    con.execute("INSTALL httpfs")
-    con.execute("LOAD httpfs")
+    # Handle both raw DuckDB and Ibis connections
+    if hasattr(con, 'raw_sql'):
+        # Ibis connection
+        con.raw_sql("INSTALL httpfs")
+        con.raw_sql("LOAD httpfs")
+    else:
+        # Raw DuckDB connection
+        con.execute("INSTALL httpfs")
+        con.execute("LOAD httpfs")
     
     key = os.getenv("AWS_ACCESS_KEY_ID", "")
     secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -44,7 +51,10 @@ def configure_s3_credentials(con: duckdb.DuckDBPyConnection) -> None:
         REGION '{region}'
     );
     """
-    con.execute(query)
+    if hasattr(con, 'raw_sql'):
+        con.raw_sql(query)
+    else:
+        con.execute(query)
 
 
 class S3Manager:
