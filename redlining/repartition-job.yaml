@@ -28,7 +28,17 @@ spec:
         - -c
         - 'set -e
 
-          python mappinginequality/repartition.py'
+          cp -r /workspace/datasets /tmp/datasets
+
+          pip install --user -e /tmp/datasets
+
+          export PATH=$HOME/.local/bin:$PATH
+
+
+          cng-datasets repartition --chunks-dir s3://public-mappinginequality/chunks
+          --output-dir s3://public-mappinginequality/hex --cleanup
+
+          '
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
@@ -61,8 +71,8 @@ spec:
         name: repartition-task
         resources:
           limits:
-            cpu: '8'
-            memory: 16Gi
+            cpu: '4'
+            memory: 8Gi
           requests:
             cpu: '4'
             memory: 8Gi

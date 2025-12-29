@@ -7,7 +7,114 @@ using rclone.
 
 from typing import Optional, List, Dict
 import subprocess
+import os
 from pathlib import Path
+
+
+def create_public_bucket(
+    bucket_name: str,
+    remote: str = "nrp",
+    set_cors: bool = True,
+) -> bool:
+    """
+    Create a public bucket with rclone and set it to public read access.
+    
+    Args:
+        bucket_name: Name of the bucket to create
+        remote: Rclone remote name (default: nrp)
+        set_cors: Whether to set CORS headers (default: True)
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Create bucket
+        print(f"Creating bucket: {bucket_name}")
+        result = subprocess.run(
+            ["rclone", "mkdir", f"{remote}:{bucket_name}"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        if result.returncode != 0 and "already exists" not in result.stderr.lower():
+            print(f"Error creating bucket: {result.stderr}")
+            return False
+        
+        # Set public read policy using AWS CLI
+        endpoint = os.getenv("AWS_PUBLIC_ENDPOINT", "s3-west.nrp-nautilus.io")
+        
+        print(f"Setting public read access for bucket: {bucket_name}")
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "PublicReadGetObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::{bucket_name}/*"
+            }]
+        }
+        
+        import json
+        policy_json = json.dumps(policy)
+        
+        result = subprocess.run(
+            [
+                "aws", "s3api", "put-bucket-policy",
+                "--bucket", bucket_name,
+                "--policy", policy_json,
+                "--endpoint-url", f"https://{endpoint}"
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=os.environ.copy()
+        )
+        
+        if result.returncode != 0:
+            print(f"Warning: Could not set public policy: {result.stderr}")
+        else:
+            print(f"✓ Public read access enabled for bucket: {bucket_name}")
+        
+        # Set CORS if requested
+        if set_cors:
+            print(f"Setting CORS configuration for bucket: {bucket_name}")
+            cors_config = {
+                "CORSRules": [{
+                    "AllowedOrigins": ["*"],
+                    "AllowedMethods": ["GET", "HEAD"],
+                    "AllowedHeaders": ["*"],
+                    "ExposeHeaders": ["ETag", "Content-Type", "Content-Disposition"],
+                    "MaxAgeSeconds": 3600
+                }]
+            }
+            
+            cors_json = json.dumps(cors_config)
+            
+            result = subprocess.run(
+                [
+                    "aws", "s3api", "put-bucket-cors",
+                    "--bucket", bucket_name,
+                    "--cors-configuration", cors_json,
+                    "--endpoint-url", f"https://{endpoint}"
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=os.environ.copy()
+            )
+            
+            if result.returncode != 0:
+                print(f"Warning: Could not set CORS: {result.stderr}")
+            else:
+                print(f"✓ CORS configuration set for bucket: {bucket_name}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error creating public bucket: {e}")
+        return False
 
 
 class RcloneSync:

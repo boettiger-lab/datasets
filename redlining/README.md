@@ -15,6 +15,14 @@ This workflow processes historical redlining data into cloud-native formats:
 
 All processing uses the `cng_datasets` Python package for standardized, reusable data processing. Jobs use the `ghcr.io/rocker-org/ml-spatial` image with all dependencies pre-installed, and clone the repository via an initContainer for fast execution.
 
+### Processing Workflow
+
+The H3 hexagonal tiling follows a **two-pass approach** (matching wdpa/):
+1. **Chunking** - Process data in parallel chunks, writing to `s3://public-mappinginequality/chunks/`
+2. **Repartitioning** - Consolidate all chunks into h0-partitioned format in `s3://public-mappinginequality/hex/`, then delete temporary chunks/
+
+This approach enables efficient parallel processing of large datasets while ensuring optimal query performance with h0 partitioning.
+
 ## Quick Start
 
 ### 1. Generate All Workflow Files
@@ -55,10 +63,12 @@ kubectl apply -f repartition-job.yaml -n biodiversity
 ```
 
 The workflow automatically:
-1. Converts GPKG to GeoParquet and PMTiles (parallel)
-2. Processes into H3 hexagons at resolution 10 with parent resolutions
-3. Repartitions by h0 for efficient querying
-4. Runs entirely in K8s (laptop can disconnect)
+1. Creates bucket and sets public read access with CORS
+2. Converts GPKG to GeoParquet and PMTiles (parallel)
+3. Processes into H3 hexagons in chunks (50 chunks, 20 parallel workers → `chunks/`)
+4. Repartitions chunks by h0 for efficient querying (`chunks/` → `hex/`)
+5. Cleans up temporary chunks directory
+6. Runs entirely in K8s (laptop can disconnect)
 
 ## Data Structure
 
@@ -73,9 +83,10 @@ The h0 partitioning enables efficient spatial queries by limiting reads to relev
 
 ## Output Locations
 
-- `s3://public-redlining/mappinginequality.parquet` - GeoParquet
-- `s3://public-redlining/mappinginequality.pmtiles` - PMTiles
-- `s3://public-redlining/hex/` - H3-indexed parquet (partitioned by h0)
+- `s3://public-mappinginequality/mappinginequality.parquet` - GeoParquet
+- `s3://public-mappinginequality/mappinginequality.pmtiles` - PMTiles
+- `s3://public-mappinginequality/chunks/` - Temporary H3 processing chunks (deleted after repartitioning)
+- `s3://public-mappinginequality/hex/` - H3-indexed parquet (partitioned by h0)
 
 ## Cleanup and Reset
 
@@ -87,13 +98,14 @@ kubectl delete job mappinginequality-convert mappinginequality-pmtiles mappingin
 
 ### Delete Data from Bucket
 ```bash
-# Delete all generated data (using mc CLI)
-mc rm --recursive --force nrp/public-mappinginequality/
+# Delete all generated data (using rclone)
+rclone purge nrp:public-mappinginequality
 
 # Or delete specific outputs:
-mc rm nrp/public-mappinginequality/mappinginequality.parquet
-mc rm nrp/public-mappinginequality/mappinginequality.pmtiles
-mc rm --recursive --force nrp/public-mappinginequality/hex/
+rclone delete nrp:public-mappinginequality/mappinginequality.parquet
+rclone delete nrp:public-mappinginequality/mappinginequality.pmtiles
+rclone purge nrp:public-mappinginequality/hex/
+rclone purge nrp:public-mappinginequality/chunks/  # if workflow was interrupted
 ```
 
 ### Complete Reset
@@ -103,13 +115,9 @@ To completely reset and rerun from scratch:
 kubectl delete job mappinginequality-convert mappinginequality-pmtiles mappinginequality-hex mappinginequality-repartition mappinginequality-workflow -n biodiversity --ignore-not-found=true
 
 # 2. Delete all data
-mc rm --recursive --force nrp/public-mappinginequality/
+rclone purge nrp:public-mappinginequality
 
-# 3. Recreate bucket (if deleted)
-mc mb nrp/public-mappinginequality
-mc anonymous set download nrp/public-mappinginequality
-
-# 4. Rerun workflow
+# 3. Rerun workflow (bucket will be recreated automatically)
 kubectl apply -f workflow.yaml -n biodiversity
 ```
 

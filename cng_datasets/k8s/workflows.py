@@ -132,10 +132,19 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
                             {"name": "BUCKET", "value": bucket}
                         ],
-                        "command": ["bash", "-c", f"set -e\n./{output_path.name}/convert_gpkg_to_parquet.sh"],
+                        "command": ["bash", "-c", f"""set -e
+# Create bucket and set public access
+python -c "
+from cng_datasets.storage.rclone import create_public_bucket
+create_public_bucket('{bucket}', remote='nrp', set_cors=True)
+"
+
+# Convert to GeoParquet
+ogr2ogr -f Parquet /vsis3/{bucket}/{dataset_name}.parquet /vsicurl/{source_url} -progress
+"""],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
-                            "limits": {"cpu": "8", "memory": "16Gi"}
+                            "limits": {"cpu": "4", "memory": "8Gi"}
                         }
                     }],
                     "volumes": [{"name": "repo", "emptyDir": {}}]
@@ -222,7 +231,7 @@ rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
-                            "limits": {"cpu": "8", "memory": "16Gi"}
+                            "limits": {"cpu": "4", "memory": "8Gi"}
                         }
                     }],
                     "volumes": [{"name": "repo", "emptyDir": {}}]
@@ -302,10 +311,10 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo):
                             {"name": "BUCKET", "value": bucket},
                             {"name": "DATASET", "value": dataset_name}
                         ],
-                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/datasets /tmp/datasets\npip install --user -e /tmp/datasets\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/hex --chunk-id ${{JOB_COMPLETION_INDEX}} --resolution 10"],
+                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/datasets /tmp/datasets\npip install --user -e /tmp/datasets\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --resolution 10"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
-                            "limits": {"cpu": "8", "memory": "16Gi"}
+                            "limits": {"cpu": "4", "memory": "8Gi"}
                         }
                     }],
                     "volumes": [{"name": "repo", "emptyDir": {}}]
@@ -377,10 +386,16 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "TMPDIR", "value": "/tmp"},
                             {"name": "BUCKET", "value": bucket}
                         ],
-                        "command": ["bash", "-c", f"set -e\npython {dataset_name}/repartition.py"],
+                        "command": ["bash", "-c", f"""set -e
+cp -r /workspace/datasets /tmp/datasets
+pip install --user -e /tmp/datasets
+export PATH=$HOME/.local/bin:$PATH
+
+cng-datasets repartition --chunks-dir s3://{bucket}/chunks --output-dir s3://{bucket}/hex --cleanup
+"""],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
-                            "limits": {"cpu": "8", "memory": "16Gi"}
+                            "limits": {"cpu": "4", "memory": "8Gi"}
                         }
                     }],
                     "volumes": [{"name": "repo", "emptyDir": {}}]

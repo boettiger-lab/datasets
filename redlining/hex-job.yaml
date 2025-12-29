@@ -41,7 +41,7 @@ spec:
           export PATH=$HOME/.local/bin:$PATH
 
           cng-datasets vector --input s3://public-mappinginequality/mappinginequality.parquet
-          --output s3://public-mappinginequality/hex --chunk-id ${JOB_COMPLETION_INDEX}
+          --output s3://public-mappinginequality/chunks --chunk-id ${JOB_COMPLETION_INDEX}
           --resolution 10'
         env:
         - name: AWS_ACCESS_KEY_ID
@@ -77,8 +77,8 @@ spec:
         name: hex-task
         resources:
           limits:
-            cpu: '8'
-            memory: 16Gi
+            cpu: '4'
+            memory: 8Gi
           requests:
             cpu: '4'
             memory: 8Gi

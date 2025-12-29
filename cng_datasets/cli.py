@@ -30,6 +30,12 @@ def main():
     raster_parser.add_argument("--output-parquet", help="Output parquet directory")
     raster_parser.add_argument("--resolution", type=int, default=10, help="H3 resolution")
     
+    # Repartition command
+    repartition_parser = subparsers.add_parser("repartition", help="Repartition chunks by h0")
+    repartition_parser.add_argument("--chunks-dir", required=True, help="Input chunks directory URL")
+    repartition_parser.add_argument("--output-dir", required=True, help="Output directory URL")
+    repartition_parser.add_argument("--cleanup", action="store_true", default=True, help="Remove chunks after repartitioning")
+    
     # K8s job generation command
     k8s_parser = subparsers.add_parser("k8s", help="Generate Kubernetes job")
     k8s_parser.add_argument("--job-name", required=True, help="Job name")
@@ -82,6 +88,14 @@ def main():
         processor.create_cog()
         if args.output_parquet:
             processor.raster_to_h3_parquet()
+    
+    elif args.command == "repartition":
+        from .vector import repartition_by_h0
+        repartition_by_h0(
+            chunks_dir=args.chunks_dir,
+            output_dir=args.output_dir,
+            cleanup=args.cleanup,
+        )
     
     elif args.command == "k8s":
         from .k8s import K8sJobManager
