@@ -153,8 +153,14 @@ def generate_dataset_workflow(
     # Generate workflow RBAC (generic for all cng-datasets workflows)
     _generate_workflow_rbac(namespace, output_path)
     
+    # Build generation command for documentation
+    parent_res_str = ','.join(map(str, parent_resolutions))
+    gen_command = (f"cng-datasets workflow --dataset {dataset_name} "
+                   f"--source-url {source_url} --bucket {bucket} "
+                   f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
+    
     # Generate ConfigMap YAML from job files
-    _generate_configmap(k8s_name, namespace, output_path)
+    _generate_configmap(k8s_name, namespace, output_path, gen_command)
     
     # Generate Argo workflow with ConfigMap-based approach
     _generate_argo_workflow(k8s_name, namespace, output_path, output_dir)
@@ -514,13 +520,14 @@ def _generate_workflow_rbac(namespace, output_path):
         ], f, default_flow_style=False)
 
 
-def _generate_configmap(dataset_name, namespace, output_path):
+def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     """Generate ConfigMap YAML containing all job definitions.
     
     Args:
         dataset_name: Sanitized k8s-compatible dataset name
         namespace: Kubernetes namespace  
         output_path: Path object where YAML files are written
+        gen_command: Command used to generate this workflow
     """
     import yaml
     
@@ -545,6 +552,18 @@ def _generate_configmap(dataset_name, namespace, output_path):
     }
     
     with open(output_path / "configmap.yaml", "w") as f:
+        f.write("# Auto-generated ConfigMap containing job definitions\n")
+        f.write("# Generated from: convert-job.yaml, pmtiles-job.yaml, hex-job.yaml, repartition-job.yaml\n")
+        f.write(f"# Generation command: {gen_command}\n")
+        f.write("#\n")
+        f.write("# This ConfigMap is equivalent to running:\n")
+        f.write(f"#   kubectl create configmap {dataset_name}-yamls \\\n")
+        f.write("#     --from-file=convert-job.yaml \\\n")
+        f.write("#     --from-file=pmtiles-job.yaml \\\n")
+        f.write("#     --from-file=hex-job.yaml \\\n")
+        f.write("#     --from-file=repartition-job.yaml\n")
+        f.write("#\n")
+        f.write("# To update: regenerate workflow with cng-datasets and re-apply with kubectl apply -f configmap.yaml\n")
         yaml.dump(configmap, f, default_flow_style=False)
 
 
