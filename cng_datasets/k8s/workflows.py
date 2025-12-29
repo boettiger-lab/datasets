@@ -228,12 +228,11 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             "name": "install-package",
                             "image": "ghcr.io/rocker-org/ml-spatial",
                             "imagePullPolicy": "Always",
-                            "workingDir": "/workspace/repo",
                             "resources": {
                                 "requests": {"cpu": "1", "memory": "2Gi"},
                                 "limits": {"cpu": "1", "memory": "2Gi"}
                             },
-                            "command": ["bash", "-c", "pip install -e ."],
+                            "command": ["bash", "-c", "cp -r /workspace/repo /tmp/repo && pip install --user -e /tmp/repo"],
                             "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                         }
                     ],
@@ -241,8 +240,6 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                         "name": "convert-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace/repo",
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace/repo"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
                             {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -255,6 +252,9 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"""set -e
+# Install package
+pip install -q git+{git_repo}
+
 # Create bucket and set public access
 python -c "
 from cng_datasets.storage.rclone import create_public_bucket
@@ -309,25 +309,10 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                         }
                     },
                     "restartPolicy": "Never",
-                    "initContainers": [
-                        {
-                            "name": "git-clone",
-                            "image": "alpine/git:2.45.2",
-                            "imagePullPolicy": "IfNotPresent",
-                            "resources": {
-                                "requests": {"cpu": "1", "memory": "1Gi"},
-                                "limits": {"cpu": "1", "memory": "1Gi"}
-                            },
-                            "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
-                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                        }
-                    ],
                     "containers": [{
                         "name": "pmtiles-task",
-                        "image": "ghcr.io/felt/tippecanoe:latest",
-                        "imagePullPolicy": "IfNotPresent",
-                        "workingDir": "/workspace/repo",
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace/repo"}],
+                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "imagePullPolicy": "Always",
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
                             {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -357,8 +342,7 @@ rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
                         }
-                    }],
-                    "volumes": [{"name": "repo", "emptyDir": {}}]
+                    }]
                 }
             }
         }
@@ -437,12 +421,11 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                             "name": "install-package",
                             "image": "ghcr.io/rocker-org/ml-spatial",
                             "imagePullPolicy": "Always",
-                            "workingDir": "/workspace/repo",
                             "resources": {
                                 "requests": {"cpu": "1", "memory": "2Gi"},
                                 "limits": {"cpu": "1", "memory": "2Gi"}
                             },
-                            "command": ["bash", "-c", "pip install -e ."],
+                            "command": ["bash", "-c", "cp -r /workspace/repo /tmp/repo && pip install --user -e /tmp/repo"],
                             "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                         }
                     ],
@@ -450,8 +433,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                         "name": "hex-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace/repo",
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace/repo"}],
+
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
                             {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -465,13 +447,12 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                             {"name": "BUCKET", "value": bucket},
                             {"name": "DATASET", "value": dataset_name}
                         ],
-                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/repo /tmp/repo\npip install --user -e /tmp/repo\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"],
+                        "command": ["bash", "-c", f"set -e\npip install -q git+{git_repo}\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
                         }
-                    }],
-                    "volumes": [{"name": "repo", "emptyDir": {}}]
+                    }]
                 }
             }
         }
@@ -511,37 +492,10 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                         }
                     },
                     "restartPolicy": "Never",
-                    "initContainers": [
-                        {
-                            "name": "git-clone",
-                            "image": "alpine/git:2.45.2",
-                            "imagePullPolicy": "IfNotPresent",
-                            "resources": {
-                                "requests": {"cpu": "1", "memory": "1Gi"},
-                                "limits": {"cpu": "1", "memory": "1Gi"}
-                            },
-                            "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
-                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                        },
-                        {
-                            "name": "install-package",
-                            "image": "ghcr.io/rocker-org/ml-spatial",
-                            "imagePullPolicy": "Always",
-                            "workingDir": "/workspace/repo",
-                            "resources": {
-                                "requests": {"cpu": "1", "memory": "2Gi"},
-                                "limits": {"cpu": "1", "memory": "2Gi"}
-                            },
-                            "command": ["bash", "-c", "pip install -e ."],
-                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                        }
-                    ],
                     "containers": [{
                         "name": "repartition-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace/repo",
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace/repo"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
                             {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -555,14 +509,14 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"""set -e
+pip install -q git+{git_repo}
 cng-datasets repartition --chunks-dir s3://{bucket}/chunks --output-dir s3://{bucket}/hex --cleanup
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
                         }
-                    }],
-                    "volumes": [{"name": "repo", "emptyDir": {}}]
+                    }]
                 }
             }
         }
