@@ -602,15 +602,14 @@ set -e
 echo "Starting {dataset_name} workflow..."
 
 # Run convert and pmtiles in parallel
-echo "Step 1: Converting to GeoParquet and PMTiles (parallel)..."
+echo "Step 1: Converting to GeoParquet and generating PMTiles (parallel)..."
 kubectl apply -f /yamls/convert-job.yaml -n {namespace}
 kubectl apply -f /yamls/pmtiles-job.yaml -n {namespace}
 
-echo "Waiting for conversion jobs to complete..."
+echo "Waiting for GeoParquet conversion to complete..."
 kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-convert -n {namespace}
-kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-pmtiles -n {namespace}
 
-echo "Step 2: H3 hexagonal tiling..."
+echo "Step 2: H3 hexagonal tiling (PMTiles continues in background)..."
 kubectl apply -f /yamls/hex-job.yaml -n {namespace}
 
 echo "Waiting for hex tiling to complete..."
@@ -623,6 +622,7 @@ echo "Waiting for repartition to complete..."
 kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-repartition -n {namespace}
 
 echo "✓ Workflow complete!"
+echo "Note: PMTiles job may still be running in the background"
 echo ""
 echo "Clean up with:"
 echo "  kubectl delete jobs {dataset_name}-convert {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace}"
