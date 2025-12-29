@@ -83,12 +83,12 @@ spec:
         volumeMounts:
         - mountPath: /workspace
           name: repo
-        workingDir: /workspace/datasets
+        workingDir: /workspace
       initContainers:
       - command:
         - sh
         - -lc
-        - git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
+        - git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/repo
         image: alpine/git:2.45.2
         imagePullPolicy: IfNotPresent
         name: git-clone

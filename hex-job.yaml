@@ -2,16 +2,22 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   labels:
-    k8s-app: cpad-2025b-holdings-repartition
-  name: cpad-2025b-holdings-repartition
+    k8s-app: cpad-2025b-holdings-hex
+  name: cpad-2025b-holdings-hex
 spec:
-  backoffLimit: 1
-  completions: 1
-  parallelism: 1
+  backoffLimitPerIndex: 3
+  completionMode: Indexed
+  completions: 200
+  parallelism: 50
+  podFailurePolicy:
+    rules:
+    - action: Ignore
+      onPodConditions:
+      - type: DisruptionTarget
   template:
     metadata:
       labels:
-        k8s-app: cpad-2025b-holdings-repartition
+        k8s-app: cpad-2025b-holdings-hex
     spec:
       affinity:
         nodeAffinity:
@@ -28,17 +34,15 @@ spec:
         - -c
         - 'set -e
 
-          cp -r /workspace/repo /tmp/repo
+          cp -r /workspace/datasets /tmp/datasets
 
-          pip install --user -e /tmp/repo
+          pip install --user -e /tmp/datasets
 
           export PATH=$HOME/.local/bin:$PATH
 
-
-          cng-datasets repartition --chunks-dir s3://public-cpad/chunks --output-dir
-          s3://public-cpad/hex --cleanup
-
-          '
+          cng-datasets vector --input s3://public-cpad/cpad-2025b-holdings.parquet
+          --output s3://public-cpad/chunks --chunk-id ${JOB_COMPLETION_INDEX} --chunk-size
+          803 --resolution 10 --parent-resolutions 9,8,0'
         env:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
@@ -66,9 +70,11 @@ spec:
           value: /tmp
         - name: BUCKET
           value: public-cpad
+        - name: DATASET
+          value: cpad-2025b-holdings
         image: ghcr.io/rocker-org/ml-spatial
         imagePullPolicy: Always
-        name: repartition-task
+        name: hex-task
         resources:
           limits:
             cpu: '4'
@@ -79,12 +85,12 @@ spec:
         volumeMounts:
         - mountPath: /workspace
           name: repo
-        workingDir: /workspace
+        workingDir: /workspace/datasets
       initContainers:
       - command:
         - sh
         - -lc
-        - git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/repo
+        - git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
         image: alpine/git:2.45.2
         imagePullPolicy: IfNotPresent
         name: git-clone

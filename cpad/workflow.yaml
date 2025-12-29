@@ -8,23 +8,31 @@ spec:
     spec:
       containers:
       - args:
-        - "\nset -e\ncd /workspace/datasets/redlining\n\necho \"Starting cpad-2025b-holdings\
-          \ workflow...\"\n\n# Run convert and pmtiles in parallel\necho \"Step 1:\
-          \ Converting to GeoParquet and PMTiles (parallel)...\"\nkubectl apply -f\
-          \ convert-job.yaml -n gpn\nkubectl apply -f pmtiles-job.yaml -n gpn\n\n\
-          echo \"Waiting for conversion jobs to complete...\"\nkubectl wait --for=condition=complete\
-          \ --timeout=3600s job/cpad-2025b-holdings-convert -n gpn\nkubectl wait --for=condition=complete\
-          \ --timeout=3600s job/cpad-2025b-holdings-pmtiles -n gpn\n\necho \"Step\
-          \ 2: H3 hexagonal tiling (50 chunks, 20 parallel)...\"\nkubectl apply -f\
-          \ hex-job.yaml -n gpn\n\necho \"Waiting for hex tiling to complete...\"\n\
-          kubectl wait --for=condition=complete --timeout=7200s job/cpad-2025b-holdings-hex\
-          \ -n gpn\n\necho \"Step 3: Repartitioning by h0...\"\nkubectl apply -f repartition-job.yaml\
-          \ -n gpn\n\necho \"Waiting for repartition to complete...\"\nkubectl wait\
-          \ --for=condition=complete --timeout=3600s job/cpad-2025b-holdings-repartition\
-          \ -n gpn\n\necho \"\u2713 Workflow complete!\"\necho \"\"\necho \"Clean\
-          \ up jobs with:\"\necho \"  kubectl delete jobs cpad-2025b-holdings-convert\
-          \ cpad-2025b-holdings-pmtiles cpad-2025b-holdings-hex cpad-2025b-holdings-repartition\
-          \ -n gpn\"\n"
+        - '
+
+          set -e
+
+
+          echo "Starting cpad-2025b-holdings workflow..."
+
+          echo "Note: Apply jobs from your local machine with:"
+
+          echo "  kubectl apply -f convert-job.yaml"
+
+          echo "  kubectl apply -f pmtiles-job.yaml"
+
+          echo "  kubectl apply -f hex-job.yaml"
+
+          echo "  kubectl apply -f repartition-job.yaml"
+
+          echo ""
+
+          echo "This orchestrator job is deprecated. Use ''kubectl apply'' directly
+          from the output directory."
+
+          exit 1
+
+          '
         command:
         - bash
         - -c
@@ -42,7 +50,7 @@ spec:
           name: workspace
       initContainers:
       - args:
-        - git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/datasets
+        - git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/repo
         command:
         - sh
         - -c

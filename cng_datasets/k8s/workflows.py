@@ -209,14 +209,14 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             "requests": {"cpu": "1", "memory": "1Gi"},
                             "limits": {"cpu": "1", "memory": "1Gi"}
                         },
-                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/datasets"],
+                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                     }],
                     "containers": [{
                         "name": "convert-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace/datasets",
+                        "workingDir": "/workspace",
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
@@ -292,14 +292,14 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                             "requests": {"cpu": "1", "memory": "1Gi"},
                             "limits": {"cpu": "1", "memory": "1Gi"}
                         },
-                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/datasets"],
+                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                     }],
                     "containers": [{
                         "name": "pmtiles-task",
-                        "image": "ghcr.io/rocker-org/ml-spatial",
-                        "imagePullPolicy": "Always",
-                        "workingDir": "/workspace/datasets",
+                        "image": "ghcr.io/felt/tippecanoe:latest",
+                        "imagePullPolicy": "IfNotPresent",
+                        "workingDir": "/workspace",
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
@@ -402,14 +402,14 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                             "requests": {"cpu": "1", "memory": "1Gi"},
                             "limits": {"cpu": "1", "memory": "1Gi"}
                         },
-                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/datasets"],
+                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                     }],
                     "containers": [{
                         "name": "hex-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace/datasets",
+                        "workingDir": "/workspace",
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
@@ -424,7 +424,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                             {"name": "BUCKET", "value": bucket},
                             {"name": "DATASET", "value": dataset_name}
                         ],
-                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/datasets /tmp/datasets\npip install --user -e /tmp/datasets\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"],
+                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/repo /tmp/repo\npip install --user -e /tmp/repo\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
@@ -478,14 +478,14 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             "requests": {"cpu": "1", "memory": "1Gi"},
                             "limits": {"cpu": "1", "memory": "1Gi"}
                         },
-                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/datasets"],
+                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                     }],
                     "containers": [{
                         "name": "repartition-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace/datasets",
+                        "workingDir": "/workspace",
                         "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
@@ -500,8 +500,8 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"""set -e
-cp -r /workspace/datasets /tmp/datasets
-pip install --user -e /tmp/datasets
+cp -r /workspace/repo /tmp/repo
+pip install --user -e /tmp/repo
 export PATH=$HOME/.local/bin:$PATH
 
 cng-datasets repartition --chunks-dir s3://{bucket}/chunks --output-dir s3://{bucket}/hex --cleanup
@@ -555,7 +555,11 @@ def _generate_workflow_rbac(namespace, output_path):
 
 
 def _generate_argo_workflow(dataset_name, namespace, output_path):
-    """Generate K8s Job that orchestrates the workflow."""
+    """Generate K8s Job that orchestrates the workflow.
+    
+    Args:
+        dataset_name: Sanitized k8s-compatible dataset name (with hyphens)
+    """
     import yaml
     
     workflow_job = {
@@ -574,7 +578,7 @@ def _generate_argo_workflow(dataset_name, namespace, output_path):
                         "name": "git-clone",
                         "image": "alpine/git:2.45.2",
                         "command": ["sh", "-c"],
-                        "args": ["git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/datasets"],
+                        "args": ["git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/repo"],
                         "volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}]
                     }],
                     "containers": [{
@@ -583,35 +587,16 @@ def _generate_argo_workflow(dataset_name, namespace, output_path):
                         "command": ["bash", "-c"],
                         "args": [f"""
 set -e
-cd /workspace/datasets/redlining
 
 echo "Starting {dataset_name} workflow..."
-
-# Run convert and pmtiles in parallel
-echo "Step 1: Converting to GeoParquet and PMTiles (parallel)..."
-kubectl apply -f convert-job.yaml -n {namespace}
-kubectl apply -f pmtiles-job.yaml -n {namespace}
-
-echo "Waiting for conversion jobs to complete..."
-kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-convert -n {namespace}
-kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-pmtiles -n {namespace}
-
-echo "Step 2: H3 hexagonal tiling (50 chunks, 20 parallel)..."
-kubectl apply -f hex-job.yaml -n {namespace}
-
-echo "Waiting for hex tiling to complete..."
-kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
-
-echo "Step 3: Repartitioning by h0..."
-kubectl apply -f repartition-job.yaml -n {namespace}
-
-echo "Waiting for repartition to complete..."
-kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-repartition -n {namespace}
-
-echo "✓ Workflow complete!"
+echo "Note: Apply jobs from your local machine with:"
+echo "  kubectl apply -f convert-job.yaml"
+echo "  kubectl apply -f pmtiles-job.yaml"
+echo "  kubectl apply -f hex-job.yaml"
+echo "  kubectl apply -f repartition-job.yaml"
 echo ""
-echo "Clean up jobs with:"
-echo "  kubectl delete jobs {dataset_name}-convert {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition -n {namespace}"
+echo "This orchestrator job is deprecated. Use 'kubectl apply' directly from the output directory."
+exit 1
 """],
                         "resources": {
                             "requests": {"cpu": "500m", "memory": "512Mi"},

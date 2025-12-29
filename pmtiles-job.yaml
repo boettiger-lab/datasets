@@ -2,8 +2,8 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   labels:
-    k8s-app: cpad-2025b-holdings-repartition
-  name: cpad-2025b-holdings-repartition
+    k8s-app: cpad_2025b_holdings-pmtiles
+  name: cpad_2025b_holdings-pmtiles
 spec:
   backoffLimit: 1
   completions: 1
@@ -11,7 +11,7 @@ spec:
   template:
     metadata:
       labels:
-        k8s-app: cpad-2025b-holdings-repartition
+        k8s-app: cpad_2025b_holdings-pmtiles
     spec:
       affinity:
         nodeAffinity:
@@ -28,15 +28,25 @@ spec:
         - -c
         - 'set -e
 
-          cp -r /workspace/repo /tmp/repo
+          # Convert GPKG to GeoJSONSeq for tippecanoe (read directly via vsicurl)
 
-          pip install --user -e /tmp/repo
+          ogr2ogr -f GeoJSONSeq /tmp/mappinginequality.geojsonl /vsicurl/https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Holdings/CPAD_2025b_Holdings.shp
+          -progress
 
-          export PATH=$HOME/.local/bin:$PATH
+
+          # Generate PMTiles from GeoJSONSeq
+
+          tippecanoe -o /tmp/mappinginequality.pmtiles -l redlining --drop-densest-as-needed
+          --extend-zooms-if-still-dropping --force /tmp/mappinginequality.geojsonl
 
 
-          cng-datasets repartition --chunks-dir s3://public-cpad/chunks --output-dir
-          s3://public-cpad/hex --cleanup
+          # Upload to S3
+
+          mc alias set s3 https://$AWS_PUBLIC_ENDPOINT $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY
+
+          mc cp /tmp/mappinginequality.pmtiles s3/public-cpad/mappinginequality.pmtiles
+
+          rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
 
           '
         env:
@@ -66,9 +76,11 @@ spec:
           value: /tmp
         - name: BUCKET
           value: public-cpad
+        - name: SOURCE_URL
+          value: https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Holdings/CPAD_2025b_Holdings.shp
         image: ghcr.io/rocker-org/ml-spatial
         imagePullPolicy: Always
-        name: repartition-task
+        name: pmtiles-task
         resources:
           limits:
             cpu: '4'
@@ -79,12 +91,12 @@ spec:
         volumeMounts:
         - mountPath: /workspace
           name: repo
-        workingDir: /workspace
+        workingDir: /workspace/datasets
       initContainers:
       - command:
         - sh
         - -lc
-        - git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/repo
+        - git clone --depth 1 "https://github.com/boettiger-lab/datasets.git" /workspace/datasets
         image: alpine/git:2.45.2
         imagePullPolicy: IfNotPresent
         name: git-clone
