@@ -31,14 +31,13 @@ def _count_parquet_rows(parquet_url: str, bucket: str = None) -> int:
     con.execute("INSTALL httpfs")
     con.execute("LOAD httpfs")
     
-    # For s3:// URLs without credentials, try public HTTPS URL
-    if parquet_url.startswith('s3://') and not os.getenv("AWS_ACCESS_KEY_ID"):
+    # For public s3:// URLs, convert to https://
+    if parquet_url.startswith('s3://'):
         # Convert s3://bucket/path to https://endpoint/bucket/path  
         path = parquet_url.replace('s3://', '')
-        parquet_url = f"https://s3-west.nrp-nautilus.io/{path}"
-    elif parquet_url.startswith('s3://'):
-        from ..storage.s3 import configure_s3_credentials
-        configure_s3_credentials(con)
+        https_url = f"https://s3-west.nrp-nautilus.io/{path}"
+        print(f"Using public HTTPS URL: {https_url}")
+        parquet_url = https_url
     
     result = con.execute(f"SELECT COUNT(*) FROM read_parquet('{parquet_url}')").fetchone()
     con.close()
