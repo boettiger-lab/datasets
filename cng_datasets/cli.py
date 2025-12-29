@@ -50,7 +50,7 @@ def main():
     workflow_parser.add_argument("--dataset", required=True, help="Dataset name (e.g., redlining)")
     workflow_parser.add_argument("--source-url", required=True, help="Source data URL")
     workflow_parser.add_argument("--bucket", required=True, help="S3 bucket for outputs")
-    workflow_parser.add_argument("--output-dir", default=".", help="Output directory for YAML files")
+    workflow_parser.add_argument("--output-dir", default="k8s", help="Output directory for YAML files")
     workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
     workflow_parser.add_argument("--h3-resolution", type=int, default=10, help="Target H3 resolution (default: 10)")
     workflow_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")

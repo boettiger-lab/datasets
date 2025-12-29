@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Auto-generated Kubernetes workflow YAML files (in k8s/ subdirectories)
+**/k8s/
+
 # C extensions
 *.so
 

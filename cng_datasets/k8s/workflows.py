@@ -123,7 +123,7 @@ def generate_dataset_workflow(
     _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
     
     # Generate pmtiles job
-    _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo)
+    _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
     
     # Count features in source file and calculate chunking parameters
     print(f"Counting features in {source_url}...")
@@ -153,8 +153,8 @@ def generate_dataset_workflow(
     # Generate workflow RBAC (generic for all cng-datasets workflows)
     _generate_workflow_rbac(namespace, output_path)
     
-    # Generate Argo workflow
-    _generate_argo_workflow(k8s_name, namespace, output_path)
+    # Generate Argo workflow with ConfigMap-based approach
+    _generate_argo_workflow(k8s_name, namespace, output_path, output_dir)
     
     print(f"\n✓ Generated complete workflow for {dataset_name}")
     print(f"\nFiles created in {output_dir}:")
@@ -162,11 +162,22 @@ def generate_dataset_workflow(
     print(f"  - pmtiles-job.yaml")
     print(f"  - hex-job.yaml")
     print(f"  - repartition-job.yaml")
-    print(f"  - workflow-rbac.yaml")
-    print(f"  - workflow.yaml")
+    print(f"  - workflow-rbac.yaml (generic, reusable)")
+    print(f"  - workflow.yaml (orchestrator)")
     print(f"\nTo run:")
+    print(f"  # One-time RBAC setup")
     print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
+    print(f"")
+    print(f"  # Create ConfigMap from job YAMLs and run workflow")
+    print(f"  kubectl create configmap {k8s_name}-yamls \\")
+    print(f"    --from-file={output_dir}/convert-job.yaml \\")
+    print(f"    --from-file={output_dir}/pmtiles-job.yaml \\")
+    print(f"    --from-file={output_dir}/hex-job.yaml \\")
+    print(f"    --from-file={output_dir}/repartition-job.yaml")
     print(f"  kubectl apply -f {output_dir}/workflow.yaml")
+    print(f"")
+    print(f"  # Monitor progress")
+    print(f"  kubectl logs -f job/{k8s_name}-workflow")
 
 
 def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
@@ -554,13 +565,18 @@ def _generate_workflow_rbac(namespace, output_path):
         ], f, default_flow_style=False)
 
 
-def _generate_argo_workflow(dataset_name, namespace, output_path):
-    """Generate K8s Job that orchestrates the workflow.
+def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir):
+    """Generate K8s Job that orchestrates the workflow using a ConfigMap.
     
     Args:
         dataset_name: Sanitized k8s-compatible dataset name (with hyphens)
+        namespace: Kubernetes namespace
+        output_path: Path object where YAML files are written
+        output_dir: String path to YAML directory for kubectl create configmap command
     """
     import yaml
+    
+    configmap_name = f"{dataset_name}-yamls"
     
     workflow_job = {
         "apiVersion": "batch/v1",
@@ -574,13 +590,6 @@ def _generate_argo_workflow(dataset_name, namespace, output_path):
                 "spec": {
                     "serviceAccountName": "cng-datasets-workflow",
                     "restartPolicy": "OnFailure",
-                    "initContainers": [{
-                        "name": "git-clone",
-                        "image": "alpine/git:2.45.2",
-                        "command": ["sh", "-c"],
-                        "args": ["git clone --depth 1 https://github.com/boettiger-lab/datasets.git /workspace/repo"],
-                        "volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}]
-                    }],
                     "containers": [{
                         "name": "workflow",
                         "image": "bitnami/kubectl:latest",
@@ -589,27 +598,43 @@ def _generate_argo_workflow(dataset_name, namespace, output_path):
 set -e
 
 echo "Starting {dataset_name} workflow..."
-echo "Note: Apply jobs from your local machine with:"
-echo "  kubectl apply -f convert-job.yaml"
-echo "  kubectl apply -f pmtiles-job.yaml"
-echo "  kubectl apply -f hex-job.yaml"
-echo "  kubectl apply -f repartition-job.yaml"
+
+# Run convert and pmtiles in parallel
+echo "Step 1: Converting to GeoParquet and PMTiles (parallel)..."
+kubectl apply -f /yamls/convert-job.yaml -n {namespace}
+kubectl apply -f /yamls/pmtiles-job.yaml -n {namespace}
+
+echo "Waiting for conversion jobs to complete..."
+kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-convert -n {namespace}
+kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-pmtiles -n {namespace}
+
+echo "Step 2: H3 hexagonal tiling..."
+kubectl apply -f /yamls/hex-job.yaml -n {namespace}
+
+echo "Waiting for hex tiling to complete..."
+kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
+
+echo "Step 3: Repartitioning by h0..."
+kubectl apply -f /yamls/repartition-job.yaml -n {namespace}
+
+echo "Waiting for repartition to complete..."
+kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-repartition -n {namespace}
+
+echo "✓ Workflow complete!"
 echo ""
-echo "This orchestrator job is deprecated. Use 'kubectl apply' directly from the output directory."
-exit 1
+echo "Clean up with:"
+echo "  kubectl delete jobs {dataset_name}-convert {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace}"
+echo "  kubectl delete configmap {configmap_name} -n {namespace}"
 """],
                         "resources": {
                             "requests": {"cpu": "500m", "memory": "512Mi"},
                             "limits": {"cpu": "500m", "memory": "512Mi"}
                         },
-                        "volumeMounts": [{
-                            "name": "workspace",
-                            "mountPath": "/workspace"
-                        }]
+                        "volumeMounts": [{"name": "yamls", "mountPath": "/yamls"}]
                     }],
                     "volumes": [{
-                        "name": "workspace",
-                        "emptyDir": {}
+                        "name": "yamls",
+                        "configMap": {"name": configmap_name}
                     }]
                 }
             },

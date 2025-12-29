@@ -55,7 +55,6 @@ cng-datasets workflow \
   --bucket public-mappinginequality \
   --h3-resolution 10 \
   --parent-resolutions "9,8,0"
-  # --namespace defaults to "biodiversity"
 ```
 
 This generates all required Kubernetes job configurations:
@@ -63,26 +62,33 @@ This generates all required Kubernetes job configurations:
 - `pmtiles-job.yaml` - PMTiles vector tile generation
 - `hex-job.yaml` - H3 hexagonal tiling (automatic chunking based on dataset size)
 - `repartition-job.yaml` - Consolidate chunks by h0 partition
-- `workflow.yaml` - K8s Job orchestrator (runs in cluster)
-- `workflow-rbac.yaml` - Kubernetes RBAC permissions
+- `workflow.yaml` - K8s Job orchestrator (runs jobs sequentially)
+- `workflow-rbac.yaml` - Kubernetes RBAC permissions (generic, one per namespace)
 
 ### 2. Run the Workflow
 
 ```bash
-# First-time setup: create RBAC permissions
-kubectl apply -f workflow-rbac.yaml
+# One-time RBAC setup
+kubectl apply -f k8s/workflow-rbac.yaml
 
-# Run the complete automated workflow (K8s orchestrator)
-kubectl apply -f workflow.yaml -n biodiversity
+# Create ConfigMap from job YAMLs and run workflow
+kubectl create configmap mappinginequality-yamls \
+  --from-file=k8s/convert-job.yaml \
+  --from-file=k8s/pmtiles-job.yaml \
+  --from-file=k8s/hex-job.yaml \
+  --from-file=k8s/repartition-job.yaml
+kubectl apply -f k8s/workflow.yaml
 
 # Monitor progress
-kubectl logs -f job/mappinginequality-workflow -n biodiversity
+kubectl logs -f job/mappinginequality-workflow
+```
 
-# Or run jobs individually:
-kubectl apply -f convert-job.yaml -n biodiversity
-kubectl apply -f pmtiles-job.yaml -n biodiversity
-kubectl apply -f hex-job.yaml -n biodiversity
-kubectl apply -f repartition-job.yaml -n biodiversity
+The workflow automatically orchestrates all steps in sequence. You can also run jobs individually:
+```bash
+kubectl apply -f convert-job.yaml
+kubectl apply -f pmtiles-job.yaml
+kubectl apply -f hex-job.yaml
+kubectl apply -f repartition-job.yaml
 ```
 
 The workflow automatically:
@@ -115,8 +121,9 @@ The h0 partitioning enables efficient spatial queries by limiting reads to relev
 
 ### Delete All Jobs
 ```bash
-# Delete all redlining jobs
-kubectl delete job mappinginequality-convert mappinginequality-pmtiles mappinginequality-hex mappinginequality-repartition mappinginequality-workflow -n biodiversity --ignore-not-found=true
+# Delete all redlining jobs and ConfigMap
+kubectl delete job mappinginequality-convert mappinginequality-pmtiles mappinginequality-hex mappinginequality-repartition mappinginequality-workflow --ignore-not-found=true
+kubectl delete configmap mappinginequality-yamls --ignore-not-found=true
 ```
 
 ### Delete Data from Bucket
@@ -134,28 +141,34 @@ rclone purge nrp:public-mappinginequality/chunks/  # if workflow was interrupted
 ### Complete Reset
 To completely reset and rerun from scratch:
 ```bash
-# 1. Delete all jobs
-kubectl delete job mappinginequality-convert mappinginequality-pmtiles mappinginequality-hex mappinginequality-repartition mappinginequality-workflow -n biodiversity --ignore-not-found=true
+# 1. Delete all jobs and ConfigMap
+kubectl delete job mappinginequality-convert mappinginequality-pmtiles mappinginequality-hex mappinginequality-repartition mappinginequality-workflow --ignore-not-found=true
+kubectl delete configmap mappinginequality-yamls --ignore-not-found=true
 
 # 2. Delete all data
 rclone purge nrp:public-mappinginequality
 
-# 3. Rerun workflow (bucket will be recreated automatically)
-kubectl apply -f workflow.yaml -n biodiversity
+# 3. Rerun workflow
+kubectl create configmap mappinginequality-yamls \
+  --from-file=k8s/convert-job.yaml \
+  --from-file=k8s/pmtiles-job.yaml \
+  --from-file=k8s/hex-job.yaml \
+  --from-file=k8s/repartition-job.yaml
+kubectl apply -f k8s/workflow.yaml
 ```
 
 ### Check Job Status
 ```bash
 # List all jobs
-kubectl get jobs -n biodiversity | grep mappinginequality
+kubectl get jobs | grep mappinginequality
 
 # Check specific job status
-kubectl describe job mappinginequality-hex -n biodiversity
+kubectl describe job mappinginequality-hex
 
 # View logs
-kubectl logs job/mappinginequality-convert -n biodiversity
-kubectl logs job/mappinginequality-hex-0-xxxxx -n biodiversity  # specific pod
+kubectl logs job/mappinginequality-convert
+kubectl logs job/mappinginequality-hex-0-xxxxx  # specific pod
 
 # List all pods for a job
-kubectl get pods -n biodiversity | grep mappinginequality-hex
+kubectl get pods | grep mappinginequality-hex
 ```

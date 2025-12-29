@@ -11,31 +11,18 @@ rclone copy CPAD_Release_2025b/ nrp:public-cpad/2025b/ -P
 
 ```bash
 cng-datasets workflow \
-  --dataset cpad_2025b_holdings \
+  --dataset cpad-2025b-holdings \
   --source-url https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Holdings/CPAD_2025b_Holdings.shp \
   --bucket public-cpad \
   --h3-resolution 10 \
-  --parent-resolutions "9,8,0" \
-  --namespace gpn \
-  --output-dir .
+  --parent-resolutions "9,8,0"
 ```
 
-Then run the jobs:
-```bash
-# Optional: Create RBAC once (only needed first time)
-kubectl apply -f workflow-rbac.yaml
 
-# Run jobs in sequence:
-kubectl apply -f convert-job.yaml
-kubectl wait --for=condition=complete --timeout=3600s job/cpad-2025b-holdings-convert -n gpn
 
-kubectl apply -f hex-job.yaml  
-kubectl wait --for=condition=complete --timeout=7200s job/cpad-2025b-holdings-hex -n gpn
-
-kubectl apply -f repartition-job.yaml
-kubectl wait --for=condition=complete --timeout=3600s job/cpad-2025b-holdings-repartition -n gpn
 ```
-
+kubectl logs -f job/cpad-2025b-holdings-workflow
+```
 
 CCED: California Conservation Easements Database
 
