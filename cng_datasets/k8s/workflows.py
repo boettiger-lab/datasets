@@ -212,23 +212,37 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                         }
                     },
                     "restartPolicy": "Never",
-                    "initContainers": [{
-                        "name": "git-clone",
-                        "image": "alpine/git:2.45.2",
-                        "imagePullPolicy": "IfNotPresent",
-                        "resources": {
-                            "requests": {"cpu": "1", "memory": "1Gi"},
-                            "limits": {"cpu": "1", "memory": "1Gi"}
+                    "initContainers": [
+                        {
+                            "name": "git-clone",
+                            "image": "alpine/git:2.45.2",
+                            "imagePullPolicy": "IfNotPresent",
+                            "resources": {
+                                "requests": {"cpu": "1", "memory": "1Gi"},
+                                "limits": {"cpu": "1", "memory": "1Gi"}
+                            },
+                            "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
+                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                         },
-                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                    }],
+                        {
+                            "name": "install-package",
+                            "image": "ghcr.io/rocker-org/ml-spatial",
+                            "imagePullPolicy": "Always",
+                            "workingDir": "/workspace/repo",
+                            "resources": {
+                                "requests": {"cpu": "1", "memory": "2Gi"},
+                                "limits": {"cpu": "1", "memory": "2Gi"}
+                            },
+                            "command": ["bash", "-c", "pip install -e ."],
+                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
+                        }
+                    ],
                     "containers": [{
                         "name": "convert-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace",
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
+                        "workingDir": "/workspace/repo",
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace/repo"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
                             {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -295,23 +309,25 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                         }
                     },
                     "restartPolicy": "Never",
-                    "initContainers": [{
-                        "name": "git-clone",
-                        "image": "alpine/git:2.45.2",
-                        "imagePullPolicy": "IfNotPresent",
-                        "resources": {
-                            "requests": {"cpu": "1", "memory": "1Gi"},
-                            "limits": {"cpu": "1", "memory": "1Gi"}
-                        },
-                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                    }],
+                    "initContainers": [
+                        {
+                            "name": "git-clone",
+                            "image": "alpine/git:2.45.2",
+                            "imagePullPolicy": "IfNotPresent",
+                            "resources": {
+                                "requests": {"cpu": "1", "memory": "1Gi"},
+                                "limits": {"cpu": "1", "memory": "1Gi"}
+                            },
+                            "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
+                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
+                        }
+                    ],
                     "containers": [{
                         "name": "pmtiles-task",
                         "image": "ghcr.io/felt/tippecanoe:latest",
                         "imagePullPolicy": "IfNotPresent",
-                        "workingDir": "/workspace",
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
+                        "workingDir": "/workspace/repo",
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace/repo"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
                             {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -405,23 +421,37 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                         }
                     },
                     "restartPolicy": "Never",
-                    "initContainers": [{
-                        "name": "git-clone",
-                        "image": "alpine/git:2.45.2",
-                        "imagePullPolicy": "IfNotPresent",
-                        "resources": {
-                            "requests": {"cpu": "1", "memory": "1Gi"},
-                            "limits": {"cpu": "1", "memory": "1Gi"}
+                    "initContainers": [
+                        {
+                            "name": "git-clone",
+                            "image": "alpine/git:2.45.2",
+                            "imagePullPolicy": "IfNotPresent",
+                            "resources": {
+                                "requests": {"cpu": "1", "memory": "1Gi"},
+                                "limits": {"cpu": "1", "memory": "1Gi"}
+                            },
+                            "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
+                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                         },
-                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                    }],
+                        {
+                            "name": "install-package",
+                            "image": "ghcr.io/rocker-org/ml-spatial",
+                            "imagePullPolicy": "Always",
+                            "workingDir": "/workspace/repo",
+                            "resources": {
+                                "requests": {"cpu": "1", "memory": "2Gi"},
+                                "limits": {"cpu": "1", "memory": "2Gi"}
+                            },
+                            "command": ["bash", "-c", "pip install -e ."],
+                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
+                        }
+                    ],
                     "containers": [{
                         "name": "hex-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace",
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
+                        "workingDir": "/workspace/repo",
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace/repo"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
                             {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -481,23 +511,37 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                         }
                     },
                     "restartPolicy": "Never",
-                    "initContainers": [{
-                        "name": "git-clone",
-                        "image": "alpine/git:2.45.2",
-                        "imagePullPolicy": "IfNotPresent",
-                        "resources": {
-                            "requests": {"cpu": "1", "memory": "1Gi"},
-                            "limits": {"cpu": "1", "memory": "1Gi"}
+                    "initContainers": [
+                        {
+                            "name": "git-clone",
+                            "image": "alpine/git:2.45.2",
+                            "imagePullPolicy": "IfNotPresent",
+                            "resources": {
+                                "requests": {"cpu": "1", "memory": "1Gi"},
+                                "limits": {"cpu": "1", "memory": "1Gi"}
+                            },
+                            "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
+                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
                         },
-                        "command": ["sh", "-lc", f"git clone --depth 1 \"{git_repo}\" /workspace/repo"],
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
-                    }],
+                        {
+                            "name": "install-package",
+                            "image": "ghcr.io/rocker-org/ml-spatial",
+                            "imagePullPolicy": "Always",
+                            "workingDir": "/workspace/repo",
+                            "resources": {
+                                "requests": {"cpu": "1", "memory": "2Gi"},
+                                "limits": {"cpu": "1", "memory": "2Gi"}
+                            },
+                            "command": ["bash", "-c", "pip install -e ."],
+                            "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}]
+                        }
+                    ],
                     "containers": [{
                         "name": "repartition-task",
                         "image": "ghcr.io/rocker-org/ml-spatial",
                         "imagePullPolicy": "Always",
-                        "workingDir": "/workspace",
-                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace"}],
+                        "workingDir": "/workspace/repo",
+                        "volumeMounts": [{"name": "repo", "mountPath": "/workspace/repo"}],
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
                             {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -511,10 +555,6 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"""set -e
-cp -r /workspace/repo /tmp/repo
-pip install --user -e /tmp/repo
-export PATH=$HOME/.local/bin:$PATH
-
 cng-datasets repartition --chunks-dir s3://{bucket}/chunks --output-dir s3://{bucket}/hex --cleanup
 """],
                         "resources": {
