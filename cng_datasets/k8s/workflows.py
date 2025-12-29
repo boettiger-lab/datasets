@@ -7,7 +7,52 @@ multiple coordinated Kubernetes jobs.
 
 from typing import Optional, Dict, Any
 from pathlib import Path
+import math
 from .jobs import K8sJobManager
+
+
+def _count_parquet_rows(parquet_url: str) -> int:
+    """
+    Count rows in a parquet file using DuckDB.
+    
+    Args:
+        parquet_url: S3 URL or local path to parquet file
+        
+    Returns:
+        Number of rows in the parquet file
+    """
+    import duckdb
+    from ..storage.s3 import configure_s3_credentials
+    
+    con = duckdb.connect()
+    configure_s3_credentials(con)
+    
+    result = con.execute(f"SELECT COUNT(*) FROM read_parquet('{parquet_url}')").fetchone()
+    return result[0]
+
+
+def _calculate_chunking(total_rows: int, max_completions: int = 200, max_parallelism: int = 50) -> tuple[int, int, int]:
+    """
+    Calculate optimal chunk size, completions, and parallelism.
+    
+    Args:
+        total_rows: Total number of rows/features in dataset
+        max_completions: Maximum number of job completions (default: 200)
+        max_parallelism: Maximum parallelism (default: 50)
+        
+    Returns:
+        Tuple of (chunk_size, completions, parallelism)
+    """
+    # Calculate chunk size to stay under max_completions
+    chunk_size = math.ceil(total_rows / max_completions)
+    
+    # Calculate actual number of completions needed
+    completions = math.ceil(total_rows / chunk_size)
+    
+    # Set parallelism to min of max_parallelism or completions
+    parallelism = min(max_parallelism, completions)
+    
+    return chunk_size, completions, parallelism
 
 
 def generate_dataset_workflow(
@@ -47,8 +92,18 @@ def generate_dataset_workflow(
     # Generate pmtiles job
     _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo)
     
+    # Count rows and calculate chunking parameters
+    parquet_url = f"s3://{bucket}/{dataset_name}.parquet"
+    print(f"Counting rows in {parquet_url}...")
+    total_rows = _count_parquet_rows(parquet_url)
+    chunk_size, completions, parallelism = _calculate_chunking(total_rows)
+    print(f"  Total rows: {total_rows:,}")
+    print(f"  Chunk size: {chunk_size:,}")
+    print(f"  Completions: {completions}")
+    print(f"  Parallelism: {parallelism}")
+    
     # Generate hex tiling job
-    _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo)
+    _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism)
     
     # Generate repartition job
     _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo)
@@ -242,7 +297,7 @@ rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism):
     """Generate H3 hex tiling job."""
     job_spec = {
         "apiVersion": "batch/v1",
@@ -252,8 +307,8 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo):
             "labels": {"k8s-app": f"{dataset_name}-hex"}
         },
         "spec": {
-            "completions": 50,
-            "parallelism": 20,
+            "completions": completions,
+            "parallelism": parallelism,
             "completionMode": "Indexed",
             "backoffLimitPerIndex": 3,
             "podFailurePolicy": {
@@ -311,7 +366,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo):
                             {"name": "BUCKET", "value": bucket},
                             {"name": "DATASET", "value": dataset_name}
                         ],
-                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/datasets /tmp/datasets\npip install --user -e /tmp/datasets\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --resolution 10"],
+                        "command": ["bash", "-c", f"set -e\ncp -r /workspace/datasets /tmp/datasets\npip install --user -e /tmp/datasets\nexport PATH=$HOME/.local/bin:$PATH\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution 10"],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
