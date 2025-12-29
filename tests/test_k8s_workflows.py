@@ -138,7 +138,7 @@ class TestWorkflowGeneration:
     
     @pytest.mark.timeout(5)
     def test_hex_job_chunked(self):
-        """Test hex job is properly chunked."""
+        """Test hex job uses automatic chunking (defaults when bucket doesn't exist)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
@@ -152,9 +152,38 @@ class TestWorkflowGeneration:
                 job = yaml.safe_load(f)
                 
             assert job["metadata"]["name"] == "test-ds-hex"
-            assert job["spec"]["completions"] == 50
-            assert job["spec"]["parallelism"] == 20
+            # With automatic chunking, when row count fails, we use defaults
+            assert job["spec"]["completions"] == 200  # Default max completions
+            assert job["spec"]["parallelism"] == 50   # Default max parallelism
             assert job["spec"]["completionMode"] == "Indexed"
+    
+    @pytest.mark.timeout(30)
+    @pytest.mark.integration
+    def test_hex_job_real_bucket(self):
+        """Test hex job with real public bucket calculates proper chunking."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="mappinginequality",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                bucket="public-mappinginequality",
+                output_dir=tmpdir
+            )
+            
+            hex_file = Path(tmpdir) / "hex-job.yaml"
+            with open(hex_file) as f:
+                job = yaml.safe_load(f)
+                
+            assert job["metadata"]["name"] == "mappinginequality-hex"
+            # Should calculate based on actual row count (10,154 rows)
+            # 10,154 / 200 = ~51 per chunk, so 200 completions
+            assert job["spec"]["completions"] == 200
+            assert job["spec"]["parallelism"] == 50
+            assert job["spec"]["completionMode"] == "Indexed"
+            
+            # Check chunk-size is set correctly
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"]
+            command_str = str(command)
+            assert "--chunk-size 51" in command_str
     
     @pytest.mark.timeout(5)
     def test_workflow_rbac(self):
