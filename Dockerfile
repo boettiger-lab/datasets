@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y \
     gdal-bin \
     git \
     libgdal-dev \
+    libarrow-dev \
+    libparquet-dev \
     rclone \
     build-essential \
     curl \
