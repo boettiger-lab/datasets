@@ -21,10 +21,10 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
       
-    - name: Install GDAL
+    - name: Install GDAL + rclone
       run: |
         sudo apt-get update
-        sudo apt-get install -y gdal-bin
+        sudo apt-get install -y gdal-bin rclone
           
     - name: Cache pip packages
       uses: actions/cache@v4

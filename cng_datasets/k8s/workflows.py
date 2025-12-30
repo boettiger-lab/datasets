@@ -82,7 +82,7 @@ def generate_dataset_workflow(
     bucket: str,
     output_dir: str = ".",
     namespace: str = "biodiversity",
-    image: str = "ghcr.io/rocker-org/ml-spatial",
+    image: str = "ghcr.io/boettiger-lab/datasets:latest",
     git_repo: str = "https://github.com/boettiger-lab/datasets.git",
     h3_resolution: int = 10,
     parent_resolutions: Optional[List[int]] = None,
@@ -232,7 +232,7 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                     "restartPolicy": "Never",
                     "containers": [{
                         "name": "convert-task",
-                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "image": "ghcr.io/boettiger-lab/datasets:latest",
                         "imagePullPolicy": "Always",
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
@@ -241,31 +241,15 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
                             {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", f"""set -e
-# Install package
 pip install -q git+{git_repo}
-
-# Create bucket and set public access
-python -c "
-from cng_datasets.storage.rclone import create_public_bucket
-create_public_bucket('{bucket}', remote='nrp', set_cors=True)
-"
-
-# Convert to GeoParquet with optimizations
-# -lco COMPRESSION=ZSTD: Better compression than default
-# -lco ROW_GROUP_SIZE=65536: Optimize for reading chunks
-# -lco FID=: Preserve feature IDs
-# -lco GEOMETRY_ENCODING=WKB: Standard geometry encoding
-ogr2ogr -f Parquet /vsis3/{bucket}/{dataset_name}.parquet /vsicurl/{source_url} \\
-  -lco COMPRESSION=ZSTD \\
-  -lco ROW_GROUP_SIZE=65536 \\
-  -lco FID= \\
-  -lco GEOMETRY_ENCODING=WKB \\
-  -progress
+cng-convert-to-parquet \\
+  {source_url} \\
+  /vsis3/{bucket}/{dataset_name}.parquet \\
+  --bucket {bucket} \\
+  --create-bucket
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
@@ -313,7 +297,7 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                     "restartPolicy": "Never",
                     "containers": [{
                         "name": "pmtiles-task",
-                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "image": "ghcr.io/boettiger-lab/datasets:latest",
                         "imagePullPolicy": "Always",
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
@@ -322,8 +306,6 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
                             {"name": "TMPDIR", "value": "/tmp"},
                             {"name": "BUCKET", "value": bucket},
                             {"name": "SOURCE_URL", "value": source_url}
@@ -422,7 +404,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                     "restartPolicy": "Never",
                     "containers": [{
                         "name": "hex-task",
-                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "image": "ghcr.io/boettiger-lab/datasets:latest",
                         "imagePullPolicy": "Always",
 
                         "env": [
@@ -432,8 +414,6 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                             {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
                             {"name": "TMPDIR", "value": "/tmp"},
                             {"name": "BUCKET", "value": bucket},
                             {"name": "DATASET", "value": dataset_name}
@@ -485,7 +465,7 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                     "restartPolicy": "Never",
                     "containers": [{
                         "name": "repartition-task",
-                        "image": "ghcr.io/rocker-org/ml-spatial",
+                        "image": "ghcr.io/boettiger-lab/datasets:latest",
                         "imagePullPolicy": "Always",
                         "env": [
                             {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
@@ -494,8 +474,6 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
                             {"name": "TMPDIR", "value": "/tmp"},
                             {"name": "BUCKET", "value": bucket}
                         ],

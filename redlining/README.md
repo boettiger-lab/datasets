@@ -13,7 +13,7 @@ This workflow processes historical redlining data into cloud-native formats:
 2. **PMTiles** - Vector tiles for web mapping
 3. **H3-indexed Parquet** - Hexagonal tiling at resolution 10 with parent hexes (h9, h8, h0)
 
-All processing uses the `cng_datasets` Python package for standardized, reusable data processing. Jobs use the `ghcr.io/rocker-org/ml-spatial` image with all dependencies pre-installed, and clone the repository via an initContainer for fast execution.
+All processing uses the `cng_datasets` Python package for standardized, reusable data processing. Jobs use the `ghcr.io/boettiger-lab/datasets` image with all dependencies pre-installed, and clone the repository via an initContainer for fast execution.
 
 ### H3 Resolution Configuration
 

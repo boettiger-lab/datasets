@@ -83,7 +83,7 @@ completionMode: Indexed # Each job gets unique index 0-121
 ```
 
 **Job configuration:**
-- Image: `ghcr.io/rocker-org/ml-spatial`
+- Image: `ghcr.io/boettiger-lab/datasets`
 - Resources: 4 CPU cores, 34 GiB RAM per task
 - Priority: Opportunistic (can be pre-empted)
 - Init container clones GitHub repo with processing scripts

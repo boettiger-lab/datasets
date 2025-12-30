@@ -36,6 +36,7 @@ dev = [
 
 [project.scripts]
 cng-datasets = "cng_datasets.cli:main"
+cng-convert-to-parquet = "cng_datasets.vector.convert_to_parquet:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
