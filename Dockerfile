@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     python3.12 \
     python3-pip \
     gdal-bin \
+    gdal-plugins \
     git \
     libgdal-dev \
     rclone \
