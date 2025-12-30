@@ -10,7 +10,12 @@ RUN apt-get update && apt-get install -y \
     libgdal-dev \
     rclone \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install tippecanoe from GitHub releases
+RUN curl -L https://github.com/felt/tippecanoe/releases/download/2.62.1/tippecanoe-linux-amd64 -o /usr/local/bin/tippecanoe && \
+    chmod +x /usr/local/bin/tippecanoe
 
 # Set GDAL environment variables
 ENV GDAL_CONFIG=/usr/bin/gdal-config
