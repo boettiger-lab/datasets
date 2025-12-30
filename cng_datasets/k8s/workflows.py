@@ -85,7 +85,10 @@ def generate_dataset_workflow(
     image: str = "ghcr.io/rocker-org/ml-spatial",
     git_repo: str = "https://github.com/boettiger-lab/datasets.git",
     h3_resolution: int = 10,
-    parent_resolutions: Optional[List[int]] = None
+    parent_resolutions: Optional[List[int]] = None,
+    hex_memory: str = "8Gi",
+    max_parallelism: int = 50,
+    max_completions: int = 200
 ):
     """
     Generate complete workflow for a dataset.
@@ -107,6 +110,9 @@ def generate_dataset_workflow(
         git_repo: Git repository URL for package source
         h3_resolution: Target H3 resolution for tiling (default: 10)
         parent_resolutions: List of parent H3 resolutions to include (default: [9, 8, 0])
+        hex_memory: Memory request/limit for hex job pods (default: "8Gi")
+        max_parallelism: Maximum parallelism for hex jobs (default: 50)
+        max_completions: Maximum job completions - increase to reduce chunk size (default: 200)
     """
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
@@ -129,7 +135,7 @@ def generate_dataset_workflow(
     print(f"Counting features in {source_url}...")
     try:
         total_rows = _count_source_features(source_url)
-        chunk_size, completions, parallelism = _calculate_chunking(total_rows)
+        chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
         print(f"  Total features: {total_rows:,}")
         print(f"  Chunk size: {chunk_size:,}")
         print(f"  Completions: {completions}")
@@ -138,14 +144,14 @@ def generate_dataset_workflow(
         # Fall back to default values if counting fails (e.g., in tests or if file doesn't exist yet)
         print(f"  Warning: Could not count features ({e}). Using default chunking parameters.")
         total_rows = 10000  # Default assumption
-        chunk_size, completions, parallelism = _calculate_chunking(total_rows)
+        chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
         print(f"  Using defaults: chunk_size={chunk_size}, completions={completions}, parallelism={parallelism}")
     
     print(f"  H3 resolution: {h3_resolution}")
     print(f"  Parent resolutions: {parent_resolutions}")
     
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, hex_memory)
     
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo)
@@ -247,8 +253,17 @@ from cng_datasets.storage.rclone import create_public_bucket
 create_public_bucket('{bucket}', remote='nrp', set_cors=True)
 "
 
-# Convert to GeoParquet
-ogr2ogr -f Parquet /vsis3/{bucket}/{dataset_name}.parquet /vsicurl/{source_url} -progress
+# Convert to GeoParquet with optimizations
+# -lco COMPRESSION=ZSTD: Better compression than default
+# -lco ROW_GROUP_SIZE=65536: Optimize for reading chunks
+# -lco FID=: Preserve feature IDs
+# -lco GEOMETRY_ENCODING=WKB: Standard geometry encoding
+ogr2ogr -f Parquet /vsis3/{bucket}/{dataset_name}.parquet /vsicurl/{source_url} \\
+  -lco COMPRESSION=ZSTD \\
+  -lco ROW_GROUP_SIZE=65536 \\
+  -lco FID= \\
+  -lco GEOMETRY_ENCODING=WKB \\
+  -progress
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
@@ -335,7 +350,7 @@ rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, hex_memory="8Gi"):
     """Generate H3 hex tiling job.
     
     Args:
@@ -349,6 +364,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
         parallelism: Number of parallel jobs
         h3_resolution: Target H3 resolution (e.g., 10)
         parent_resolutions: List of parent resolutions (e.g., [9, 8, 0])
+        hex_memory: Memory request/limit (e.g., "8Gi", "16Gi")
     """
     # Format parent resolutions as comma-separated string
     parent_res_str = ','.join(map(str, parent_resolutions))
@@ -410,8 +426,8 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                         ],
                         "command": ["bash", "-c", f"set -e\npip install -q git+{git_repo}\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"],
                         "resources": {
-                            "requests": {"cpu": "4", "memory": "8Gi"},
-                            "limits": {"cpu": "4", "memory": "8Gi"}
+                            "requests": {"cpu": "4", "memory": hex_memory},
+                            "limits": {"cpu": "4", "memory": hex_memory}
                         }
                     }]
                 }

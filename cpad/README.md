@@ -15,6 +15,9 @@ cng-datasets workflow \
   --source-url https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Holdings/CPAD_2025b_Holdings.shp \
   --bucket public-cpad \
   --h3-resolution 10 \
+  --hex-memory 400Gi \
+  --max-completions 400 \
+  --max-parallelism 5 \
   --parent-resolutions "9,8,0"
 ```
 

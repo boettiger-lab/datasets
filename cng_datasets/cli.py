@@ -54,6 +54,9 @@ def main():
     workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
     workflow_parser.add_argument("--h3-resolution", type=int, default=10, help="Target H3 resolution (default: 10)")
     workflow_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
+    workflow_parser.add_argument("--hex-memory", type=str, default="8Gi", help="Memory per hex job pod (default: 8Gi)")
+    workflow_parser.add_argument("--max-parallelism", type=int, default=50, help="Maximum parallel hex jobs (default: 50)")
+    workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
     
     # Storage management command
     storage_parser = subparsers.add_parser("storage", help="Manage cloud storage")
@@ -131,6 +134,9 @@ def main():
             namespace=args.namespace,
             h3_resolution=args.h3_resolution,
             parent_resolutions=parent_res,
+            hex_memory=args.hex_memory,
+            max_parallelism=args.max_parallelism,
+            max_completions=args.max_completions,
         )
     
     elif args.command == "storage":
