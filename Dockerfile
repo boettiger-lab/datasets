@@ -34,8 +34,7 @@ COPY README_PACKAGE.md .
 COPY cng_datasets/ ./cng_datasets/
 
 # Upgrade pip and install the package
-RUN python -m pip install --upgrade pip && \
-    pip install -e .
+RUN pip3 install -e . --break-system-packages
 
 # Set Python to run in unbuffered mode (recommended for containers)
 ENV PYTHONUNBUFFERED=1
