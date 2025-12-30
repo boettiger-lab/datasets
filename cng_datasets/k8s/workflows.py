@@ -487,7 +487,7 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                         ],
                         "command": ["bash", "-c", f"""set -e
 pip install -q git+{git_repo}
-cng-datasets repartition --chunks-dir s3://{bucket}/chunks --output-dir s3://{bucket}/hex --cleanup
+cng-datasets repartition --chunks-dir s3://{bucket}/chunks --output-dir s3://{bucket}/hex --source-parquet s3://{bucket}/{dataset_name}.parquet --cleanup
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},

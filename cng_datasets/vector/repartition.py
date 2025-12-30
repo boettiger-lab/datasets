@@ -15,14 +15,17 @@ from cng_datasets.storage.s3 import configure_s3_credentials
 def repartition_by_h0(
     chunks_dir: str,
     output_dir: str,
+    source_parquet: str = None,
     cleanup: bool = True,
 ) -> None:
     """
     Repartition chunks by h0 for efficient spatial querying.
+    Joins back attribute columns from source parquet (without geometry).
     
     Args:
         chunks_dir: S3 URL or local path to chunks directory
         output_dir: S3 URL or local path to output directory
+        source_parquet: S3 URL to original parquet (for joining attributes)
         cleanup: Whether to remove chunks directory after repartitioning
     """
     print(f"Repartitioning chunks from {chunks_dir} to {output_dir}")
@@ -38,8 +41,53 @@ def repartition_by_h0(
     local_dir = '/tmp/hex'
     os.makedirs(local_dir, exist_ok=True)
     
-    print('Reading chunks and writing to local directory with h0 partitioning...')
-    con.read_parquet(f'{chunks_dir}/*.parquet').to_parquet(f'{local_dir}/', partition_by='h0')
+    # Read chunks (contains: fid, h10, h9, h8, h0)
+    chunks = con.read_parquet(f'{chunks_dir}/*.parquet')
+    
+    # If source parquet provided, join back all attributes (except geometry)
+    if source_parquet:
+        print(f'Joining attributes from {source_parquet}...')
+        
+        # Read source and identify geometry/ID column
+        source = con.read_parquet(source_parquet)
+        source_cols = source.columns
+        
+        # Find geometry column to exclude
+        geom_col = None
+        for col in ['geometry', 'geom', 'shape', 'GEOMETRY', 'GEOM', 'SHAPE']:
+            if col in source_cols:
+                geom_col = col
+                break
+        
+        # Find ID column
+        id_col = None
+        for col in ['FID', 'fid', 'OBJECTID', 'objectid', 'ID', 'id', '_fid']:
+            if col in source_cols:
+                id_col = col
+                break
+        
+        if not id_col:
+            print('⚠ No ID column found in source, proceeding without attribute join')
+            result = chunks
+        else:
+            # Select all columns except geometry, rename ID column to fid for join
+            attr_cols = [c for c in source_cols if c != geom_col]
+            if id_col != 'fid':
+                # Rename ID column to match chunks
+                source = source.rename({id_col: 'fid'})
+                attr_cols = ['fid' if c == id_col else c for c in attr_cols]
+            
+            print(f'  Joining on column: {id_col} → fid')
+            print(f'  Adding {len(attr_cols) - 1} attribute columns')
+            
+            # Join chunks with attributes
+            result = chunks.inner_join(source.select(attr_cols), 'fid')
+    else:
+        print('No source parquet provided, proceeding without attribute join')
+        result = chunks
+    
+    print('Writing to local directory with h0 partitioning...')
+    result.to_parquet(f'{local_dir}/', partition_by='h0')
     
     print('Uploading partitioned data to S3...')
     con.read_parquet(f'{local_dir}/**/*.parquet').to_parquet(f'{output_dir}/', partition_by='h0')

@@ -35,6 +35,7 @@ def main():
     repartition_parser = subparsers.add_parser("repartition", help="Repartition chunks by h0")
     repartition_parser.add_argument("--chunks-dir", required=True, help="Input chunks directory URL")
     repartition_parser.add_argument("--output-dir", required=True, help="Output directory URL")
+    repartition_parser.add_argument("--source-parquet", required=True, help="Source parquet with full attributes")
     repartition_parser.add_argument("--cleanup", action="store_true", default=True, help="Remove chunks after repartitioning")
     
     # K8s job generation command
@@ -103,6 +104,7 @@ def main():
         repartition_by_h0(
             chunks_dir=args.chunks_dir,
             output_dir=args.output_dir,
+            source_parquet=args.source_parquet,
             cleanup=args.cleanup,
         )
     

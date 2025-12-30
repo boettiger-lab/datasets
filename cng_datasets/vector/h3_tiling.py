@@ -99,6 +99,9 @@ def setup_duckdb_connection(
     con.execute(f"SET http_retries={http_retries}")
     con.execute(f"SET http_retry_wait_ms={http_retry_wait_ms}")
     
+    # Configure temp directory for spill-to-disk operations
+    con.execute("SET temp_directory='/tmp'")
+    
     return con
 
 
@@ -171,8 +174,21 @@ class H3VectorProcessor:
         Returns:
             Output file path if successful, None if chunk_id out of range
         """
-        # Create a view of the source table
-        self.con.execute(f"CREATE OR REPLACE VIEW source_table AS SELECT * FROM read_parquet('{self.input_url}')")
+        # Read only the chunk we need with column projection for speed
+        # Use LIMIT/OFFSET with parquet metadata for efficient chunk selection
+        offset = chunk_id * self.chunk_size
+        
+        self.con.execute(f"""
+            CREATE OR REPLACE VIEW source_table AS 
+            SELECT * FROM read_parquet('{self.input_url}')
+            LIMIT {self.chunk_size} OFFSET {offset}
+        """)
+        
+        # Get row count to validate chunk
+        chunk_rows = self.con.execute("SELECT COUNT(*) FROM source_table").fetchone()[0]
+        if chunk_rows == 0:
+            print(f"Chunk {chunk_id} is empty (offset {offset:,} beyond data)")
+            return None
         
         # Find and rename geometry column
         geom_col = self._find_geometry_column('source_table')
@@ -181,42 +197,42 @@ class H3VectorProcessor:
         result = self.con.execute("SELECT * FROM source_table LIMIT 0").description
         all_columns = [col[0] for col in result]
         
-        # Get column names to keep (all except geom by default)
-        if keep_cols is None:
-            keep_cols = [col for col in all_columns if col != geom_col]
+        # Find or create a unique ID column
+        id_col = None
+        for col in ['FID', 'fid', 'OBJECTID', 'objectid', 'ID', 'id']:
+            if col in all_columns:
+                id_col = col
+                break
         
-        # Calculate chunk boundaries
-        total_rows = self.con.execute("SELECT COUNT(*) FROM source_table").fetchone()[0]
-        num_chunks = (total_rows + self.chunk_size - 1) // self.chunk_size
+        # If no ID column exists, create a row_number as ID
+        if id_col is None:
+            print("  No ID column found, creating row_number as _fid")
+            id_col = '_fid'
+            self.con.execute(f"""
+                CREATE OR REPLACE VIEW source_table_with_id AS 
+                SELECT row_number() OVER () - 1 + {offset} AS {id_col}, *
+                FROM source_table
+            """)
+            chunk_view_name = 'source_table_with_id'
+        else:
+            print(f"  Using existing ID column: {id_col}")
+            chunk_view_name = 'source_table'
         
-        print(f"Total rows: {total_rows:,}")
-        print(f"Chunk size: {self.chunk_size:,}")
-        print(f"Number of chunks: {num_chunks}")
+        print(f"\nProcessing chunk {chunk_id} ({chunk_rows:,} rows)")
         
-        # Check if chunk_id is valid
-        if chunk_id < 0 or chunk_id >= num_chunks:
-            print(f"Index {chunk_id} out of range [0, {num_chunks - 1}].")
-            return None
-        
-        offset = chunk_id * self.chunk_size
-        print(f"\nProcessing chunk {chunk_id + 1}/{num_chunks} "
-              f"(rows {offset:,} to {min(offset + self.chunk_size, total_rows):,})")
-        
-        # Create chunk view with renamed geometry column
-        col_list = ', '.join([f'"{col}"' for col in keep_cols])
+        # Create optimized chunk view with ONLY ID and geometry (minimal memory for UNNEST)
         self.con.execute(f"""
             CREATE OR REPLACE VIEW chunk_table AS 
-            SELECT {col_list}, {geom_col} AS geom
-            FROM source_table
-            LIMIT {self.chunk_size} OFFSET {offset}
+            SELECT "{id_col}" AS fid, {geom_col} AS geom
+            FROM {chunk_view_name}
         """)
         
-        # Convert to H3 cells
+        # Convert to H3 cells - only keeping ID column
         h3_sql = geom_to_h3_cells(
             self.con, 
             'chunk_table', 
             zoom=self.h3_resolution, 
-            keep_cols=keep_cols
+            keep_cols=['fid']  # Only keep ID for minimal memory during UNNEST
         )
         
         # Build final query with unnested h3 cells and parent resolutions
@@ -229,8 +245,9 @@ class H3VectorProcessor:
         
         parent_cols_str = ', ' + ', '.join(parent_cols) if parent_cols else ''
         
+        # UNNEST with only ID + h3 cells (minimal RAM usage!)
         final_sql = f"""
-            SELECT {col_list}, 
+            SELECT fid, 
                    UNNEST(h3id) AS {h3_col}
                    {parent_cols_str}
             FROM ({h3_sql})
@@ -239,7 +256,14 @@ class H3VectorProcessor:
         # Generate output file path
         output_file = f"{self.output_url}/chunk_{chunk_id:06d}.parquet"
         
-        self.con.execute(f"COPY ({final_sql}) TO '{output_file}' (FORMAT PARQUET)")
+        # Write with compression and row group optimization
+        self.con.execute(f"""
+            COPY ({final_sql}) 
+            TO '{output_file}' 
+            (FORMAT PARQUET, 
+             COMPRESSION 'ZSTD',
+             ROW_GROUP_SIZE 100000)
+        """)
         
         print(f"  ✓ Chunk {chunk_id} written to {output_file}")
         return output_file
