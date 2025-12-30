@@ -1,4 +1,4 @@
-FROM ghcr.io/osgeo/gdal:ubuntu-small-3.10.0
+FROM ghcr.io/osgeo/gdal:ubuntu-full-latest
 
 # Set working directory
 WORKDIR /app
