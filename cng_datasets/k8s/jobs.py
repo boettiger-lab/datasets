@@ -167,8 +167,16 @@ class K8sJobManager:
     
     def save_job_yaml(self, job_spec: Dict[str, Any], output_path: str):
         """Save job specification to YAML file."""
+        # Custom representer for multi-line strings to use literal style
+        def str_representer(dumper, data):
+            if '\n' in data:
+                return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+            return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+        
+        yaml.add_representer(str, str_representer)
+        
         with open(output_path, 'w') as f:
-            yaml.dump(job_spec, f, default_flow_style=False)
+            yaml.dump(job_spec, f, default_flow_style=False, sort_keys=False)
         print(f"Job YAML saved to {output_path}")
     
     def submit_job(self, job_spec: Dict[str, Any]) -> str:
