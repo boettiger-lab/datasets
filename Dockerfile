@@ -1,15 +1,18 @@
-FROM python:3.12-slim
+FROM ubuntu:24.04
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies including GDAL and rclone
+# Install system dependencies including GDAL with Parquet support
 RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    && add-apt-repository ppa:ubuntugis/ubuntugis-unstable \
+    && apt-get update && apt-get install -y \
+    python3.12 \
+    python3-pip \
     gdal-bin \
     git \
     libgdal-dev \
-    libarrow-dev \
-    libparquet-dev \
     rclone \
     build-essential \
     curl \
