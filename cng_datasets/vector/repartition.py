@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import ibis
 from cng_datasets.storage.s3 import configure_s3_credentials
+from cng_datasets.vector.h3_tiling import identify_id_column
 
 
 def repartition_by_h0(
@@ -41,47 +42,50 @@ def repartition_by_h0(
     local_dir = '/tmp/hex'
     os.makedirs(local_dir, exist_ok=True)
     
-    # Read chunks (contains: fid, h10, h9, h8, h0)
+    # Read chunks (sparse format: ID_column, h10, h9, h8, h0)
     chunks = con.read_parquet(f'{chunks_dir}/*.parquet')
+    chunk_cols = chunks.columns
+    
+    # Identify ID column in chunks (it's the non-h3 column)
+    chunk_id_col = None
+    for col in chunk_cols:
+        if not col.startswith('h') or not col[1:].isdigit():
+            chunk_id_col = col
+            break
+    
+    if not chunk_id_col:
+        raise ValueError(f"Could not identify ID column in chunks. Columns: {chunk_cols}")
+    
+    print(f"Chunks ID column: {chunk_id_col}")
     
     # If source parquet provided, join back all attributes (except geometry)
     if source_parquet:
         print(f'Joining attributes from {source_parquet}...')
         
-        # Read source and identify geometry/ID column
+        # Read source to get column info
         source = con.read_parquet(source_parquet)
         source_cols = source.columns
         
-        # Find geometry column to exclude
+        # Use helper to find geometry column (case-insensitive)
+        col_lower_map = {col.lower(): col for col in source_cols}
         geom_col = None
-        for col in ['geometry', 'geom', 'shape', 'GEOMETRY', 'GEOM', 'SHAPE']:
-            if col in source_cols:
-                geom_col = col
+        for name in ['geometry', 'geom', 'shape']:
+            if name in col_lower_map:
+                geom_col = col_lower_map[name]
                 break
         
-        # Find ID column
-        id_col = None
-        for col in ['FID', 'fid', 'OBJECTID', 'objectid', 'ID', 'id', '_fid']:
-            if col in source_cols:
-                id_col = col
-                break
+        # Verify the chunk ID column exists in source
+        if chunk_id_col not in source_cols:
+            raise ValueError(f"Chunk ID column '{chunk_id_col}' not found in source parquet. Source columns: {source_cols}")
         
-        if not id_col:
-            print('⚠ No ID column found in source, proceeding without attribute join')
-            result = chunks
-        else:
-            # Select all columns except geometry, rename ID column to fid for join
-            attr_cols = [c for c in source_cols if c != geom_col]
-            if id_col != 'fid':
-                # Rename ID column to match chunks
-                source = source.rename({id_col: 'fid'})
-                attr_cols = ['fid' if c == id_col else c for c in attr_cols]
-            
-            print(f'  Joining on column: {id_col} → fid')
-            print(f'  Adding {len(attr_cols) - 1} attribute columns')
-            
-            # Join chunks with attributes
-            result = chunks.inner_join(source.select(attr_cols), 'fid')
+        # Select all columns except geometry (keep original ID column name)
+        attr_cols = [c for c in source_cols if c != geom_col]
+        
+        print(f'  Joining on column: {chunk_id_col}')
+        print(f'  Adding {len(attr_cols) - 1} attribute columns')
+        
+        # Join chunks with attributes (using the ID column from chunks)
+        result = chunks.inner_join(source.select(attr_cols), chunk_id_col)
     else:
         print('No source parquet provided, proceeding without attribute join')
         result = chunks

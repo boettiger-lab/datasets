@@ -86,6 +86,7 @@ def generate_dataset_workflow(
     git_repo: str = "https://github.com/boettiger-lab/datasets.git",
     h3_resolution: int = 10,
     parent_resolutions: Optional[List[int]] = None,
+    id_column: Optional[str] = None,
     hex_memory: str = "8Gi",
     max_parallelism: int = 50,
     max_completions: int = 200
@@ -110,6 +111,7 @@ def generate_dataset_workflow(
         git_repo: Git repository URL for package source
         h3_resolution: Target H3 resolution for tiling (default: 10)
         parent_resolutions: List of parent H3 resolutions to include (default: [9, 8, 0])
+        id_column: ID column name (auto-detected if not specified)
         hex_memory: Memory request/limit for hex job pods (default: "8Gi")
         max_parallelism: Maximum parallelism for hex jobs (default: 50)
         max_completions: Maximum job completions - increase to reduce chunk size (default: 200)
@@ -151,7 +153,7 @@ def generate_dataset_workflow(
     print(f"  Parent resolutions: {parent_resolutions}")
     
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, hex_memory)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory)
     
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo)
@@ -350,7 +352,7 @@ rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, hex_memory="8Gi"):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi"):
     """Generate H3 hex tiling job.
     
     Args:
@@ -364,10 +366,22 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
         parallelism: Number of parallel jobs
         h3_resolution: Target H3 resolution (e.g., 10)
         parent_resolutions: List of parent resolutions (e.g., [9, 8, 0])
+        id_column: ID column name (auto-detected if None)
         hex_memory: Memory request/limit (e.g., "8Gi", "16Gi")
     """
     # Format parent resolutions as comma-separated string
     parent_res_str = ','.join(map(str, parent_resolutions))
+    
+    # Build command with optional id-column parameter
+    cmd_parts = [
+        "set -e",
+        f"pip install -q git+{git_repo}",
+        f"cng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
+    ]
+    if id_column:
+        cmd_parts[-1] += f" --id-column {id_column}"
+    
+    command_str = "\n".join(cmd_parts)
     
     job_spec = {
         "apiVersion": "batch/v1",
@@ -424,7 +438,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
                             {"name": "BUCKET", "value": bucket},
                             {"name": "DATASET", "value": dataset_name}
                         ],
-                        "command": ["bash", "-c", f"set -e\npip install -q git+{git_repo}\ncng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"],
+                        "command": ["bash", "-c", command_str],
                         "resources": {
                             "requests": {"cpu": "4", "memory": hex_memory},
                             "limits": {"cpu": "4", "memory": hex_memory}

@@ -6,10 +6,85 @@ into H3 hexagonal cells at specified resolutions, with support for
 chunked processing of large datasets.
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import duckdb
 import os
 from cng_datasets.storage.s3 import configure_s3_credentials
+
+
+def identify_id_column(
+    con: duckdb.DuckDBPyConnection,
+    table_name: str,
+    specified_id_col: Optional[str] = None,
+    check_uniqueness: bool = True,
+) -> Tuple[str, bool]:
+    """
+    Identify or validate an ID column in a table.
+    
+    Uses case-insensitive matching to find common ID column names, or validates
+    a user-specified column. Optionally checks for uniqueness.
+    
+    Args:
+        con: DuckDB connection
+        table_name: Name of the table or view to check
+        specified_id_col: User-specified ID column name (if provided)
+        check_uniqueness: Whether to validate that the ID column is unique
+        
+    Returns:
+        Tuple of (column_name, is_unique) where:
+        - column_name: Actual column name in the table (preserving case)
+        - is_unique: True if column is unique (or check was skipped)
+        
+    Raises:
+        ValueError: If specified column not found or uniqueness check fails
+    """
+    # Get all column names
+    result = con.execute(f"SELECT * FROM {table_name} LIMIT 0").description
+    all_columns = [col[0] for col in result]
+    
+    # If user specified a column, validate it exists
+    if specified_id_col:
+        # Case-insensitive search
+        col_lower_map = {col.lower(): col for col in all_columns}
+        actual_col = col_lower_map.get(specified_id_col.lower())
+        
+        if not actual_col:
+            raise ValueError(f"Specified ID column '{specified_id_col}' not found in table. Available columns: {', '.join(all_columns)}")
+        
+        id_col = actual_col
+    else:
+        # Auto-detect common ID column names (case-insensitive)
+        col_lower_map = {col.lower(): col for col in all_columns}
+        common_id_names = ['fid', 'objectid', 'id', 'uid', 'gid', 'ogc_fid']
+        
+        id_col = None
+        for name in common_id_names:
+            if name in col_lower_map:
+                id_col = col_lower_map[name]
+                break
+        
+        if not id_col:
+            # No ID column found
+            return None, False
+    
+    # Check uniqueness if requested
+    is_unique = True
+    if check_uniqueness:
+        total_count = con.execute(f'SELECT COUNT(*) FROM {table_name}').fetchone()[0]
+        unique_count = con.execute(f'SELECT COUNT(DISTINCT "{id_col}") FROM {table_name}').fetchone()[0]
+        
+        is_unique = (total_count == unique_count)
+        
+        if not is_unique:
+            warning_msg = f"Warning: ID column '{id_col}' has {total_count} rows but only {unique_count} unique values"
+            if specified_id_col:
+                # User specified it, so this is an error
+                raise ValueError(warning_msg)
+            else:
+                # Auto-detected, so just warn and return
+                print(f"  {warning_msg}")
+    
+    return id_col, is_unique
 
 
 def geom_to_h3_cells(
@@ -120,6 +195,7 @@ class H3VectorProcessor:
         h3_resolution: int = 10,
         parent_resolutions: Optional[List[int]] = None,
         chunk_size: int = 500,
+        id_column: Optional[str] = None,
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
     ):
@@ -132,6 +208,7 @@ class H3VectorProcessor:
             h3_resolution: Target H3 resolution for tiling
             parent_resolutions: List of parent resolutions to include (e.g., [9, 8, 0])
             chunk_size: Number of rows to process per chunk
+            id_column: Name of ID column to use (auto-detected if not specified)
             read_credentials: Dict with AWS credentials for reading (key, secret, region, endpoint)
             write_credentials: Dict with AWS credentials for writing (key, secret, region, endpoint)
         """
@@ -140,6 +217,7 @@ class H3VectorProcessor:
         self.h3_resolution = h3_resolution
         self.parent_resolutions = parent_resolutions or [9, 8, 0]
         self.chunk_size = chunk_size
+        self.id_column = id_column
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
         
@@ -193,18 +271,15 @@ class H3VectorProcessor:
         # Find and rename geometry column
         geom_col = self._find_geometry_column('source_table')
         
-        # Get all columns
-        result = self.con.execute("SELECT * FROM source_table LIMIT 0").description
-        all_columns = [col[0] for col in result]
+        # Identify or validate ID column
+        id_col, is_unique = identify_id_column(
+            self.con, 
+            'source_table', 
+            specified_id_col=self.id_column,
+            check_uniqueness=True
+        )
         
-        # Find or create a unique ID column
-        id_col = None
-        for col in ['FID', 'fid', 'OBJECTID', 'objectid', 'ID', 'id']:
-            if col in all_columns:
-                id_col = col
-                break
-        
-        # If no ID column exists, create a row_number as ID
+        # If no ID column found, create a synthetic one
         if id_col is None:
             print("  No ID column found, creating row_number as _fid")
             id_col = '_fid'
@@ -215,24 +290,25 @@ class H3VectorProcessor:
             """)
             chunk_view_name = 'source_table_with_id'
         else:
-            print(f"  Using existing ID column: {id_col}")
+            print(f"  Using ID column: {id_col} (unique: {is_unique})")
             chunk_view_name = 'source_table'
         
         print(f"\nProcessing chunk {chunk_id} ({chunk_rows:,} rows)")
         
         # Create optimized chunk view with ONLY ID and geometry (minimal memory for UNNEST)
+        # Keep original ID column name to preserve data fidelity
         self.con.execute(f"""
             CREATE OR REPLACE VIEW chunk_table AS 
-            SELECT "{id_col}" AS fid, {geom_col} AS geom
+            SELECT "{id_col}", {geom_col} AS geom
             FROM {chunk_view_name}
         """)
         
-        # Convert to H3 cells - only keeping ID column
+        # Convert to H3 cells - only keeping ID column (with original name)
         h3_sql = geom_to_h3_cells(
             self.con, 
             'chunk_table', 
             zoom=self.h3_resolution, 
-            keep_cols=['fid']  # Only keep ID for minimal memory during UNNEST
+            keep_cols=[id_col]  # Keep original ID column name
         )
         
         # Build final query with unnested h3 cells and parent resolutions
@@ -246,10 +322,10 @@ class H3VectorProcessor:
         parent_cols_str = ', ' + ', '.join(parent_cols) if parent_cols else ''
         
         # UNNEST with only ID + h3 cells (minimal RAM usage!)
+        # Use original ID column name for output consistency
         final_sql = f"""
-            SELECT fid, 
-                   UNNEST(h3id) AS {h3_col}
-                   {parent_cols_str}
+            SELECT "{id_col}", 
+                   UNNEST(h3id) AS {h3_col}{parent_cols_str}
             FROM ({h3_sql})
         """
         
