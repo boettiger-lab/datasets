@@ -6,6 +6,7 @@ WORKDIR /app
 # Install system dependencies including GDAL and rclone
 RUN apt-get update && apt-get install -y \
     gdal-bin \
+    git \
     libgdal-dev \
     rclone \
     build-essential \
