@@ -21,8 +21,13 @@ COPY README.md .
 COPY README_PACKAGE.md .
 COPY cng_datasets/ ./cng_datasets/
 
-# Upgrade pip and install the package
-RUN pip3 install -e . --break-system-packages 
+# Create and activate virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Upgrade pip and install the package in the virtual environment
+RUN pip install --upgrade pip && \
+    pip install -e .
 
 # Set Python to run in unbuffered mode (recommended for containers)
 ENV PYTHONUNBUFFERED=1
