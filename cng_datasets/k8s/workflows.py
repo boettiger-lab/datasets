@@ -358,7 +358,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     cmd_parts = [
         "set -e",
         f"pip install -q git+{git_repo}",
-        f"cng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
+        f"cng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/{dataset_name}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
     ]
     if id_column:
         cmd_parts[-1] += f" --id-column {id_column}"
@@ -477,15 +477,21 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "TMPDIR", "value": "/tmp"},
                             {"name": "BUCKET", "value": bucket}
                         ],
+                        "volumeMounts": [
+                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+                        ],
                         "command": ["bash", "-c", f"""set -e
 pip install -q git+{git_repo}
-cng-datasets repartition --chunks-dir s3://{bucket}/chunks --output-dir s3://{bucket}/hex --source-parquet s3://{bucket}/{dataset_name}.parquet --cleanup
+cng-datasets repartition --chunks-dir s3://{bucket}/{dataset_name}/chunks --output-dir s3://{bucket}/{dataset_name}/hex --source-parquet s3://{bucket}/{dataset_name}.parquet --cleanup
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
                         }
-                    }]
+                    }],
+                    "volumes": [
+                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
+                    ]
                 }
             }
         }
