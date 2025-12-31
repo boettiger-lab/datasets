@@ -205,7 +205,7 @@ def _convert_with_id_column(
 ):
     """Convert with synthetic ID column using DuckDB + geoparquet-io write."""
     try:
-        from geoparquet_io.core.common import write_geoparquet_table
+        from geoparquet_io.core.common import write_parquet_with_metadata
     except ImportError:
         raise ImportError("geoparquet-io is required. Install with: pip install geoparquet-io")
     
@@ -236,24 +236,15 @@ def _convert_with_id_column(
             FROM ST_Read('{source_path}')
         """
         
-        # Execute query and get PyArrow table
-        arrow_table = con.execute(query).arrow()
-        
         # Write using geoparquet-io's function which adds proper GeoParquet metadata
         if verbose:
             print(f"  Writing GeoParquet with proper metadata...")
         
-        # Determine geometry column (should be 'geometry' or 'geom')
-        geom_col = None
-        for col in arrow_table.column_names:
-            if col.lower() in ['geometry', 'geom', 'shape']:
-                geom_col = col
-                break
-        
-        write_geoparquet_table(
-            table=arrow_table,
+        # Use write_parquet_with_metadata which works with DuckDB directly
+        write_parquet_with_metadata(
+            con=con,
+            query=query,
             output_file=destination,
-            geometry_column=geom_col,
             compression=compression,
             compression_level=compression_level,
             row_group_rows=row_group_size,
