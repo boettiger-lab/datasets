@@ -243,6 +243,9 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
                             {"name": "BUCKET", "value": bucket}
                         ],
+                        "volumeMounts": [
+                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+                        ],
                         "command": ["bash", "-c", f"""set -e
 pip install -q git+{git_repo}
 cng-convert-to-parquet \\
@@ -255,7 +258,10 @@ cng-convert-to-parquet \\
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
                         }
-                    }]
+                    }],
+                    "volumes": [
+                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
+                    ]
                 }
             }
         }
