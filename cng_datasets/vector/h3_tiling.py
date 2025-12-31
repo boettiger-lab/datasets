@@ -419,19 +419,23 @@ class H3VectorProcessor:
                 """)
                 
                 # Append by creating a union and rewriting
+                # Write directly to final output (overwriting) - works with both local and S3 paths
                 self.con.execute(f"""
                     COPY (
                         SELECT * FROM read_parquet('{output_file}')
                         UNION ALL
                         SELECT * FROM read_parquet('{temp_batch_file}')
                     )
-                    TO '{output_file}.new' 
-                    (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
+                    TO '{output_file}' 
+                    (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000, OVERWRITE_OR_IGNORE true)
                 """)
                 
-                # Replace old file with new
-                os.replace(f"{output_file}.new", output_file)
-                os.remove(temp_batch_file)
+                # Clean up temp file only if it's local
+                if temp_batch_file.startswith('/tmp/') or not temp_batch_file.startswith('s3://'):
+                    try:
+                        os.remove(temp_batch_file)
+                    except Exception as e:
+                        print(f"  Warning: Could not remove temp file {temp_batch_file}: {e}")
             
             if (batch_id + 1) % 10 == 0 or batch_id == num_batches - 1:
                 print(f"  Progress: {batch_id + 1}/{num_batches} batches")
