@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     git \
     rclone \
     curl \
+    awscli \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
