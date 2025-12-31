@@ -187,7 +187,7 @@ class TestS3Connection:
                 processor = H3VectorProcessor(
                     input_url="s3://public-mappinginequality/mappinginequality.parquet",
                     output_url=tmpdir,
-                    h3_resolution=6,
+                    h3_resolution=10,
                     chunk_size=10
                 )
                 
@@ -202,7 +202,7 @@ class TestS3Connection:
                     # Verify the output has expected structure
                     result = processor.con.execute(f"SELECT * FROM read_parquet('{output_file}')").fetchdf()
                     assert len(result) > 0, "Should have processed some rows"
-                    assert 'h6' in result.columns, "Should have h6 column"
+                    assert 'h10' in result.columns, "Should have h10 column"
                     print(f"Successfully processed {len(result)} rows")
                     
                     processor.con.close()
