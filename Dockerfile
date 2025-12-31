@@ -22,6 +22,7 @@ COPY cng_datasets/ ./cng_datasets/
 # Create virtual environment and install the package with uv
 RUN uv venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+RUN uv pip install pip  # Ensure pip is available for users
 RUN uv pip install -e .
 
 # Set Python to run in unbuffered mode (recommended for containers)
