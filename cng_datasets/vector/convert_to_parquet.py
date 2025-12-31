@@ -121,24 +121,23 @@ def _check_projection(
         else:
             source_path = source_url
         
-        # Get CRS info
+        # Get CRS info using ST_Read_Meta
         result = con.execute(f"""
-            SELECT ST_SRID(geom) as srid
-            FROM ST_Read('{source_path}')
-            LIMIT 1
+            SELECT
+                layers[1].geometry_fields[1].crs.auth_name as auth_name,
+                layers[1].geometry_fields[1].crs.auth_code as auth_code
+            FROM ST_Read_Meta('{source_path}')
         """).fetchone()
         
-        if result is None or result[0] is None:
+        if result is None or result[0] is None or result[1] is None:
             print("  Warning: No CRS found in source data, assuming EPSG:4326")
             return False, None
         
-        source_srid = result[0]
+        auth_name, auth_code = result
+        source_crs = f"{auth_name}:{auth_code}"
         
-        # Parse target CRS to get SRID
-        target_srid = int(target_crs.split(':')[1]) if ':' in target_crs else int(target_crs)
-        
-        needs_reprojection = source_srid != target_srid
-        source_crs = f"EPSG:{source_srid}"
+        # Normalize comparison (EPSG is most common)
+        needs_reprojection = source_crs.upper() != target_crs.upper()
         
         return needs_reprojection, source_crs
         
@@ -355,17 +354,27 @@ def _convert_direct_with_reprojection(
         else:
             source_path = source_url
         
-        # Parse target SRID
-        target_srid = int(target_crs.split(':')[1]) if ':' in target_crs else int(target_crs)
-        
         # Read source and reproject
         if verbose:
             print(f"  Reading source and reprojecting to {target_crs}...")
         
+        # Get source CRS for ST_Transform
+        meta_result = con.execute(f"""
+            SELECT
+                layers[1].geometry_fields[1].crs.auth_name as auth_name,
+                layers[1].geometry_fields[1].crs.auth_code as auth_code
+            FROM ST_Read_Meta('{source_path}')
+        """).fetchone()
+        
+        if meta_result and meta_result[0] and meta_result[1]:
+            source_crs = f"{meta_result[0]}:{meta_result[1]}"
+        else:
+            source_crs = "EPSG:4326"  # fallback
+        
         query = f"""
             SELECT 
                 * EXCLUDE (geom),
-                ST_Transform(geom, {target_srid}) as geom
+                ST_Transform(geom, '{source_crs}', '{target_crs}') as geom
             FROM ST_Read('{source_path}')
         """
         
@@ -452,11 +461,6 @@ def _convert_with_id_column(
         else:
             source_path = source_url
         
-        # Parse target SRID if reprojection needed
-        target_srid = None
-        if needs_reprojection:
-            target_srid = int(target_crs.split(':')[1]) if ':' in target_crs else int(target_crs)
-        
         # Read source with DuckDB spatial and add ID column
         if verbose:
             action = "Reading source, reprojecting, and adding ID column" if needs_reprojection else "Reading source and adding ID column"
@@ -464,11 +468,24 @@ def _convert_with_id_column(
         
         # Build query with optional reprojection
         if needs_reprojection:
+            # Get source CRS for ST_Transform
+            meta_result = con.execute(f"""
+                SELECT
+                    layers[1].geometry_fields[1].crs.auth_name as auth_name,
+                    layers[1].geometry_fields[1].crs.auth_code as auth_code
+                FROM ST_Read_Meta('{source_path}')
+            """).fetchone()
+            
+            if meta_result and meta_result[0] and meta_result[1]:
+                source_crs = f"{meta_result[0]}:{meta_result[1]}"
+            else:
+                source_crs = "EPSG:4326"  # fallback
+            
             query = f"""
                 SELECT 
                     row_number() OVER () AS {id_col_name},
                     * EXCLUDE (geom),
-                    ST_Transform(geom, {target_srid}) as geom
+                    ST_Transform(geom, '{source_crs}', '{target_crs}') as geom
                 FROM ST_Read('{source_path}')
             """
         else:
