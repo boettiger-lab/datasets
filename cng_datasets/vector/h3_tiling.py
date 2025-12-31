@@ -381,8 +381,9 @@ class H3VectorProcessor:
         
         parent_cols_str = ', ' + ', '.join(parent_cols) if parent_cols else ''
         
-        # Process in small batches to control memory
-        output_file = f"{self.output_url}/chunk_{chunk_id:06d}.parquet"
+        # Use local /tmp for fast batch processing, then copy to final destination
+        local_output = f"/tmp/h3_output_{chunk_id:06d}.parquet"
+        final_output = f"{self.output_url}/chunk_{chunk_id:06d}.parquet"
         
         for batch_id in range(num_batches):
             batch_offset = batch_id * self.intermediate_chunk_size
@@ -399,49 +400,57 @@ class H3VectorProcessor:
                 )
             """
             
-            # Append to output file
+            # Build up local file with fast local disk I/O
             if batch_id == 0:
-                # First batch: create file
+                # First batch: create local file
                 self.con.execute(f"""
                     COPY ({unnest_sql}) 
-                    TO '{output_file}' 
+                    TO '{local_output}' 
                     (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
                 """)
             else:
-                # Subsequent batches: append
-                # DuckDB requires us to use a different approach for append
-                # We'll write to temp and then merge
-                temp_batch_file = f"{output_file}.batch_{batch_id}.tmp"
+                # Subsequent batches: append using local temp files
+                temp_batch_file = f"/tmp/h3_batch_{chunk_id:06d}_{batch_id}.tmp"
                 self.con.execute(f"""
                     COPY ({unnest_sql}) 
                     TO '{temp_batch_file}' 
                     (FORMAT PARQUET, COMPRESSION 'ZSTD')
                 """)
                 
-                # Append by creating a union and rewriting
-                # Write directly to final output (overwriting) - works with both local and S3 paths
+                # Merge into local output using fast local disk
                 self.con.execute(f"""
                     COPY (
-                        SELECT * FROM read_parquet('{output_file}')
+                        SELECT * FROM read_parquet('{local_output}')
                         UNION ALL
                         SELECT * FROM read_parquet('{temp_batch_file}')
                     )
-                    TO '{output_file}' 
-                    (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000, OVERWRITE_OR_IGNORE true)
+                    TO '{local_output}.new' 
+                    (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
                 """)
                 
-                # Clean up temp file only if it's local
-                if temp_batch_file.startswith('/tmp/') or not temp_batch_file.startswith('s3://'):
-                    try:
-                        os.remove(temp_batch_file)
-                    except Exception as e:
-                        print(f"  Warning: Could not remove temp file {temp_batch_file}: {e}")
+                # Fast local file operations
+                os.replace(f"{local_output}.new", local_output)
+                os.remove(temp_batch_file)
             
             if (batch_id + 1) % 10 == 0 or batch_id == num_batches - 1:
                 print(f"  Progress: {batch_id + 1}/{num_batches} batches")
         
-        print(f"  ✓ Pass 2 complete: {output_file}")
-        return output_file
+        # Final step: copy completed file to S3 (single write operation)
+        print(f"  Writing final output to {final_output}...")
+        self.con.execute(f"""
+            COPY (SELECT * FROM read_parquet('{local_output}'))
+            TO '{final_output}'
+            (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
+        """)
+        
+        # Clean up local file
+        try:
+            os.remove(local_output)
+        except Exception as e:
+            print(f"  Warning: Could not remove local output file: {e}")
+        
+        print(f"  ✓ Pass 2 complete: {final_output}")
+        return final_output
     
     def process_all_chunks(self) -> List[str]:
         """
