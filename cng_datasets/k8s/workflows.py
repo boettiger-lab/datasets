@@ -316,6 +316,9 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "BUCKET", "value": bucket},
                             {"name": "SOURCE_URL", "value": source_url}
                         ],
+                        "volumeMounts": [
+                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+                        ],
                         "command": ["bash", "-c", f"""set -e
 # Convert GPKG to GeoJSONSeq for tippecanoe (read directly via vsicurl)
 ogr2ogr -f GeoJSONSeq /tmp/mappinginequality.geojsonl /vsicurl/{source_url} -progress
@@ -323,16 +326,18 @@ ogr2ogr -f GeoJSONSeq /tmp/mappinginequality.geojsonl /vsicurl/{source_url} -pro
 # Generate PMTiles from GeoJSONSeq
 tippecanoe -o /tmp/mappinginequality.pmtiles -l redlining --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/mappinginequality.geojsonl
 
-# Upload to S3
-mc alias set s3 https://$AWS_PUBLIC_ENDPOINT $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY
-mc cp /tmp/mappinginequality.pmtiles s3/{bucket}/mappinginequality.pmtiles
+# Upload to S3 using rclone
+rclone copy /tmp/mappinginequality.pmtiles nrp:{bucket}/
 rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
                         }
-                    }]
+                    }],
+                    "volumes": [
+                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
+                    ]
                 }
             }
         }
