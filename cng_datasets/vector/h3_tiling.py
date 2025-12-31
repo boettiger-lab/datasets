@@ -24,6 +24,8 @@ def identify_id_column(
     Uses case-insensitive matching to find common ID column names, or validates
     a user-specified column. Optionally checks for uniqueness.
     
+    Prioritizes _cng_fid as the standard synthetic ID column created by convert_to_parquet.
+    
     Args:
         con: DuckDB connection
         table_name: Name of the table or view to check
@@ -54,8 +56,9 @@ def identify_id_column(
         id_col = actual_col
     else:
         # Auto-detect common ID column names (case-insensitive)
+        # _cng_fid is our standard synthetic ID from convert_to_parquet
         col_lower_map = {col.lower(): col for col in all_columns}
-        common_id_names = ['fid', 'objectid', 'id', 'uid', 'gid', 'ogc_fid']
+        common_id_names = ['_cng_fid', 'fid', 'objectid', 'id', 'uid', 'gid', 'ogc_fid']
         
         id_col = None
         for name in common_id_names:
@@ -279,9 +282,10 @@ class H3VectorProcessor:
             check_uniqueness=True
         )
         
-        # If no ID column found, create a synthetic one
-        if id_col is None:
-            print("  No ID column found, creating row_number as _fid")
+        # If no ID column found or not unique, create a synthetic one
+        # But if _cng_fid already exists (from convert_to_parquet), use it!
+        if id_col is None or not is_unique:
+            print(f"  No valid ID column found, creating row_number as _fid")
             id_col = '_fid'
             self.con.execute(f"""
                 CREATE OR REPLACE VIEW source_table_with_id AS 

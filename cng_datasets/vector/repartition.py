@@ -46,12 +46,23 @@ def repartition_by_h0(
     chunks = con.read_parquet(f'{chunks_dir}/*.parquet')
     chunk_cols = chunks.columns
     
-    # Identify ID column in chunks (it's the non-h3 column)
+    # Identify ID column in chunks
+    # Prioritize _cng_fid (standard from convert_to_parquet), then _fid (fallback), then other non-h3 columns
     chunk_id_col = None
-    for col in chunk_cols:
-        if not col.startswith('h') or not col[1:].isdigit():
-            chunk_id_col = col
+    priority_ids = ['_cng_fid', '_fid']
+    
+    # First check for priority IDs
+    for priority_id in priority_ids:
+        if priority_id in chunk_cols:
+            chunk_id_col = priority_id
             break
+    
+    # If no priority ID found, look for any non-h3 column
+    if not chunk_id_col:
+        for col in chunk_cols:
+            if not col.startswith('h') or not col[1:].isdigit():
+                chunk_id_col = col
+                break
     
     if not chunk_id_col:
         raise ValueError(f"Could not identify ID column in chunks. Columns: {chunk_cols}")
