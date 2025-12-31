@@ -82,7 +82,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-dataset",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 namespace="test-ns"
@@ -116,7 +116,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir
             )
@@ -142,7 +142,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir
             )
@@ -191,7 +191,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 namespace="custom-ns"
@@ -224,7 +224,7 @@ class TestEdgeCases:
             # Should handle this gracefully
             generate_dataset_workflow(
                 dataset_name="my-dataset-2024",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir
             )
@@ -240,7 +240,7 @@ class TestEdgeCases:
             
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 bucket="test-bucket",
                 output_dir=str(output_dir)
             )

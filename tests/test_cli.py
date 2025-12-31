@@ -22,7 +22,7 @@ class TestCLI:
                 "cng-datasets",
                 "workflow",
                 "--dataset", "test-ds",
-                "--source-url", "https://example.com/data.gpkg",
+                "--source-url", "https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 "--bucket", "test-bucket",
                 "--output-dir", tmpdir,
                 "--namespace", "test-ns"
@@ -102,7 +102,7 @@ class TestCLI:
                 "cng-datasets",
                 "workflow",
                 "--dataset", "test",
-                "--source-url", "https://example.com/data.gpkg",
+                "--source-url", "https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 "--bucket", "bucket",
                 "--output-dir", tmpdir
                 # namespace defaults to "biodiversity"

@@ -159,7 +159,7 @@ class TestS3Connection:
                 # Just read row count - tests network connection and S3 access
                 # Using the same bucket as the working example
                 result = con.execute(
-                    "SELECT COUNT(*) as cnt FROM read_parquet('s3://public-redlining/hex/**') LIMIT 1"
+                    "SELECT COUNT(*) as cnt FROM read_parquet('s3://public-mappinginequality/mappinginequality.parquet') LIMIT 1"
                 ).fetchone()
                 
                 assert result is not None, "Should get result from S3"
@@ -183,11 +183,11 @@ class TestS3Connection:
                 "AWS_S3_ENDPOINT": "s3-west.nrp-nautilus.io",
                 "AWS_HTTPS": "TRUE",
             }):
-                # Use the same working bucket as the network test
+                # Use source parquet with geometry from the bucket
                 processor = H3VectorProcessor(
-                    input_url="s3://public-redlining/hex/h3_res=7/hex_h7.parquet",
+                    input_url="s3://public-mappinginequality/mappinginequality.parquet",
                     output_url=tmpdir,
-                    h3_resolution=4,
+                    h3_resolution=6,
                     chunk_size=10
                 )
                 
@@ -202,7 +202,7 @@ class TestS3Connection:
                     # Verify the output has expected structure
                     result = processor.con.execute(f"SELECT * FROM read_parquet('{output_file}')").fetchdf()
                     assert len(result) > 0, "Should have processed some rows"
-                    assert 'h4' in result.columns, "Should have h4 column"
+                    assert 'h6' in result.columns, "Should have h6 column"
                     print(f"Successfully processed {len(result)} rows")
                     
                     processor.con.close()
