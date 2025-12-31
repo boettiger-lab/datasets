@@ -2,12 +2,14 @@
 """
 Convert vector datasets to optimized GeoParquet format.
 
-This script provides a DuckDB-based conversion with guaranteed ID columns
-and cloud-native optimizations for large-scale dataset processing.
+This script provides conversion with guaranteed ID columns and proper GeoParquet
+metadata using geoparquet-io for cloud-native optimizations.
 """
 
 import argparse
 import sys
+import tempfile
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 import duckdb
@@ -29,12 +31,12 @@ def convert_to_parquet(
     """
     Convert a vector dataset to optimized GeoParquet with guaranteed ID column.
     
-    Uses DuckDB spatial extension for larger-than-RAM processing with streaming.
+    Uses geoparquet-io for proper GeoParquet 1.1 metadata and DuckDB for ID handling.
     Ensures every output has a valid, unique ID column for downstream processing.
     
     Args:
         source_url: Source dataset URL (supports /vsicurl/, s3://, file paths)
-        destination: Output path (supports /vsis3/, file paths)
+        destination: Output path (supports /vsis3/, s3://, file paths)
         bucket: S3 bucket name (required if create_bucket=True)
         create_bucket: Whether to create and configure the bucket
         compression: Compression algorithm (ZSTD, GZIP, SNAPPY, NONE)
@@ -54,196 +56,214 @@ def convert_to_parquet(
         from cng_datasets.storage.rclone import create_public_bucket
         create_public_bucket(bucket, remote='nrp', set_cors=True)
     
-    # Prepare source path for DuckDB
-    if source_url.startswith('http://') or source_url.startswith('https://'):
-        source_path = f"/vsicurl/{source_url}"
-    else:
-        source_path = source_url
-    
-    # Convert destination path: /vsis3/bucket/path -> s3://bucket/path for DuckDB
+    # Convert destination path: /vsis3/bucket/path -> s3://bucket/path
     dest_path = destination
     if destination.startswith('/vsis3/'):
-        dest_path = 's3://' + destination[7:]  # Remove /vsis3/ prefix
+        dest_path = 's3://' + destination[7:]
     elif destination.startswith('s3://'):
-        dest_path = destination  # Already correct format
+        dest_path = destination
     
     print(f"Converting {source_url} to {dest_path}")
     if progress:
         print(f"  Compression: {compression} level {compression_level}")
         print(f"  Row group size: {row_group_size:,}")
     
-    # Setup DuckDB connection
-    con = _setup_duckdb_connection()
-    
     try:
-        # Configure S3 credentials for DuckDB
-        from cng_datasets.storage.s3 import configure_s3_credentials
-        configure_s3_credentials(con)
+        # Check if we need to add an ID column
+        print("  Checking for ID column...")
+        needs_id, id_col_name = _check_needs_id_column(source_url, id_column, force_id)
         
-        # Read source and detect ID column
-        print("  Reading source data...")
-        id_col, has_valid_id = _identify_or_create_id_column(
-            con, source_path, id_column, force_id, progress
-        )
-        
-        # Build query with ID column handling
-        query = _build_conversion_query(source_path, id_col, has_valid_id)
-        
-        # Write optimized GeoParquet
-        print(f"  Writing optimized GeoParquet (ID column: {id_col})...")
-        _write_geoparquet(
-            con, query, dest_path, compression, compression_level,
-            row_group_size, geometry_encoding, progress
-        )
+        if needs_id:
+            # Two-step process: convert with geoparquet-io, then add ID column
+            print(f"  Creating synthetic ID column: {id_col_name}")
+            _convert_with_id_column(source_url, dest_path, id_col_name, compression, 
+                                   compression_level, row_group_size, progress)
+        else:
+            # Direct conversion with geoparquet-io
+            print(f"  Using existing ID column: {id_col_name}")
+            _convert_direct(source_url, dest_path, compression, compression_level, 
+                           row_group_size, progress)
         
         print("✓ Conversion completed successfully!")
-        if id_col and not has_valid_id:
-            print(f"  Note: Created synthetic ID column '{id_col}' for downstream processing")
+        if needs_id:
+            print(f"  Note: Created synthetic ID column '{id_col_name}' for downstream processing")
         
     except Exception as e:
         print(f"✗ Conversion failed: {e}", file=sys.stderr)
         raise
+
+
+def _check_needs_id_column(
+    source_url: str,
+    specified_id: Optional[str],
+    force_id: bool
+) -> Tuple[bool, str]:
+    """
+    Check if source needs an ID column added.
+    
+    Returns:
+        Tuple of (needs_id, id_column_name)
+    """
+    from cng_datasets.vector.h3_tiling import identify_id_column, setup_duckdb_connection
+    
+    # Configure SSL for GDAL
+    _configure_ssl()
+    
+    # Setup DuckDB to inspect source
+    con = setup_duckdb_connection()
+    
+    try:
+        # Configure S3 credentials
+        from cng_datasets.storage.s3 import configure_s3_credentials
+        configure_s3_credentials(con)
+        
+        # Prepare source path
+        if source_url.startswith('http://') or source_url.startswith('https://'):
+            source_path = f"/vsicurl/{source_url}"
+        else:
+            source_path = source_url
+        
+        # Create view to inspect
+        con.execute(f"""
+            CREATE OR REPLACE VIEW source_data AS 
+            SELECT * FROM ST_Read('{source_path}')
+        """)
+        
+        # Check for ID column
+        id_col, is_unique = identify_id_column(
+            con, 'source_data', 
+            specified_id_col=specified_id,
+            check_uniqueness=True
+        )
+        
+        if id_col and is_unique:
+            return False, id_col  # Has valid ID, no need to add
+        elif force_id:
+            return True, '_cng_fid'  # Need to add synthetic ID
+        else:
+            return False, id_col if id_col else None
+            
     finally:
         con.close()
 
 
-def _setup_duckdb_connection() -> duckdb.DuckDBPyConnection:
-    """Setup DuckDB with spatial extension."""
-    import os
-    
-    # Configure GDAL SSL certificate path for DuckDB spatial extension
-    # Try common certificate bundle locations
+def _configure_ssl():
+    """Configure SSL certificates for GDAL."""
     cert_paths = [
-        '/etc/ssl/certs/ca-certificates.crt',  # Debian/Ubuntu
-        '/etc/ssl/certs/ca-bundle.crt',         # RedHat/CentOS
-        '/etc/pki/tls/certs/ca-bundle.crt',    # Older RedHat
-        '/etc/ssl/cert.pem',                    # Alpine
-        '/usr/local/share/ca-certificates/',   # Custom installs
+        '/etc/ssl/certs/ca-certificates.crt',
+        '/etc/ssl/certs/ca-bundle.crt',
+        '/etc/pki/tls/certs/ca-bundle.crt',
+        '/etc/ssl/cert.pem',
     ]
     
     for cert_path in cert_paths:
         if os.path.exists(cert_path):
             os.environ['CURL_CA_BUNDLE'] = cert_path
             os.environ['SSL_CERT_FILE'] = cert_path
-            break
-    else:
-        # If no cert bundle found, disable SSL verification as fallback
-        # (not ideal but necessary for some container environments)
-        os.environ['GDAL_HTTP_UNSAFESSL'] = 'YES'
+            return
     
-    con = duckdb.connect()
-    
-    # Install and load spatial extension (uses GDAL internally)
-    con.execute("INSTALL spatial")
-    con.execute("LOAD spatial")
-    
-    # Configure for large files
-    con.execute("SET temp_directory='/tmp'")
-    con.execute("SET http_retries=20")
-    con.execute("SET http_retry_wait_ms=5000")
-    
-    return con
+    # Fallback: disable SSL verification
+    os.environ['GDAL_HTTP_UNSAFESSL'] = 'YES'
 
 
-def _identify_or_create_id_column(
-    con: duckdb.DuckDBPyConnection,
-    source_path: str,
-    specified_id: Optional[str],
-    force_id: bool,
-    verbose: bool
-) -> Tuple[str, bool]:
-    """
-    Identify existing ID column or determine if synthetic ID needed.
-    
-    Returns:
-        Tuple of (id_column_name, has_existing_valid_id)
-    """
-    from cng_datasets.vector.h3_tiling import identify_id_column
-    
-    # Create temporary view to inspect source
-    con.execute(f"""
-        CREATE OR REPLACE VIEW source_data AS 
-        SELECT * FROM ST_Read('{source_path}')
-    """)
-    
-    # Use the existing identify_id_column logic
-    id_col, is_unique = identify_id_column(
-        con, 'source_data', 
-        specified_id_col=specified_id,
-        check_uniqueness=True
-    )
-    
-    if id_col and is_unique:
-        if verbose:
-            print(f"  Using existing ID column: {id_col}")
-        return id_col, True
-    elif id_col and not is_unique:
-        if verbose:
-            print(f"  Warning: ID column '{id_col}' is not unique")
-        if force_id:
-            if verbose:
-                print(f"  Creating synthetic ID column: _cng_fid")
-            return '_cng_fid', False
-        return id_col, False
-    else:
-        # No ID column found
-        if force_id:
-            if verbose:
-                print(f"  No ID column found, creating: _cng_fid")
-            return '_cng_fid', False
-        return None, False
-
-
-def _build_conversion_query(
-    source_path: str, 
-    id_col: Optional[str],
-    has_existing_id: bool
-) -> str:
-    """Build SQL query for conversion with ID column handling."""
-    
-    if id_col and not has_existing_id:
-        # Need to create synthetic ID
-        query = f"""
-            SELECT 
-                row_number() OVER () AS {id_col},
-                *
-            FROM ST_Read('{source_path}')
-        """
-    else:
-        # Use existing columns as-is
-        query = f"SELECT * FROM ST_Read('{source_path}')"
-    
-    return query
-
-
-def _write_geoparquet(
-    con: duckdb.DuckDBPyConnection,
-    query: str,
+def _convert_direct(
+    source_url: str,
     destination: str,
     compression: str,
     compression_level: int,
     row_group_size: int,
-    geometry_encoding: str,
     verbose: bool
 ):
-    """Write query results to optimized GeoParquet file."""
+    """Convert directly using geoparquet-io."""
+    try:
+        from geoparquet_io.core.convert import convert_to_geoparquet
+    except ImportError:
+        raise ImportError("geoparquet-io is required. Install with: pip install geoparquet-io")
     
-    # DuckDB COPY command for optimized writes
-    copy_sql = f"""
-        COPY ({query}) 
-        TO '{destination}' 
-        (
-            FORMAT PARQUET,
-            COMPRESSION '{compression}',
-            COMPRESSION_LEVEL {compression_level},
-            ROW_GROUP_SIZE {row_group_size}
+    # Use geoparquet-io for proper GeoParquet metadata
+    convert_to_geoparquet(
+        input_file=source_url,
+        output_file=destination,
+        skip_hilbert=True,  # Don't do expensive Hilbert ordering
+        verbose=verbose,
+        compression=compression,
+        compression_level=compression_level,
+        row_group_rows=row_group_size,
+        profile=None,
+        geoparquet_version="1.1"
+    )
+
+
+def _convert_with_id_column(
+    source_url: str,
+    destination: str,
+    id_col_name: str,
+    compression: str,
+    compression_level: int,
+    row_group_size: int,
+    verbose: bool
+):
+    """Convert with synthetic ID column using DuckDB + geoparquet-io write."""
+    try:
+        from geoparquet_io.core.common import write_geoparquet_table
+    except ImportError:
+        raise ImportError("geoparquet-io is required. Install with: pip install geoparquet-io")
+    
+    from cng_datasets.vector.h3_tiling import setup_duckdb_connection
+    from cng_datasets.storage.s3 import configure_s3_credentials
+    
+    _configure_ssl()
+    
+    con = setup_duckdb_connection()
+    
+    try:
+        configure_s3_credentials(con)
+        
+        # Prepare source path
+        if source_url.startswith('http://') or source_url.startswith('https://'):
+            source_path = f"/vsicurl/{source_url}"
+        else:
+            source_path = source_url
+        
+        # Read source with DuckDB spatial and add ID column
+        if verbose:
+            print(f"  Reading source and adding ID column...")
+        
+        query = f"""
+            SELECT 
+                row_number() OVER () AS {id_col_name},
+                *
+            FROM ST_Read('{source_path}')
+        """
+        
+        # Execute query and get PyArrow table
+        arrow_table = con.execute(query).arrow()
+        
+        # Write using geoparquet-io's function which adds proper GeoParquet metadata
+        if verbose:
+            print(f"  Writing GeoParquet with proper metadata...")
+        
+        # Determine geometry column (should be 'geometry' or 'geom')
+        geom_col = None
+        for col in arrow_table.column_names:
+            if col.lower() in ['geometry', 'geom', 'shape']:
+                geom_col = col
+                break
+        
+        write_geoparquet_table(
+            table=arrow_table,
+            output_file=destination,
+            geometry_column=geom_col,
+            compression=compression,
+            compression_level=compression_level,
+            row_group_rows=row_group_size,
+            geoparquet_version="1.1",
+            verbose=verbose,
+            profile=None
         )
-    """
-    
-    if verbose:
-        print(f"  Executing: COPY (...) TO '{destination}'")
-    
-    con.execute(copy_sql)
+        
+    finally:
+        con.close()
 
 
 def main():
