@@ -166,6 +166,39 @@ def _configure_ssl():
     os.environ['GDAL_HTTP_UNSAFESSL'] = 'YES'
 
 
+def _upload_via_rclone(local_file: str, destination: str, verbose: bool = True):
+    """Upload file to S3 via rclone to preserve GeoParquet metadata."""
+    import subprocess
+    
+    # Convert s3:// or /vsis3/ to rclone format: nrp:bucket/path
+    if destination.startswith('s3://'):
+        s3_path = destination[5:]  # Remove 's3://'
+    elif destination.startswith('/vsis3/'):
+        s3_path = destination[7:]  # Remove '/vsis3/'
+    else:
+        raise ValueError(f"Invalid S3 destination: {destination}")
+    
+    # Split bucket and path
+    parts = s3_path.split('/', 1)
+    bucket = parts[0]
+    key = parts[1] if len(parts) > 1 else ''
+    
+    # Use rclone copyto for single file upload
+    rclone_dest = f"nrp:{bucket}/{key}"
+    
+    cmd = ['rclone', 'copyto', local_file, rclone_dest]
+    if verbose:
+        cmd.append('-v')
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        raise RuntimeError(f"rclone upload failed: {result.stderr}")
+    
+    if verbose and result.stdout:
+        print(result.stdout)
+
+
 def _convert_direct(
     source_url: str,
     destination: str,
@@ -180,18 +213,52 @@ def _convert_direct(
     except ImportError:
         raise ImportError("geoparquet-io is required. Install with: pip install geoparquet-io")
     
-    # Use geoparquet-io for proper GeoParquet metadata
-    convert_to_geoparquet(
-        input_file=source_url,
-        output_file=destination,
-        skip_hilbert=True,  # Don't do expensive Hilbert ordering
-        verbose=verbose,
-        compression=compression,
-        compression_level=compression_level,
-        row_group_rows=row_group_size,
-        profile=None,
-        geoparquet_version="1.1"
-    )
+    # If destination is S3, write to temp file first, then upload via rclone
+    # This preserves GeoParquet metadata (DuckDB COPY would strip it)
+    if destination.startswith('s3://') or destination.startswith('/vsis3/'):
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            # Convert to local temp file with proper GeoParquet metadata
+            if verbose:
+                print(f"  Converting to temporary file: {tmp_path}")
+            
+            convert_to_geoparquet(
+                input_file=source_url,
+                output_file=tmp_path,
+                skip_hilbert=True,
+                verbose=verbose,
+                compression=compression,
+                compression_level=compression_level,
+                row_group_rows=row_group_size,
+                profile=None,
+                geoparquet_version="1.1"
+            )
+            
+            # Upload to S3 using rclone (preserves GeoParquet metadata)
+            if verbose:
+                print(f"  Uploading to S3 via rclone: {destination}")
+            
+            _upload_via_rclone(tmp_path, destination, verbose=verbose)
+            
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+    else:
+        # Local file - convert directly
+        convert_to_geoparquet(
+            input_file=source_url,
+            output_file=destination,
+            skip_hilbert=True,
+            verbose=verbose,
+            compression=compression,
+            compression_level=compression_level,
+            row_group_rows=row_group_size,
+            profile=None,
+            geoparquet_version="1.1"
+        )
 
 
 def _convert_with_id_column(
@@ -236,22 +303,55 @@ def _convert_with_id_column(
             FROM ST_Read('{source_path}')
         """
         
-        # Write using geoparquet-io's function which adds proper GeoParquet metadata
-        if verbose:
-            print(f"  Writing GeoParquet with proper metadata...")
-        
-        # Use write_parquet_with_metadata which works with DuckDB directly
-        write_parquet_with_metadata(
-            con=con,
-            query=query,
-            output_file=destination,
-            compression=compression,
-            compression_level=compression_level,
-            row_group_rows=row_group_size,
-            geoparquet_version="1.1",
-            verbose=verbose,
-            profile=None
-        )
+        # If destination is S3, write to temp file first, then upload via rclone
+        # This preserves GeoParquet metadata (DuckDB COPY would strip it)
+        if destination.startswith('s3://') or destination.startswith('/vsis3/'):
+            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            try:
+                # Write to local temp file with proper GeoParquet metadata
+                if verbose:
+                    print(f"  Writing to temporary file: {tmp_path}")
+                
+                write_parquet_with_metadata(
+                    con=con,
+                    query=query,
+                    output_file=tmp_path,
+                    compression=compression,
+                    compression_level=compression_level,
+                    row_group_rows=row_group_size,
+                    geoparquet_version="1.1",
+                    verbose=verbose,
+                    profile=None
+                )
+                
+                # Upload to S3 using rclone (preserves GeoParquet metadata)
+                if verbose:
+                    print(f"  Uploading to S3 via rclone: {destination}")
+                
+                _upload_via_rclone(tmp_path, destination, verbose=verbose)
+                
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        else:
+            # Local file - write directly
+            if verbose:
+                print(f"  Writing GeoParquet with proper metadata...")
+            
+            write_parquet_with_metadata(
+                con=con,
+                query=query,
+                output_file=destination,
+                compression=compression,
+                compression_level=compression_level,
+                row_group_rows=row_group_size,
+                geoparquet_version="1.1",
+                verbose=verbose,
+                profile=None
+            )
         
     finally:
         con.close()
