@@ -12,10 +12,6 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install tippecanoe from GitHub releases
-RUN curl -L https://github.com/felt/tippecanoe/releases/download/2.62.1/tippecanoe-linux-amd64 -o /usr/local/bin/tippecanoe && \
-    chmod +x /usr/local/bin/tippecanoe
-
 # Copy package files
 COPY pyproject.toml .
 COPY README.md .
