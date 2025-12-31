@@ -270,7 +270,13 @@ cng-convert-to-parquet \\
 
 
 def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
-    """Generate PMTiles job."""
+    """Generate PMTiles job.
+    
+    Uses the optimized GeoParquet from convert job as input (includes ID column).
+    """
+    # Use the converted geoparquet instead of original source
+    geoparquet_url = f"https://s3-west.nrp-nautilus.io/{bucket}/{dataset_name}.parquet"
+    
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -314,21 +320,22 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
                             {"name": "TMPDIR", "value": "/tmp"},
                             {"name": "BUCKET", "value": bucket},
-                            {"name": "SOURCE_URL", "value": source_url}
+                            {"name": "DATASET", "value": dataset_name}
                         ],
                         "volumeMounts": [
                             {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
                         ],
                         "command": ["bash", "-c", f"""set -e
-# Convert GPKG to GeoJSONSeq for tippecanoe (read directly via vsicurl)
-ogr2ogr -f GeoJSONSeq /tmp/mappinginequality.geojsonl /vsicurl/{source_url} -progress
+# Use optimized GeoParquet (has ID column) from convert job
+# Read via vsicurl from S3
+ogr2ogr -f GeoJSONSeq /tmp/$DATASET.geojsonl /vsicurl/{geoparquet_url} -progress
 
 # Generate PMTiles from GeoJSONSeq
-tippecanoe -o /tmp/mappinginequality.pmtiles -l redlining --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/mappinginequality.geojsonl
+tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/$DATASET.geojsonl
 
 # Upload to S3 using rclone
-rclone copy /tmp/mappinginequality.pmtiles nrp:{bucket}/
-rm /tmp/mappinginequality.geojsonl /tmp/mappinginequality.pmtiles
+rclone copy /tmp/$DATASET.pmtiles nrp:{bucket}/
+rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
@@ -626,18 +633,19 @@ set -e
 
 echo "Starting {dataset_name} workflow..."
 
-# Run convert and pmtiles in parallel
-echo "Step 1: Converting to GeoParquet and generating PMTiles (parallel)..."
+# Step 1: Convert to optimized GeoParquet (needed by both pmtiles and hex jobs)
+echo "Step 1: Converting to optimized GeoParquet..."
 kubectl apply -f /yamls/convert-job.yaml -n {namespace}
-kubectl apply -f /yamls/pmtiles-job.yaml -n {namespace}
 
 echo "Waiting for GeoParquet conversion to complete..."
 kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-convert -n {namespace}
 
-echo "Step 2: H3 hexagonal tiling (PMTiles continues in background)..."
+# Step 2: Run pmtiles and hex tiling in parallel (both use the converted geoparquet)
+echo "Step 2: H3 hexagonal tiling and PMTiles generation (parallel)..."
+kubectl apply -f /yamls/pmtiles-job.yaml -n {namespace}
 kubectl apply -f /yamls/hex-job.yaml -n {namespace}
 
-echo "Waiting for hex tiling to complete..."
+echo "Waiting for hex tiling to complete (PMTiles continues in background)..."
 kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
 
 echo "Step 3: Repartitioning by h0..."
