@@ -60,7 +60,14 @@ def convert_to_parquet(
     else:
         source_path = source_url
     
-    print(f"Converting {source_url} to {destination}")
+    # Convert destination path: /vsis3/bucket/path -> s3://bucket/path for DuckDB
+    dest_path = destination
+    if destination.startswith('/vsis3/'):
+        dest_path = 's3://' + destination[7:]  # Remove /vsis3/ prefix
+    elif destination.startswith('s3://'):
+        dest_path = destination  # Already correct format
+    
+    print(f"Converting {source_url} to {dest_path}")
     if progress:
         print(f"  Compression: {compression} level {compression_level}")
         print(f"  Row group size: {row_group_size:,}")
@@ -85,7 +92,7 @@ def convert_to_parquet(
         # Write optimized GeoParquet
         print(f"  Writing optimized GeoParquet (ID column: {id_col})...")
         _write_geoparquet(
-            con, query, destination, compression, compression_level,
+            con, query, dest_path, compression, compression_level,
             row_group_size, geometry_encoding, progress
         )
         
