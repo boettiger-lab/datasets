@@ -69,6 +69,9 @@ def create_public_bucket(
         import json
         policy_json = json.dumps(policy)
         
+        # Build environment with AWS credentials explicitly
+        env = os.environ.copy()
+        
         result = subprocess.run(
             [
                 "aws", "s3api", "put-bucket-policy",
@@ -79,7 +82,7 @@ def create_public_bucket(
             capture_output=True,
             text=True,
             check=False,
-            env=os.environ.copy()
+            env=env
         )
         
         if result.returncode != 0:

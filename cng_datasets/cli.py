@@ -76,6 +76,13 @@ def main():
     sync_parser.add_argument("--destination", required=True, help="Destination path")
     sync_parser.add_argument("--dry-run", action="store_true", help="Dry run mode")
     
+    setup_bucket_parser = storage_subparsers.add_parser("setup-bucket", help="Setup public bucket with CORS")
+    setup_bucket_parser.add_argument("--bucket", required=True, help="Bucket name")
+    setup_bucket_parser.add_argument("--remote", default="nrp", help="Rclone remote name (default: nrp)")
+    setup_bucket_parser.add_argument("--endpoint", help="S3 endpoint URL (defaults to AWS_PUBLIC_ENDPOINT env var)")
+    setup_bucket_parser.add_argument("--no-cors", action="store_true", help="Skip CORS configuration")
+    setup_bucket_parser.add_argument("--verify", action="store_true", help="Verify bucket configuration after setup")
+    
     args = parser.parse_args()
     
     if args.command == "vector":
@@ -159,6 +166,25 @@ def main():
             from .storage import RcloneSync
             syncer = RcloneSync(dry_run=args.dry_run)
             syncer.sync(args.source, args.destination)
+        elif args.storage_command == "setup-bucket":
+            from .storage import setup_public_bucket
+            from .storage.setup_bucket import verify_bucket_config
+            import json
+            
+            success = setup_public_bucket(
+                bucket_name=args.bucket,
+                remote=args.remote,
+                endpoint=args.endpoint,
+                set_cors=not args.no_cors,
+                verbose=True
+            )
+            
+            if success and args.verify:
+                print("\nVerifying configuration...")
+                results = verify_bucket_config(args.bucket, args.endpoint)
+                print(json.dumps(results, indent=2))
+            
+            sys.exit(0 if success else 1)
     
     else:
         parser.print_help()

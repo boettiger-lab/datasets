@@ -18,8 +18,6 @@ import duckdb
 def convert_to_parquet(
     source_url: str,
     destination: str,
-    bucket: Optional[str] = None,
-    create_bucket: bool = False,
     compression: str = "ZSTD",
     compression_level: int = 15,
     row_group_size: int = 100000,
@@ -34,11 +32,12 @@ def convert_to_parquet(
     Uses geoparquet-io for proper GeoParquet 1.1 metadata and DuckDB for ID handling.
     Ensures every output has a valid, unique ID column for downstream processing.
     
+    Note: If writing to S3, ensure the bucket exists and has proper permissions.
+    Use 'cng-datasets storage setup-bucket' before running this command.
+    
     Args:
         source_url: Source dataset URL (supports /vsicurl/, s3://, file paths)
         destination: Output path (supports /vsis3/, s3://, file paths)
-        bucket: S3 bucket name (required if create_bucket=True)
-        create_bucket: Whether to create and configure the bucket
         compression: Compression algorithm (ZSTD, GZIP, SNAPPY, NONE)
         compression_level: Compression level (1-22 for ZSTD)
         row_group_size: Number of rows per group (affects query performance)
@@ -47,15 +46,6 @@ def convert_to_parquet(
         force_id: Create _cng_fid if no suitable ID column exists
         progress: Show progress during conversion
     """
-    # Create bucket if requested
-    if create_bucket:
-        if not bucket:
-            raise ValueError("bucket parameter required when create_bucket=True")
-        
-        print(f"Creating bucket: {bucket}")
-        from cng_datasets.storage.rclone import create_public_bucket
-        create_public_bucket(bucket, remote='nrp', set_cors=True)
-    
     # Convert destination path: /vsis3/bucket/path -> s3://bucket/path
     dest_path = destination
     if destination.startswith('/vsis3/'):
@@ -372,15 +362,7 @@ def main():
         help="Output GeoParquet path (file path or /vsis3/bucket/path)"
     )
     parser.add_argument(
-        "--bucket",
-        help="S3 bucket name (required with --create-bucket)"
-    )
-    parser.add_argument(
-        "--create-bucket",
-        action="store_true",
-        help="Create and configure S3 bucket before conversion"
-    )
-    parser.add_argument(
+
         "--compression",
         default="ZSTD",
         choices=["ZSTD", "GZIP", "SNAPPY", "NONE"],
@@ -424,8 +406,6 @@ def main():
     convert_to_parquet(
         source_url=args.source_url,
         destination=args.destination,
-        bucket=args.bucket,
-        create_bucket=args.create_bucket,
         compression=args.compression,
         compression_level=args.compression_level,
         row_group_size=args.row_group_size,

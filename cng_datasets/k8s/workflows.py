@@ -127,6 +127,9 @@ def generate_dataset_workflow(
     if parent_resolutions is None:
         parent_resolutions = [9, 8, 0]
     
+    # Generate bucket setup job (must run first)
+    _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
+    
     # Generate conversion job
     _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
     
@@ -175,6 +178,7 @@ def generate_dataset_workflow(
     
     print(f"\n✓ Generated complete workflow for {dataset_name}")
     print(f"\nFiles created in {output_dir}:")
+    print(f"  - setup-bucket-job.yaml")
     print(f"  - convert-job.yaml")
     print(f"  - pmtiles-job.yaml")
     print(f"  - hex-job.yaml")
@@ -196,6 +200,81 @@ def generate_dataset_workflow(
     print(f"  # Clean up")
     print(f"  kubectl delete -f {output_dir}/workflow.yaml")
     print(f"  kubectl delete -f {output_dir}/configmap.yaml")
+
+
+def _generate_setup_bucket_job(manager, dataset_name, bucket, output_path, git_repo):
+    """Generate S3 bucket setup job with public access and CORS."""
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": f"{dataset_name}-setup-bucket",
+            "labels": {"k8s-app": f"{dataset_name}-setup-bucket"}
+        },
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 2,
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-setup-bucket"}},
+                "spec": {
+                    "priorityClassName": "opportunistic",
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [{
+                                    "matchExpressions": [{
+                                        "key": "feature.node.kubernetes.io/pci-10de.present",
+                                        "operator": "NotIn",
+                                        "values": ["true"]
+                                    }]
+                                }]
+                            }
+                        }
+                    },
+                    "restartPolicy": "Never",
+                    "containers": [{
+                        "name": "setup-bucket-task",
+                        "image": "ghcr.io/boettiger-lab/datasets:latest",
+                        "imagePullPolicy": "Always",
+                        "env": [
+                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
+                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
+                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
+                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
+                            {"name": "AWS_HTTPS", "value": "false"},
+                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
+                            {"name": "BUCKET", "value": bucket}
+                        ],
+                        "volumeMounts": [
+                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+                        ],
+                        "command": ["bash", "-c", f"""set -e
+echo "Installing cng-datasets..."
+pip install -q git+{git_repo}
+
+echo "Setting up bucket with public access and CORS..."
+cng-datasets storage setup-bucket \\
+  --bucket "${{BUCKET}}" \\
+  --remote nrp \\
+  --verify
+
+echo "Bucket setup complete!"
+"""],
+                        "resources": {
+                            "requests": {"cpu": "1", "memory": "2Gi"},
+                            "limits": {"cpu": "1", "memory": "2Gi"}
+                        }
+                    }],
+                    "volumes": [
+                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
+                    ]
+                }
+            }
+        }
+    }
+    manager.save_job_yaml(job_spec, str(output_path / "setup-bucket-job.yaml"))
 
 
 def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
@@ -250,9 +329,7 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
 pip install -q git+{git_repo}
 cng-convert-to-parquet \\
   {source_url} \\
-  /vsis3/{bucket}/{dataset_name}.parquet \\
-  --bucket {bucket} \\
-  --create-bucket
+  /vsis3/{bucket}/{dataset_name}.parquet
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
@@ -564,7 +641,7 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     import yaml
     
     # Read all job YAML files
-    job_files = ["convert-job.yaml", "pmtiles-job.yaml", "hex-job.yaml", "repartition-job.yaml"]
+    job_files = ["setup-bucket-job.yaml", "convert-job.yaml", "pmtiles-job.yaml", "hex-job.yaml", "repartition-job.yaml"]
     data = {}
     
     for job_file in job_files:
@@ -585,11 +662,12 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     
     with open(output_path / "configmap.yaml", "w") as f:
         f.write("# Auto-generated ConfigMap containing job definitions\n")
-        f.write("# Generated from: convert-job.yaml, pmtiles-job.yaml, hex-job.yaml, repartition-job.yaml\n")
+        f.write("# Generated from: setup-bucket-job.yaml, convert-job.yaml, pmtiles-job.yaml, hex-job.yaml, repartition-job.yaml\n")
         f.write(f"# Generation command: {gen_command}\n")
         f.write("#\n")
         f.write("# This ConfigMap is equivalent to running:\n")
         f.write(f"#   kubectl create configmap {dataset_name}-yamls \\\n")
+        f.write("#     --from-file=setup-bucket-job.yaml \\\n")
         f.write("#     --from-file=convert-job.yaml \\\n")
         f.write("#     --from-file=pmtiles-job.yaml \\\n")
         f.write("#     --from-file=hex-job.yaml \\\n")
@@ -633,6 +711,13 @@ set -e
 
 echo "Starting {dataset_name} workflow..."
 
+# Step 0: Setup bucket with public access and CORS
+echo "Step 0: Setting up bucket..."
+kubectl apply -f /yamls/setup-bucket-job.yaml -n {namespace}
+
+echo "Waiting for bucket setup to complete..."
+kubectl wait --for=condition=complete --timeout=600s job/{dataset_name}-setup-bucket -n {namespace}
+
 # Step 1: Convert to optimized GeoParquet (needed by both pmtiles and hex jobs)
 echo "Step 1: Converting to optimized GeoParquet..."
 kubectl apply -f /yamls/convert-job.yaml -n {namespace}
@@ -658,7 +743,7 @@ echo "✓ Workflow complete!"
 echo "Note: PMTiles job may still be running in the background"
 echo ""
 echo "Clean up with:"
-echo "  kubectl delete jobs {dataset_name}-convert {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace}"
+echo "  kubectl delete jobs {dataset_name}-setup-bucket {dataset_name}-convert {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace}"
 echo "  kubectl delete configmap {configmap_name} -n {namespace}"
 """],
                         "resources": {
