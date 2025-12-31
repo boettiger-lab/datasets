@@ -102,6 +102,28 @@ def convert_to_parquet(
 
 def _setup_duckdb_connection() -> duckdb.DuckDBPyConnection:
     """Setup DuckDB with spatial extension."""
+    import os
+    
+    # Configure GDAL SSL certificate path for DuckDB spatial extension
+    # Try common certificate bundle locations
+    cert_paths = [
+        '/etc/ssl/certs/ca-certificates.crt',  # Debian/Ubuntu
+        '/etc/ssl/certs/ca-bundle.crt',         # RedHat/CentOS
+        '/etc/pki/tls/certs/ca-bundle.crt',    # Older RedHat
+        '/etc/ssl/cert.pem',                    # Alpine
+        '/usr/local/share/ca-certificates/',   # Custom installs
+    ]
+    
+    for cert_path in cert_paths:
+        if os.path.exists(cert_path):
+            os.environ['CURL_CA_BUNDLE'] = cert_path
+            os.environ['SSL_CERT_FILE'] = cert_path
+            break
+    else:
+        # If no cert bundle found, disable SSL verification as fallback
+        # (not ideal but necessary for some container environments)
+        os.environ['GDAL_HTTP_UNSAFESSL'] = 'YES'
+    
     con = duckdb.connect()
     
     # Install and load spatial extension (uses GDAL internally)
