@@ -256,7 +256,3 @@ See the individual dataset directories for complete examples:
 - `redlining/` - Vector polygon processing with chunking
 - `wetlands/` - Raster to H3 conversion
 - `wdpa/` - Large-scale protected areas processing
-
-## License
-
-MIT

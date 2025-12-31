@@ -24,13 +24,15 @@ def convert_to_parquet(
     geometry_encoding: str = "WKB",
     id_column: Optional[str] = None,
     force_id: bool = True,
-    progress: bool = True
+    progress: bool = True,
+    target_crs: str = "EPSG:4326"
 ):
     """
     Convert a vector dataset to optimized GeoParquet with guaranteed ID column.
     
     Uses geoparquet-io for proper GeoParquet 1.1 metadata and DuckDB for ID handling.
     Ensures every output has a valid, unique ID column for downstream processing.
+    Automatically reprojects to EPSG:4326 if source is in a different CRS.
     
     Note: If writing to S3, ensure the bucket exists and has proper permissions.
     Use 'cng-datasets storage setup-bucket' before running this command.
@@ -45,6 +47,7 @@ def convert_to_parquet(
         id_column: Specific ID column to use (auto-detected if not specified)
         force_id: Create _cng_fid if no suitable ID column exists
         progress: Show progress during conversion
+        target_crs: Target CRS for output (default: EPSG:4326 for H3 hex processing)
     """
     # Convert destination path: /vsis3/bucket/path -> s3://bucket/path
     dest_path = destination
@@ -59,6 +62,14 @@ def convert_to_parquet(
         print(f"  Row group size: {row_group_size:,}")
     
     try:
+        # Check projection and reproject if necessary
+        print("  Checking projection...")
+        needs_reprojection, source_crs = _check_projection(source_url, target_crs)
+        if needs_reprojection:
+            print(f"  Source CRS: {source_crs} -> Reprojecting to {target_crs}")
+        else:
+            print(f"  Source already in {target_crs}")
+        
         # Check if we need to add an ID column
         print("  Checking for ID column...")
         needs_id, id_col_name = _check_needs_id_column(source_url, id_column, force_id)
@@ -67,12 +78,13 @@ def convert_to_parquet(
             # Two-step process: convert with geoparquet-io, then add ID column
             print(f"  Creating synthetic ID column: {id_col_name}")
             _convert_with_id_column(source_url, dest_path, id_col_name, compression, 
-                                   compression_level, row_group_size, progress)
+                                   compression_level, row_group_size, progress,
+                                   needs_reprojection, target_crs)
         else:
             # Direct conversion with geoparquet-io
             print(f"  Using existing ID column: {id_col_name}")
             _convert_direct(source_url, dest_path, compression, compression_level, 
-                           row_group_size, progress)
+                           row_group_size, progress, needs_reprojection, target_crs)
         
         print("✓ Conversion completed successfully!")
         if needs_id:
@@ -81,6 +93,57 @@ def convert_to_parquet(
     except Exception as e:
         print(f"✗ Conversion failed: {e}", file=sys.stderr)
         raise
+
+
+def _check_projection(
+    source_url: str,
+    target_crs: str = "EPSG:4326"
+) -> Tuple[bool, Optional[str]]:
+    """
+    Check if source dataset needs reprojection.
+    
+    Returns:
+        Tuple of (needs_reprojection, source_crs)
+    """
+    from cng_datasets.vector.h3_tiling import setup_duckdb_connection
+    
+    _configure_ssl()
+    con = setup_duckdb_connection()
+    
+    try:
+        # Configure S3 credentials
+        from cng_datasets.storage.s3 import configure_s3_credentials
+        configure_s3_credentials(con)
+        
+        # Prepare source path
+        if source_url.startswith('http://') or source_url.startswith('https://'):
+            source_path = f"/vsicurl/{source_url}"
+        else:
+            source_path = source_url
+        
+        # Get CRS info
+        result = con.execute(f"""
+            SELECT ST_SRID(geom) as srid
+            FROM ST_Read('{source_path}')
+            LIMIT 1
+        """).fetchone()
+        
+        if result is None or result[0] is None:
+            print("  Warning: No CRS found in source data, assuming EPSG:4326")
+            return False, None
+        
+        source_srid = result[0]
+        
+        # Parse target CRS to get SRID
+        target_srid = int(target_crs.split(':')[1]) if ':' in target_crs else int(target_crs)
+        
+        needs_reprojection = source_srid != target_srid
+        source_crs = f"EPSG:{source_srid}"
+        
+        return needs_reprojection, source_crs
+        
+    finally:
+        con.close()
 
 
 def _check_needs_id_column(
@@ -195,9 +258,20 @@ def _convert_direct(
     compression: str,
     compression_level: int,
     row_group_size: int,
-    verbose: bool
+    verbose: bool,
+    needs_reprojection: bool = False,
+    target_crs: str = "EPSG:4326"
 ):
-    """Convert directly using geoparquet-io."""
+    """Convert directly using geoparquet-io or DuckDB if reprojection needed."""
+    # If reprojection is needed, use DuckDB path
+    if needs_reprojection:
+        _convert_direct_with_reprojection(
+            source_url, destination, compression, compression_level,
+            row_group_size, verbose, target_crs
+        )
+        return
+    
+    # Otherwise use geoparquet-io for direct conversion
     try:
         from geoparquet_io.core.convert import convert_to_geoparquet
     except ImportError:
@@ -251,6 +325,100 @@ def _convert_direct(
         )
 
 
+def _convert_direct_with_reprojection(
+    source_url: str,
+    destination: str,
+    compression: str,
+    compression_level: int,
+    row_group_size: int,
+    verbose: bool,
+    target_crs: str
+):
+    """Convert with reprojection using DuckDB + geoparquet-io write."""
+    try:
+        from geoparquet_io.core.common import write_parquet_with_metadata
+    except ImportError:
+        raise ImportError("geoparquet-io is required. Install with: pip install geoparquet-io")
+    
+    from cng_datasets.vector.h3_tiling import setup_duckdb_connection
+    from cng_datasets.storage.s3 import configure_s3_credentials
+    
+    _configure_ssl()
+    con = setup_duckdb_connection()
+    
+    try:
+        configure_s3_credentials(con)
+        
+        # Prepare source path
+        if source_url.startswith('http://') or source_url.startswith('https://'):
+            source_path = f"/vsicurl/{source_url}"
+        else:
+            source_path = source_url
+        
+        # Parse target SRID
+        target_srid = int(target_crs.split(':')[1]) if ':' in target_crs else int(target_crs)
+        
+        # Read source and reproject
+        if verbose:
+            print(f"  Reading source and reprojecting to {target_crs}...")
+        
+        query = f"""
+            SELECT 
+                * EXCLUDE (geom),
+                ST_Transform(geom, {target_srid}) as geom
+            FROM ST_Read('{source_path}')
+        """
+        
+        # If destination is S3, write to temp file first, then upload via rclone
+        if destination.startswith('s3://') or destination.startswith('/vsis3/'):
+            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            try:
+                if verbose:
+                    print(f"  Writing to temporary file: {tmp_path}")
+                
+                write_parquet_with_metadata(
+                    con=con,
+                    query=query,
+                    output_file=tmp_path,
+                    compression=compression,
+                    compression_level=compression_level,
+                    row_group_rows=row_group_size,
+                    geoparquet_version="1.1",
+                    verbose=verbose,
+                    profile=None
+                )
+                
+                if verbose:
+                    print(f"  Uploading to S3 via rclone: {destination}")
+                
+                _upload_via_rclone(tmp_path, destination, verbose=verbose)
+                
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        else:
+            # Local file - write directly
+            if verbose:
+                print(f"  Writing GeoParquet with proper metadata...")
+            
+            write_parquet_with_metadata(
+                con=con,
+                query=query,
+                output_file=destination,
+                compression=compression,
+                compression_level=compression_level,
+                row_group_rows=row_group_size,
+                geoparquet_version="1.1",
+                verbose=verbose,
+                profile=None
+            )
+        
+    finally:
+        con.close()
+
+
 def _convert_with_id_column(
     source_url: str,
     destination: str,
@@ -258,7 +426,9 @@ def _convert_with_id_column(
     compression: str,
     compression_level: int,
     row_group_size: int,
-    verbose: bool
+    verbose: bool,
+    needs_reprojection: bool = False,
+    target_crs: str = "EPSG:4326"
 ):
     """Convert with synthetic ID column using DuckDB + geoparquet-io write."""
     try:
@@ -282,16 +452,32 @@ def _convert_with_id_column(
         else:
             source_path = source_url
         
+        # Parse target SRID if reprojection needed
+        target_srid = None
+        if needs_reprojection:
+            target_srid = int(target_crs.split(':')[1]) if ':' in target_crs else int(target_crs)
+        
         # Read source with DuckDB spatial and add ID column
         if verbose:
-            print(f"  Reading source and adding ID column...")
+            action = "Reading source, reprojecting, and adding ID column" if needs_reprojection else "Reading source and adding ID column"
+            print(f"  {action}...")
         
-        query = f"""
-            SELECT 
-                row_number() OVER () AS {id_col_name},
-                *
-            FROM ST_Read('{source_path}')
-        """
+        # Build query with optional reprojection
+        if needs_reprojection:
+            query = f"""
+                SELECT 
+                    row_number() OVER () AS {id_col_name},
+                    * EXCLUDE (geom),
+                    ST_Transform(geom, {target_srid}) as geom
+                FROM ST_Read('{source_path}')
+            """
+        else:
+            query = f"""
+                SELECT 
+                    row_number() OVER () AS {id_col_name},
+                    *
+                FROM ST_Read('{source_path}')
+            """
         
         # If destination is S3, write to temp file first, then upload via rclone
         # This preserves GeoParquet metadata (DuckDB COPY would strip it)
