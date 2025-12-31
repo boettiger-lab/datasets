@@ -125,13 +125,13 @@ All jobs and RBAC use the specified namespace.
 
 1. **Chunking Phase** (`hex-job.yaml`):
    - Process source data in parallel chunks
-   - Write to temporary `s3://bucket/chunks/` directory
+   - Write to temporary `s3://bucket/dataset-name/chunks/` directory
    - Each chunk contains all H3 resolutions
 
 2. **Repartition Phase** (`repartition-job.yaml`):
    - Read all chunks
    - Repartition by h0 hexagon (continent-scale)
-   - Write to final `s3://bucket/hex/` directory
+   - Write to final `s3://bucket/dataset-name/hex/` directory
    - Delete temporary `chunks/` directory
 
 This enables efficient parallel processing while ensuring optimal query performance.
@@ -140,12 +140,13 @@ This enables efficient parallel processing while ensuring optimal query performa
 
 ```
 s3://bucket/
-├── dataset.parquet         # GeoParquet with all attributes
-├── dataset.pmtiles         # PMTiles vector tiles
-├── hex/                    # H3-indexed parquet (partitioned by h0)
-│   └── h0=*/
-│       └── *.parquet
-└── chunks/                 # Temporary (deleted after repartition)
+├── dataset-name.parquet         # GeoParquet with all attributes
+├── dataset-name.pmtiles         # PMTiles vector tiles
+└── dataset-name/
+    ├── hex/                     # H3-indexed parquet (partitioned by h0)
+    │   └── h0=*/
+    │       └── *.parquet
+    └── chunks/                  # Temporary (deleted after repartition)
 ```
 
 ## Monitoring & Debugging

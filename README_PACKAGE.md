@@ -147,7 +147,7 @@ from cng_datasets.k8s import K8sJobManager
 # Step 1: Process locally or generate K8s job
 processor = H3VectorProcessor(
     input_url="s3://public-dataset/input.parquet",
-    output_url="s3://public-dataset/chunks/",
+    output_url="s3://public-dataset/dataset-name/chunks/",
     h3_resolution=10,
     chunk_size=500
 )

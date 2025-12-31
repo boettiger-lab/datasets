@@ -22,6 +22,18 @@ cng-datasets workflow \
 ```
 
 
+```bash
+cng-datasets workflow \
+  --dataset cpad-2025b-units \
+  --source-url https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Units/CPAD_2025b_Units.shp \
+  --bucket public-cpad \
+  --h3-resolution 9 \
+  --hex-memory 200Gi \
+  --max-completions 400 \
+  --max-parallelism 50 \
+  --parent-resolutions "9,8,0"
+```
+
 
 ```
 kubectl logs -f job/cpad-2025b-holdings-workflow
