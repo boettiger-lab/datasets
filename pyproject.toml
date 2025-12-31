@@ -64,3 +64,8 @@ markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
     "timeout: marks tests with timeout values (provided by pytest-timeout plugin)",
 ]
+
+[tool.uv.workspace]
+members = [
+    "test-data",
+]
