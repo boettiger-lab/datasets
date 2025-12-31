@@ -198,6 +198,7 @@ class H3VectorProcessor:
         h3_resolution: int = 10,
         parent_resolutions: Optional[List[int]] = None,
         chunk_size: int = 500,
+        intermediate_chunk_size: int = 10,
         id_column: Optional[str] = None,
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
@@ -210,7 +211,8 @@ class H3VectorProcessor:
             output_url: S3 URL or local path to output directory
             h3_resolution: Target H3 resolution for tiling
             parent_resolutions: List of parent resolutions to include (e.g., [9, 8, 0])
-            chunk_size: Number of rows to process per chunk
+            chunk_size: Number of rows to process in pass 1 (geometry to H3 arrays)
+            intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays)
             id_column: Name of ID column to use (auto-detected if not specified)
             read_credentials: Dict with AWS credentials for reading (key, secret, region, endpoint)
             write_credentials: Dict with AWS credentials for writing (key, secret, region, endpoint)
@@ -220,6 +222,7 @@ class H3VectorProcessor:
         self.h3_resolution = h3_resolution
         self.parent_resolutions = parent_resolutions or [9, 8, 0]
         self.chunk_size = chunk_size
+        self.intermediate_chunk_size = intermediate_chunk_size
         self.id_column = id_column
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
@@ -246,7 +249,10 @@ class H3VectorProcessor:
         keep_cols: Optional[List[str]] = None
     ) -> Optional[str]:
         """
-        Process a single chunk of the input dataset.
+        Process a single chunk using two-pass approach to avoid OOM.
+        
+        Pass 1: Convert geometries to H3 cell arrays (no unnesting)
+        Pass 2: Read small batches, unnest arrays, write final output
         
         Args:
             chunk_id: Zero-based chunk index to process
@@ -255,8 +261,31 @@ class H3VectorProcessor:
         Returns:
             Output file path if successful, None if chunk_id out of range
         """
-        # Read only the chunk we need with column projection for speed
-        # Use LIMIT/OFFSET with parquet metadata for efficient chunk selection
+        # PASS 1: Geometry to H3 arrays (no unnesting)
+        intermediate_file = self._process_pass1(chunk_id)
+        if intermediate_file is None:
+            return None
+        
+        # PASS 2: Unnest arrays in small batches
+        output_file = self._process_pass2(chunk_id, intermediate_file)
+        
+        # Clean up intermediate file
+        try:
+            if intermediate_file.startswith('/tmp/'):
+                os.remove(intermediate_file)
+        except Exception as e:
+            print(f"  Warning: Could not remove intermediate file: {e}")
+        
+        return output_file
+    
+    def _process_pass1(
+        self,
+        chunk_id: int,
+    ) -> Optional[str]:
+        """
+        Pass 1: Convert geometries to H3 cell arrays without unnesting.
+        Writes intermediate parquet with arrays to disk.
+        """
         offset = chunk_id * self.chunk_size
         
         self.con.execute(f"""
@@ -265,16 +294,15 @@ class H3VectorProcessor:
             LIMIT {self.chunk_size} OFFSET {offset}
         """)
         
-        # Get row count to validate chunk
         chunk_rows = self.con.execute("SELECT COUNT(*) FROM source_table").fetchone()[0]
         if chunk_rows == 0:
             print(f"Chunk {chunk_id} is empty (offset {offset:,} beyond data)")
             return None
         
-        # Find and rename geometry column
+        print(f"\nPass 1 - Chunk {chunk_id} ({chunk_rows:,} rows): Converting geometries to H3 arrays...")
+        
         geom_col = self._find_geometry_column('source_table')
         
-        # Identify or validate ID column
         id_col, is_unique = identify_id_column(
             self.con, 
             'source_table', 
@@ -282,10 +310,8 @@ class H3VectorProcessor:
             check_uniqueness=True
         )
         
-        # If no ID column found or not unique, create a synthetic one
-        # But if _cng_fid already exists (from convert_to_parquet), use it!
         if id_col is None or not is_unique:
-            print(f"  No valid ID column found, creating row_number as _fid")
+            print(f"  Creating synthetic ID as _fid")
             id_col = '_fid'
             self.con.execute(f"""
                 CREATE OR REPLACE VIEW source_table_with_id AS 
@@ -294,28 +320,58 @@ class H3VectorProcessor:
             """)
             chunk_view_name = 'source_table_with_id'
         else:
-            print(f"  Using ID column: {id_col} (unique: {is_unique})")
+            print(f"  Using ID column: {id_col}")
             chunk_view_name = 'source_table'
         
-        print(f"\nProcessing chunk {chunk_id} ({chunk_rows:,} rows)")
-        
-        # Create optimized chunk view with ONLY ID and geometry (minimal memory for UNNEST)
-        # Keep original ID column name to preserve data fidelity
         self.con.execute(f"""
             CREATE OR REPLACE VIEW chunk_table AS 
             SELECT "{id_col}", {geom_col} AS geom
             FROM {chunk_view_name}
         """)
         
-        # Convert to H3 cells - only keeping ID column (with original name)
+        # Generate H3 arrays WITHOUT unnesting
         h3_sql = geom_to_h3_cells(
             self.con, 
             'chunk_table', 
             zoom=self.h3_resolution, 
-            keep_cols=[id_col]  # Keep original ID column name
+            keep_cols=[id_col]
         )
         
-        # Build final query with unnested h3 cells and parent resolutions
+        # Write arrays to intermediate file (NO UNNEST!)
+        intermediate_file = f"/tmp/h3_intermediate_{chunk_id:06d}.parquet"
+        
+        self.con.execute(f"""
+            COPY ({h3_sql}) 
+            TO '{intermediate_file}' 
+            (FORMAT PARQUET, COMPRESSION 'ZSTD')
+        """)
+        
+        print(f"  ✓ Pass 1 complete: {intermediate_file}")
+        return intermediate_file
+    
+    def _process_pass2(
+        self,
+        chunk_id: int,
+        intermediate_file: str,
+    ) -> str:
+        """
+        Pass 2: Read H3 arrays in small batches, unnest, and write final output.
+        """
+        print(f"Pass 2 - Chunk {chunk_id}: Unnesting arrays in small batches...")
+        
+        # Get total rows in intermediate file
+        total_rows = self.con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{intermediate_file}')"
+        ).fetchone()[0]
+        
+        num_batches = (total_rows + self.intermediate_chunk_size - 1) // self.intermediate_chunk_size
+        print(f"  Processing {total_rows} rows in {num_batches} batches of {self.intermediate_chunk_size}")
+        
+        # Get ID column name from intermediate file
+        result = self.con.execute(f"SELECT * FROM read_parquet('{intermediate_file}') LIMIT 0").description
+        id_col = result[0][0]  # First column is the ID
+        
+        # Build parent resolution columns
         h3_col = f"h{self.h3_resolution}"
         parent_cols = []
         for parent_res in sorted(self.parent_resolutions):
@@ -325,27 +381,62 @@ class H3VectorProcessor:
         
         parent_cols_str = ', ' + ', '.join(parent_cols) if parent_cols else ''
         
-        # UNNEST with only ID + h3 cells (minimal RAM usage!)
-        # Use original ID column name for output consistency
-        final_sql = f"""
-            SELECT "{id_col}", 
-                   UNNEST(h3id) AS {h3_col}{parent_cols_str}
-            FROM ({h3_sql})
-        """
-        
-        # Generate output file path
+        # Process in small batches to control memory
         output_file = f"{self.output_url}/chunk_{chunk_id:06d}.parquet"
         
-        # Write with compression and row group optimization
-        self.con.execute(f"""
-            COPY ({final_sql}) 
-            TO '{output_file}' 
-            (FORMAT PARQUET, 
-             COMPRESSION 'ZSTD',
-             ROW_GROUP_SIZE 100000)
-        """)
+        for batch_id in range(num_batches):
+            batch_offset = batch_id * self.intermediate_chunk_size
+            
+            # Read small batch and unnest
+            # IMPORTANT: Use subquery to apply LIMIT/OFFSET to input rows BEFORE unnest
+            # Otherwise DuckDB applies LIMIT/OFFSET to the unnested output!
+            unnest_sql = f"""
+                SELECT "{id_col}", 
+                       UNNEST(h3id) AS {h3_col}{parent_cols_str}
+                FROM (
+                    SELECT * FROM read_parquet('{intermediate_file}')
+                    LIMIT {self.intermediate_chunk_size} OFFSET {batch_offset}
+                )
+            """
+            
+            # Append to output file
+            if batch_id == 0:
+                # First batch: create file
+                self.con.execute(f"""
+                    COPY ({unnest_sql}) 
+                    TO '{output_file}' 
+                    (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
+                """)
+            else:
+                # Subsequent batches: append
+                # DuckDB requires us to use a different approach for append
+                # We'll write to temp and then merge
+                temp_batch_file = f"{output_file}.batch_{batch_id}.tmp"
+                self.con.execute(f"""
+                    COPY ({unnest_sql}) 
+                    TO '{temp_batch_file}' 
+                    (FORMAT PARQUET, COMPRESSION 'ZSTD')
+                """)
+                
+                # Append by creating a union and rewriting
+                self.con.execute(f"""
+                    COPY (
+                        SELECT * FROM read_parquet('{output_file}')
+                        UNION ALL
+                        SELECT * FROM read_parquet('{temp_batch_file}')
+                    )
+                    TO '{output_file}.new' 
+                    (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
+                """)
+                
+                # Replace old file with new
+                os.replace(f"{output_file}.new", output_file)
+                os.remove(temp_batch_file)
+            
+            if (batch_id + 1) % 10 == 0 or batch_id == num_batches - 1:
+                print(f"  Progress: {batch_id + 1}/{num_batches} batches")
         
-        print(f"  ✓ Chunk {chunk_id} written to {output_file}")
+        print(f"  ✓ Pass 2 complete: {output_file}")
         return output_file
     
     def process_all_chunks(self) -> List[str]:
@@ -380,6 +471,7 @@ def process_vector_chunks(
     h3_resolution: int = 10,
     parent_resolutions: Optional[List[int]] = None,
     chunk_size: int = 500,
+    intermediate_chunk_size: int = 10,
     **kwargs
 ) -> Optional[List[str]]:
     """
@@ -391,7 +483,8 @@ def process_vector_chunks(
         chunk_id: Specific chunk to process, or None to process all
         h3_resolution: Target H3 resolution
         parent_resolutions: List of parent resolutions to include
-        chunk_size: Number of rows per chunk
+        chunk_size: Number of rows per chunk in pass 1
+        intermediate_chunk_size: Number of rows per batch in pass 2 (unnesting)
         **kwargs: Additional arguments passed to H3VectorProcessor
         
     Returns:
@@ -403,6 +496,7 @@ def process_vector_chunks(
         h3_resolution=h3_resolution,
         parent_resolutions=parent_resolutions,
         chunk_size=chunk_size,
+        intermediate_chunk_size=intermediate_chunk_size,
         **kwargs
     )
     

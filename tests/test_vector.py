@@ -341,14 +341,148 @@ class TestVectorProcessing:
                 input_url=test_parquet,
                 output_url=tmpdir,
                 h3_resolution=8,
-                chunk_size=100
+                chunk_size=100,
+                intermediate_chunk_size=10
             )
             
             assert processor.input_url == test_parquet
             assert processor.output_url == tmpdir
             assert processor.h3_resolution == 8
             assert processor.chunk_size == 100
+            assert processor.intermediate_chunk_size == 10
             
+            processor.con.close()
+    
+    @pytest.mark.timeout(10)
+    def test_two_pass_processing_intermediate_file(self):
+        """Test that two-pass processing creates and cleans up intermediate file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create test data with multiple features to ensure array creation
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            con.execute(f"""
+                CREATE TABLE test_data AS 
+                SELECT 
+                    ROW_NUMBER() OVER () as id,
+                    'feature' || ROW_NUMBER() OVER () as name,
+                    ST_GeomFromText('POLYGON((-122.5 37.7, -122.4 37.7, -122.4 37.8, -122.5 37.8, -122.5 37.7))') as geom
+                FROM range(3)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+            
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                parent_resolutions=[0],
+                chunk_size=5,
+                intermediate_chunk_size=2
+            )
+            
+            # Track intermediate file creation
+            from pathlib import Path as PathLib
+            intermediate_files_before = set(PathLib('/tmp').iterdir())
+            
+            # Process chunk
+            output_file = processor.process_chunk(0)
+            
+            # Check intermediate file was created during processing
+            # (It should be cleaned up after, so we can't check it now)
+            assert output_file is not None
+            assert Path(output_file).exists()
+            
+            # Verify output has expected structure
+            result_con = setup_duckdb_connection()
+            result = result_con.execute(f"SELECT * FROM read_parquet('{output_file}')").fetchdf()
+            
+            assert 'h8' in result.columns
+            assert 'h0' in result.columns
+            assert 'id' in result.columns
+            assert len(result) > 0
+            
+            # Verify intermediate file was cleaned up
+            intermediate_files_after = set(PathLib('/tmp').iterdir())
+            new_intermediate_files = [f.name for f in (intermediate_files_after - intermediate_files_before) 
+                                     if f.name.startswith('h3_intermediate')]
+            assert len(new_intermediate_files) == 0, f"Intermediate files not cleaned up: {new_intermediate_files}"
+            
+            result_con.close()
+            processor.con.close()
+    
+    @pytest.mark.timeout(10)
+    def test_small_intermediate_chunk_size(self):
+        """Test processing with very small intermediate_chunk_size to verify batching.
+        
+        IMPORTANT: Each polygon's ID should be preserved in ALL its H3 cells.
+        So polygon ID=0 generates cells with ID=0, polygon ID=1 generates cells with ID=1, etc.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create 5 different polygons, each with unique ID
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            
+            # First verify the input data has correct IDs
+            con.execute(f"""
+                CREATE TABLE test_data AS 
+                SELECT 
+                    i as id,
+                    ST_GeomFromText('POLYGON((-122.5 37.7, -122.4 37.7, -122.4 37.8, -122.5 37.8, -122.5 37.7))') as geom
+                FROM range(5) t(i)
+            """)
+            
+            # Verify input has 5 rows with IDs 0-4
+            input_check = con.execute("SELECT id FROM test_data ORDER BY id").fetchdf()
+            assert len(input_check) == 5, f"Expected 5 input rows, got {len(input_check)}"
+            assert list(input_check['id']) == [0, 1, 2, 3, 4], f"Input IDs incorrect: {list(input_check['id'])}"
+            
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+            
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            
+            # Use very small intermediate_chunk_size to force multiple batches in pass 2
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                parent_resolutions=[0],
+                chunk_size=10,
+                intermediate_chunk_size=1  # Process 1 row at a time in pass 2
+            )
+            
+            output_file = processor.process_chunk(0)
+            
+            assert output_file is not None
+            assert Path(output_file).exists()
+            
+            # Verify output is correct despite small batch size
+            result_con = setup_duckdb_connection()
+            result = result_con.execute(f"SELECT * FROM read_parquet('{output_file}') ORDER BY id, h8").fetchdf()
+            
+            assert 'h8' in result.columns
+            assert 'h0' in result.columns
+            assert 'id' in result.columns
+            
+            # Critical test: All 5 polygon IDs should be preserved in output
+            # Each polygon generates one or more H3 cells, but ALL cells from that polygon keep its ID
+            unique_ids = sorted(result['id'].unique())
+            assert len(unique_ids) == 5, f"Expected 5 unique polygon IDs (0-4), got {len(unique_ids)}: {unique_ids}"
+            assert unique_ids == [0, 1, 2, 3, 4], f"Expected IDs 0-4, got {unique_ids}"
+            
+            # Verify we have at least as many output rows as input polygons
+            assert len(result) >= 5, f"Expected at least 5 output rows, got {len(result)}"
+            
+            # Verify each ID appears at least once (could appear multiple times if polygon generates multiple cells)
+            for expected_id in [0, 1, 2, 3, 4]:
+                id_count = len(result[result['id'] == expected_id])
+                assert id_count > 0, f"ID {expected_id} missing from output!"
+            
+            result_con.close()
             processor.con.close()
     
     @pytest.mark.timeout(5)

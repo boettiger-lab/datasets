@@ -32,7 +32,8 @@ process_vector_chunks(
     input_url="s3://my-bucket/input.parquet",
     output_url="s3://my-bucket/output/",
     h3_resolution=10,
-    chunk_size=500
+    chunk_size=500,
+    intermediate_chunk_size=10  # Reduce if hitting OOM with large polygons
 )
 
 # Process specific chunk (useful for parallel K8s jobs)
@@ -44,6 +45,12 @@ process_vector_chunks(
 )
 ```
 
+**Two-Pass Processing**: The toolkit uses a memory-efficient two-pass approach:
+- **Pass 1**: Converts geometries to H3 cell arrays (no unnesting) and writes to intermediate file
+- **Pass 2**: Reads arrays in small batches, unnests them, and writes final output
+
+This prevents OOM errors when processing large polygons at high H3 resolutions. If you still hit memory limits, reduce `intermediate_chunk_size` (default: 10).
+
 ### Using the Class Interface
 
 ```python
@@ -54,7 +61,8 @@ processor = H3VectorProcessor(
     output_url="s3://my-bucket/h3-indexed/",
     h3_resolution=10,
     parent_resolutions=[9, 8, 0],
-    chunk_size=500
+    chunk_size=500,  # Pass 1: rows to process at once
+    intermediate_chunk_size=10  # Pass 2: array rows to unnest at once
 )
 
 # Process all chunks
@@ -96,13 +104,15 @@ cng-datasets vector \
     --input s3://bucket/input.parquet \
     --output s3://bucket/output/ \
     --resolution 10 \
-    --chunk-size 500
+    --chunk-size 500 \
+    --intermediate-chunk-size 10
 
-# Process specific chunk
+# Process specific chunk (reduce intermediate-chunk-size if hitting OOM)
 cng-datasets vector \
     --input s3://bucket/input.parquet \
     --output s3://bucket/output/ \
-    --chunk-id 0
+    --chunk-id 0 \
+    --intermediate-chunk-size 5
 
 # Generate K8s job
 cng-datasets k8s \

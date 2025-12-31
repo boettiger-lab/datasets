@@ -20,7 +20,8 @@ def main():
     vector_parser.add_argument("--input", required=True, help="Input file URL")
     vector_parser.add_argument("--output", required=True, help="Output directory URL")
     vector_parser.add_argument("--resolution", type=int, default=10, help="H3 resolution")
-    vector_parser.add_argument("--chunk-size", type=int, default=500, help="Chunk size")
+    vector_parser.add_argument("--chunk-size", type=int, default=500, help="Number of rows to process in pass 1 (geometry to H3 arrays)")
+    vector_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     vector_parser.add_argument("--chunk-id", type=int, help="Process specific chunk")
     vector_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
     vector_parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
@@ -88,6 +89,7 @@ def main():
             h3_resolution=args.resolution,
             parent_resolutions=parent_res,
             chunk_size=args.chunk_size,
+            intermediate_chunk_size=args.intermediate_chunk_size,
             id_column=args.id_column,
         )
     
