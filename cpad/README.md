@@ -27,7 +27,8 @@ cng-datasets workflow \
   --dataset cpad-2025b-units \
   --source-url https://s3-west.nrp-nautilus.io/public-cpad/2025b/CPAD_2025b_Units/CPAD_2025b_Units.shp \
   --bucket public-cpad \
-  --h3-resolution 9 \
+  --h3-resolution 10 \
+  --intermediate-chunk-size 5 \
   --hex-memory 200Gi \
   --max-completions 400 \
   --max-parallelism 50 \

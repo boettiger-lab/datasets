@@ -62,6 +62,7 @@ def main():
     workflow_parser.add_argument("--hex-memory", type=str, default="8Gi", help="Memory per hex job pod (default: 8Gi)")
     workflow_parser.add_argument("--max-parallelism", type=int, default=50, help="Maximum parallel hex jobs (default: 50)")
     workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
+    workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     
     # Storage management command
     storage_parser = subparsers.add_parser("storage", help="Manage cloud storage")
@@ -153,6 +154,7 @@ def main():
             hex_memory=args.hex_memory,
             max_parallelism=args.max_parallelism,
             max_completions=args.max_completions,
+            intermediate_chunk_size=args.intermediate_chunk_size,
         )
     
     elif args.command == "storage":

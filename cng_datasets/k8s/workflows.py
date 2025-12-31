@@ -89,7 +89,8 @@ def generate_dataset_workflow(
     id_column: Optional[str] = None,
     hex_memory: str = "8Gi",
     max_parallelism: int = 50,
-    max_completions: int = 200
+    max_completions: int = 200,
+    intermediate_chunk_size: int = 10
 ):
     """
     Generate complete workflow for a dataset.
@@ -115,6 +116,7 @@ def generate_dataset_workflow(
         hex_memory: Memory request/limit for hex job pods (default: "8Gi")
         max_parallelism: Maximum parallelism for hex jobs (default: 50)
         max_completions: Maximum job completions - increase to reduce chunk size (default: 200)
+        intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM (default: 10)
     """
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
@@ -156,7 +158,7 @@ def generate_dataset_workflow(
     print(f"  Parent resolutions: {parent_resolutions}")
     
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size)
     
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo)
@@ -429,7 +431,7 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi"):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10):
     """Generate H3 hex tiling job.
     
     Args:
@@ -445,6 +447,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
         parent_resolutions: List of parent resolutions (e.g., [9, 8, 0])
         id_column: ID column name (auto-detected if None)
         hex_memory: Memory request/limit (e.g., "8Gi", "16Gi")
+        intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays)
     """
     # Format parent resolutions as comma-separated string
     parent_res_str = ','.join(map(str, parent_resolutions))
@@ -453,7 +456,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     cmd_parts = [
         "set -e",
         f"pip install -q git+{git_repo}",
-        f"cng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/{dataset_name}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
+        f"cng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/{dataset_name}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --intermediate-chunk-size {intermediate_chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
     ]
     if id_column:
         cmd_parts[-1] += f" --id-column {id_column}"
