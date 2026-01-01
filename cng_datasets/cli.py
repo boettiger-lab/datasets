@@ -29,10 +29,17 @@ def main():
     
     # Raster processing command
     raster_parser = subparsers.add_parser("raster", help="Process raster datasets")
-    raster_parser.add_argument("--input", required=True, help="Input raster file")
-    raster_parser.add_argument("--output-cog", required=True, help="Output COG file")
-    raster_parser.add_argument("--output-parquet", help="Output parquet directory")
-    raster_parser.add_argument("--resolution", type=int, default=10, help="H3 resolution")
+    raster_parser.add_argument("--input", required=True, help="Input raster file (local or /vsis3/ URL)")
+    raster_parser.add_argument("--output-cog", help="Output COG file path")
+    raster_parser.add_argument("--output-parquet", help="Output parquet directory (e.g., s3://bucket/dataset/hex/)")
+    raster_parser.add_argument("--resolution", type=int, help="H3 resolution (auto-detected if not specified)")
+    raster_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
+    raster_parser.add_argument("--h0-index", type=int, help="Process specific h0 region (0-121), or omit to process all")
+    raster_parser.add_argument("--value-column", default="value", help="Name for raster value column (default: 'value')")
+    raster_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
+    raster_parser.add_argument("--compression", default="deflate", help="COG compression (deflate, lzw, zstd)")
+    raster_parser.add_argument("--blocksize", type=int, default=512, help="COG block size (default: 512)")
+    raster_parser.add_argument("--resampling", default="nearest", help="Resampling method (default: nearest)")
     
     # Repartition command
     repartition_parser = subparsers.add_parser("repartition", help="Repartition chunks by h0")
@@ -103,15 +110,36 @@ def main():
     
     elif args.command == "raster":
         from .raster import RasterProcessor
+        
+        # Parse parent resolutions
+        parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
+        
         processor = RasterProcessor(
             input_path=args.input,
             output_cog_path=args.output_cog,
-            output_parquet_path=args.output_parquet or "",
+            output_parquet_path=args.output_parquet,
             h3_resolution=args.resolution,
+            parent_resolutions=parent_res,
+            h0_index=args.h0_index,
+            value_column=args.value_column,
+            nodata_value=args.nodata,
+            compression=args.compression,
+            blocksize=args.blocksize,
+            resampling=args.resampling,
         )
-        processor.create_cog()
+        
+        # Create COG if output path specified
+        if args.output_cog:
+            processor.create_cog()
+        
+        # Process to H3 parquet if output path specified
         if args.output_parquet:
-            processor.raster_to_h3_parquet()
+            if args.h0_index is not None:
+                # Process single h0 region
+                processor.process_h0_region()
+            else:
+                # Process all h0 regions
+                processor.process_all_h0_regions()
     
     elif args.command == "repartition":
         from .vector import repartition_by_h0
