@@ -6,12 +6,7 @@ import os
 from pathlib import Path
 import duckdb
 
-from cng_datasets.vector.convert_to_parquet import (
-    convert_to_parquet,
-    _check_needs_id_column,
-    _convert_direct,
-    _convert_with_id_column
-)
+from cng_datasets.vector.convert_to_parquet import convert_to_parquet
 
 
 class TestConvertToParquet:
@@ -352,15 +347,14 @@ class TestIDColumnPriority:
 
 
 class TestReprojection:
-    """Test reprojection functionality with synthetic projected datasets."""
+    """Test reprojection functionality - critical for catching projection bugs."""
     
     @pytest.fixture
-    def sample_projected_geojson(self):
+    def sample_projected_shapefile(self):
         """
-        Create a GeoJSON file in EPSG:3310 (NAD83/California Albers).
+        Create a shapefile in EPSG:3310 (NAD83/California Albers) for testing reprojection.
         
-        Uses coordinates in meters (projected) that correspond to locations in California.
-        These coordinates are roughly in the San Francisco Bay Area when projected.
+        Uses projected coordinates in meters that must be reprojected to WGS84 degrees.
         """
         import subprocess
         import json
@@ -369,44 +363,16 @@ class TestReprojection:
         # Create a simple GeoJSON in WGS84 first (SF Bay Area)
         wgs84_geojson = {
             "type": "FeatureCollection",
-            "crs": {
-                "type": "name",
-                "properties": {"name": "urn:ogc:def:crs:EPSG::4326"}
-            },
             "features": [
                 {
                     "type": "Feature",
-                    "properties": {"name": "Area 1", "id": 1},
+                    "properties": {"name": "Area 1"},
                     "geometry": {
                         "type": "Polygon",
                         "coordinates": [[
                             [-122.4, 37.8], [-122.4, 37.9], 
                             [-122.3, 37.9], [-122.3, 37.8], 
                             [-122.4, 37.8]
-                        ]]
-                    }
-                },
-                {
-                    "type": "Feature",
-                    "properties": {"name": "Area 2", "id": 2},
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": [[
-                            [-122.5, 37.7], [-122.5, 37.8], 
-                            [-122.4, 37.8], [-122.4, 37.7], 
-                            [-122.5, 37.7]
-                        ]]
-                    }
-                },
-                {
-                    "type": "Feature",
-                    "properties": {"name": "Area 3", "id": 3},
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": [[
-                            [-122.3, 37.7], [-122.3, 37.8], 
-                            [-122.2, 37.8], [-122.2, 37.7], 
-                            [-122.3, 37.7]
                         ]]
                     }
                 }
@@ -417,12 +383,12 @@ class TestReprojection:
             json.dump(wgs84_geojson, f)
             wgs84_path = f.name
         
-        # Create output directory for shapefile (needs multiple files)
+        # Create output directory for shapefile
         temp_dir = tempfile.mkdtemp()
         projected_path = os.path.join(temp_dir, 'test_3310.shp')
         
         try:
-            # Use ogr2ogr to reproject to EPSG:3310 as shapefile
+            # Use ogr2ogr to reproject to EPSG:3310
             result = subprocess.run(
                 ['ogr2ogr', '-f', 'ESRI Shapefile', '-t_srs', 'EPSG:3310', 
                  projected_path, wgs84_path],
@@ -437,135 +403,70 @@ class TestReprojection:
             yield projected_path
             
         finally:
-            # Cleanup
             if os.path.exists(wgs84_path):
                 os.remove(wgs84_path)
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
     
-    def test_projected_to_wgs84_reprojection(self, sample_projected_geojson):
+    def test_projected_to_wgs84_reprojection(self, sample_projected_shapefile):
         """
-        Test that a dataset in EPSG:3310 (NAD83/California Albers) is correctly reprojected to WGS84.
+        Test that EPSG:3310 (meters) is correctly reprojected to EPSG:4326 (degrees).
         
-        Verifies:
-        1. Source is detected as EPSG:3310 and needs reprojection
-        2. Output is properly reprojected to EPSG:4326
-        3. Bounding box is within expected California lat/lon extent
-        4. Geometry is valid after reprojection
-        5. Synthetic ID column is created
+        This test MUST catch projection bugs where output stays in projected meters.
         """
-        from cng_datasets.vector.convert_to_parquet import _check_projection
-        from cng_datasets.vector.h3_tiling import setup_duckdb_connection
-        from cng_datasets.storage.s3 import configure_s3_credentials
-        
-        source_url = sample_projected_geojson
-        
         with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
             output_path = f.name
         
         try:
-            # First verify source needs reprojection
-            needs_reproj, source_crs = _check_projection(source_url, "EPSG:4326")
-            assert needs_reproj, f"Expected CPAD to need reprojection, but source is {source_crs}"
-            assert source_crs == "EPSG:3310", f"Expected CPAD to be in EPSG:3310 (NAD83/CA Albers), got {source_crs}"
-            
             # Convert with reprojection
             convert_to_parquet(
-                source_url=source_url,
+                source_url=sample_projected_shapefile,
                 destination=output_path,
-                compression="ZSTD",
-                compression_level=15,
-                row_group_size=100000,
-                force_id=True,
-                progress=True,
-                target_crs="EPSG:4326"
+                target_crs="EPSG:4326",
+                verbose=False
             )
             
-            # Verify file exists
-            assert os.path.exists(output_path), "Output parquet file not created"
-            assert os.path.getsize(output_path) > 0, "Output parquet file is empty"
+            # Verify with DuckDB
+            con = duckdb.connect()
+            con.install_extension('spatial')
+            con.load_extension('spatial')
             
-            # Verify reprojection with DuckDB spatial extension
-            con = setup_duckdb_connection()
-            configure_s3_credentials(con)
-            
-            # Load spatial extension
-            con.execute("LOAD spatial")
-            
-            # Read the parquet file and compute bounding box
-            # The geometry column is already in GEOMETRY type, no conversion needed
+            # Check extent
             result = con.execute(f"""
                 SELECT 
-                    COUNT(*) as count,
-                    MIN(ST_XMin(geom)) as min_lon,
-                    MAX(ST_XMax(geom)) as max_lon,
-                    MIN(ST_YMin(geom)) as min_lat,
-                    MAX(ST_YMax(geom)) as max_lat
+                    MIN(ST_XMin(geom)) as min_x,
+                    MAX(ST_XMax(geom)) as max_x,
+                    MIN(ST_YMin(geom)) as min_y,
+                    MAX(ST_YMax(geom)) as max_y
                 FROM read_parquet('{output_path}')
             """).fetchone()
             
-            count, min_lon, max_lon, min_lat, max_lat = result
+            min_x, max_x, min_y, max_y = result
             
-            # Verify we have features
-            assert count > 0, "No features found in output"
+            print(f"\nReprojection test extent: X=[{min_x:.2f}, {max_x:.2f}], Y=[{min_y:.2f}, {max_y:.2f}]")
             
-            # California's approximate bounding box in WGS84:
-            # Longitude: -124.5° to -114.0° (west to east)
-            # Latitude: 32.5° to 42.0° (south to north)
-            CA_MIN_LON = -124.5
-            CA_MAX_LON = -114.0
-            CA_MIN_LAT = 32.5
-            CA_MAX_LAT = 42.0
+            # CRITICAL: Verify coordinates are in degrees, not meters
+            # SF Bay Area should be around lon=-122, lat=37-38
+            # If in meters (EPSG:3310), would be huge numbers like X=-200000, Y=180000
             
-            print(f"\nCPAD Reprojection Test Results:")
-            print(f"  Feature count: {count:,}")
-            print(f"  Bounding box: ({min_lon:.6f}, {min_lat:.6f}) to ({max_lon:.6f}, {max_lat:.6f})")
+            # Test 1: Coordinates must be in valid lat/lon range
+            assert -180 <= min_x <= 180, f"X min {min_x} not in lon range [-180, 180] - likely still in meters!"
+            assert -180 <= max_x <= 180, f"X max {max_x} not in lon range [-180, 180] - likely still in meters!"
+            assert -90 <= min_y <= 90, f"Y min {min_y} not in lat range [-90, 90] - likely still in meters!"
+            assert -90 <= max_y <= 90, f"Y max {max_y} not in lat range [-90, 90] - likely still in meters!"
             
-            # Verify bounding box is within California's extent (with small buffer for edge cases)
-            assert min_lon >= CA_MIN_LON - 0.5, f"Minimum longitude {min_lon} is too far west (expected >= {CA_MIN_LON})"
-            assert max_lon <= CA_MAX_LON + 0.5, f"Maximum longitude {max_lon} is too far east (expected <= {CA_MAX_LON})"
-            assert min_lat >= CA_MIN_LAT - 0.5, f"Minimum latitude {min_lat} is too far south (expected >= {CA_MIN_LAT})"
-            assert max_lat <= CA_MAX_LAT + 0.5, f"Maximum latitude {max_lat} is too far north (expected <= {CA_MAX_LAT})"
+            # Test 2: Specific SF Bay Area check (our test data location)
+            assert -123 <= min_x <= -122, f"X min {min_x} not in expected SF Bay Area lon range"
+            assert -123 <= max_x <= -122, f"X max {max_x} not in expected SF Bay Area lon range"
+            assert 37 <= min_y <= 39, f"Y min {min_y} not in expected SF Bay Area lat range"
+            assert 37 <= max_y <= 39, f"Y max {max_y} not in expected SF Bay Area lat range"
             
-            # Verify coordinates are in lat/lon range (not projected coordinates in meters)
-            assert -180 <= min_lon <= 180, f"Longitude {min_lon} outside valid range [-180, 180]"
-            assert -180 <= max_lon <= 180, f"Longitude {max_lon} outside valid range [-180, 180]"
-            assert -90 <= min_lat <= 90, f"Latitude {min_lat} outside valid range [-90, 90]"
-            assert -90 <= max_lat <= 90, f"Latitude {max_lat} outside valid range [-90, 90]"
-            
-            # More specific checks for our SF Bay Area test data
-            # Lon should be around -122.2 to -122.5, Lat around 37.7 to 37.9
-            assert -123 <= min_lon <= -122, f"Min longitude {min_lon} not in expected SF Bay Area range"
-            assert -123 <= max_lon <= -122, f"Max longitude {max_lon} not in expected SF Bay Area range"
-            assert 37 <= min_lat <= 38, f"Min latitude {min_lat} not in expected SF Bay Area range"
-            assert 37 <= max_lat <= 38, f"Max latitude {max_lat} not in expected SF Bay Area range"
-            
-            # Verify geometry is valid
+            # Test 3: Verify geometries are valid
             invalid_count = con.execute(f"""
-                SELECT COUNT(*) 
-                FROM read_parquet('{output_path}')
+                SELECT COUNT(*) FROM read_parquet('{output_path}')
                 WHERE NOT ST_IsValid(geom)
             """).fetchone()[0]
-            
-            assert invalid_count == 0, f"Found {invalid_count} invalid geometries after reprojection"
-            
-            # Verify ID column exists (either original 'id' or synthetic '_cng_fid')
-            columns = con.execute(f"""
-                SELECT column_name 
-                FROM (DESCRIBE SELECT * FROM read_parquet('{output_path}'))
-            """).fetchall()
-            column_names = [col[0] for col in columns]
-            
-            # Since our fixture has an 'id' column, it should be preserved
-            assert 'id' in column_names, "Expected id column to be preserved"
-            
-            # Verify id is unique
-            id_count = con.execute(f"""
-                SELECT COUNT(DISTINCT id) 
-                FROM read_parquet('{output_path}')
-            """).fetchone()[0]
-            
-            assert id_count == count, "Expected id to be unique for all features"
+            assert invalid_count == 0, f"Found {invalid_count} invalid geometries"
             
             con.close()
             

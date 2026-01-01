@@ -2,17 +2,306 @@
 """
 Convert vector datasets to optimized GeoParquet format.
 
-This script provides conversion with guaranteed ID columns and proper GeoParquet
-metadata using geoparquet-io for cloud-native optimizations.
+Simple workflow:
+1. Detect source CRS using GDAL
+2. Read data with DuckDB ST_Read
+3. Add ID column if needed
+4. Reproject if needed (ST_Transform + ST_FlipCoordinates)
+5. Write locally with geoparquet-io optimizations
+6. Upload to S3 via rclone if needed
 """
 
 import argparse
 import sys
 import tempfile
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 import duckdb
+import geopandas as gpd
+
+
+def detect_crs(source_url: str, verbose: bool = False) -> Optional[str]:
+    """
+    Detect the CRS of a vector dataset using geopandas.
+    
+    Works with VSI paths (/vsicurl/, s3://, etc.).
+    
+    Args:
+        source_url: Source dataset URL
+        verbose: Print debug information
+        
+    Returns:
+        CRS string (e.g., "EPSG:4326") or None if detection fails
+    """
+    try:
+        # Read just the first row to get CRS info quickly
+        gdf = gpd.read_file(source_url, rows=1)
+        
+        if gdf.crs is None:
+            if verbose:
+                print("Warning: No CRS found in dataset")
+            return None
+        
+        # Try to get EPSG code
+        if gdf.crs.to_epsg():
+            return f"EPSG:{gdf.crs.to_epsg()}"
+        
+        # Fallback to authority string if available
+        if gdf.crs.to_authority():
+            auth, code = gdf.crs.to_authority()
+            return f"{auth}:{code}"
+        
+        if verbose:
+            print(f"Warning: Could not determine EPSG code, CRS is: {gdf.crs}")
+        return None
+        
+    except Exception as e:
+        if verbose:
+            print(f"Warning: CRS detection failed: {e}")
+        return None
+
+
+def is_geographic_crs(crs: str) -> bool:
+    """
+    Check if a CRS is geographic (uses degrees) vs projected (uses meters).
+    
+    Args:
+        crs: CRS string (e.g., "EPSG:4326")
+        
+    Returns:
+        True if geographic, False if projected
+    """
+    # Common geographic CRS codes
+    if crs in ["EPSG:4326", "EPSG:4269", "EPSG:4267"]:
+        return True
+    
+    # Extract EPSG code
+    if crs.startswith("EPSG:"):
+        try:
+            code = int(crs.split(":")[1])
+            # EPSG codes 4000-4999 are typically geographic
+            if 4000 <= code < 5000:
+                return True
+        except (ValueError, IndexError):
+            pass
+    
+    return False
+
+
+def check_id_column(source_url: str, id_column: Optional[str] = None, 
+                    force_id: bool = True, verbose: bool = False) -> Tuple[bool, str]:
+    """
+    Check if we need to create an ID column.
+    
+    Args:
+        source_url: Source dataset URL
+        id_column: Specific ID column name to use
+        force_id: Create _cng_fid if no suitable ID exists
+        verbose: Print debug information
+        
+    Returns:
+        (needs_id, id_column_name) tuple
+    """
+    con = duckdb.connect(':memory:')
+    con.install_extension("spatial")
+    con.load_extension("spatial")
+    
+    try:
+        # Read just the schema - ST_Read handles URLs directly
+        columns = con.execute(f"""
+            DESCRIBE SELECT * FROM ST_Read('{source_url}') LIMIT 0
+        """).fetchall()
+        
+        column_names = [col[0].lower() for col in columns]
+        
+        # If user specified an ID column, check if it exists
+        if id_column:
+            if id_column.lower() in column_names:
+                return False, id_column  # Use existing column
+            else:
+                raise ValueError(f"Specified ID column '{id_column}' not found in source data")
+        
+        # Look for common ID column names
+        common_ids = ['id', 'fid', 'objectid', 'gid', 'uid']
+        for id_name in common_ids:
+            if id_name in column_names:
+                if verbose:
+                    print(f"  Found existing ID column: {id_name}")
+                return False, id_name
+        
+        # No ID found - create one if force_id is True
+        if force_id:
+            if verbose:
+                print("  No ID column found - will create _cng_fid")
+            return True, "_cng_fid"
+        else:
+            raise ValueError("No ID column found and force_id=False")
+            
+    finally:
+        con.close()
+
+
+def build_read_reproject_query(source_url: str, source_crs: Optional[str], 
+                               target_crs: str, verbose: bool = False) -> str:
+    """
+    Build DuckDB query to read and reproject data. Nothing about IDs.
+    
+    Args:
+        source_url: Source dataset URL
+        source_crs: Source CRS (None = no reprojection needed)
+        target_crs: Target CRS
+        verbose: Print debug information
+        
+    Returns:
+        DuckDB SQL query string
+    """
+    # Determine geometry transformation
+    if source_crs and source_crs != target_crs:
+        # Need to reproject
+        if is_geographic_crs(target_crs):
+            # ST_Transform outputs lat/lon for geographic CRS, but GeoParquet expects lon/lat
+            geom_expr = f"ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) AS geom"
+        else:
+            geom_expr = f"ST_Transform(geom, '{source_crs}', '{target_crs}') AS geom"
+    else:
+        # No reprojection needed
+        geom_expr = "geom"
+    
+    query = f"""
+    SELECT 
+        * EXCLUDE (geom),
+        {geom_expr}
+    FROM ST_Read('{source_url}')
+    """
+    
+    if verbose:
+        print(f"Read/Reproject Query: {query.strip()}")
+    
+    return query
+
+
+def add_id_column_query(base_query: str, id_column: str = "_cng_fid") -> str:
+    """
+    Wrap a query to add a synthetic ID column.
+    
+    Args:
+        base_query: Base query that reads/reprojects data
+        id_column: Name of ID column to create
+        
+    Returns:
+        Wrapped query with ID column
+    """
+    return f"""
+    SELECT 
+        ROW_NUMBER() OVER () AS {id_column},
+        *
+    FROM ({base_query})
+    """
+
+
+def write_with_duckdb(query: str, output_path: str,
+                      compression: str = "ZSTD",
+                      compression_level: int = 15,
+                      row_group_size: int = 100000,
+                      verbose: bool = False) -> None:
+    """
+    Write parquet file using DuckDB COPY. Simple and reliable.
+    
+    Args:
+        query: DuckDB query that produces the data to write
+        output_path: Local output file path
+        compression: Compression algorithm
+        compression_level: Compression level
+        row_group_size: Rows per group
+        verbose: Print debug information
+    """
+    con = duckdb.connect(':memory:')
+    con.install_extension("spatial")
+    con.load_extension("spatial")
+    
+    try:
+        if verbose:
+            print(f"  Writing with DuckDB to {output_path}...")
+        
+        # Use COPY - it works!
+        con.execute(f"""
+            COPY ({query})
+            TO '{output_path}'
+            (FORMAT PARQUET, 
+             COMPRESSION {compression},
+             ROW_GROUP_SIZE {row_group_size})
+        """)
+        
+        if verbose:
+            print(f"  ✓ Wrote {output_path}")
+            
+    finally:
+        con.close()
+
+
+def apply_geoparquet_optimizations(input_path: str, output_path: str,
+                                    verbose: bool = False) -> None:
+    """
+    Apply geoparquet-io optimizations to an existing parquet file.
+    
+    This adds proper GeoParquet 1.1 metadata and optimizations.
+    
+    Args:
+        input_path: Input parquet file
+        output_path: Output parquet file (can be same as input for in-place)
+        verbose: Print debug information
+    """
+    # Import the actual function from the module
+    from geoparquet_io.core.add_bbox_column import add_bbox_column
+    
+    if verbose:
+        print(f"  Applying GeoParquet optimizations...")
+    
+    # Add bbox column which also ensures proper metadata
+    add_bbox_column(input_path, output_path, verbose=verbose)
+    
+    if verbose:
+        print(f"  ✓ Applied optimizations")
+
+
+def upload_to_s3(local_path: str, s3_destination: str, verbose: bool = True) -> None:
+    """
+    Upload a local file to S3 using rclone.
+    
+    Args:
+        local_path: Local file path
+        s3_destination: S3 destination (s3://bucket/path)
+        verbose: Print progress information
+    """
+    # Convert s3://bucket/path to rclone format bucket:path
+    if not s3_destination.startswith('s3://'):
+        raise ValueError(f"S3 destination must start with s3://: {s3_destination}")
+    
+    # Parse s3://bucket/path -> bucket:path
+    s3_path = s3_destination[5:]  # Remove s3://
+    parts = s3_path.split('/', 1)
+    if len(parts) == 1:
+        rclone_dest = f"{parts[0]}:"
+    else:
+        bucket, path = parts
+        rclone_dest = f"{bucket}:{path}"
+    
+    if verbose:
+        print(f"  Uploading {local_path} to {s3_destination}...")
+    
+    result = subprocess.run(
+        ['rclone', 'copyto', local_path, rclone_dest, '--progress'],
+        capture_output=not verbose,
+        text=True
+    )
+    
+    if result.returncode != 0:
+        raise RuntimeError(f"rclone upload failed: {result.stderr if result.stderr else 'Unknown error'}")
+    
+    if verbose:
+        print(f"  ✓ Uploaded to {s3_destination}")
 
 
 def convert_to_parquet(
@@ -25,656 +314,180 @@ def convert_to_parquet(
     id_column: Optional[str] = None,
     force_id: bool = True,
     progress: bool = True,
-    target_crs: str = "EPSG:4326"
+    target_crs: str = "EPSG:4326",
+    verbose: bool = False
 ):
     """
-    Convert a vector dataset to optimized GeoParquet with guaranteed ID column.
+    Convert a vector dataset to optimized GeoParquet.
     
-    Uses geoparquet-io for proper GeoParquet 1.1 metadata and DuckDB for ID handling.
-    Ensures every output has a valid, unique ID column for downstream processing.
-    Automatically reprojects to EPSG:4326 if source is in a different CRS.
-    
-    Note: If writing to S3, ensure the bucket exists and has proper permissions.
-    Use 'cng-datasets storage setup-bucket' before running this command.
+    Workflow:
+    1. Detect source CRS using GDAL
+    2. Check if ID column exists or needs creation
+    3. Build DuckDB query to read, add ID, and reproject
+    4. Write GeoParquet locally with geoparquet-io optimizations
+    5. Upload to S3 via rclone if destination is S3
     
     Args:
-        source_url: Source dataset URL (supports /vsicurl/, s3://, file paths)
-        destination: Output path (supports /vsis3/, s3://, file paths)
+        source_url: Source dataset URL (supports s3://, http://, file paths)
+        destination: Output path (s3:// or local file path)
         compression: Compression algorithm (ZSTD, GZIP, SNAPPY, NONE)
         compression_level: Compression level (1-22 for ZSTD)
-        row_group_size: Number of rows per group (affects query performance)
+        row_group_size: Number of rows per group
         geometry_encoding: Geometry encoding (WKB, WKT)
         id_column: Specific ID column to use (auto-detected if not specified)
         force_id: Create _cng_fid if no suitable ID column exists
         progress: Show progress during conversion
-        target_crs: Target CRS for output (default: EPSG:4326 for H3 hex processing)
+        target_crs: Target CRS for output (default: EPSG:4326)
+        verbose: Print detailed debug information
     """
-    # Convert destination path: /vsis3/bucket/path -> s3://bucket/path
-    dest_path = destination
-    if destination.startswith('/vsis3/'):
-        dest_path = 's3://' + destination[7:]
-    elif destination.startswith('s3://'):
-        dest_path = destination
+    print(f"Converting {source_url}")
+    print(f"       to {destination}")
     
-    print(f"Converting {source_url} to {dest_path}")
     if progress:
         print(f"  Compression: {compression} level {compression_level}")
         print(f"  Row group size: {row_group_size:,}")
     
     try:
-        # Check projection and reproject if necessary
-        print("  Checking projection...")
-        needs_reprojection, source_crs = _check_projection(source_url, target_crs)
-        if needs_reprojection:
-            print(f"  Source CRS: {source_crs} -> Reprojecting to {target_crs}")
-        else:
-            print(f"  Source already in {target_crs}")
+        # Step 1: Detect source CRS
+        print("  Detecting source CRS...")
+        source_crs = detect_crs(source_url, verbose=verbose)
         
-        # Check if we need to add an ID column
+        needs_reprojection = False
+        if source_crs:
+            if source_crs != target_crs:
+                print(f"  Source CRS: {source_crs} -> Reprojecting to {target_crs}")
+                needs_reprojection = True
+            else:
+                print(f"  Source already in {target_crs}")
+        else:
+            print(f"  Warning: Could not detect source CRS, assuming {target_crs}")
+            source_crs = None
+        
+        # Step 2: Build read/reproject query
+        print("  Building read/reproject query...")
+        query = build_read_reproject_query(
+            source_url,
+            source_crs if needs_reprojection else None,
+            target_crs,
+            verbose=verbose
+        )
+        
+        # Step 3: Check ID column and wrap query if needed
         print("  Checking for ID column...")
-        needs_id, id_col_name = _check_needs_id_column(source_url, id_column, force_id)
+        needs_id, id_col_name = check_id_column(source_url, id_column, force_id, verbose)
         
         if needs_id:
-            # Two-step process: convert with geoparquet-io, then add ID column
-            print(f"  Creating synthetic ID column: {id_col_name}")
-            _convert_with_id_column(source_url, dest_path, id_col_name, compression, 
-                                   compression_level, row_group_size, progress,
-                                   needs_reprojection, target_crs)
+            print(f"  Adding synthetic ID column: {id_col_name}")
+            query = add_id_column_query(query, id_col_name)
         else:
-            # Direct conversion with geoparquet-io
             print(f"  Using existing ID column: {id_col_name}")
-            _convert_direct(source_url, dest_path, compression, compression_level, 
-                           row_group_size, progress, needs_reprojection, target_crs)
+        
+        # Step 4: Write with DuckDB
+        is_s3_dest = destination.startswith('s3://')
+        
+        if is_s3_dest:
+            # Write to temp file first
+            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            try:
+                # Write data
+                write_with_duckdb(query, tmp_path, compression, compression_level, 
+                                 row_group_size, verbose)
+                
+                # Apply GeoParquet optimizations in-place
+                apply_geoparquet_optimizations(tmp_path, tmp_path, verbose)
+                
+                # Upload to S3
+                upload_to_s3(tmp_path, destination, verbose=progress)
+                
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        else:
+            # Write directly to destination
+            write_with_duckdb(query, destination, compression, compression_level,
+                            row_group_size, verbose)
+            
+            # Apply GeoParquet optimizations in-place
+            apply_geoparquet_optimizations(destination, destination, verbose)
         
         print("✓ Conversion completed successfully!")
-        if needs_id:
-            print(f"  Note: Created synthetic ID column '{id_col_name}' for downstream processing")
         
     except Exception as e:
         print(f"✗ Conversion failed: {e}", file=sys.stderr)
+        if verbose:
+            import traceback
+            traceback.print_exc()
         raise
-
-
-def _check_projection(
-    source_url: str,
-    target_crs: str = "EPSG:4326"
-) -> Tuple[bool, Optional[str]]:
-    """
-    Check if source dataset needs reprojection.
-    
-    Returns:
-        Tuple of (needs_reprojection, source_crs)
-    """
-    import subprocess
-    import json
-    
-    _configure_ssl()
-    
-    # Prepare source path for GDAL
-    if source_url.startswith('http://') or source_url.startswith('https://'):
-        source_path = f"/vsicurl/{source_url}"
-    else:
-        source_path = source_url
-    
-    try:
-        # Use ogrinfo to get CRS information in JSON format
-        result = subprocess.run(
-            ['ogrinfo', '-json', source_path],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode != 0:
-            print(f"  Warning: Could not read source metadata: {result.stderr}")
-            return False, None
-        
-        # Parse JSON output
-        info = json.loads(result.stdout)
-        
-        # Extract CRS from first layer
-        if 'layers' in info and len(info['layers']) > 0:
-            layer = info['layers'][0]
-            if 'geometryFields' in layer and len(layer['geometryFields']) > 0:
-                geom_field = layer['geometryFields'][0]
-                if 'coordinateSystem' in geom_field:
-                    crs_info = geom_field['coordinateSystem']
-                    
-                    # Try to get EPSG code from various locations
-                    source_crs = None
-                    
-                    # Check for authority name and code
-                    if 'id' in crs_info:
-                        auth = crs_info['id'].get('authority', '')
-                        code = crs_info['id'].get('code', '')
-                        if auth and code:
-                            source_crs = f"{auth}:{code}"
-                    
-                    # Fallback: check WKT for EPSG reference
-                    if not source_crs and 'wkt' in crs_info:
-                        wkt = crs_info['wkt']
-                        if 'EPSG",3310' in wkt or 'EPSG","3310' in wkt:
-                            source_crs = "EPSG:3310"
-                        elif 'EPSG",4269' in wkt or 'EPSG","4269' in wkt:
-                            # NAD83 geographic
-                            source_crs = "EPSG:4269"
-                        elif 'EPSG",4326' in wkt or 'EPSG","4326' in wkt:
-                            source_crs = "EPSG:4326"
-                    
-                    if source_crs:
-                        # Normalize comparison
-                        needs_reprojection = source_crs.upper() != target_crs.upper()
-                        # Also check if source is NAD83 (EPSG:4269) and target is WGS84 (EPSG:4326)
-                        # These are very similar but technically different
-                        if source_crs.upper() == "EPSG:4269" and target_crs.upper() == "EPSG:4326":
-                            # For most purposes, these are close enough, but let's reproject anyway
-                            needs_reprojection = True
-                        
-                        return needs_reprojection, source_crs
-        
-        print("  Warning: No CRS found in source data, assuming EPSG:4326")
-        return False, None
-        
-    except subprocess.TimeoutExpired:
-        print("  Warning: Timeout reading source metadata, assuming EPSG:4326")
-        return False, None
-    except json.JSONDecodeError as e:
-        print(f"  Warning: Could not parse source metadata: {e}, assuming EPSG:4326")
-        return False, None
-    except Exception as e:
-        print(f"  Warning: Error checking projection: {e}, assuming EPSG:4326")
-        return False, None
-
-
-def _check_needs_id_column(
-    source_url: str,
-    specified_id: Optional[str],
-    force_id: bool
-) -> Tuple[bool, str]:
-    """
-    Check if source needs an ID column added.
-    
-    Returns:
-        Tuple of (needs_id, id_column_name)
-    """
-    from cng_datasets.vector.h3_tiling import identify_id_column, setup_duckdb_connection
-    
-    # Configure SSL for GDAL
-    _configure_ssl()
-    
-    # Setup DuckDB to inspect source
-    con = setup_duckdb_connection()
-    
-    try:
-        # Configure S3 credentials
-        from cng_datasets.storage.s3 import configure_s3_credentials
-        configure_s3_credentials(con)
-        
-        # Prepare source path
-        if source_url.startswith('http://') or source_url.startswith('https://'):
-            source_path = f"/vsicurl/{source_url}"
-        else:
-            source_path = source_url
-        
-        # Create view to inspect
-        con.execute(f"""
-            CREATE OR REPLACE VIEW source_data AS 
-            SELECT * FROM ST_Read('{source_path}')
-        """)
-        
-        # Check for ID column
-        id_col, is_unique = identify_id_column(
-            con, 'source_data', 
-            specified_id_col=specified_id,
-            check_uniqueness=True
-        )
-        
-        if id_col and is_unique:
-            return False, id_col  # Has valid ID, no need to add
-        elif force_id:
-            return True, '_cng_fid'  # Need to add synthetic ID
-        else:
-            return False, id_col if id_col else None
-            
-    finally:
-        con.close()
-
-
-def _configure_ssl():
-    """Configure SSL certificates for GDAL."""
-    cert_paths = [
-        '/etc/ssl/certs/ca-certificates.crt',
-        '/etc/ssl/certs/ca-bundle.crt',
-        '/etc/pki/tls/certs/ca-bundle.crt',
-        '/etc/ssl/cert.pem',
-    ]
-    
-    for cert_path in cert_paths:
-        if os.path.exists(cert_path):
-            os.environ['CURL_CA_BUNDLE'] = cert_path
-            os.environ['SSL_CERT_FILE'] = cert_path
-            return
-    
-    # Fallback: disable SSL verification
-    os.environ['GDAL_HTTP_UNSAFESSL'] = 'YES'
-
-
-def _upload_via_rclone(local_file: str, destination: str, verbose: bool = True):
-    """Upload file to S3 via rclone to preserve GeoParquet metadata."""
-    import subprocess
-    
-    # Convert s3:// or /vsis3/ to rclone format: nrp:bucket/path
-    if destination.startswith('s3://'):
-        s3_path = destination[5:]  # Remove 's3://'
-    elif destination.startswith('/vsis3/'):
-        s3_path = destination[7:]  # Remove '/vsis3/'
-    else:
-        raise ValueError(f"Invalid S3 destination: {destination}")
-    
-    # Split bucket and path
-    parts = s3_path.split('/', 1)
-    bucket = parts[0]
-    key = parts[1] if len(parts) > 1 else ''
-    
-    # Use rclone copyto for single file upload
-    rclone_dest = f"nrp:{bucket}/{key}"
-    
-    cmd = ['rclone', 'copyto', local_file, rclone_dest]
-    if verbose:
-        cmd.append('-v')
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        raise RuntimeError(f"rclone upload failed: {result.stderr}")
-    
-    if verbose and result.stdout:
-        print(result.stdout)
-
-
-def _convert_direct(
-    source_url: str,
-    destination: str,
-    compression: str,
-    compression_level: int,
-    row_group_size: int,
-    verbose: bool,
-    needs_reprojection: bool = False,
-    target_crs: str = "EPSG:4326"
-):
-    """Convert directly using geoparquet-io or DuckDB if reprojection needed."""
-    # If reprojection is needed, use DuckDB path
-    if needs_reprojection:
-        _convert_direct_with_reprojection(
-            source_url, destination, compression, compression_level,
-            row_group_size, verbose, target_crs
-        )
-        return
-    
-    # Otherwise use geoparquet-io for direct conversion
-    try:
-        from geoparquet_io.core.convert import convert_to_geoparquet
-    except ImportError:
-        raise ImportError("geoparquet-io is required. Install with: pip install geoparquet-io")
-    
-    # If destination is S3, write to temp file first, then upload via rclone
-    # This preserves GeoParquet metadata (DuckDB COPY would strip it)
-    if destination.startswith('s3://') or destination.startswith('/vsis3/'):
-        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
-            tmp_path = tmp.name
-        
-        try:
-            # Convert to local temp file with proper GeoParquet metadata
-            if verbose:
-                print(f"  Converting to temporary file: {tmp_path}")
-            
-            convert_to_geoparquet(
-                input_file=source_url,
-                output_file=tmp_path,
-                skip_hilbert=True,
-                verbose=verbose,
-                compression=compression,
-                compression_level=compression_level,
-                row_group_rows=row_group_size,
-                profile=None,
-                geoparquet_version="1.1"
-            )
-            
-            # Upload to S3 using rclone (preserves GeoParquet metadata)
-            if verbose:
-                print(f"  Uploading to S3 via rclone: {destination}")
-            
-            _upload_via_rclone(tmp_path, destination, verbose=verbose)
-            
-        finally:
-            # Clean up temp file
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-    else:
-        # Local file - convert directly
-        convert_to_geoparquet(
-            input_file=source_url,
-            output_file=destination,
-            skip_hilbert=True,
-            verbose=verbose,
-            compression=compression,
-            compression_level=compression_level,
-            row_group_rows=row_group_size,
-            profile=None,
-            geoparquet_version="1.1"
-        )
-
-
-def _convert_direct_with_reprojection(
-    source_url: str,
-    destination: str,
-    compression: str,
-    compression_level: int,
-    row_group_size: int,
-    verbose: bool,
-    target_crs: str
-):
-    """Convert with reprojection using DuckDB + geoparquet-io write."""
-    try:
-        from geoparquet_io.core.common import write_parquet_with_metadata
-    except ImportError:
-        raise ImportError("geoparquet-io is required. Install with: pip install geoparquet-io")
-    
-    from cng_datasets.vector.h3_tiling import setup_duckdb_connection
-    from cng_datasets.storage.s3 import configure_s3_credentials
-    
-    _configure_ssl()
-    con = setup_duckdb_connection()
-    
-    try:
-        configure_s3_credentials(con)
-        
-        # Prepare source path
-        if source_url.startswith('http://') or source_url.startswith('https://'):
-            source_path = f"/vsicurl/{source_url}"
-        else:
-            source_path = source_url
-        
-        # Read source and reproject
-        if verbose:
-            print(f"  Reading source and reprojecting to {target_crs}...")
-        
-        # Get source CRS for ST_Transform
-        meta_result = con.execute(f"""
-            SELECT
-                layers[1].geometry_fields[1].crs.auth_name as auth_name,
-                layers[1].geometry_fields[1].crs.auth_code as auth_code
-            FROM ST_Read_Meta('{source_path}')
-        """).fetchone()
-        
-        if meta_result and meta_result[0] and meta_result[1]:
-            source_crs = f"{meta_result[0]}:{meta_result[1]}"
-        else:
-            source_crs = "EPSG:4326"  # fallback
-        
-        # Only flip coordinates when target is geographic CRS (EPSG:4326)
-        # ST_Transform outputs in official axis order (lat/lon for EPSG:4326)
-        # but GeoParquet expects lon/lat order for geographic CRS
-        if target_crs.upper() in ('EPSG:4326', 'EPSG:4269', 'WGS84'):
-            geom_expr = f"ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) as geom"
-        else:
-            geom_expr = f"ST_Transform(geom, '{source_crs}', '{target_crs}') as geom"
-        
-        query = f"""
-            SELECT 
-                * EXCLUDE (geom),
-                {geom_expr}
-            FROM ST_Read('{source_path}')
-        """
-        
-        # If destination is S3, write to temp file first, then upload via rclone
-        if destination.startswith('s3://') or destination.startswith('/vsis3/'):
-            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
-                tmp_path = tmp.name
-            
-            try:
-                if verbose:
-                    print(f"  Writing to temporary file: {tmp_path}")
-                
-                write_parquet_with_metadata(
-                    con=con,
-                    query=query,
-                    output_file=tmp_path,
-                    compression=compression,
-                    compression_level=compression_level,
-                    row_group_rows=row_group_size,
-                    geoparquet_version="1.1",
-                    verbose=verbose,
-                    profile=None
-                )
-                
-                if verbose:
-                    print(f"  Uploading to S3 via rclone: {destination}")
-                
-                _upload_via_rclone(tmp_path, destination, verbose=verbose)
-                
-            finally:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-        else:
-            # Local file - write directly
-            if verbose:
-                print(f"  Writing GeoParquet with proper metadata...")
-            
-            write_parquet_with_metadata(
-                con=con,
-                query=query,
-                output_file=destination,
-                compression=compression,
-                compression_level=compression_level,
-                row_group_rows=row_group_size,
-                geoparquet_version="1.1",
-                verbose=verbose,
-                profile=None
-            )
-        
-    finally:
-        con.close()
-
-
-def _convert_with_id_column(
-    source_url: str,
-    destination: str,
-    id_col_name: str,
-    compression: str,
-    compression_level: int,
-    row_group_size: int,
-    verbose: bool,
-    needs_reprojection: bool = False,
-    target_crs: str = "EPSG:4326"
-):
-    """Convert with synthetic ID column using DuckDB + geoparquet-io write."""
-    try:
-        from geoparquet_io.core.common import write_parquet_with_metadata
-    except ImportError:
-        raise ImportError("geoparquet-io is required. Install with: pip install geoparquet-io")
-    
-    from cng_datasets.vector.h3_tiling import setup_duckdb_connection
-    from cng_datasets.storage.s3 import configure_s3_credentials
-    
-    _configure_ssl()
-    
-    con = setup_duckdb_connection()
-    
-    try:
-        configure_s3_credentials(con)
-        
-        # Prepare source path
-        if source_url.startswith('http://') or source_url.startswith('https://'):
-            source_path = f"/vsicurl/{source_url}"
-        else:
-            source_path = source_url
-        
-        # Read source with DuckDB spatial and add ID column
-        if verbose:
-            action = "Reading source, reprojecting, and adding ID column" if needs_reprojection else "Reading source and adding ID column"
-            print(f"  {action}...")
-        
-        # Build query with optional reprojection
-        if needs_reprojection:
-            # Get source CRS for ST_Transform
-            meta_result = con.execute(f"""
-                SELECT
-                    layers[1].geometry_fields[1].crs.auth_name as auth_name,
-                    layers[1].geometry_fields[1].crs.auth_code as auth_code
-                FROM ST_Read_Meta('{source_path}')
-            """).fetchone()
-            
-            if meta_result and meta_result[0] and meta_result[1]:
-                source_crs = f"{meta_result[0]}:{meta_result[1]}"
-            else:
-                source_crs = "EPSG:4326"  # fallback
-            
-            # Only flip coordinates when target is geographic CRS (EPSG:4326)
-            # ST_Transform outputs in official axis order (lat/lon for EPSG:4326)
-            # but GeoParquet expects lon/lat order for geographic CRS
-            if target_crs.upper() in ('EPSG:4326', 'EPSG:4269', 'WGS84'):
-                geom_expr = f"ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) as geom"
-            else:
-                geom_expr = f"ST_Transform(geom, '{source_crs}', '{target_crs}') as geom"
-            
-            query = f"""
-                SELECT 
-                    row_number() OVER () AS {id_col_name},
-                    * EXCLUDE (geom),
-                    {geom_expr}
-                FROM ST_Read('{source_path}')
-            """
-        else:
-            query = f"""
-                SELECT 
-                    row_number() OVER () AS {id_col_name},
-                    * EXCLUDE (geom),
-                    geom
-                FROM ST_Read('{source_path}')
-            """
-        
-        # If destination is S3, write to temp file first, then upload via rclone
-        # This preserves GeoParquet metadata (DuckDB COPY would strip it)
-        if destination.startswith('s3://') or destination.startswith('/vsis3/'):
-            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
-                tmp_path = tmp.name
-            
-            try:
-                # Write to local temp file with proper GeoParquet metadata
-                if verbose:
-                    print(f"  Writing to temporary file: {tmp_path}")
-                
-                write_parquet_with_metadata(
-                    con=con,
-                    query=query,
-                    output_file=tmp_path,
-                    compression=compression,
-                    compression_level=compression_level,
-                    row_group_rows=row_group_size,
-                    geoparquet_version="1.1",
-                    verbose=verbose,
-                    profile=None
-                )
-                
-                # Upload to S3 using rclone (preserves GeoParquet metadata)
-                if verbose:
-                    print(f"  Uploading to S3 via rclone: {destination}")
-                
-                _upload_via_rclone(tmp_path, destination, verbose=verbose)
-                
-            finally:
-                # Clean up temp file
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-        else:
-            # Local file - write directly
-            if verbose:
-                print(f"  Writing GeoParquet with proper metadata...")
-            
-            write_parquet_with_metadata(
-                con=con,
-                query=query,
-                output_file=destination,
-                compression=compression,
-                compression_level=compression_level,
-                row_group_rows=row_group_size,
-                geoparquet_version="1.1",
-                verbose=verbose,
-                profile=None
-            )
-        
-    finally:
-        con.close()
 
 
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
         description="Convert vector datasets to optimized GeoParquet format",
-        epilog="Uses DuckDB for larger-than-RAM processing and ensures valid ID columns."
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Convert local shapefile
+  cng-convert-to-parquet input.shp output.parquet
+  
+  # Convert from S3 to S3
+  cng-convert-to-parquet s3://bucket/input.shp s3://bucket/output.parquet
+  
+  # Convert with custom compression
+  cng-convert-to-parquet input.shp output.parquet --compression GZIP --compression-level 9
+  
+  # Convert and specify ID column
+  cng-convert-to-parquet input.shp output.parquet --id-column objectid
+        """
     )
-    parser.add_argument(
-        "source_url",
-        help="Source dataset URL (http://, https://, s3://, or file path)"
-    )
-    parser.add_argument(
-        "destination",
-        help="Output GeoParquet path (file path or /vsis3/bucket/path)"
-    )
-    parser.add_argument(
-
-        "--compression",
-        default="ZSTD",
-        choices=["ZSTD", "GZIP", "SNAPPY", "NONE"],
-        help="Compression algorithm (default: ZSTD)"
-    )
-    parser.add_argument(
-        "--compression-level",
-        type=int,
-        default=15,
-        help="Compression level (default: 15 for ZSTD, 1-22)"
-    )
-    parser.add_argument(
-        "--row-group-size",
-        type=int,
-        default=100000,
-        help="Rows per group, affects query performance (default: 100,000)"
-    )
-    parser.add_argument(
-        "--geometry-encoding",
-        default="WKB",
-        choices=["WKB", "WKT"],
-        help="Geometry encoding (default: WKB)"
-    )
-    parser.add_argument(
-        "--id-column",
-        help="Specific ID column to use (auto-detected if not specified)"
-    )
-    parser.add_argument(
-        "--no-force-id",
-        action="store_true",
-        help="Don't create synthetic _cng_fid if no valid ID column exists"
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Don't show progress messages"
-    )
+    
+    parser.add_argument("source", help="Source dataset URL or path")
+    parser.add_argument("destination", help="Output GeoParquet path")
+    
+    parser.add_argument("--compression", default="ZSTD",
+                       choices=["ZSTD", "GZIP", "SNAPPY", "NONE"],
+                       help="Compression algorithm (default: ZSTD)")
+    parser.add_argument("--compression-level", type=int, default=15,
+                       help="Compression level (default: 15 for ZSTD)")
+    parser.add_argument("--row-group-size", type=int, default=100000,
+                       help="Rows per group (default: 100000)")
+    parser.add_argument("--geometry-encoding", default="WKB",
+                       choices=["WKB", "WKT"],
+                       help="Geometry encoding (default: WKB)")
+    
+    parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
+    parser.add_argument("--no-force-id", action="store_true",
+                       help="Don't create synthetic ID if none exists")
+    parser.add_argument("--target-crs", default="EPSG:4326",
+                       help="Target CRS (default: EPSG:4326)")
+    
+    parser.add_argument("--no-progress", action="store_true",
+                       help="Disable progress output")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Enable detailed debug output")
     
     args = parser.parse_args()
     
-    convert_to_parquet(
-        source_url=args.source_url,
-        destination=args.destination,
-        compression=args.compression,
-        compression_level=args.compression_level,
-        row_group_size=args.row_group_size,
-        geometry_encoding=args.geometry_encoding,
-        id_column=args.id_column,
-        force_id=not args.no_force_id,
-        progress=not args.no_progress
-    )
+    try:
+        convert_to_parquet(
+            source_url=args.source,
+            destination=args.destination,
+            compression=args.compression,
+            compression_level=args.compression_level,
+            row_group_size=args.row_group_size,
+            geometry_encoding=args.geometry_encoding,
+            id_column=args.id_column,
+            force_id=not args.no_force_id,
+            progress=not args.no_progress,
+            target_crs=args.target_crs,
+            verbose=args.verbose
+        )
+        sys.exit(0)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
