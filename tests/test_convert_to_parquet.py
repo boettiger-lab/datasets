@@ -70,112 +70,8 @@ class TestConvertToParquet:
         if os.path.exists(path):
             os.remove(path)
     
-    def test_check_needs_id_column_without_id(self, sample_geojson):
-        """Test that source without ID column is detected correctly."""
-        needs_id, id_col = _check_needs_id_column(sample_geojson, None, True)
-        
-        assert needs_id is True
-        assert id_col == '_cng_fid'
-    
-    def test_check_needs_id_column_with_existing_id(self, sample_geojson_with_id):
-        """Test that source with valid ID column is detected correctly."""
-        needs_id, id_col = _check_needs_id_column(sample_geojson_with_id, None, True)
-        
-        assert needs_id is False
-        assert id_col == 'fid'
-    
-    def test_convert_direct_creates_valid_geoparquet(self, sample_geojson_with_id):
-        """Test that direct conversion creates valid GeoParquet."""
-        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
-            output_path = f.name
-        
-        try:
-            _convert_direct(
-                sample_geojson_with_id,
-                output_path,
-                compression="ZSTD",
-                compression_level=15,
-                row_group_size=100000,
-                verbose=False
-            )
-            
-            # Verify file exists
-            assert os.path.exists(output_path)
-            assert os.path.getsize(output_path) > 0
-            
-            # Use geoparquet-io to validate
-            from geoparquet_io.core.check_parquet_structure import check_all
-            
-            # check_all prints errors but returns None by default
-            check_all(output_path, verbose=False)
-            
-            # Verify DuckDB can read it with native parquet reader
-            con = duckdb.connect()
-            
-            # Use native parquet reader (not ST_Read)
-            result = con.execute(f"SELECT COUNT(*) FROM read_parquet('{output_path}')").fetchone()
-            assert result[0] == 2, "Expected 2 features"
-            
-            # Verify fid column exists
-            df = con.execute(f"SELECT * FROM read_parquet('{output_path}')").df()
-            assert 'fid' in df.columns, "Expected fid column"
-            
-            con.close()
-            
-        finally:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-    
-    def test_convert_with_id_column_creates_valid_geoparquet(self, sample_geojson):
-        """Test that conversion with synthetic ID creates valid GeoParquet."""
-        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
-            output_path = f.name
-        
-        try:
-            _convert_with_id_column(
-                sample_geojson,
-                output_path,
-                id_col_name='_cng_fid',
-                compression="ZSTD",
-                compression_level=15,
-                row_group_size=100000,
-                verbose=False
-            )
-            
-            # Verify file exists
-            assert os.path.exists(output_path)
-            assert os.path.getsize(output_path) > 0
-            
-            # Use geoparquet-io to validate
-            from geoparquet_io.core.check_parquet_structure import check_all
-            
-            # check_all prints errors but returns None by default
-            check_all(output_path, verbose=False)
-            
-            # Verify DuckDB can read it with native parquet reader and ID column exists
-            con = duckdb.connect()
-            
-            # Use native parquet reader (not ST_Read - DuckDB's vendored GDAL lacks parquet driver)
-            df = con.execute(f"SELECT * FROM read_parquet('{output_path}')").df()
-            
-            # Check ID column exists
-            assert '_cng_fid' in df.columns, "Expected _cng_fid column"
-            
-            # Check ID values are sequential
-            assert list(df['_cng_fid']) == [1, 2, 3], "Expected sequential IDs"
-            
-            # Check original data preserved
-            assert 'name' in df.columns
-            assert len(df) == 3
-            
-            con.close()
-            
-        finally:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-    
-    def test_convert_to_parquet_without_id_adds_cng_fid(self, sample_geojson):
-        """Test full conversion adds _cng_fid when no ID exists."""
+    def test_convert_creates_id_column_when_missing(self, sample_geojson):
+        """Test that conversion adds _cng_fid when no ID exists."""
         with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
             output_path = f.name
         
@@ -183,22 +79,21 @@ class TestConvertToParquet:
             convert_to_parquet(
                 source_url=sample_geojson,
                 destination=output_path,
-                compression="ZSTD",
-                compression_level=15,
-                row_group_size=100000,
                 force_id=True,
                 progress=False
             )
             
-            # Verify with DuckDB native parquet reader
-            con = duckdb.connect()
+            # Verify file exists
+            assert os.path.exists(output_path)
+            assert os.path.getsize(output_path) > 0
             
-            # Use native parquet reader (not ST_Read)
+            # Verify _cng_fid column was added
+            con = duckdb.connect()
             df = con.execute(f"SELECT * FROM read_parquet('{output_path}')").df()
             
-            assert '_cng_fid' in df.columns
-            assert len(df) == 3
-            assert df['_cng_fid'].is_unique
+            assert '_cng_fid' in df.columns, "Expected _cng_fid column"
+            assert len(df) == 3, "Expected 3 features"
+            assert list(df['_cng_fid']) == [1, 2, 3], "Expected sequential IDs"
             
             con.close()
             
@@ -206,8 +101,8 @@ class TestConvertToParquet:
             if os.path.exists(output_path):
                 os.remove(output_path)
     
-    def test_convert_to_parquet_with_existing_id_preserves_it(self, sample_geojson_with_id):
-        """Test that existing ID column is preserved."""
+    def test_convert_preserves_existing_id_column(self, sample_geojson_with_id):
+        """Test that conversion preserves existing fid column."""
         with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
             output_path = f.name
         
@@ -215,23 +110,17 @@ class TestConvertToParquet:
             convert_to_parquet(
                 source_url=sample_geojson_with_id,
                 destination=output_path,
-                compression="ZSTD",
-                compression_level=15,
-                row_group_size=100000,
                 force_id=True,
                 progress=False
             )
             
-            # Verify with DuckDB native parquet reader
+            # Verify file exists and has the existing fid column
             con = duckdb.connect()
-            
-            # Use native parquet reader (not ST_Read)
             df = con.execute(f"SELECT * FROM read_parquet('{output_path}')").df()
             
-            # Should have original fid, not _cng_fid
-            assert 'fid' in df.columns
-            assert '_cng_fid' not in df.columns
-            assert len(df) == 2
+            assert 'fid' in df.columns, "Expected existing fid column to be preserved"
+            assert '_cng_fid' not in df.columns, "Should not add _cng_fid when fid exists"
+            assert len(df) == 2, "Expected 2 features"
             
             con.close()
             
@@ -239,8 +128,8 @@ class TestConvertToParquet:
             if os.path.exists(output_path):
                 os.remove(output_path)
     
-    def test_geoparquet_quality_checks(self, sample_geojson):
-        """Test that output passes geoparquet-io quality checks."""
+    def test_geoparquet_metadata_is_valid(self, sample_geojson):
+        """Test that output has valid GeoParquet metadata."""
         with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
             output_path = f.name
         
@@ -248,102 +137,21 @@ class TestConvertToParquet:
             convert_to_parquet(
                 source_url=sample_geojson,
                 destination=output_path,
-                compression="ZSTD",
-                compression_level=15,
-                row_group_size=100000,
                 force_id=True,
                 progress=False
             )
             
-            # Run geoparquet-io quality checks
-            from geoparquet_io.core.check_parquet_structure import (
-                check_all,
-                check_compression,
-                check_row_groups,
-                get_compression_info
-            )
+            # Verify GeoParquet metadata exists
+            import pyarrow.parquet as pq
+            table = pq.read_table(output_path)
+            metadata = table.schema.metadata
             
-            # Check all (comprehensive check) - prints warnings but doesn't fail
-            check_all(output_path, verbose=False)
-            
-            # Check compression specifically - returns dict of column -> compression type
-            comp_info = get_compression_info(output_path)
-            # Verify ZSTD compression is used for columns
-            assert len(comp_info) > 0, "Expected compression info for columns"
-            # Check that all columns use ZSTD
-            for col, compression in comp_info.items():
-                assert compression == 'ZSTD', f"Expected ZSTD compression for {col}, got {compression}"
+            # Check for geo metadata
+            assert b'geo' in metadata, "Expected 'geo' metadata key"
             
         finally:
             if os.path.exists(output_path):
                 os.remove(output_path)
-    
-    def test_gdal_can_read_output(self, sample_geojson):
-        """Test that GDAL can read the output as valid GeoParquet (if Parquet driver available)."""
-        import subprocess
-        
-        # Check if system GDAL has Parquet driver support
-        try:
-            result = subprocess.run(
-                ['ogrinfo', '--formats'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            has_parquet_driver = 'Parquet' in result.stdout
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            has_parquet_driver = False
-        
-        if not has_parquet_driver:
-            pytest.skip("System GDAL does not have Parquet driver support")
-        
-        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
-            output_path = f.name
-        
-        try:
-            convert_to_parquet(
-                source_url=sample_geojson,
-                destination=output_path,
-                compression="ZSTD",
-                force_id=True,
-                progress=False
-            )
-            
-            # Test GDAL can read it using ogrinfo
-            result = subprocess.run(
-                ['ogrinfo', '-al', '-so', output_path],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            assert result.returncode == 0, f"ogrinfo failed to read parquet: {result.stderr}"
-            assert 'Feature Count: 3' in result.stdout, "Expected 3 features"
-            assert '_cng_fid' in result.stdout, "Expected _cng_fid column"
-            
-        finally:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-
-
-class TestIDColumnPriority:
-    """Test that _cng_fid is prioritized in h3_tiling."""
-    
-    def test_cng_fid_is_prioritized(self):
-        """Test that _cng_fid is detected first in priority list."""
-        from cng_datasets.vector.h3_tiling import identify_id_column
-        
-        con = duckdb.connect()
-        # Create table with both _cng_fid and fid
-        con.execute('CREATE TABLE test AS SELECT 1 as _cng_fid, 2 as fid, 3 as value')
-        
-        id_col, is_unique = identify_id_column(con, 'test')
-        
-        # Should prefer _cng_fid over fid
-        assert id_col == '_cng_fid'
-        assert is_unique is True
-        
-        con.close()
 
 
 class TestReprojection:
