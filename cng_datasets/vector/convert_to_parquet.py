@@ -412,10 +412,18 @@ def _convert_direct_with_reprojection(
         else:
             source_crs = "EPSG:4326"  # fallback
         
+        # Only flip coordinates when target is geographic CRS (EPSG:4326)
+        # ST_Transform outputs in official axis order (lat/lon for EPSG:4326)
+        # but GeoParquet expects lon/lat order for geographic CRS
+        if target_crs.upper() in ('EPSG:4326', 'EPSG:4269', 'WGS84'):
+            geom_expr = f"ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) as geom"
+        else:
+            geom_expr = f"ST_Transform(geom, '{source_crs}', '{target_crs}') as geom"
+        
         query = f"""
             SELECT 
                 * EXCLUDE (geom),
-                ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) as geom
+                {geom_expr}
             FROM ST_Read('{source_path}')
         """
         
@@ -522,11 +530,19 @@ def _convert_with_id_column(
             else:
                 source_crs = "EPSG:4326"  # fallback
             
+            # Only flip coordinates when target is geographic CRS (EPSG:4326)
+            # ST_Transform outputs in official axis order (lat/lon for EPSG:4326)
+            # but GeoParquet expects lon/lat order for geographic CRS
+            if target_crs.upper() in ('EPSG:4326', 'EPSG:4269', 'WGS84'):
+                geom_expr = f"ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) as geom"
+            else:
+                geom_expr = f"ST_Transform(geom, '{source_crs}', '{target_crs}') as geom"
+            
             query = f"""
                 SELECT 
                     row_number() OVER () AS {id_col_name},
                     * EXCLUDE (geom),
-                    ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) as geom
+                    {geom_expr}
                 FROM ST_Read('{source_path}')
             """
         else:
