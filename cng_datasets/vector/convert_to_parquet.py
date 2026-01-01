@@ -275,18 +275,14 @@ def upload_to_s3(local_path: str, s3_destination: str, verbose: bool = True) -> 
         s3_destination: S3 destination (s3://bucket/path)
         verbose: Print progress information
     """
-    # Convert s3://bucket/path to rclone format bucket:path
+    # Convert s3://bucket/path to rclone format nrp:bucket/path
     if not s3_destination.startswith('s3://'):
         raise ValueError(f"S3 destination must start with s3://: {s3_destination}")
     
-    # Parse s3://bucket/path -> bucket:path
+    # Parse s3://bucket/path -> nrp:bucket/path
+    # The 'nrp' remote is configured in rclone for NRP Nautilus S3
     s3_path = s3_destination[5:]  # Remove s3://
-    parts = s3_path.split('/', 1)
-    if len(parts) == 1:
-        rclone_dest = f"{parts[0]}:"
-    else:
-        bucket, path = parts
-        rclone_dest = f"{bucket}:{path}"
+    rclone_dest = f"nrp:{s3_path}"
     
     if verbose:
         print(f"  Uploading {local_path} to {s3_destination}...")
