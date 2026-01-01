@@ -331,7 +331,7 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
 pip install -q git+{git_repo}
 cng-convert-to-parquet \\
   {source_url} \\
-  /vsis3/{bucket}/{dataset_name}.parquet
+  s3://{bucket}/{dataset_name}.parquet
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
