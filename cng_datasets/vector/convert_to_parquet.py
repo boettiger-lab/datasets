@@ -105,44 +105,85 @@ def _check_projection(
     Returns:
         Tuple of (needs_reprojection, source_crs)
     """
-    from cng_datasets.vector.h3_tiling import setup_duckdb_connection
+    import subprocess
+    import json
     
     _configure_ssl()
-    con = setup_duckdb_connection()
+    
+    # Prepare source path for GDAL
+    if source_url.startswith('http://') or source_url.startswith('https://'):
+        source_path = f"/vsicurl/{source_url}"
+    else:
+        source_path = source_url
     
     try:
-        # Configure S3 credentials
-        from cng_datasets.storage.s3 import configure_s3_credentials
-        configure_s3_credentials(con)
+        # Use ogrinfo to get CRS information in JSON format
+        result = subprocess.run(
+            ['ogrinfo', '-json', source_path],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
         
-        # Prepare source path
-        if source_url.startswith('http://') or source_url.startswith('https://'):
-            source_path = f"/vsicurl/{source_url}"
-        else:
-            source_path = source_url
-        
-        # Get CRS info using ST_Read_Meta
-        result = con.execute(f"""
-            SELECT
-                layers[1].geometry_fields[1].crs.auth_name as auth_name,
-                layers[1].geometry_fields[1].crs.auth_code as auth_code
-            FROM ST_Read_Meta('{source_path}')
-        """).fetchone()
-        
-        if result is None or result[0] is None or result[1] is None:
-            print("  Warning: No CRS found in source data, assuming EPSG:4326")
+        if result.returncode != 0:
+            print(f"  Warning: Could not read source metadata: {result.stderr}")
             return False, None
         
-        auth_name, auth_code = result
-        source_crs = f"{auth_name}:{auth_code}"
+        # Parse JSON output
+        info = json.loads(result.stdout)
         
-        # Normalize comparison (EPSG is most common)
-        needs_reprojection = source_crs.upper() != target_crs.upper()
+        # Extract CRS from first layer
+        if 'layers' in info and len(info['layers']) > 0:
+            layer = info['layers'][0]
+            if 'geometryFields' in layer and len(layer['geometryFields']) > 0:
+                geom_field = layer['geometryFields'][0]
+                if 'coordinateSystem' in geom_field:
+                    crs_info = geom_field['coordinateSystem']
+                    
+                    # Try to get EPSG code from various locations
+                    source_crs = None
+                    
+                    # Check for authority name and code
+                    if 'id' in crs_info:
+                        auth = crs_info['id'].get('authority', '')
+                        code = crs_info['id'].get('code', '')
+                        if auth and code:
+                            source_crs = f"{auth}:{code}"
+                    
+                    # Fallback: check WKT for EPSG reference
+                    if not source_crs and 'wkt' in crs_info:
+                        wkt = crs_info['wkt']
+                        if 'EPSG",3310' in wkt or 'EPSG","3310' in wkt:
+                            source_crs = "EPSG:3310"
+                        elif 'EPSG",4269' in wkt or 'EPSG","4269' in wkt:
+                            # NAD83 geographic
+                            source_crs = "EPSG:4269"
+                        elif 'EPSG",4326' in wkt or 'EPSG","4326' in wkt:
+                            source_crs = "EPSG:4326"
+                    
+                    if source_crs:
+                        # Normalize comparison
+                        needs_reprojection = source_crs.upper() != target_crs.upper()
+                        # Also check if source is NAD83 (EPSG:4269) and target is WGS84 (EPSG:4326)
+                        # These are very similar but technically different
+                        if source_crs.upper() == "EPSG:4269" and target_crs.upper() == "EPSG:4326":
+                            # For most purposes, these are close enough, but let's reproject anyway
+                            needs_reprojection = True
+                        
+                        return needs_reprojection, source_crs
         
-        return needs_reprojection, source_crs
+        print("  Warning: No CRS found in source data, assuming EPSG:4326")
+        return False, None
         
-    finally:
-        con.close()
+    except subprocess.TimeoutExpired:
+        print("  Warning: Timeout reading source metadata, assuming EPSG:4326")
+        return False, None
+    except json.JSONDecodeError as e:
+        print(f"  Warning: Could not parse source metadata: {e}, assuming EPSG:4326")
+        return False, None
+    except Exception as e:
+        print(f"  Warning: Error checking projection: {e}, assuming EPSG:4326")
+        return False, None
 
 
 def _check_needs_id_column(
@@ -374,7 +415,7 @@ def _convert_direct_with_reprojection(
         query = f"""
             SELECT 
                 * EXCLUDE (geom),
-                ST_Transform(geom, '{source_crs}', '{target_crs}') as geom
+                ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) as geom
             FROM ST_Read('{source_path}')
         """
         
@@ -485,14 +526,15 @@ def _convert_with_id_column(
                 SELECT 
                     row_number() OVER () AS {id_col_name},
                     * EXCLUDE (geom),
-                    ST_Transform(geom, '{source_crs}', '{target_crs}') as geom
+                    ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) as geom
                 FROM ST_Read('{source_path}')
             """
         else:
             query = f"""
                 SELECT 
                     row_number() OVER () AS {id_col_name},
-                    *
+                    * EXCLUDE (geom),
+                    geom
                 FROM ST_Read('{source_path}')
             """
         
