@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-01-01
+
+### Changed
+- Made GDAL an optional dependency (install with `pip install -e ".[raster]"`)
+- Tests requiring GDAL array support now skip gracefully when unavailable
+- Updated documentation with GDAL installation instructions
+
+### Fixed
+- Test suite now passes in virtual environments without system GDAL
+- All 50 core tests pass, 9 GDAL-dependent tests skip cleanly
+
 ## [0.1.0] - 2026-01-01
 
 ### Added

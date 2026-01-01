@@ -11,9 +11,34 @@ import shutil
 from pathlib import Path
 import duckdb
 import numpy as np
-from osgeo import gdal, osr
+
+# Check if GDAL is available with array support
+try:
+    from osgeo import gdal, osr
+    gdal.UseExceptions()
+    GDAL_AVAILABLE = True
+    try:
+        from osgeo import gdal_array
+        GDAL_ARRAY_AVAILABLE = True
+    except ImportError:
+        GDAL_ARRAY_AVAILABLE = False
+except ImportError:
+    GDAL_AVAILABLE = False
+    GDAL_ARRAY_AVAILABLE = False
+
+# Skip marker for tests requiring GDAL array support
+requires_gdal_array = pytest.mark.skipif(
+    not GDAL_ARRAY_AVAILABLE,
+    reason="GDAL with NumPy array support not available (requires system GDAL installation)"
+)
+
+requires_gdal = pytest.mark.skipif(
+    not GDAL_AVAILABLE,
+    reason="GDAL not available"
+)
 
 
+@requires_gdal_array
 class TestRasterProcessor:
     """Test the RasterProcessor class with small synthetic rasters."""
     
@@ -338,6 +363,7 @@ class TestH3EdgeLengths:
         assert sig.return_annotation == int or str(sig.return_annotation) == 'int'
 
 
+@requires_gdal_array
 class TestCOGOptimization:
     """Test COG creation options and optimizations."""
     

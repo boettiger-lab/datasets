@@ -18,7 +18,25 @@ pip install -e .
 
 # With development tools
 pip install -e ".[dev]"
+
+# With raster processing support (requires system GDAL)
+pip install -e ".[raster]"
 ```
+
+**Note on GDAL**: For raster processing, GDAL requires system libraries. Install GDAL first:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install gdal-bin libgdal-dev python3-gdal
+
+# macOS
+brew install gdal
+
+# Then install with raster support
+pip install -e ".[raster]"
+```
+
+For containerized environments (Docker/Kubernetes), use images with GDAL pre-installed like `ghcr.io/rocker-org/ml-spatial:latest`.
 
 ## Quick Start
 
