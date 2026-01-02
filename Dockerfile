@@ -25,7 +25,6 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # Copy package files
 COPY pyproject.toml .
 COPY README.md .
-COPY README_PACKAGE.md .
 COPY cng_datasets/ ./cng_datasets/
 
 # Create virtual environment with access to system packages (for GDAL)
