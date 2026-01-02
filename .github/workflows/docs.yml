@@ -22,21 +22,16 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/boettiger-lab/datasets:latest
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
+      - name: Install documentation dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
-          pip install -r docs/requirements.txt
+          pip install sphinx furo myst-parser sphinx-autobuild linkify-it-py
 
       - name: Build documentation
         run: |
