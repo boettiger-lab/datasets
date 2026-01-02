@@ -1,6 +1,30 @@
+# Boettiger Lab Geospatial Datasets
+
+A collection of cloud-native geospatial datasets optimized for analysis and visualization, available as H3-indexed GeoParquet, PMTiles, and Cloud-Optimized GeoTIFFs (COGs). All datasets are accessible via a [STAC catalog](https://radiantearth.github.io/stac-browser/#/external/s3-west.nrp-nautilus.io/public-data/stac/catalog.json) hosted on the National Research Platform.
+
+## Available Datasets
+
+Our collection currently includes 11 published datasets covering biodiversity, conservation, environmental justice, and infrastructure:
+
+- **CPAD** (California Protected Areas Database) - Protected lands in California
+- **IUCN** - Global species range maps and Red List assessments  
+- **WDPA** (World Database on Protected Areas) - Global protected areas
+- **Mapping Inequality** - Historical redlining maps of US cities
+- **HydroBasins** - Global watershed boundaries at multiple hierarchical levels
+- **Natural Capital Project** - Ecosystem services and nature's contributions to people
+- **GBIF** - Global biodiversity occurrence records
+- **US Census** - Demographic and geographic data
+- **Carbon** - Carbon storage and emissions datasets
+- **Social Vulnerability Index** - CDC's social vulnerability indicators
+- **Wetlands** - National Wetlands Inventory data
+
+All datasets are H3-indexed at resolution 0 (coarsest partitioning) for efficient spatial queries and parallel processing. Browse the [STAC catalog](https://radiantearth.github.io/stac-browser/#/external/s3-west.nrp-nautilus.io/public-data/stac/catalog.json) for complete metadata, spatial/temporal extents, and direct HTTPS access to files.
+
+---
+
 # CNG Datasets Toolkit
 
-A Python toolkit for processing large geospatial datasets into cloud-native formats with H3 hexagonal indexing.
+This Python toolkit was used to process and generate the datasets above, converting large geospatial datasets into cloud-native formats with H3 hexagonal indexing.
 
 [![Documentation](https://img.shields.io/badge/docs-github%20pages-blue)](https://boettiger-lab.github.io/datasets/)
 [![PyPI](https://img.shields.io/pypi/v/cng-datasets)](https://pypi.org/project/cng-datasets/)

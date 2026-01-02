@@ -38,7 +38,7 @@ dev = [
     "mypy>=1.7.0",
 ]
 raster = [
-    "GDAL>=3.0.0",
+    "GDAL>=3.11.0",
 ]
 docs = [
     "sphinx>=7.0",
