@@ -210,23 +210,22 @@ class RasterProcessor:
         gdal.DontUseExceptions()
         
         # Translate options for COG
+        # COG driver is always tiled, so no TILED option needed
         translate_options = {
             'format': 'COG',
             'creationOptions': [
                 f'COMPRESS={self.compression.upper()}',
                 f'BLOCKSIZE={self.blocksize}',
-                'TILED=YES',
-                'BIGTIFF=YES',
+                'BIGTIFF=IF_SAFER',
                 'NUM_THREADS=ALL_CPUS',
             ]
         }
         
         # Add overview settings
         if overviews:
-            translate_options['creationOptions'].extend([
-                f'RESAMPLING={overview_resampling}',
-                'OVERVIEW_RESAMPLING=' + overview_resampling,
-            ])
+            translate_options['creationOptions'].append(
+                f'RESAMPLING={overview_resampling}'
+            )
         
         # Reproject to EPSG:4326 if needed
         ds = gdal.Open(self.input_path)
