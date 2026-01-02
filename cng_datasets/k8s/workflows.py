@@ -8,6 +8,7 @@ multiple coordinated Kubernetes jobs.
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 import math
+import yaml
 from .jobs import K8sJobManager
 
 
@@ -767,3 +768,142 @@ echo "  kubectl delete configmap {configmap_name} -n {namespace}"
     
     with open(output_path / "workflow.yaml", "w") as f:
         yaml.dump(workflow_job, f, default_flow_style=False)
+
+
+def generate_sync_job(
+    job_name: str,
+    source: str,
+    destination: str,
+    output_file: str = "sync-job.yaml",
+    namespace: str = "biodiversity",
+    image: str = "ghcr.io/boettiger-lab/datasets:latest",
+    cpu: str = "2",
+    memory: str = "4Gi",
+    dry_run: bool = False,
+) -> str:
+    """
+    Generate Kubernetes job for syncing between two S3 storage locations using rclone.
+    
+    Args:
+        job_name: Name for the Kubernetes job
+        source: Source path in rclone remote format (e.g., 'remote1:bucket/path')
+        destination: Destination path in rclone remote format (e.g., 'remote2:bucket/path')
+        output_file: Path to save the generated YAML file
+        namespace: Kubernetes namespace (default: biodiversity)
+        image: Container image with rclone (default: ghcr.io/boettiger-lab/datasets:latest)
+        cpu: CPU request/limit (default: 2)
+        memory: Memory request/limit (default: 4Gi)
+        dry_run: If True, only show what would be synced without actually syncing
+        
+    Returns:
+        Path to the generated YAML file
+        
+    Example:
+        >>> generate_sync_job(
+        ...     job_name="sync-data",
+        ...     source="nrp:public-dataset/data",
+        ...     destination="aws:backup-bucket/data",
+        ...     output_file="k8s/sync-job.yaml"
+        ... )
+    """
+    dry_run_flag = "--dry-run" if dry_run else ""
+    
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": job_name,
+            "namespace": namespace,
+            "labels": {"k8s-app": job_name}
+        },
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 2,
+            "ttlSecondsAfterFinished": 10800,  # Clean up after 3 hours
+            "template": {
+                "metadata": {"labels": {"k8s-app": job_name}},
+                "spec": {
+                    "priorityClassName": "opportunistic",
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [{
+                                    "matchExpressions": [{
+                                        "key": "feature.node.kubernetes.io/pci-10de.present",
+                                        "operator": "NotIn",
+                                        "values": ["true"]
+                                    }]
+                                }]
+                            }
+                        }
+                    },
+                    "restartPolicy": "Never",
+                    "containers": [{
+                        "name": "sync-task",
+                        "image": image,
+                        "imagePullPolicy": "Always",
+                        "volumeMounts": [
+                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+                        ],
+                        "command": ["bash", "-c"],
+                        "args": [f"""set -e
+echo "Starting rclone sync..."
+echo "Source: {source}"
+echo "Destination: {destination}"
+echo ""
+
+# Run rclone sync
+rclone sync {dry_run_flag} -v --progress \\
+    "{source}" \\
+    "{destination}"
+
+echo ""
+echo "Sync complete!"
+
+# Show summary
+echo ""
+echo "Summary:"
+rclone size "{destination}"
+"""],
+                        "resources": {
+                            "requests": {"cpu": cpu, "memory": memory},
+                            "limits": {"cpu": cpu, "memory": memory}
+                        }
+                    }],
+                    "volumes": [
+                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
+                    ]
+                }
+            }
+        }
+    }
+    
+    # Save to file with custom representer for multiline strings
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Custom representer for multi-line strings to use literal style (|)
+    def str_representer(dumper, data):
+        if '\n' in data:
+            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+    
+    yaml.add_representer(str, str_representer)
+    
+    with open(output_path, "w") as f:
+        yaml.dump(job_spec, f, default_flow_style=False, sort_keys=False)
+    
+    print(f"✓ Generated sync job: {output_file}")
+    print(f"")
+    print(f"Submit with:")
+    print(f"  kubectl apply -f {output_file} -n {namespace}")
+    print(f"")
+    print(f"Monitor progress:")
+    print(f"  kubectl logs -f job/{job_name} -n {namespace}")
+    print(f"")
+    print(f"Clean up:")
+    print(f"  kubectl delete -f {output_file} -n {namespace}")
+    
+    return str(output_path)
+

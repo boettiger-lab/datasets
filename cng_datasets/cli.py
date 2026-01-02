@@ -71,6 +71,17 @@ def main():
     workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     
+    # Sync job generation command
+    sync_job_parser = subparsers.add_parser("sync-job", help="Generate Kubernetes job for syncing between S3 locations")
+    sync_job_parser.add_argument("--job-name", required=True, help="Job name")
+    sync_job_parser.add_argument("--source", required=True, help="Source path (e.g., 'remote1:bucket/path')")
+    sync_job_parser.add_argument("--destination", required=True, help="Destination path (e.g., 'remote2:bucket/path')")
+    sync_job_parser.add_argument("--output", default="sync-job.yaml", help="Output YAML file (default: sync-job.yaml)")
+    sync_job_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
+    sync_job_parser.add_argument("--cpu", default="2", help="CPU request/limit (default: 2)")
+    sync_job_parser.add_argument("--memory", default="4Gi", help="Memory request/limit (default: 4Gi)")
+    sync_job_parser.add_argument("--dry-run", action="store_true", help="Dry run mode (show what would be synced)")
+    
     # Storage management command
     storage_parser = subparsers.add_parser("storage", help="Manage cloud storage")
     storage_subparsers = storage_parser.add_subparsers(dest="storage_command")
@@ -165,6 +176,19 @@ def main():
                 command=args.container_command,
             )
         manager.save_job_yaml(job_spec, args.output)
+    
+    elif args.command == "sync-job":
+        from .k8s import generate_sync_job
+        generate_sync_job(
+            job_name=args.job_name,
+            source=args.source,
+            destination=args.destination,
+            output_file=args.output,
+            namespace=args.namespace,
+            cpu=args.cpu,
+            memory=args.memory,
+            dry_run=args.dry_run,
+        )
     
     elif args.command == "workflow":
         from .k8s import generate_dataset_workflow
