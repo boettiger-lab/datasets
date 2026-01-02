@@ -28,14 +28,15 @@ COPY README.md .
 COPY README_PACKAGE.md .
 COPY cng_datasets/ ./cng_datasets/
 
-# Create virtual environment and install everything with uv
-RUN uv venv /opt/venv
+# Create virtual environment with access to system packages (for GDAL)
+RUN uv venv /opt/venv --system-site-packages
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install GDAL matching system version, then install the package
-RUN export GDAL_VERSION=$(gdal-config --version) && \
-    uv pip install "GDAL==${GDAL_VERSION}" && \
-    uv pip install -e ".[raster]"
+# Pin NumPy to 1.x for compatibility with system GDAL
+RUN uv pip install "numpy<2"
+
+# Install the package (GDAL already available from system)
+RUN uv pip install -e "."
 
 # Set Python to run in unbuffered mode (recommended for containers)
 ENV PYTHONUNBUFFERED=1
