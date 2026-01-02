@@ -48,6 +48,7 @@ Quick Links
 * :doc:`quickstart`
 * :doc:`api_reference`
 * `GitHub Repository <https://github.com/boettiger-lab/datasets>`_
+* `Browse Data Catalog (STAC) <stac/index.html>`_
 
 Indices and tables
 ==================
