@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     rclone \
     curl \
     unzip \
+    make \
     python3-dev \
     python3-numpy \
     && rm -rf /var/lib/apt/lists/*
