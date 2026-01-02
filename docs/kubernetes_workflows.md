@@ -1,8 +1,10 @@
-# Kubernetes Workflow Guide
+# Kubernetes Workflows
+
+Generate and run complete Kubernetes workflows for large-scale geospatial processing.
 
 ## Overview
 
-The `cng-datasets` package generates complete Kubernetes workflows for processing geospatial datasets into cloud-native formats. The workflow uses a **PVC-based orchestration** approach that allows stateless execution entirely within Kubernetes.
+The K8s workflow module generates complete workflows for processing datasets into cloud-native formats. The workflow uses a **PVC-based orchestration** approach that allows stateless execution entirely within Kubernetes.
 
 ## Architecture
 
@@ -11,21 +13,21 @@ The `cng-datasets` package generates complete Kubernetes workflows for processin
 The workflow uses a Persistent Volume Claim (PVC) to store job YAML files, enabling:
 - **Stateless execution**: No git repository dependencies
 - **Laptop disconnect**: Workflows run entirely in cluster
-- **Clean separation**: YAML files remain readable and separate (not embedded as ConfigMap strings)
+- **Clean separation**: YAML files remain readable and separate
 - **Reusability**: Same RBAC across all datasets in a namespace
 
 ### Workflow Components
 
-1. **Processing Jobs** (apply YAMLs individually or via orchestrator):
+1. **Processing Jobs**:
    - `convert-job.yaml` - Convert source format → GeoParquet
    - `pmtiles-job.yaml` - Generate PMTiles vector tiles
    - `hex-job.yaml` - H3 hexagonal tiling with automatic chunking
    - `repartition-job.yaml` - Consolidate chunks by h0 partition
 
 2. **Orchestration Infrastructure**:
-   - `workflow-rbac.yaml` - Generic ServiceAccount/Role/RoleBinding (one per namespace)
-   - `workflow-pvc.yaml` - PVC for storing YAML files in cluster
-   - `workflow-upload.yaml` - Helper job for uploading YAMLs to PVC
+   - `workflow-rbac.yaml` - ServiceAccount/Role/RoleBinding (one per namespace)
+   - `workflow-pvc.yaml` - PVC for storing YAML files
+   - `workflow-upload.yaml` - Job for uploading YAMLs to PVC
    - `workflow.yaml` - Orchestrator job that applies jobs from PVC
 
 ## Quick Start
@@ -43,7 +45,7 @@ cng-datasets workflow \
   --output-dir my-dataset/
 ```
 
-### 2. Run Complete Workflow (Recommended)
+### 2. Run Complete Workflow
 
 ```bash
 # One-time setup per namespace
@@ -55,6 +57,8 @@ kubectl apply -f my-dataset/workflow-pvc.yaml
 # Upload YAML files to PVC
 kubectl apply -f my-dataset/workflow-upload.yaml
 kubectl wait --for=condition=ready pod -l job-name=my-dataset-upload-yamls -n biodiversity
+
+# Copy YAML files to PVC
 POD=$(kubectl get pods -l job-name=my-dataset-upload-yamls -n biodiversity -o jsonpath='{.items[0].metadata.name}')
 kubectl cp my-dataset/convert-job.yaml $POD:/yamls/ -n biodiversity
 kubectl cp my-dataset/pmtiles-job.yaml $POD:/yamls/ -n biodiversity
@@ -77,22 +81,23 @@ kubectl apply -f my-dataset/workflow-rbac.yaml
 # Run each job manually
 kubectl apply -f my-dataset/convert-job.yaml
 kubectl apply -f my-dataset/pmtiles-job.yaml
+
 # Wait for convert to finish before hex
 kubectl wait --for=condition=complete job/my-dataset-convert -n biodiversity
+
 kubectl apply -f my-dataset/hex-job.yaml
 kubectl wait --for=condition=complete job/my-dataset-hex -n biodiversity
+
 kubectl apply -f my-dataset/repartition-job.yaml
 ```
 
-## Configurable Options
+## Configuration
 
 ### H3 Resolutions
 
-The workflow generates H3 hexagons at configurable resolutions:
-
 ```bash
---h3-resolution 10        # Primary resolution (default: 10)
---parent-resolutions "9,8,0"  # Parent hexes for aggregation (default: "9,8,0")
+--h3-resolution 10              # Primary resolution (default: 10)
+--parent-resolutions "9,8,0"    # Parent hexes for aggregation
 ```
 
 **Resolution Reference:**
@@ -104,20 +109,20 @@ The workflow generates H3 hexagons at configurable resolutions:
 - h7: ~600m (district)
 - h0: continent-scale (partitioning key)
 
-### Chunking Behavior
-
-The hex job automatically determines optimal chunking based on feature count:
-- Uses GDAL to count features from source URL
-- Targets 200 completions with 50 parallelism
-- Falls back to defaults if counting fails
-
 ### Namespace
 
 ```bash
---namespace biodiversity  # Default namespace (must exist)
+--namespace biodiversity  # Kubernetes namespace (must exist)
 ```
 
 All jobs and RBAC use the specified namespace.
+
+### Chunking Behavior
+
+The hex job automatically determines optimal chunking:
+- Uses GDAL to count features from source URL
+- Targets 200 completions with 50 parallelism
+- Falls back to defaults if counting fails
 
 ## Processing Details
 
@@ -125,16 +130,14 @@ All jobs and RBAC use the specified namespace.
 
 1. **Chunking Phase** (`hex-job.yaml`):
    - Process source data in parallel chunks
-   - Write to temporary `s3://bucket/dataset-name/chunks/` directory
+   - Write to temporary `s3://bucket/dataset-name/chunks/`
    - Each chunk contains all H3 resolutions
 
 2. **Repartition Phase** (`repartition-job.yaml`):
    - Read all chunks
    - Repartition by h0 hexagon (continent-scale)
-   - Write to final `s3://bucket/dataset-name/hex/` directory
+   - Write to final `s3://bucket/dataset-name/hex/`
    - Delete temporary `chunks/` directory
-
-This enables efficient parallel processing while ensuring optimal query performance.
 
 ### Output Structure
 
@@ -143,10 +146,12 @@ s3://bucket/
 ├── dataset-name.parquet         # GeoParquet with all attributes
 ├── dataset-name.pmtiles         # PMTiles vector tiles
 └── dataset-name/
-    ├── hex/                     # H3-indexed parquet (partitioned by h0)
-    │   └── h0=*/
-    │       └── *.parquet
-    └── chunks/                  # Temporary (deleted after repartition)
+    └── hex/                     # H3-indexed parquet (partitioned by h0)
+        └── h0=0/
+            └── *.parquet
+        └── h0=1/
+            └── *.parquet
+        ...
 ```
 
 ## Monitoring & Debugging
@@ -162,7 +167,7 @@ kubectl describe job my-dataset-hex -n biodiversity
 
 # View logs
 kubectl logs job/my-dataset-workflow -n biodiversity
-kubectl logs job/my-dataset-hex-0-xxxxx -n biodiversity  # specific pod
+kubectl logs job/my-dataset-hex-0-xxxxx -n biodiversity
 
 # List pods for a job
 kubectl get pods -n biodiversity | grep my-dataset-hex
@@ -200,7 +205,11 @@ kubectl describe pod <pod-name> -n biodiversity
 
 ```bash
 # Delete all dataset jobs and PVC
-kubectl delete job my-dataset-convert my-dataset-pmtiles my-dataset-hex my-dataset-repartition my-dataset-upload-yamls my-dataset-workflow -n biodiversity --ignore-not-found=true
+kubectl delete job my-dataset-convert my-dataset-pmtiles \
+  my-dataset-hex my-dataset-repartition \
+  my-dataset-upload-yamls my-dataset-workflow \
+  -n biodiversity --ignore-not-found=true
+
 kubectl delete pvc my-dataset-workflow-yamls -n biodiversity --ignore-not-found=true
 ```
 
@@ -217,20 +226,10 @@ rclone purge nrp:bucket-name/hex/
 
 ## Advanced Usage
 
-### Custom Chunking
-
-Override automatic chunking by editing `hex-job.yaml`:
-```yaml
-env:
-  - name: CHUNK_SIZE
-    value: "100"  # Features per chunk
-  - name: TOTAL_CHUNKS  
-    value: "50"   # Number of chunks
-```
-
 ### Custom Resource Limits
 
-Edit individual job YAML files to adjust CPU/memory:
+Edit individual job YAML files:
+
 ```yaml
 resources:
   requests:
@@ -243,7 +242,8 @@ resources:
 
 ### Multiple Datasets
 
-The generic RBAC (`cng-datasets-workflow`) can be shared across datasets:
+The generic RBAC can be shared:
+
 ```bash
 # Apply RBAC once
 kubectl apply -f workflow-rbac.yaml
@@ -251,25 +251,23 @@ kubectl apply -f workflow-rbac.yaml
 # Run multiple datasets
 kubectl apply -f dataset1/workflow.yaml
 kubectl apply -f dataset2/workflow.yaml
-# Each gets its own PVC for YAML files
 ```
+
+Each dataset gets its own PVC for YAML files.
 
 ## Design Rationale
 
 ### Why PVC Instead of Git?
-
-- **No dev repository dependency**: Don't require push access to run workflows
-- **Stateless K8s execution**: Everything runs in cluster, laptop can disconnect
-- **No initContainer overhead**: No git clone delays
+- No dev repository dependency
+- Stateless K8s execution
+- No initContainer overhead
 
 ### Why Not ConfigMaps?
-
-- **Readability**: YAMLs remain separate files, not embedded strings
-- **Size limits**: ConfigMaps have 1MB limit, can be restrictive
-- **Maintainability**: Easier to inspect and modify individual jobs
+- Better readability (files not embedded strings)
+- No 1MB size limit
+- Easier to inspect and modify
 
 ### Why Generic RBAC?
-
-- **Simplicity**: One ServiceAccount/Role/RoleBinding per namespace
-- **Consistency**: Same permissions for all datasets
-- **Scalability**: No per-dataset RBAC proliferation
+- One ServiceAccount per namespace
+- Consistent permissions
+- No per-dataset RBAC proliferation

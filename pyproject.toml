@@ -39,6 +39,13 @@ dev = [
 raster = [
     "GDAL>=3.0.0",
 ]
+docs = [
+    "sphinx>=7.0",
+    "furo",
+    "myst-parser",
+    "sphinx-autobuild",
+    "linkify-it-py",
+]
 
 [project.scripts]
 cng-datasets = "cng_datasets.cli:main"
