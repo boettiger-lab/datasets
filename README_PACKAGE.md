@@ -36,7 +36,29 @@ brew install gdal
 pip install -e ".[raster]"
 ```
 
-For containerized environments (Docker/Kubernetes), use images with GDAL pre-installed like `ghcr.io/rocker-org/ml-spatial:latest`.
+### Using Docker (Recommended)
+
+The easiest way to use this package with full GDAL support is via Docker:
+
+```bash
+# Pull the pre-built image
+docker pull ghcr.io/boettiger-lab/datasets:latest
+
+# Run interactively
+docker run -it --rm -v $(pwd):/data ghcr.io/boettiger-lab/datasets:latest bash
+
+# Or run a specific command
+docker run --rm -v $(pwd):/data ghcr.io/boettiger-lab/datasets:latest \
+  cng-datasets raster --input /data/input.tif --output-cog /data/output.tif
+```
+
+The Docker image includes:
+- GDAL with full NumPy array support
+- All Python dependencies
+- AWS CLI and rclone for cloud storage
+- Pre-installed cng-datasets package
+
+For Kubernetes jobs, the image is available at `ghcr.io/boettiger-lab/datasets:latest`.
 
 ## Quick Start
 

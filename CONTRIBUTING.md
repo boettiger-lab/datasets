@@ -49,6 +49,45 @@ Run with coverage:
 pytest --cov=cng_datasets tests/
 ```
 
+**Note on GDAL Tests**: Some raster tests require GDAL with NumPy array support. If you see tests being skipped, you have two options:
+
+#### Option 1: Use Docker (Recommended)
+
+Run tests in the Docker container with full GDAL support:
+
+```bash
+# Build the image locally
+docker build -t cng-datasets .
+
+# Run tests in container
+docker run --rm -v $(pwd):/workspace -w /workspace cng-datasets \
+  bash -c "pip install -e '.[dev,raster]' && pytest tests/ -v"
+```
+
+Or use the pre-built image:
+
+```bash
+docker pull ghcr.io/boettiger-lab/datasets:latest
+docker run --rm -v $(pwd):/workspace -w /workspace \
+  ghcr.io/boettiger-lab/datasets:latest \
+  bash -c "pip install -e '.[dev,raster]' && pytest tests/ -v"
+```
+
+#### Option 2: Install System GDAL
+
+Install GDAL system libraries and reinstall the Python package:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install gdal-bin libgdal-dev python3-gdal
+
+# macOS
+brew install gdal
+
+# Then reinstall with raster support
+pip install -e ".[raster]"
+```
+
 ### Code Style
 
 We use `black` for code formatting and `ruff` for linting.

@@ -15,13 +15,18 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Install test dependencies
+    - name: Install package and test dependencies
       run: |
-        pip install pytest pytest-cov pyyaml
+        pip install -e ".[dev,raster]"
     
     - name: Run tests
       run: |
         pytest tests/ -v --cov=cng_datasets --cov-report=xml --cov-report=term
+    
+    - name: Show test summary
+      run: |
+        echo "Test Summary:"
+        pytest tests/ --co -q | tail -1
     
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
