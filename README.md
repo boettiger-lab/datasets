@@ -125,10 +125,13 @@ s3://bucket/
 
 These routines rely on several software tools that can all read and write to S3 buckets: GDAL, duckdb, and rclone.  GDAL and duckdb can both 'stream' data directly to a bucket without writing to a local file, and the package relies on environmental variables to configure them.  rclone provides file-based operations when streaming is not an option or slower.  The initial bucket creation and setting access permissions and CORS uses aws cli. 
 
+NRP uses a different internal endpoint URL which provides faster performance (notably, can handle many more open connections for parallel read/write).  
+
 
 ### Sync
 
 Sync bucket to other S3 system, e.g. source.coop.  (Be sure to create the bucket first, e.g. with source.coop create the repo in the web interface.)
+*NOTE* With large datasets, this can be important to run as k8s job rather than syncing through a local machine, which will be slow and prone to network timeouts.
 
 
 ```
