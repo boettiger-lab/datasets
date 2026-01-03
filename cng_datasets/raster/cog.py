@@ -355,6 +355,11 @@ class RasterProcessor:
         h0_table = self.con.read_parquet("s3://public-grids/hex/h0-valid.parquet")
         h0_filtered = h0_table.filter(h0_table.i == h0_index)
         h0_result = h0_filtered.fetchdf()
+        
+        if len(h0_result) == 0:
+            print(f"  ⚠ No h0 region found for index {h0_index}")
+            return None
+            
         h0_geom_wkt = h0_result['geom'].iloc[0]
         h0_cell = h0_result['h0'].iloc[0]
         
