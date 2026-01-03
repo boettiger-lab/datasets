@@ -12,6 +12,15 @@ import duckdb
 from osgeo import gdal, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
 
+# Configure GDAL environment before any operations
+if 'GDAL_DATA' in os.environ:
+    gdal.SetConfigOption('GDAL_DATA', os.environ['GDAL_DATA'])
+if 'PROJ_LIB' in os.environ:
+    gdal.SetConfigOption('PROJ_LIB', os.environ['PROJ_LIB'])
+
+# Set GDAL to use exceptions for better error handling
+gdal.UseExceptions()
+
 
 def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     """Convert path to appropriate GDAL VSI notation.
@@ -272,9 +281,6 @@ class RasterProcessor:
         
         print(f"Creating COG: {output_path}")
         print(f"  Input: {self.input_path}")
-        
-        # GDAL configuration for COG creation
-        gdal.DontUseExceptions()
         
         # Translate options for COG
         # COG driver is always tiled, so no TILED option needed
