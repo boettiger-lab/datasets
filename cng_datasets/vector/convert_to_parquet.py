@@ -39,7 +39,7 @@ def is_parquet_file(source_url: str) -> bool:
     return path.lower().endswith('.parquet')
 
 
-def detect_crs(source_url: str, verbose: bool = False) -> Optional[str]:
+def detect_crs(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> Optional[str]:
     """
     Detect the CRS of a vector dataset using geopandas.
     
@@ -47,6 +47,7 @@ def detect_crs(source_url: str, verbose: bool = False) -> Optional[str]:
     
     Args:
         source_url: Source dataset URL
+        layer: Layer name for multi-layer datasets (e.g., GDB)
         verbose: Print debug information
         
     Returns:
@@ -54,7 +55,10 @@ def detect_crs(source_url: str, verbose: bool = False) -> Optional[str]:
     """
     try:
         # Read just the first row to get CRS info quickly
-        gdf = gpd.read_file(source_url, rows=1)
+        kwargs = {'rows': 1}
+        if layer:
+            kwargs['layer'] = layer
+        gdf = gpd.read_file(source_url, **kwargs)
         
         if gdf.crs is None:
             if verbose:
@@ -107,13 +111,14 @@ def is_geographic_crs(crs: str) -> bool:
     return False
 
 
-def check_id_column(source_url: str, id_column: Optional[str] = None, 
+def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Optional[str] = None, 
                     force_id: bool = True, verbose: bool = False) -> Tuple[bool, str]:
     """
     Check if we need to create an ID column.
     
     Args:
         source_url: Source dataset URL
+        layer: Layer name for multi-layer datasets (e.g., GDB)
         id_column: Specific ID column name to use
         force_id: Create _cng_fid if no suitable ID exists
         verbose: Print debug information
@@ -127,8 +132,9 @@ def check_id_column(source_url: str, id_column: Optional[str] = None,
     
     try:
         # Read just the schema - ST_Read handles URLs directly
+        layer_param = f", layer='{layer}'" if layer else ""
         columns = con.execute(f"""
-            DESCRIBE SELECT * FROM ST_Read('{source_url}') LIMIT 0
+            DESCRIBE SELECT * FROM ST_Read('{source_url}'{layer_param}) LIMIT 0
         """).fetchall()
         
         column_names = [col[0].lower() for col in columns]
@@ -161,7 +167,7 @@ def check_id_column(source_url: str, id_column: Optional[str] = None,
 
 
 def build_read_reproject_query(source_url: str, source_crs: Optional[str], 
-                               target_crs: str, verbose: bool = False) -> str:
+                               target_crs: str, layer: Optional[str] = None, verbose: bool = False) -> str:
     """
     Build DuckDB query to read and reproject data. Nothing about IDs.
     
@@ -169,6 +175,7 @@ def build_read_reproject_query(source_url: str, source_crs: Optional[str],
         source_url: Source dataset URL
         source_crs: Source CRS (None = no reprojection needed)
         target_crs: Target CRS
+        layer: Layer name for multi-layer datasets (e.g., GDB)
         verbose: Print debug information
         
     Returns:
@@ -186,11 +193,12 @@ def build_read_reproject_query(source_url: str, source_crs: Optional[str],
         # No reprojection needed
         geom_expr = "geom"
     
+    layer_param = f", layer='{layer}'" if layer else ""
     query = f"""
     SELECT 
         * EXCLUDE (geom),
         {geom_expr}
-    FROM ST_Read('{source_url}')
+    FROM ST_Read('{source_url}'{layer_param})
     """
     
     if verbose:
@@ -472,6 +480,7 @@ def convert_to_parquet(
     force_id: bool = True,
     progress: bool = True,
     target_crs: str = "EPSG:4326",
+    layer: Optional[str] = None,
     verbose: bool = False
 ):
     """
@@ -495,6 +504,7 @@ def convert_to_parquet(
         force_id: Create _cng_fid if no suitable ID column exists
         progress: Show progress during conversion
         target_crs: Target CRS for output (default: EPSG:4326)
+        layer: Layer name for multi-layer datasets (e.g., GDB)
         verbose: Print detailed debug information
     """
     # Check if input is already parquet
@@ -515,6 +525,8 @@ def convert_to_parquet(
     
     # Original processing for non-parquet inputs
     print(f"Converting {source_url}")
+    if layer:
+        print(f"     layer {layer}")
     print(f"       to {destination}")
     
     if progress:
@@ -524,7 +536,7 @@ def convert_to_parquet(
     try:
         # Step 1: Detect source CRS
         print("  Detecting source CRS...")
-        source_crs = detect_crs(source_url, verbose=verbose)
+        source_crs = detect_crs(source_url, layer=layer, verbose=verbose)
         
         needs_reprojection = False
         if source_crs:
@@ -543,12 +555,14 @@ def convert_to_parquet(
             source_url,
             source_crs if needs_reprojection else None,
             target_crs,
+            layer=layer,
             verbose=verbose
         )
         
         # Step 3: Check ID column and wrap query if needed
         print("  Checking for ID column...")
-        needs_id, id_col_name = check_id_column(source_url, id_column, force_id, verbose)
+        needs_id, id_col_name = check_id_column(source_url, layer=layer, id_column=id_column, 
+                                                  force_id=force_id, verbose=verbose)
         
         if needs_id:
             print(f"  Adding synthetic ID column: {id_col_name}")
@@ -636,6 +650,7 @@ Examples:
                        help="Don't create synthetic ID if none exists")
     parser.add_argument("--target-crs", default="EPSG:4326",
                        help="Target CRS (default: EPSG:4326)")
+    parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")
     
     parser.add_argument("--no-progress", action="store_true",
                        help="Disable progress output")
@@ -656,6 +671,7 @@ Examples:
             force_id=not args.no_force_id,
             progress=not args.no_progress,
             target_crs=args.target_crs,
+            layer=args.layer,
             verbose=args.verbose
         )
         sys.exit(0)

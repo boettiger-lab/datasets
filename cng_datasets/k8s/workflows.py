@@ -88,6 +88,7 @@ def generate_dataset_workflow(
     h3_resolution: int = 10,
     parent_resolutions: Optional[List[int]] = None,
     id_column: Optional[str] = None,
+    layer: Optional[str] = None,
     hex_memory: str = "8Gi",
     max_parallelism: int = 50,
     max_completions: int = 200,
@@ -134,7 +135,7 @@ def generate_dataset_workflow(
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
     
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
+    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer)
     
     # Generate pmtiles job
     _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
@@ -542,8 +543,17 @@ echo "Bucket setup complete!"
     manager.save_job_yaml(job_spec, str(output_path / "setup-bucket-job.yaml"))
 
 
-def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
+def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None):
     """Generate GeoParquet conversion job."""
+    # Build the conversion command with optional layer parameter
+    layer_flag = f" \\
+  --layer {layer}" if layer else ""
+    convert_cmd = f"""set -e
+cng-convert-to-parquet \\
+  {source_url} \\
+  s3://{bucket}/{dataset_name}.parquet{layer_flag}
+"""
+    
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -590,11 +600,7 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                         "volumeMounts": [
                             {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
                         ],
-                        "command": ["bash", "-c", f"""set -e
-cng-convert-to-parquet \\
-  {source_url} \\
-  s3://{bucket}/{dataset_name}.parquet
-"""],
+                        "command": ["bash", "-c", convert_cmd],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "8Gi"},
                             "limits": {"cpu": "4", "memory": "8Gi"}
