@@ -33,9 +33,9 @@ RUN uv venv /opt/venv --system-site-packages
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Pin NumPy to 1.x for compatibility with system GDAL
-RUN uv pip install "numpy<2" pip
+RUN uv pip install "numpy<2"
 
-# Install the package (GDAL already available from system)
+# Install the package with uv for fast resolution (GDAL already available from system)
 RUN uv pip install -e "."
 
 # Set Python to run in unbuffered mode (recommended for containers)
