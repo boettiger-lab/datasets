@@ -17,7 +17,7 @@ jobs:
     
     - name: Install package and test dependencies
       run: |
-        pip install -e ".[dev,raster]"
+        uv pip install -e ".[dev,raster]"
     
     - name: Run tests
       run: |
