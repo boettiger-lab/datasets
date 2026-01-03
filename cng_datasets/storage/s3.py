@@ -34,9 +34,13 @@ def configure_s3_credentials(con) -> None:
     endpoint = os.getenv("AWS_S3_ENDPOINT", "s3-west.nrp-nautilus.io")
     region = os.getenv("AWS_REGION", "us-east-1")
     use_ssl = os.getenv("AWS_HTTPS", "TRUE")
+    url_style = os.getenv("AWS_VIRTUAL_HOSTING", "FALSE")
     
-    # Determine URL style based on endpoint
-    url_style = "vhost" if "amazonaws.com" in endpoint else "path"
+    # Convert TRUE/FALSE strings to path/vhost
+    if url_style.upper() == "FALSE":
+        url_style = "path"
+    else:
+        url_style = "vhost"
     
     # Always create secret, even for anonymous/public access (empty key/secret)
     # USE_SSL must be a string, not boolean!
