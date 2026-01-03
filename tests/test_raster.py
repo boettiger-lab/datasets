@@ -315,15 +315,28 @@ class TestRasterToH3Conversion:
         return raster_path
     
     @pytest.mark.timeout(120)
-    @pytest.mark.skipif(
-        not os.getenv("AWS_ACCESS_KEY_ID"),
-        reason="Requires AWS credentials and s3://public-grids access"
-    )
     def test_process_h0_region_basic(self, tiny_raster, temp_dir):
         """Test processing a single h0 region to parquet."""
         from cng_datasets.raster import RasterProcessor
+        import geopandas as gpd
+        from shapely.geometry import box
         
-        # Use a temporary local output (not S3) for testing
+        # Create a mock h0 grid file locally that covers our test area
+        # San Francisco area: -122.5 to -122.45, 37.7 to 37.75
+        h0_geom = box(-123, 37, -122, 38)  # Wider box to ensure coverage
+        h0_gdf = gpd.GeoDataFrame({
+            'i': [0],
+            'h0': ['8007fffffffffff'],  # Mock h0 cell ID
+            'geometry': [h0_geom]
+        }, crs='EPSG:4326')
+        
+        # Rename geometry column to 'geom' to match expected schema
+        h0_gdf = h0_gdf.rename_geometry('geom')
+        
+        h0_file = os.path.join(temp_dir, 'h0-test.parquet')
+        h0_gdf.to_parquet(h0_file)
+        
+        # Use a temporary local output
         output_dir = os.path.join(temp_dir, 'hex_output')
         os.makedirs(output_dir, exist_ok=True)
         
@@ -332,34 +345,21 @@ class TestRasterToH3Conversion:
             output_parquet_path=output_dir,
             h3_resolution=7,  # Coarse resolution for speed
             parent_resolutions=[0],
+            h0_grid_path=h0_file,  # Use local h0 grid file
             value_column="test_value",
             nodata_value=999,
         )
         
-        # Find which h0 region contains our test area (San Francisco)
-        # h0 for San Francisco area is typically in the 80s range
-        con = processor.con
-        h0_table = con.read_parquet("s3://public-grids/hex/h0-valid.parquet")
+        # Test the pipeline by processing this h0 region
+        result = processor.process_h0_region(0)
         
-        # Check if we can access the h0 grid (requires network)
-        try:
-            h0_data = h0_table.execute()
-            # Find h0 that intersects our test area
-            # For now, just use h0 index 0 as a test
-            h0_index = 0
-        except Exception as e:
-            pytest.skip(f"Could not access h0 grid: {e}")
-        
-        # This will likely return None since our tiny raster probably doesn't intersect h0=0
-        # But it tests the pipeline
-        result = processor.process_h0_region(h0_index)
-        
-        # If result is not None, check the output
+        # Check the output exists
         if result:
             assert os.path.exists(result)
             
             # Verify parquet structure
-            df = con.read_parquet(result).execute()
+            con = processor.con
+            df = con.read_parquet(result).fetchdf()
             assert 'test_value' in df.columns
             assert 'h7' in df.columns
             assert 'h0' in df.columns
@@ -367,6 +367,9 @@ class TestRasterToH3Conversion:
             
             # Verify nodata was excluded
             assert 999 not in df['test_value'].values
+        else:
+            # If no data in region, that's also valid
+            pass
 
 
 class TestH3EdgeLengths:
@@ -507,10 +510,6 @@ class TestIntegration:
     """Integration tests for complete workflows."""
     
     @pytest.mark.timeout(120)
-    @pytest.mark.skipif(
-        not os.getenv("AWS_ACCESS_KEY_ID"),
-        reason="Requires AWS credentials"
-    )
     def test_complete_workflow_small_dataset(self):
         """Test complete workflow: raster → COG → H3 parquet."""
         import tempfile

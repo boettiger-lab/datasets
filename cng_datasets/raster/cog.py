@@ -156,6 +156,7 @@ class RasterProcessor:
         h3_resolution: Optional[int] = None,
         parent_resolutions: Optional[List[int]] = None,
         h0_index: Optional[int] = None,
+        h0_grid_path: str = "s3://public-grids/hex/h0-valid.parquet",
         value_column: str = "value",
         compression: str = "deflate",
         blocksize: int = 512,
@@ -174,6 +175,7 @@ class RasterProcessor:
             h3_resolution: Target H3 resolution (auto-detected if None)
             parent_resolutions: List of parent resolutions to include (e.g., [9, 8, 0])
             h0_index: Specific h0 cell index to process (0-121), or None for all
+            h0_grid_path: Path to h0 grid parquet file (default: s3://public-grids/hex/h0-valid.parquet)
             value_column: Name for the raster value column in parquet
             compression: Compression method for COG (deflate, lzw, zstd, etc.)
             blocksize: Block size for COG tiling
@@ -187,6 +189,7 @@ class RasterProcessor:
         self.output_cog_path = output_cog_path
         self.output_parquet_path = output_parquet_path
         self.h0_index = h0_index
+        self.h0_grid_path = h0_grid_path
         self.value_column = value_column
         self.compression = compression
         self.blocksize = blocksize
@@ -362,7 +365,7 @@ class RasterProcessor:
         # Load h0 polygons to get the geometry using SQL with ST_AsText for WKT
         h0_result = self.con.execute(f"""
             SELECT h0, ST_AsText(geom) as geom_wkt
-            FROM read_parquet('s3://public-grids/hex/h0-valid.parquet')
+            FROM read_parquet('{self.h0_grid_path}')
             WHERE i = {h0_index}
         """).fetchdf()
         
@@ -409,10 +412,6 @@ class RasterProcessor:
             columns={'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'FLOAT'}
         )
         
-        # Filter nodata if specified
-        if self.nodata_value is not None:
-            xyz_table = xyz_table.filter(xyz_table.Z != self.nodata_value)
-        
         # Build parent resolution columns
         h3_col = f"h{self.h3_resolution}"
         parent_cols = []
@@ -426,21 +425,28 @@ class RasterProcessor:
         
         parent_sql = ', ' + ', '.join(parent_exprs) if parent_exprs else ''
         
+        # Add nodata filter to WHERE clause if specified
+        where_clause = f"WHERE Z != {self.nodata_value}" if self.nodata_value is not None else ""
+        
         # Generate H3 cells with parent resolutions
         output_path = f"{self.output_parquet_path}/h0={h0_cell}/data_0.parquet"
         
+        # Create output directory if it doesn't exist
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+        
         query = f"""
-            SELECT 
-                Z AS {self.value_column},
-                h3_latlng_to_cell_string(Y, X, {self.h3_resolution}) AS {h3_col}
-                {parent_sql}
-            FROM xyz_table
+            COPY (
+                SELECT 
+                    Z AS {self.value_column},
+                    h3_latlng_to_cell_string(Y, X, {self.h3_resolution}) AS {h3_col}
+                    {parent_sql}
+                FROM xyz_table
+                {where_clause}
+            ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
         """
         
-        self.con.execute(query).write_parquet(
-            output_path,
-            compression='zstd'
-        )
+        self.con.execute(query)
         
         # Clean up
         try:
