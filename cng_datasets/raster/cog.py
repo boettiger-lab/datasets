@@ -371,9 +371,9 @@ class RasterProcessor:
         
         print(f"\nProcessing h0 region {h0_index}...")
         
-        # Load h0 polygons to get the geometry using SQL
+        # Load h0 polygons to get the geometry using SQL with ST_AsText for WKT
         h0_result = self.con.execute(f"""
-            SELECT h0, geom 
+            SELECT h0, ST_AsText(geom) as geom_wkt
             FROM read_parquet('s3://public-grids/hex/h0-valid.parquet')
             WHERE i = {h0_index}
         """).fetchdf()
@@ -382,7 +382,7 @@ class RasterProcessor:
             print(f"  ⚠ No h0 region found for index {h0_index}")
             return None
             
-        h0_geom_wkt = h0_result['geom'].iloc[0]
+        h0_geom_wkt = h0_result['geom_wkt'].iloc[0]
         h0_cell = h0_result['h0'].iloc[0]
         
         print(f"  h0 cell: {h0_cell}")
