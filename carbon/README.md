@@ -77,7 +77,7 @@ cng-datasets raster-workflow \
   --dataset irrecoverable-carbon \
   --source-url s3://public-carbon/cogs/irrecoverable_c_total_2018.tif \
   --bucket public-carbon \
-  --output-dir carbon/k8s \
+  --output-dir k8s \
   --h3-resolution 8 \
   --parent-resolutions 0 \
   --value-column carbon

@@ -13,6 +13,28 @@ from osgeo import gdal, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
 
 
+def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
+    """Convert path to appropriate GDAL VSI notation.
+    
+    Args:
+        path: Input path (s3://, https://, or local)
+        use_public_endpoint: If True, convert s3:// to /vsicurl/ with public HTTPS URL
+                            for single-file reads (faster for public data)
+    
+    Returns:
+        Path in GDAL VSI notation
+    """
+    if path.startswith("s3://"):
+        if use_public_endpoint:
+            # Use public HTTPS endpoint with /vsicurl/ for single file reads
+            bucket_path = path[5:]  # Remove s3://
+            return f"/vsicurl/https://s3-west.nrp-nautilus.io/{bucket_path}"
+        else:
+            # Use /vsis3/ for writes and multi-file operations
+            return f"/vsis3/{path[5:]}"
+    return path
+
+
 def detect_nodata_value(raster_path: str, verbose: bool = True) -> Optional[float]:
     """
     Detect NoData value from raster metadata.
@@ -24,6 +46,8 @@ def detect_nodata_value(raster_path: str, verbose: bool = True) -> Optional[floa
     Returns:
         NoData value if found, None otherwise
     """
+    # Use public endpoint for single-file reads
+    raster_path = _ensure_vsi_path(raster_path, use_public_endpoint=True)
     ds = gdal.Open(raster_path)
     if ds is None:
         raise ValueError(f"Could not open raster: {raster_path}")
@@ -59,6 +83,8 @@ def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
     Returns:
         Recommended H3 resolution (0-15)
     """
+    # Use public endpoint for single-file reads
+    raster_path = _ensure_vsi_path(raster_path, use_public_endpoint=True)
     ds = gdal.Open(raster_path)
     if ds is None:
         raise ValueError(f"Could not open raster: {raster_path}")
@@ -145,7 +171,8 @@ class RasterProcessor:
             read_credentials: Dict with AWS credentials for reading
             write_credentials: Dict with AWS credentials for writing
         """
-        self.input_path = input_path
+        # Use public endpoint for input reads
+        self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=True)
         self.output_cog_path = output_cog_path
         self.output_parquet_path = output_parquet_path
         self.h0_index = h0_index

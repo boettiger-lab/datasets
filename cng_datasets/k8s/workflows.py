@@ -307,10 +307,7 @@ def _generate_raster_hex_job(
     cmd_parts = [
         "set -e",
         f"pip install -q git+{git_repo}",
-        # Use /vsis3/ for k8s execution if source is s3
-        f"INPUT_URL=\"{source_url}\"",
-        "if [[ $INPUT_URL == s3://* ]]; then INPUT_URL=\"/vsis3/${INPUT_URL#s3://}\"; fi",
-        f"cng-datasets raster --input \"$INPUT_URL\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column}"
+        f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column}"
     ]
     
     if nodata_value is not None:
