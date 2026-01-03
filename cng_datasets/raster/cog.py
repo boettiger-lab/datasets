@@ -17,9 +17,15 @@ from cng_datasets.storage.s3 import configure_s3_credentials
 if 'GDAL_DATA' in os.environ:
     os.environ.setdefault('GDAL_DATA', os.environ['GDAL_DATA'])
 if 'PROJ_LIB' in os.environ:
-    os.environ.setdefault('PROJ_LIB', os.environ['PROJ_LIB'])
+    proj_lib = os.environ['PROJ_LIB']
+    os.environ.setdefault('PROJ_LIB', proj_lib)
     # Also set PROJ_DATA which some versions need
-    os.environ.setdefault('PROJ_DATA', os.environ['PROJ_LIB'])
+    os.environ.setdefault('PROJ_DATA', proj_lib)
+    # Set PROJ search paths programmatically
+    try:
+        osr.SetPROJSearchPaths([proj_lib])
+    except:
+        pass  # May not be available in all GDAL versions
 
 # Try setting via GDAL config options as well
 for key in ['GDAL_DATA', 'PROJ_LIB', 'PROJ_DATA']:
