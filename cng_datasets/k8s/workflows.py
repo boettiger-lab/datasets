@@ -357,8 +357,9 @@ def _generate_raster_hex_job(
                             {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "GDAL_DATA", "value": "/opt/conda/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/opt/conda/share/proj"},
+                            {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
+                            {"name": "PROJ_LIB", "value": "/usr/local/share/proj"},
+                            {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
                             {"name": "BUCKET", "value": bucket}
                         ],
                         "command": ["bash", "-c", command_str],
