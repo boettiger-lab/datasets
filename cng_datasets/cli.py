@@ -71,6 +71,20 @@ def main():
     workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     
+    # Raster workflow generation command
+    raster_workflow_parser = subparsers.add_parser("raster-workflow", help="Generate complete raster dataset workflow")
+    raster_workflow_parser.add_argument("--dataset", required=True, help="Dataset name")
+    raster_workflow_parser.add_argument("--source-url", required=True, help="Source COG URL")
+    raster_workflow_parser.add_argument("--bucket", required=True, help="S3 bucket for outputs")
+    raster_workflow_parser.add_argument("--output-dir", default="k8s", help="Output directory for YAML files")
+    raster_workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace")
+    raster_workflow_parser.add_argument("--h3-resolution", type=int, default=8, help="Target H3 resolution (default: 8)")
+    raster_workflow_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
+    raster_workflow_parser.add_argument("--value-column", default="value", help="Name for raster value column")
+    raster_workflow_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
+    raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
+    raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
+    
     # Sync job generation command
     sync_job_parser = subparsers.add_parser("sync-job", help="Generate Kubernetes job for syncing between S3 locations")
     sync_job_parser.add_argument("--job-name", required=True, help="Job name")
@@ -207,6 +221,24 @@ def main():
             max_parallelism=args.max_parallelism,
             max_completions=args.max_completions,
             intermediate_chunk_size=args.intermediate_chunk_size,
+        )
+    
+    elif args.command == "raster-workflow":
+        from .k8s import generate_raster_workflow
+        # Parse parent resolutions
+        parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
+        generate_raster_workflow(
+            dataset_name=args.dataset,
+            source_url=args.source_url,
+            bucket=args.bucket,
+            output_dir=args.output_dir,
+            namespace=args.namespace,
+            h3_resolution=args.h3_resolution,
+            parent_resolutions=parent_res,
+            value_column=args.value_column,
+            nodata_value=args.nodata,
+            hex_memory=args.hex_memory,
+            max_parallelism=args.max_parallelism,
         )
     
     elif args.command == "storage":

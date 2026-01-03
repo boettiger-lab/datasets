@@ -13,6 +13,35 @@ from osgeo import gdal, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
 
 
+def detect_nodata_value(raster_path: str, verbose: bool = True) -> Optional[float]:
+    """
+    Detect NoData value from raster metadata.
+    
+    Args:
+        raster_path: Path to raster file (can be /vsis3/ URL)
+        verbose: Whether to print detection message (default: True)
+        
+    Returns:
+        NoData value if found, None otherwise
+    """
+    ds = gdal.Open(raster_path)
+    if ds is None:
+        raise ValueError(f"Could not open raster: {raster_path}")
+    
+    # Get the first band
+    band = ds.GetRasterBand(1)
+    nodata_value = band.GetNoDataValue()
+    
+    ds = None
+    
+    if nodata_value is not None and verbose:
+        print(f"✓ Auto-detected NoData value: {nodata_value}")
+    elif verbose:
+        print("ℹ No NoData value found in raster metadata")
+    
+    return nodata_value
+
+
 def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
     """
     Detect optimal H3 resolution based on raster resolution.
@@ -124,9 +153,20 @@ class RasterProcessor:
         self.compression = compression
         self.blocksize = blocksize
         self.resampling = resampling
-        self.nodata_value = nodata_value
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
+        
+        # Auto-detect NoData value if not specified
+        if nodata_value is None:
+            detected_nodata = detect_nodata_value(input_path, verbose=True)
+            if detected_nodata is not None:
+                self.nodata_value = detected_nodata
+            else:
+                self.nodata_value = None
+                print("ℹ No NoData value specified or detected - all values will be included")
+        else:
+            self.nodata_value = nodata_value
+            print(f"✓ Using user-specified NoData value: {nodata_value}")
         
         # Handle H3 resolution with informative messages
         detected_resolution = detect_optimal_h3_resolution(input_path, verbose=False)
