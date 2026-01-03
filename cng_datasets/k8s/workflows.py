@@ -546,8 +546,7 @@ echo "Bucket setup complete!"
 def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None):
     """Generate GeoParquet conversion job."""
     # Build the conversion command with optional layer parameter
-    layer_flag = f" \\
-  --layer {layer}" if layer else ""
+    layer_flag = f" \\\n  --layer {layer}" if layer else ""
     convert_cmd = f"""set -e
 cng-convert-to-parquet \\
   {source_url} \\
