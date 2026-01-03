@@ -31,7 +31,7 @@ jobs:
 
       - name: Install documentation dependencies
         run: |
-          pip install sphinx furo myst-parser sphinx-autobuild linkify-it-py
+          uv pip install sphinx furo myst-parser sphinx-autobuild linkify-it-py
 
       - name: Build documentation
         run: |
