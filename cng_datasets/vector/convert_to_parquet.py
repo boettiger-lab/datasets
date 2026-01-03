@@ -20,6 +20,23 @@ from pathlib import Path
 from typing import Optional, Tuple
 import duckdb
 import geopandas as gpd
+from urllib.parse import urlparse
+
+
+def is_parquet_file(source_url: str) -> bool:
+    """
+    Check if a source URL points to a parquet file.
+    
+    Args:
+        source_url: Source dataset URL
+        
+    Returns:
+        True if the file ends with .parquet, False otherwise
+    """
+    # Parse URL to get the path component
+    parsed = urlparse(source_url)
+    path = parsed.path if parsed.path else source_url
+    return path.lower().endswith('.parquet')
 
 
 def detect_crs(source_url: str, verbose: bool = False) -> Optional[str]:
@@ -201,6 +218,150 @@ def add_id_column_query(base_query: str, id_column: str = "_cng_fid") -> str:
     """
 
 
+def process_parquet_input(
+    source_url: str,
+    destination: str,
+    compression: str = "ZSTD",
+    compression_level: int = 15,
+    row_group_size: int = 100000,
+    id_column: Optional[str] = None,
+    force_id: bool = True,
+    progress: bool = True,
+    target_crs: str = "EPSG:4326",
+    verbose: bool = False
+):
+    """
+    Process a parquet input file to ensure it has global ID and cloud optimization.
+    
+    When the input is already parquet, we use DuckDB to read it directly
+    without using ST_Read, ensuring we have an ID column and applying
+    GeoParquet optimizations.
+    
+    Args:
+        source_url: Source parquet URL (supports s3://, http://, file paths)
+        destination: Output path (s3:// or local file path)
+        compression: Compression algorithm (ZSTD, GZIP, SNAPPY, NONE)
+        compression_level: Compression level (1-22 for ZSTD)
+        row_group_size: Number of rows per group
+        id_column: Specific ID column to use (auto-detected if not specified)
+        force_id: Create _cng_fid if no suitable ID column exists
+        progress: Show progress during conversion
+        target_crs: Target CRS for output (default: EPSG:4326)
+        verbose: Print detailed debug information
+    """
+    print(f"Processing parquet file: {source_url}")
+    print(f"               Output to: {destination}")
+    
+    if progress:
+        print(f"  Compression: {compression} level {compression_level}")
+        print(f"  Row group size: {row_group_size:,}")
+    
+    con = duckdb.connect(':memory:')
+    con.install_extension("spatial")
+    con.load_extension("spatial")
+    
+    try:
+        # Convert s3:// URLs to GDAL format for reading
+        read_url = source_url
+        if source_url.startswith('s3://'):
+            # DuckDB spatial extension can read from vsicurl
+            path = source_url.replace('s3://', '')
+            read_url = f"https://s3-west.nrp-nautilus.io/{path}"
+        
+        # Check for ID column
+        print("  Checking for ID column...")
+        columns = con.execute(f"""
+            DESCRIBE SELECT * FROM read_parquet('{read_url}') LIMIT 0
+        """).fetchall()
+        
+        column_names = [col[0].lower() for col in columns]
+        
+        # Determine ID column
+        needs_id = False
+        id_col_name = None
+        
+        if id_column:
+            if id_column.lower() in column_names:
+                id_col_name = id_column
+            else:
+                raise ValueError(f"Specified ID column '{id_column}' not found in source data")
+        else:
+            # Look for common ID column names
+            common_ids = ['id', 'fid', 'objectid', 'gid', 'uid', '_cng_fid']
+            for id_name in common_ids:
+                if id_name in column_names:
+                    id_col_name = id_name
+                    break
+            
+            if id_col_name is None:
+                if force_id:
+                    needs_id = True
+                    id_col_name = "_cng_fid"
+                else:
+                    raise ValueError("No ID column found and force_id=False")
+        
+        if needs_id:
+            print(f"  Adding synthetic ID column: {id_col_name}")
+        else:
+            print(f"  Using existing ID column: {id_col_name}")
+        
+        # Build query to read and optionally add ID
+        if needs_id:
+            query = f"""
+            SELECT 
+                ROW_NUMBER() OVER () AS {id_col_name},
+                *
+            FROM read_parquet('{read_url}')
+            """
+        else:
+            query = f"""
+            SELECT * FROM read_parquet('{read_url}')
+            """
+        
+        # Write with DuckDB
+        is_s3_dest = destination.startswith('s3://')
+        
+        if is_s3_dest:
+            # Write to temp file first
+            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            try:
+                if verbose:
+                    print(f"  Writing to temporary file: {tmp_path}")
+                
+                write_with_duckdb(query, tmp_path, compression, compression_level,
+                                row_group_size, verbose)
+                
+                # Apply GeoParquet optimizations in-place
+                apply_geoparquet_optimizations(tmp_path, tmp_path, verbose)
+                
+                # Upload to S3
+                upload_to_s3(tmp_path, destination, verbose=progress)
+                
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        else:
+            # Write directly to destination
+            write_with_duckdb(query, destination, compression, compression_level,
+                            row_group_size, verbose)
+            
+            # Apply GeoParquet optimizations in-place
+            apply_geoparquet_optimizations(destination, destination, verbose)
+        
+        print("✓ Parquet processing completed successfully!")
+        
+    except Exception as e:
+        print(f"✗ Parquet processing failed: {e}", file=sys.stderr)
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        raise
+    finally:
+        con.close()
+
+
 def write_with_duckdb(query: str, output_path: str,
                       compression: str = "ZSTD",
                       compression_level: int = 15,
@@ -336,6 +497,23 @@ def convert_to_parquet(
         target_crs: Target CRS for output (default: EPSG:4326)
         verbose: Print detailed debug information
     """
+    # Check if input is already parquet
+    if is_parquet_file(source_url):
+        # Use parquet-specific processing (no ST_Read)
+        return process_parquet_input(
+            source_url=source_url,
+            destination=destination,
+            compression=compression,
+            compression_level=compression_level,
+            row_group_size=row_group_size,
+            id_column=id_column,
+            force_id=force_id,
+            progress=progress,
+            target_crs=target_crs,
+            verbose=verbose
+        )
+    
+    # Original processing for non-parquet inputs
     print(f"Converting {source_url}")
     print(f"       to {destination}")
     

@@ -363,7 +363,7 @@ def _generate_raster_hex_job(
                         ],
                         "command": ["bash", "-c", command_str],
                         "resources": {
-                            "requests": {"cpu": "4", "memory": hex_memory},
+                            "requests": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": "250Gi"},
                             "limits": {"cpu": "4", "memory": hex_memory}
                         }
                     }]
