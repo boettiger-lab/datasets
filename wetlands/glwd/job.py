@@ -3,125 +3,101 @@ import os
 import sys
 import psutil
 import time
-
-# Add parent directory to path to import cng_datasets
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
-
-from cng_datasets.raster import RasterProcessor
+from osgeo import gdal
+import ibis
+from cng.utils import *  # noqa
+from cng.h3 import *  # noqa
+from ibis import _
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Process raster tile for a given h0 hex index"
-    )
-    parser.add_argument(
-        "--i", 
-        type=int, 
-        required=True, 
-        help="H0 hex index to process (0-121, matches column i in h0-valid.parquet)"
-    )
-    parser.add_argument(
-        "--zoom", 
-        type=int, 
-        default=None, 
-        help="H3 resolution to aggregate to (default: auto-detect from raster)"
-    )
-    parser.add_argument(
-        "--parent-resolutions",
-        type=str,
-        default="0",
-        help="Comma-separated parent resolutions (e.g., '9,8,0')"
-    )
-    parser.add_argument(
-        "--input-url", 
-        default="https://minio.carlboettiger.info/public-wetlands/GLWD_v2_0/GLWD_v2_0_combined_classes/GLWD_v2_0_main_class.tif",
-        help="Input raster URL (http/https or /vsis3/ path)"
-    )
-    parser.add_argument(
-        "--output-url", 
-        default="s3://public-wetlands/hex/",
-        help="Output parquet base path (e.g., s3://bucket/dataset/hex/)"
-    )
-    parser.add_argument(
-        "--value-column",
-        default="value",
-        help="Name for the raster value column (default: 'value')"
-    )
-    parser.add_argument(
-        "--nodata",
-        type=float,
-        default=None,
-        help="NoData value to exclude (e.g., 65535 for many rasters)"
-    )
-    parser.add_argument(
-        "--profile", 
-        action="store_true", 
-        help="Enable memory and runtime profiling"
-    )
-    
-    args = parser.parse_args()
-    
-    if args.profile:
-        start_time = time.time()
-    
-    # Parse parent resolutions
-    parent_resolutions = [int(r.strip()) for r in args.parent_resolutions.split(',') if r.strip()]
-    
-    print(f"=" * 60)
-    print(f"Raster H3 Processing Job")
-    print(f"=" * 60)
-    print(f"H0 Index: {args.i}")
-    print(f"Input: {args.input_url}")
-    print(f"Output: {args.output_url}")
-    
-    if args.zoom is not None:
-        print(f"H3 Resolution: {args.zoom} (specified)")
-    else:
-        print(f"H3 Resolution: auto-detect")
-    
-    print(f"Parent Resolutions: {parent_resolutions}")
-    print(f"Value Column: {args.value_column}")
-    
-    if args.nodata is not None:
-        print(f"NoData Value: {args.nodata}")
-    
-    print(f"=" * 60)
-    print("", flush=True)
-    
-    # Create processor
-    processor = RasterProcessor(
-        input_path=args.input_url,
-        output_parquet_path=args.output_url,
-        h3_resolution=args.zoom,  # None = auto-detect
-        parent_resolutions=parent_resolutions,
-        h0_index=args.i,
-        value_column=args.value_column,
-        nodata_value=args.nodata,
-    )
-    
-    # Process the h0 region
-    output_file = processor.process_h0_region()
-    
-    if output_file:
-        print(f"\n✓ Successfully processed h0 region {args.i}")
-        print(f"  Output: {output_file}")
-    else:
-        print(f"\n⚠ No data in h0 region {args.i}")
-    
-    if args.profile:
-        end_time = time.time()
-        process = psutil.Process(os.getpid())
-        mem_info = process.memory_info()
-        print(f"\nProfiling:")
-        print(f"  Maximum RAM: {mem_info.rss / 1024**2:.2f} MiB")
-        print(f"  Runtime: {end_time - start_time:.2f} seconds")
-    
-    print(f"\n{'=' * 60}")
-    print(flush=True)
+  parser = argparse.ArgumentParser(description="Process tif tile for a given hex index i")
+  parser.add_argument("--i", type=int, required=True, help="Hex index i to process (matches column i in h0-valid.parquet)")
+  parser.add_argument("--zoom", type=int, default=8, help="H3 resolution to aggregate to (default 8)")
+  parser.add_argument("--input-url", default="/vsis3/public-carbon/cogs/vulnerable_c_total_2018.tif", help="Input raster URL")
+  parser.add_argument("--output-url", default="s3://public-carbon/hex/vulnerable_carbon/", help="Output parquet bucket")
+  parser.add_argument("--profile", action="store_true", help="Enable memory and runtime profiling")
+  args = parser.parse_args()
+
+  i = args.i
+  zoom = args.zoom
+
+  gdal.DontUseExceptions()
+  install_h3()
+  con = ibis.duckdb.connect(extensions=["spatial", "h3"])
+  print("Connected to DuckDB", flush=True)
+
+  # internal endpoint on NRP does not use ssl.
+  set_secrets(
+    con,
+    key=os.getenv("AWS_ACCESS_KEY_ID"),
+    secret=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    endpoint=os.getenv("AWS_S3_ENDPOINT"),
+    use_ssl="FALSE",
+  )
+  print("AWS secrets configured", flush=True)
+
+  print(f"Input URL: {args.input_url}", flush=True)
+  print(f"Output URL: {args.output_url}", flush=True)
+
+  import ibis.expr.datatypes as dt
+
+  @ibis.udf.scalar.builtin
+  def ST_GeomFromText(geom) -> dt.geometry:  # noqa: D401
+    ...
+
+  @ibis.udf.scalar.builtin
+  def ST_MakeValid(geom) -> dt.geometry:  # noqa: D401
+    ...
+
+  df = con.read_parquet("s3://public-grids/hex/h0-valid.parquet")
+  wkt = df.filter(_.i == i).geom.execute().set_crs("EPSG:4326").to_wkt()[0]
+  h0 =  df.filter(_.i == i).h0.execute()[0]
 
 
-if __name__ == "__main__":
-    main()
+  # Prefer https vsicurl to avoid needing AWS credentials for the public file
+  input_url = args.input_url
+
+  output_url = args.output_url
+
+  if input_url.startswith("/vsis3/"):
+    # keep as is, else allow override
+    pass
+
+  gdal.Warp(
+    "/tmp/carbon.xyz",
+    input_url,
+    dstSRS="EPSG:4326",
+    cutlineWKT=wkt,
+    cropToCutline=True,
+  )
+
+  # compute h0 id for output path (from the polygon we just used)
+  (
+    con.read_csv(
+      "/tmp/carbon.xyz",
+      delim=" ",
+      columns={"X": "FLOAT", "Y": "FLOAT", "Z": "INTEGER"},
+    )
+    #.mutate(Z=ibis.ifelse(_.Z == 65535, None, _.Z))
+    #.filter(_.Z != 65535)
+    .mutate(
+      h0=h3_latlng_to_cell_string(_.Y, _.X, 0),  # base
+      h_zoom=h3_latlng_to_cell_string(_.Y, _.X, zoom),
+    )
+    .select(_.Z, _.h_zoom, _.h0)
+    .rename({f"h{zoom}": "h_zoom"})
+    .to_parquet(
+      f"{output_url}/h0={h0}/data_0.parquet"
+    )
+  )
+  print("Finished writing parquet", flush=True)
+
+  if args.profile:
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    print(f"Maximum RAM used: {mem_info.rss / 1024**2:.2f} MiB", flush=True)
+    print(f"Total runtime: {end_time - start_time:.2f} seconds", flush=True)
 
 if __name__ == "__main__":
     main()

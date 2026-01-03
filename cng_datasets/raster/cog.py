@@ -12,26 +12,6 @@ import duckdb
 from osgeo import gdal, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
 
-# Configure GDAL/PROJ environment before any operations
-# Set the data directories
-if 'GDAL_DATA' in os.environ:
-    os.environ.setdefault('GDAL_DATA', os.environ['GDAL_DATA'])
-if 'PROJ_LIB' in os.environ:
-    proj_lib = os.environ['PROJ_LIB']
-    os.environ.setdefault('PROJ_LIB', proj_lib)
-    # Also set PROJ_DATA which some versions need
-    os.environ.setdefault('PROJ_DATA', proj_lib)
-    # Set PROJ search paths programmatically
-    try:
-        osr.SetPROJSearchPaths([proj_lib])
-    except:
-        pass  # May not be available in all GDAL versions
-
-# Try setting via GDAL config options as well
-for key in ['GDAL_DATA', 'PROJ_LIB', 'PROJ_DATA']:
-    if key in os.environ:
-        gdal.SetConfigOption(key, os.environ[key])
-
 # Set GDAL to use exceptions for better error handling
 gdal.UseExceptions()
 
@@ -51,7 +31,12 @@ def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
         if use_public_endpoint:
             # Use public HTTPS endpoint with /vsicurl/ for single file reads
             bucket_path = path[5:]  # Remove s3://
-            return f"/vsicurl/https://s3-west.nrp-nautilus.io/{bucket_path}"
+            # Never hardwire endpoint - respect AWS_PUBLIC_ENDPOINT or AWS_S3_ENDPOINT env var
+            endpoint = os.getenv('AWS_PUBLIC_ENDPOINT', os.getenv('AWS_S3_ENDPOINT', 's3-west.nrp-nautilus.io'))
+            # Determine protocol from AWS_HTTPS env var (default TRUE for public endpoint)
+            use_ssl = os.getenv('AWS_HTTPS', 'TRUE').upper() != 'FALSE'
+            protocol = 'https' if use_ssl else 'http'
+            return f"/vsicurl/{protocol}://{endpoint}/{bucket_path}"
         else:
             # Use /vsis3/ for writes and multi-file operations
             return f"/vsis3/{path[5:]}"
@@ -129,12 +114,15 @@ def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
     # Use ~3x pixel resolution as target H3 edge length
     target_edge_m = pixel_res_m * 3
     
-    # H3 average edge lengths in meters (from h3geo.org)
-    h3_edge_lengths = {
-        15: 0.584169, 14: 1.546100, 13: 4.092010, 12: 10.830188, 11: 28.663897,
-        10: 75.863783, 9: 200.786148, 8: 531.414010, 7: 1406.475763, 6: 3724.532667,
-        5: 9854.090990, 4: 26071.75968, 3: 68979.22179, 2: 182512.9565, 1: 483056.8391, 0: 1281256.011
+    # H3 average edge lengths in Km (from https://h3geo.org/docs/core-library/restable/)
+    # Converting to meters for comparison
+    h3_edge_lengths_km = {
+        0: 1281.256011, 1: 483.0568391, 2: 182.5129565, 3: 68.97922179,
+        4: 26.07175968, 5: 9.854090990, 6: 3.724532667, 7: 1.406475763,
+        8: 0.531414010, 9: 0.200786148, 10: 0.075863783, 11: 0.028663897,
+        12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169
     }
+    h3_edge_lengths = {res: km * 1000 for res, km in h3_edge_lengths_km.items()}
     
     # Find closest H3 resolution
     best_res = 8  # default
@@ -414,9 +402,10 @@ class RasterProcessor:
         print(f"  Converting XYZ to H3 cells...")
         
         # Read XYZ and convert to H3
+        # Note: Raw DuckDB uses 'delimiter', Ibis uses 'delim'
         xyz_table = self.con.read_csv(
             xyz_file,
-            delim=' ',
+            delimiter=' ',
             columns={'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'FLOAT'}
         )
         
