@@ -306,7 +306,6 @@ def _generate_raster_hex_job(
     # Build command
     cmd_parts = [
         "set -e",
-        f"pip install -q git+{git_repo}",
         f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column}"
     ]
     
@@ -520,9 +519,6 @@ def _generate_setup_bucket_job(manager, dataset_name, bucket, output_path, git_r
                             {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
                         ],
                         "command": ["bash", "-c", f"""set -e
-echo "Installing cng-datasets..."
-pip install -q git+{git_repo}
-
 echo "Setting up bucket with public access and CORS..."
 cng-datasets storage setup-bucket \\
   --bucket "${{BUCKET}}" \\
@@ -595,7 +591,6 @@ def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
                         ],
                         "command": ["bash", "-c", f"""set -e
-pip install -q git+{git_repo}
 cng-convert-to-parquet \\
   {source_url} \\
   s3://{bucket}/{dataset_name}.parquet
@@ -722,7 +717,6 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     # Build command with optional id-column parameter
     cmd_parts = [
         "set -e",
-        f"pip install -q git+{git_repo}",
         f"cng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/{dataset_name}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --intermediate-chunk-size {intermediate_chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
     ]
     if id_column:
@@ -846,7 +840,6 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
                         ],
                         "command": ["bash", "-c", f"""set -e
-pip install -q git+{git_repo}
 cng-datasets repartition --chunks-dir s3://{bucket}/{dataset_name}/chunks --output-dir s3://{bucket}/{dataset_name}/hex --source-parquet s3://{bucket}/{dataset_name}.parquet --cleanup
 """],
                         "resources": {

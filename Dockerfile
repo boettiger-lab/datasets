@@ -33,7 +33,8 @@ RUN uv venv /opt/venv --system-site-packages
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Pin NumPy to 1.x for compatibility with system GDAL
-RUN uv pip install "numpy<2"
+# Also install pip so users can pip install instead of uv pip install.
+RUN uv pip install "numpy<2" pip
 
 # Install the package with uv for fast resolution (GDAL already available from system)
 RUN uv pip install -e "."
