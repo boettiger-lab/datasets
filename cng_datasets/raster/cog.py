@@ -12,11 +12,19 @@ import duckdb
 from osgeo import gdal, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
 
-# Configure GDAL environment before any operations
+# Configure GDAL/PROJ environment before any operations
+# Set the data directories
 if 'GDAL_DATA' in os.environ:
-    gdal.SetConfigOption('GDAL_DATA', os.environ['GDAL_DATA'])
+    os.environ.setdefault('GDAL_DATA', os.environ['GDAL_DATA'])
 if 'PROJ_LIB' in os.environ:
-    gdal.SetConfigOption('PROJ_LIB', os.environ['PROJ_LIB'])
+    os.environ.setdefault('PROJ_LIB', os.environ['PROJ_LIB'])
+    # Also set PROJ_DATA which some versions need
+    os.environ.setdefault('PROJ_DATA', os.environ['PROJ_LIB'])
+
+# Try setting via GDAL config options as well
+for key in ['GDAL_DATA', 'PROJ_LIB', 'PROJ_DATA']:
+    if key in os.environ:
+        gdal.SetConfigOption(key, os.environ[key])
 
 # Set GDAL to use exceptions for better error handling
 gdal.UseExceptions()
