@@ -351,10 +351,12 @@ class RasterProcessor:
         
         print(f"\nProcessing h0 region {h0_index}...")
         
-        # Load h0 polygons to get the geometry
-        h0_table = self.con.read_parquet("s3://public-grids/hex/h0-valid.parquet")
-        h0_filtered = h0_table.filter(h0_table.i == h0_index)
-        h0_result = h0_filtered.fetchdf()
+        # Load h0 polygons to get the geometry using SQL
+        h0_result = self.con.execute(f"""
+            SELECT h0, geom 
+            FROM read_parquet('s3://public-grids/hex/h0-valid.parquet')
+            WHERE i = {h0_index}
+        """).fetchdf()
         
         if len(h0_result) == 0:
             print(f"  ⚠ No h0 region found for index {h0_index}")
