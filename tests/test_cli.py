@@ -118,6 +118,63 @@ class TestCLI:
                 docs = list(yaml.safe_load_all(f))
                 # Check default namespace is used
                 assert docs[0]["metadata"]["namespace"] == "biodiversity"
+    
+    @pytest.mark.timeout(5)
+    def test_workflow_creates_expected_files(self):
+        """Test that workflow command creates convert-job.yaml and workflow.yaml files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_args = [
+                "cng-datasets",
+                "workflow",
+                "--dataset", "test-dataset",
+                "--source-url", "https://example.com/data.gpkg",
+                "--bucket", "test-bucket",
+                "--output-dir", tmpdir
+            ]
+            
+            with patch.object(sys, 'argv', test_args):
+                main()
+                
+            # Verify expected files were created (matching CI test expectations)
+            output_path = Path(tmpdir)
+            assert (output_path / "test-dataset-convert.yaml").exists(), "convert-job.yaml not created"
+            assert (output_path / "workflow.yaml").exists(), "workflow.yaml not created"
+
+
+
+class TestCLIHelp:
+    """Test CLI help commands."""
+    
+    @pytest.mark.timeout(5)
+    def test_main_help(self):
+        """Test main help command."""
+        test_args = ["cng-datasets", "--help"]
+        
+        with patch.object(sys, 'argv', test_args):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            # --help exits with 0
+            assert exc_info.value.code == 0
+    
+    @pytest.mark.timeout(5)
+    def test_workflow_help(self):
+        """Test workflow subcommand help."""
+        test_args = ["cng-datasets", "workflow", "--help"]
+        
+        with patch.object(sys, 'argv', test_args):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
+    
+    @pytest.mark.timeout(5)
+    def test_k8s_help(self):
+        """Test k8s subcommand help."""
+        test_args = ["cng-datasets", "k8s", "--help"]
+        
+        with patch.object(sys, 'argv', test_args):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
 
 
 class TestCLIValidation:

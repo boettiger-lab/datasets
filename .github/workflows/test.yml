@@ -54,32 +54,3 @@ jobs:
       run: |
         ruff check cng_datasets/ --select E,F,W --ignore E501
       continue-on-error: true
-
-  cli-test:
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/boettiger-lab/datasets:latest
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Test CLI commands
-      run: |
-        # Test help commands
-        cng-datasets --help
-        cng-datasets workflow --help
-        cng-datasets k8s --help
-        
-        # Test workflow generation
-        mkdir -p /tmp/test-workflow
-        cng-datasets workflow \
-          --dataset test-dataset \
-          --source-url https://example.com/data.gpkg \
-          --bucket test-bucket \
-          --output-dir /tmp/test-workflow
-        
-        # Verify files were created
-        ls -la /tmp/test-workflow/
-        test -f /tmp/test-workflow/convert-job.yaml
-        test -f /tmp/test-workflow/workflow.yaml
-        echo "✓ CLI tests passed"
