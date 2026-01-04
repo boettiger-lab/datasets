@@ -182,11 +182,11 @@ def generate_dataset_workflow(
     
     print(f"\n✓ Generated complete workflow for {dataset_name}")
     print(f"\nFiles created in {output_dir}:")
-    print(f"  - setup-bucket-job.yaml")
-    print(f"  - convert-job.yaml")
-    print(f"  - pmtiles-job.yaml")
-    print(f"  - hex-job.yaml")
-    print(f"  - repartition-job.yaml")
+    print(f"  - {k8s_name}-setup-bucket.yaml")
+    print(f"  - {k8s_name}-convert.yaml")
+    print(f"  - {k8s_name}-pmtiles.yaml")
+    print(f"  - {k8s_name}-hex.yaml")
+    print(f"  - {k8s_name}-repartition.yaml")
     print(f"  - workflow-rbac.yaml (generic, reusable)")
     print(f"  - configmap.yaml (job configs)")
     print(f"  - workflow.yaml (orchestrator)")
@@ -282,8 +282,8 @@ def generate_raster_workflow(
     
     print(f"\n✓ Generated raster workflow for {dataset_name}")
     print(f"\nFiles created in {output_dir}:")
-    print(f"  - setup-bucket-job.yaml")
-    print(f"  - hex-job.yaml")
+    print(f"  - {k8s_name}-setup-bucket.yaml")
+    print(f"  - {k8s_name}-hex.yaml")
     print(f"  - workflow-rbac.yaml")
     print(f"  - configmap.yaml")
     print(f"  - workflow.yaml")
@@ -372,14 +372,14 @@ def _generate_raster_hex_job(
             }
         }
     }
-    manager.save_job_yaml(job_spec, str(output_path / "hex-job.yaml"))
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-hex.yaml"))
 
 
 def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command):
     """Generate ConfigMap for raster workflow."""
     import yaml
     
-    job_files = ["setup-bucket-job.yaml", "hex-job.yaml"]
+    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-hex.yaml"]
     data = {}
     
     for job_file in job_files:
@@ -433,14 +433,14 @@ echo "Starting {dataset_name} raster workflow..."
 
 # Step 0: Setup bucket
 echo "Step 0: Setting up bucket..."
-kubectl apply -f /yamls/setup-bucket-job.yaml -n {namespace}
+kubectl apply -f /yamls/{dataset_name}-setup-bucket.yaml -n {namespace}
 
 echo "Waiting for bucket setup..."
 kubectl wait --for=condition=complete --timeout=600s job/{dataset_name}-setup-bucket -n {namespace}
 
 # Step 1: Hex tiling
 echo "Step 1: H3 hexagonal tiling..."
-kubectl apply -f /yamls/hex-job.yaml -n {namespace}
+kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
 
 echo "Waiting for hex tiling..."
 kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
@@ -540,7 +540,7 @@ echo "Bucket setup complete!"
             }
         }
     }
-    manager.save_job_yaml(job_spec, str(output_path / "setup-bucket-job.yaml"))
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-setup-bucket.yaml"))
 
 
 def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None):
@@ -612,7 +612,7 @@ cng-convert-to-parquet \\
             }
         }
     }
-    manager.save_job_yaml(job_spec, str(output_path / "convert-job.yaml"))
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-convert.yaml"))
 
 
 def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
@@ -695,7 +695,7 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
             }
         }
     }
-    manager.save_job_yaml(job_spec, str(output_path / "pmtiles-job.yaml"))
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-pmtiles.yaml"))
 
 
 def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10):
@@ -848,8 +848,8 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
 cng-datasets repartition --chunks-dir s3://{bucket}/{dataset_name}/chunks --output-dir s3://{bucket}/{dataset_name}/hex --source-parquet s3://{bucket}/{dataset_name}.parquet --cleanup
 """],
                         "resources": {
-                            "requests": {"cpu": "4", "memory": "8Gi"},
-                            "limits": {"cpu": "4", "memory": "8Gi"}
+                            "requests": {"cpu": "4", "memory": "32Gi"},
+                            "limits": {"cpu": "4", "memory": "32Gi"}
                         }
                     }],
                     "volumes": [
@@ -859,7 +859,7 @@ cng-datasets repartition --chunks-dir s3://{bucket}/{dataset_name}/chunks --outp
             }
         }
     }
-    manager.save_job_yaml(job_spec, str(output_path / "repartition-job.yaml"))
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-repartition.yaml"))
 
 
 def _generate_workflow_rbac(namespace, output_path):
@@ -909,7 +909,7 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     import yaml
     
     # Read all job YAML files
-    job_files = ["setup-bucket-job.yaml", "convert-job.yaml", "pmtiles-job.yaml", "hex-job.yaml", "repartition-job.yaml"]
+    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-convert.yaml", f"{dataset_name}-pmtiles.yaml", f"{dataset_name}-hex.yaml", f"{dataset_name}-repartition.yaml"]
     data = {}
     
     for job_file in job_files:
@@ -930,16 +930,16 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     
     with open(output_path / "configmap.yaml", "w") as f:
         f.write("# Auto-generated ConfigMap containing job definitions\n")
-        f.write("# Generated from: setup-bucket-job.yaml, convert-job.yaml, pmtiles-job.yaml, hex-job.yaml, repartition-job.yaml\n")
+        f.write(f"# Generated from: {dataset_name}-setup-bucket.yaml, {dataset_name}-convert.yaml, {dataset_name}-pmtiles.yaml, {dataset_name}-hex.yaml, {dataset_name}-repartition.yaml\n")
         f.write(f"# Generation command: {gen_command}\n")
         f.write("#\n")
         f.write("# This ConfigMap is equivalent to running:\n")
         f.write(f"#   kubectl create configmap {dataset_name}-yamls \\\n")
-        f.write("#     --from-file=setup-bucket-job.yaml \\\n")
-        f.write("#     --from-file=convert-job.yaml \\\n")
-        f.write("#     --from-file=pmtiles-job.yaml \\\n")
-        f.write("#     --from-file=hex-job.yaml \\\n")
-        f.write("#     --from-file=repartition-job.yaml\n")
+        f.write(f"#     --from-file={dataset_name}-setup-bucket.yaml \\\n")
+        f.write(f"#     --from-file={dataset_name}-convert.yaml \\\n")
+        f.write(f"#     --from-file={dataset_name}-pmtiles.yaml \\\n")
+        f.write(f"#     --from-file={dataset_name}-hex.yaml \\\n")
+        f.write(f"#     --from-file={dataset_name}-repartition.yaml\n")
         f.write("#\n")
         f.write("# To update: regenerate workflow with cng-datasets and re-apply with kubectl apply -f configmap.yaml\n")
         yaml.dump(configmap, f, default_flow_style=False)
@@ -981,28 +981,28 @@ echo "Starting {dataset_name} workflow..."
 
 # Step 0: Setup bucket with public access and CORS
 echo "Step 0: Setting up bucket..."
-kubectl apply -f /yamls/setup-bucket-job.yaml -n {namespace}
+kubectl apply -f /yamls/{dataset_name}-setup-bucket.yaml -n {namespace}
 
 echo "Waiting for bucket setup to complete..."
 kubectl wait --for=condition=complete --timeout=600s job/{dataset_name}-setup-bucket -n {namespace}
 
 # Step 1: Convert to optimized GeoParquet (needed by both pmtiles and hex jobs)
 echo "Step 1: Converting to optimized GeoParquet..."
-kubectl apply -f /yamls/convert-job.yaml -n {namespace}
+kubectl apply -f /yamls/{dataset_name}-convert.yaml -n {namespace}
 
 echo "Waiting for GeoParquet conversion to complete..."
 kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-convert -n {namespace}
 
 # Step 2: Run pmtiles and hex tiling in parallel (both use the converted geoparquet)
 echo "Step 2: H3 hexagonal tiling and PMTiles generation (parallel)..."
-kubectl apply -f /yamls/pmtiles-job.yaml -n {namespace}
-kubectl apply -f /yamls/hex-job.yaml -n {namespace}
+kubectl apply -f /yamls/{dataset_name}-pmtiles.yaml -n {namespace}
+kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
 
 echo "Waiting for hex tiling to complete (PMTiles continues in background)..."
 kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
 
 echo "Step 3: Repartitioning by h0..."
-kubectl apply -f /yamls/repartition-job.yaml -n {namespace}
+kubectl apply -f /yamls/{dataset_name}-repartition.yaml -n {namespace}
 
 echo "Waiting for repartition to complete..."
 kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-repartition -n {namespace}
