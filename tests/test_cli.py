@@ -34,7 +34,7 @@ class TestCLI:
                 
             # Verify files were created
             output_path = Path(tmpdir)
-            assert (output_path / "convert-job.yaml").exists()
+            assert (output_path / "test-ds-convert.yaml").exists()
             assert (output_path / "workflow.yaml").exists()
     
     @pytest.mark.timeout(5)

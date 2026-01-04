@@ -92,10 +92,10 @@ class TestWorkflowGeneration:
             
             # Check all expected files exist
             expected_files = [
-                "convert-job.yaml",
-                "pmtiles-job.yaml",
+                "test-dataset-convert.yaml",
+                "test-dataset-pmtiles.yaml",
                 "hex-job.yaml",
-                "repartition-job.yaml",
+                "test-dataset-repartition.yaml",
                 "workflow-rbac.yaml",
                 "workflow.yaml"
             ]
@@ -121,7 +121,7 @@ class TestWorkflowGeneration:
                 output_dir=tmpdir
             )
             
-            convert_file = Path(tmpdir) / "convert-job.yaml"
+            convert_file = Path(tmpdir) / "test-ds-convert.yaml"
             with open(convert_file) as f:
                 job = yaml.safe_load(f)
                 
@@ -230,7 +230,7 @@ class TestEdgeCases:
             )
             
             # Check files were created
-            assert (Path(tmpdir) / "convert-job.yaml").exists()
+            assert (Path(tmpdir) / "my-dataset-2024-convert.yaml").exists()
     
     @pytest.mark.timeout(5)
     def test_output_dir_created(self):
@@ -246,7 +246,7 @@ class TestEdgeCases:
             )
             
             assert output_dir.exists()
-            assert (output_dir / "convert-job.yaml").exists()
+            assert (output_dir / "test-ds-convert.yaml").exists()
 
 
 if __name__ == "__main__":
