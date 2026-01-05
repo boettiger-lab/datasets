@@ -39,9 +39,9 @@ def is_parquet_file(source_url: str) -> bool:
     return path.lower().endswith('.parquet')
 
 
-def detect_crs(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> Optional[str]:
+def inspect_source(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> Tuple[Optional[str], str]:
     """
-    Detect the CRS of a vector dataset using geopandas.
+    Inspect a vector dataset to get its CRS and geometry column name.
     
     Works with VSI paths (/vsicurl/, s3://, etc.).
     
@@ -51,7 +51,7 @@ def detect_crs(source_url: str, layer: Optional[str] = None, verbose: bool = Fal
         verbose: Print debug information
         
     Returns:
-        CRS string (e.g., "EPSG:4326") or None if detection fails
+        Tuple of (CRS string or None, geometry column name)
     """
     try:
         # Read just the first row to get CRS info quickly
@@ -60,28 +60,30 @@ def detect_crs(source_url: str, layer: Optional[str] = None, verbose: bool = Fal
             kwargs['layer'] = layer
         gdf = gpd.read_file(source_url, **kwargs)
         
+        geom_name = gdf.geometry.name if gdf.geometry is not None else "geom"
+        
         if gdf.crs is None:
             if verbose:
                 print("Warning: No CRS found in dataset")
-            return None
+            return None, geom_name
         
         # Try to get EPSG code
         if gdf.crs.to_epsg():
-            return f"EPSG:{gdf.crs.to_epsg()}"
+            return f"EPSG:{gdf.crs.to_epsg()}", geom_name
         
         # Fallback to authority string if available
         if gdf.crs.to_authority():
             auth, code = gdf.crs.to_authority()
-            return f"{auth}:{code}"
+            return f"{auth}:{code}", geom_name
         
         if verbose:
             print(f"Warning: Could not determine EPSG code, CRS is: {gdf.crs}")
-        return None
+        return None, geom_name
         
     except Exception as e:
         if verbose:
-            print(f"Warning: CRS detection failed: {e}")
-        return None
+            print(f"Warning: Source inspection failed: {e}")
+        return None, "geom"
 
 
 def is_geographic_crs(crs: str) -> bool:
@@ -167,7 +169,7 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
 
 
 def build_read_reproject_query(source_url: str, source_crs: Optional[str], 
-                               target_crs: str, layer: Optional[str] = None, verbose: bool = False) -> str:
+                               target_crs: str, geom_col: str = "geom", layer: Optional[str] = None, verbose: bool = False) -> str:
     """
     Build DuckDB query to read and reproject data. Nothing about IDs.
     
@@ -175,6 +177,7 @@ def build_read_reproject_query(source_url: str, source_crs: Optional[str],
         source_url: Source dataset URL
         source_crs: Source CRS (None = no reprojection needed)
         target_crs: Target CRS
+        geom_col: Geometry column name
         layer: Layer name for multi-layer datasets (e.g., GDB)
         verbose: Print debug information
         
@@ -186,17 +189,17 @@ def build_read_reproject_query(source_url: str, source_crs: Optional[str],
         # Need to reproject
         if is_geographic_crs(target_crs):
             # ST_Transform outputs lat/lon for geographic CRS, but GeoParquet expects lon/lat
-            geom_expr = f"ST_FlipCoordinates(ST_Transform(geom, '{source_crs}', '{target_crs}')) AS geom"
+            geom_expr = f"ST_FlipCoordinates(ST_Transform({geom_col}, '{source_crs}', '{target_crs}')) AS {geom_col}"
         else:
-            geom_expr = f"ST_Transform(geom, '{source_crs}', '{target_crs}') AS geom"
+            geom_expr = f"ST_Transform({geom_col}, '{source_crs}', '{target_crs}') AS {geom_col}"
     else:
         # No reprojection needed
-        geom_expr = "geom"
+        geom_expr = geom_col
     
     layer_param = f", layer='{layer}'" if layer else ""
     query = f"""
     SELECT 
-        * EXCLUDE (geom),
+        * EXCLUDE ({geom_col}),
         {geom_expr}
     FROM ST_Read('{source_url}'{layer_param})
     """
@@ -538,9 +541,11 @@ def convert_to_parquet(
         source_url = f"/vsicurl/{source_url}"
     
     try:
-        # Step 1: Detect source CRS
-        print("  Detecting source CRS...")
-        source_crs = detect_crs(source_url, layer=layer, verbose=verbose)
+        # Step 1: Detect source CRS and geometry column
+        print("  Inspecting source...")
+        source_crs, geom_col = inspect_source(source_url, layer=layer, verbose=verbose)
+        
+        print(f"  Geometry column: {geom_col}")
         
         needs_reprojection = False
         if source_crs:
@@ -559,6 +564,7 @@ def convert_to_parquet(
             source_url,
             source_crs if needs_reprojection else None,
             target_crs,
+            geom_col=geom_col,
             layer=layer,
             verbose=verbose
         )

@@ -219,5 +219,8 @@ redlining/*-job.yaml
 # Generated workflow files
 redlining/*.yaml
 sync/sync-job.yaml
-*.gdb!datacenters/datacentermap/k8s/
-!datacenters/datacentermap/k8s/pvc.yaml
+
+*.csv
+*job.yaml
+*.gdb
+
