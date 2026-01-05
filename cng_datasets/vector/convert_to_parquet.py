@@ -533,6 +533,10 @@ def convert_to_parquet(
         print(f"  Compression: {compression} level {compression_level}")
         print(f"  Row group size: {row_group_size:,}")
     
+    # Handle HTTP(S) for GDAL/DuckDB ST_Read
+    if source_url.lower().startswith(('http://', 'https://')) and not source_url.startswith('/vsi'):
+        source_url = f"/vsicurl/{source_url}"
+    
     try:
         # Step 1: Detect source CRS
         print("  Detecting source CRS...")
