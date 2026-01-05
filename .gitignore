@@ -221,6 +221,6 @@ redlining/*.yaml
 sync/sync-job.yaml
 
 *.csv
-*job.yaml
+*.yaml
 *.gdb
 

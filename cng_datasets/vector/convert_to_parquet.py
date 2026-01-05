@@ -39,9 +39,9 @@ def is_parquet_file(source_url: str) -> bool:
     return path.lower().endswith('.parquet')
 
 
-def inspect_source(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> Tuple[Optional[str], str]:
+def detect_crs(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> Optional[str]:
     """
-    Inspect a vector dataset to get its CRS and geometry column name.
+    Detect the CRS of a vector dataset using geopandas.
     
     Works with VSI paths (/vsicurl/, s3://, etc.).
     
@@ -51,7 +51,7 @@ def inspect_source(source_url: str, layer: Optional[str] = None, verbose: bool =
         verbose: Print debug information
         
     Returns:
-        Tuple of (CRS string or None, geometry column name)
+        CRS string (e.g., "EPSG:4326") or None if detection fails
     """
     try:
         # Read just the first row to get CRS info quickly
@@ -60,30 +60,78 @@ def inspect_source(source_url: str, layer: Optional[str] = None, verbose: bool =
             kwargs['layer'] = layer
         gdf = gpd.read_file(source_url, **kwargs)
         
-        geom_name = gdf.geometry.name if gdf.geometry is not None else "geom"
-        
         if gdf.crs is None:
             if verbose:
                 print("Warning: No CRS found in dataset")
-            return None, geom_name
+            return None
         
         # Try to get EPSG code
         if gdf.crs.to_epsg():
-            return f"EPSG:{gdf.crs.to_epsg()}", geom_name
+            return f"EPSG:{gdf.crs.to_epsg()}"
         
         # Fallback to authority string if available
         if gdf.crs.to_authority():
             auth, code = gdf.crs.to_authority()
-            return f"{auth}:{code}", geom_name
+            return f"{auth}:{code}"
         
         if verbose:
             print(f"Warning: Could not determine EPSG code, CRS is: {gdf.crs}")
-        return None, geom_name
+        return None
         
     except Exception as e:
         if verbose:
-            print(f"Warning: Source inspection failed: {e}")
-        return None, "geom"
+            print(f"Warning: CRS detection failed: {e}")
+        return None
+
+
+def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> str:
+    """
+    Get the name of the geometry column as seen by DuckDB.
+    
+    Args:
+        source_url: Source dataset URL
+        layer: Layer name
+        verbose: Print debug information
+        
+    Returns:
+        Geometry column name (defaulting to 'geom')
+    """
+    con = duckdb.connect(':memory:')
+    con.install_extension("spatial")
+    con.load_extension("spatial")
+    
+    try:
+        layer_param = f", layer='{layer}'" if layer else ""
+        query = f"DESCRIBE SELECT * FROM ST_Read('{source_url}'{layer_param}) LIMIT 0"
+        
+        columns = con.execute(query).fetchall()
+        
+        # Look for geometry type
+        for col_name, col_type, *_ in columns:
+            if col_type == 'GEOMETRY':
+                if verbose:
+                    print(f"  Detected geometry column: {col_name}")
+                return col_name
+                
+        # Fallback for when type info isn't clear (though ST_Read usually returns GEOMETRY)
+        col_names = [c[0].lower() for c in columns]
+        if 'geom' in col_names:
+            return 'geom'
+        if 'geometry' in col_names:
+            return 'geometry'
+        if 'shape' in col_names:
+            return 'shape'
+            
+        if verbose:
+            print("  Warning: Could not detect geometry column, defaulting to 'geom'")
+        return "geom"
+        
+    except Exception as e:
+        if verbose:
+            print(f"Warning: Geometry column detection failed: {e}")
+        return "geom"
+    finally:
+        con.close()
 
 
 def is_geographic_crs(crs: str) -> bool:
@@ -542,8 +590,11 @@ def convert_to_parquet(
     
     try:
         # Step 1: Detect source CRS and geometry column
-        print("  Inspecting source...")
-        source_crs, geom_col = inspect_source(source_url, layer=layer, verbose=verbose)
+        print("  Detecting source CRS...")
+        source_crs = detect_crs(source_url, layer=layer, verbose=verbose)
+        
+        print("  Detecting geometry column...")
+        geom_col = get_geometry_column(source_url, layer=layer, verbose=verbose)
         
         print(f"  Geometry column: {geom_col}")
         
