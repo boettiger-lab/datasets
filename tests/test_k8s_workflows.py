@@ -94,7 +94,7 @@ class TestWorkflowGeneration:
             expected_files = [
                 "test-dataset-convert.yaml",
                 "test-dataset-pmtiles.yaml",
-                "hex-job.yaml",
+                "test-dataset-hex.yaml",
                 "test-dataset-repartition.yaml",
                 "workflow-rbac.yaml",
                 "workflow.yaml"
@@ -147,7 +147,7 @@ class TestWorkflowGeneration:
                 output_dir=tmpdir
             )
             
-            hex_file = Path(tmpdir) / "hex-job.yaml"
+            hex_file = Path(tmpdir) / "test-ds-hex.yaml"
             with open(hex_file) as f:
                 job = yaml.safe_load(f)
                 
@@ -169,7 +169,7 @@ class TestWorkflowGeneration:
                 output_dir=tmpdir
             )
             
-            hex_file = Path(tmpdir) / "hex-job.yaml"
+            hex_file = Path(tmpdir) / "mappinginequality-hex.yaml"
             with open(hex_file) as f:
                 job = yaml.safe_load(f)
                 
