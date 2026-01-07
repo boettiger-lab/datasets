@@ -792,7 +792,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
             }
         }
     }
-    manager.save_job_yaml(job_spec, str(output_path / "hex-job.yaml"))
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-hex.yaml"))
 
 
 def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo):
@@ -999,7 +999,8 @@ kubectl apply -f /yamls/{dataset_name}-pmtiles.yaml -n {namespace}
 kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
 
 echo "Waiting for hex tiling to complete (PMTiles continues in background)..."
-kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
+echo "Timeout set to 48 hours (172800s)..."
+kubectl wait --for=condition=complete --timeout=172800s job/{dataset_name}-hex -n {namespace}
 
 echo "Step 3: Repartitioning by h0..."
 kubectl apply -f /yamls/{dataset_name}-repartition.yaml -n {namespace}
