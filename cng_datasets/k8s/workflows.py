@@ -205,7 +205,7 @@ def generate_dataset_workflow(
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
     
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer)
+    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer, memory=hex_memory)
     
     # Generate pmtiles job
     _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
@@ -613,7 +613,7 @@ echo "Bucket setup complete!"
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-setup-bucket.yaml"))
 
 
-def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None):
+def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None, memory="8Gi"):
     """Generate GeoParquet conversion job."""
     # Build the conversion command with optional layer parameter
     layer_flag = f" \\\n  --layer {layer}" if layer else ""
@@ -671,8 +671,8 @@ cng-convert-to-parquet \\
                         ],
                         "command": ["bash", "-c", convert_cmd],
                         "resources": {
-                            "requests": {"cpu": "4", "memory": "8Gi"},
-                            "limits": {"cpu": "4", "memory": "8Gi"}
+                            "requests": {"cpu": "4", "memory": memory},
+                            "limits": {"cpu": "4", "memory": memory}
                         }
                     }],
                     "volumes": [

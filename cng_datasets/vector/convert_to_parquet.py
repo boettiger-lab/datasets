@@ -393,6 +393,9 @@ def process_parquet_input(
     con.install_extension("spatial")
     con.load_extension("spatial")
     
+    # Enable large buffer size for complex geometries
+    con.execute("SET arrow_large_buffer_size=true")
+    
     try:
         # Convert s3:// URLs to GDAL format for reading
         read_url = source_url
@@ -514,6 +517,9 @@ def write_with_duckdb(query: str, output_path: str,
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    
+    # Enable large buffer size for complex geometries (Total buffer > 2GB)
+    con.execute("SET arrow_large_buffer_size=true")
     
     try:
         if verbose:
