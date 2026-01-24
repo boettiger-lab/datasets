@@ -15,11 +15,15 @@ import argparse
 import sys
 import tempfile
 import os
+import shutil
+import glob
 import subprocess
+import zipfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union
 import duckdb
 import geopandas as gpd
+from urllib.request import urlretrieve
 from urllib.parse import urlparse
 
 
@@ -39,26 +43,86 @@ def is_parquet_file(source_url: str) -> bool:
     return path.lower().endswith('.parquet')
 
 
-def detect_crs(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> Optional[str]:
+def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> None:
+    """
+    Download a file from a URL and extract it if it is a zip file.
+    
+    Args:
+        url: Source URL
+        extract_to: Directory to extract to
+        verbose: Print debug information
+    """
+    try:
+        if verbose:
+            print(f"  Downloading {url}...")
+            
+        # Handle S3 URLs via https if possible, otherwise rely on system tools or direct download
+        # For simplicity, if it's s3-west.nrp-nautilus.io, we can use requests/urllib
+        # If it's generic s3://, we might need boto3 or rclone? 
+        # For now, let's assume http/https or file path
+        
+        local_zip = os.path.join(extract_to, "downloadpkg.zip")
+        
+        if url.startswith("s3://"):
+             # Simple S3 to https conversion for Nautilus
+             if "nrp-nautilus.io" in url or "public-iucn" in url: # minimal heuristic
+                 # This might need to be more robust, but complying with user request example
+                 path = url.replace("s3://", "")
+                 url = f"https://s3-west.nrp-nautilus.io/{path}"
+        
+        if url.startswith(("http://", "https://")):
+            urlretrieve(url, local_zip)
+        else:
+            # Assume local file
+            if os.path.exists(url):
+                shutil.copy(url, local_zip)
+            else:
+                raise ValueError(f"File not found: {url}")
+                
+        if verbose:
+            print(f"  Extracting zip file...")
+            
+        with zipfile.ZipFile(local_zip, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+            
+        # Cleanup zip
+        os.remove(local_zip)
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to download/extract zip: {e}")
+
+
+def find_shapefiles(directory: str) -> List[str]:
+    """
+    Recursively find all .shp files in a directory.
+    """
+    shapefiles = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith(".shp"):
+                shapefiles.append(os.path.join(root, file))
+    return sorted(shapefiles)
+
+
+def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = False) -> Optional[str]:
     """
     Detect the CRS of a vector dataset using geopandas.
     
-    Works with VSI paths (/vsicurl/, s3://, etc.).
-    
     Args:
-        source_url: Source dataset URL
-        layer: Layer name for multi-layer datasets (e.g., GDB)
+        source_input: Source dataset URL or path
+        layer: Layer name
         verbose: Print debug information
-        
-    Returns:
-        CRS string (e.g., "EPSG:4326") or None if detection fails
     """
     try:
         # Read just the first row to get CRS info quickly
         kwargs = {'rows': 1}
         if layer:
             kwargs['layer'] = layer
-        gdf = gpd.read_file(source_url, **kwargs)
+            
+        # If source_input is a URL that geopandas can't handle directly without vsicurl, ensure it's handled
+        # But for shapefiles on disk (which pass into here), it works fine.
+        
+        gdf = gpd.read_file(source_input, **kwargs)
         
         if gdf.crs is None:
             if verbose:
@@ -216,17 +280,17 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
         con.close()
 
 
-def build_read_reproject_query(source_url: str, source_crs: Optional[str], 
+def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str], 
                                target_crs: str, geom_col: str = "geom", layer: Optional[str] = None, verbose: bool = False) -> str:
     """
-    Build DuckDB query to read and reproject data. Nothing about IDs.
+    Build DuckDB query to read and reproject data. Can handle multiple input files.
     
     Args:
-        source_url: Source dataset URL
+        source_inputs: Source dataset URL or list of file paths
         source_crs: Source CRS (None = no reprojection needed)
         target_crs: Target CRS
         geom_col: Geometry column name
-        layer: Layer name for multi-layer datasets (e.g., GDB)
+        layer: Layer name
         verbose: Print debug information
         
     Returns:
@@ -245,15 +309,25 @@ def build_read_reproject_query(source_url: str, source_crs: Optional[str],
         geom_expr = geom_col
     
     layer_param = f", layer='{layer}'" if layer else ""
-    query = f"""
-    SELECT 
-        * EXCLUDE ({geom_col}),
-        {geom_expr}
-    FROM ST_Read('{source_url}'{layer_param})
-    """
+    
+    # helper to format a single SELECT
+    def make_select(src):
+        return f"""
+        SELECT 
+            * EXCLUDE ({geom_col}),
+            {geom_expr}
+        FROM ST_Read('{src}'{layer_param})
+        """
+
+    if isinstance(source_inputs, list):
+        # Union all inputs
+        selects = [make_select(src) for src in source_inputs]
+        query = "\nUNION ALL\n".join(selects)
+    else:
+        query = make_select(source_inputs)
     
     if verbose:
-        print(f"Read/Reproject Query: {query.strip()}")
+        print(f"Read/Reproject Query (preview): {query[:500]}...")
     
     return query
 
@@ -584,17 +658,43 @@ def convert_to_parquet(
         print(f"  Compression: {compression} level {compression_level}")
         print(f"  Row group size: {row_group_size:,}")
     
-    # Handle HTTP(S) for GDAL/DuckDB ST_Read
-    if source_url.lower().startswith(('http://', 'https://')) and not source_url.startswith('/vsi'):
-        source_url = f"/vsicurl/{source_url}"
+    is_zip = source_url.lower().endswith(".zip")
     
     try:
+        temp_dir = None
+        source_inputs = []
+        
+        if is_zip:
+            print(f"  Detected Zip archive: {source_url}")
+            temp_dir = tempfile.mkdtemp()
+            print(f"  Created temporary directory: {temp_dir}")
+            
+            download_and_extract(source_url, temp_dir, verbose=verbose)
+            
+            shapefiles = find_shapefiles(temp_dir)
+            if not shapefiles:
+                raise ValueError("No shapefiles found in zip archive")
+                
+            print(f"  Found {len(shapefiles)} shapefiles in archive")
+            source_inputs = shapefiles
+            
+            # Use the first shapefile as representative for metadata
+            representative_source = shapefiles[0]
+            print(f"  Using {os.path.basename(representative_source)} for metadata detection")
+            
+        else:
+            # Handle HTTP(S) for GDAL/DuckDB ST_Read
+            if source_url.lower().startswith(('http://', 'https://')) and not source_url.startswith('/vsi'):
+                 source_url = f"/vsicurl/{source_url}"
+            source_inputs = source_url
+            representative_source = source_url
+
         # Step 1: Detect source CRS and geometry column
         print("  Detecting source CRS...")
-        source_crs = detect_crs(source_url, layer=layer, verbose=verbose)
+        source_crs = detect_crs(representative_source, layer=layer, verbose=verbose)
         
         print("  Detecting geometry column...")
-        geom_col = get_geometry_column(source_url, layer=layer, verbose=verbose)
+        geom_col = get_geometry_column(representative_source, layer=layer, verbose=verbose)
         
         print(f"  Geometry column: {geom_col}")
         
@@ -612,7 +712,7 @@ def convert_to_parquet(
         # Step 2: Build read/reproject query
         print("  Building read/reproject query...")
         query = build_read_reproject_query(
-            source_url,
+            source_inputs,
             source_crs if needs_reprojection else None,
             target_crs,
             geom_col=geom_col,
@@ -622,7 +722,7 @@ def convert_to_parquet(
         
         # Step 3: Check ID column and wrap query if needed
         print("  Checking for ID column...")
-        needs_id, id_col_name = check_id_column(source_url, layer=layer, id_column=id_column, 
+        needs_id, id_col_name = check_id_column(representative_source, layer=layer, id_column=id_column, 
                                                   force_id=force_id, verbose=verbose)
         
         if needs_id:
@@ -661,14 +761,20 @@ def convert_to_parquet(
             # Apply GeoParquet optimizations in-place
             apply_geoparquet_optimizations(destination, destination, verbose)
         
-        print("✓ Conversion completed successfully!")
-        
+        if verbose:
+            print("✓ Conversion completed successfully!")
+            
     except Exception as e:
         print(f"✗ Conversion failed: {e}", file=sys.stderr)
         if verbose:
             import traceback
             traceback.print_exc()
         raise
+    finally:
+        if 'temp_dir' in locals() and temp_dir and os.path.exists(temp_dir):
+             if verbose:
+                 print(f"  Cleaning up temporary directory: {temp_dir}")
+             shutil.rmtree(temp_dir)
 
 
 def main():
