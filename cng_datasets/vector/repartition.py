@@ -37,6 +37,7 @@ def repartition_by_h0(
     con.raw_sql('SET preserve_insertion_order=false')  # saves RAM
     con.raw_sql('SET http_timeout=1200')
     con.raw_sql('SET http_retries=30')
+    con.raw_sql('SET arrow_large_buffer_size=true')
     
     # Create local temporary directory
     local_dir = '/tmp/hex'

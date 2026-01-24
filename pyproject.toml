@@ -7,7 +7,7 @@ name = "cng-datasets"
 version = "0.1.1"
 description = "Cloud-native geospatial dataset processing toolkit"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Boettiger Lab", email = "cboettig@berkeley.edu"}

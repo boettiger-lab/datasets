@@ -29,6 +29,12 @@ def configure_s3_credentials(con) -> None:
         con.execute("INSTALL httpfs")
         con.execute("LOAD httpfs")
     
+    # Enable large buffer size for complex geometries
+    if hasattr(con, 'raw_sql'):
+        con.raw_sql("SET arrow_large_buffer_size=true")
+    else:
+        con.execute("SET arrow_large_buffer_size=true")
+    
     key = os.getenv("AWS_ACCESS_KEY_ID", "")
     secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     endpoint = os.getenv("AWS_S3_ENDPOINT", "s3-west.nrp-nautilus.io")

@@ -180,6 +180,9 @@ def setup_duckdb_connection(
     # Configure temp directory for spill-to-disk operations
     con.execute("SET temp_directory='/tmp'")
     
+    # Enable large buffer size for complex geometries
+    con.execute("SET arrow_large_buffer_size=true")
+    
     return con
 
 

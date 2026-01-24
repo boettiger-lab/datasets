@@ -26,6 +26,19 @@ import geopandas as gpd
 from urllib.request import urlretrieve
 from urllib.parse import urlparse
 
+# Monkeypatch geoparquet-io to ensure internal connections set arrow_large_buffer_size=true
+# This fixes Arrow Appender overflow errors on large geospatial datasets
+try:
+    import geoparquet_io.core.common
+    _original_get_duckdb_connection = geoparquet_io.core.common.get_duckdb_connection
+    def _patched_get_duckdb_connection(*args, **kwargs):
+        con = _original_get_duckdb_connection(*args, **kwargs)
+        con.execute("SET arrow_large_buffer_size=true")
+        return con
+    geoparquet_io.core.common.get_duckdb_connection = _patched_get_duckdb_connection
+except ImportError:
+    pass
+
 
 def is_parquet_file(source_url: str) -> bool:
     """
@@ -163,6 +176,7 @@ def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: b
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    con.execute("SET arrow_large_buffer_size=true")
     
     try:
         layer_param = f", layer='{layer}'" if layer else ""
@@ -243,6 +257,7 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    con.execute("SET arrow_large_buffer_size=true")
     
     try:
         # Read just the schema - ST_Read handles URLs directly
