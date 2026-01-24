@@ -209,7 +209,7 @@ def generate_dataset_workflow(
     _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size)
     
     # Generate pmtiles job
-    _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
+    _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo, memory=hex_memory)
     
     # Count features in source file and calculate chunking parameters
     print(f"Counting features in {source_url}...")
@@ -687,7 +687,7 @@ cng-convert-to-parquet \\
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-convert.yaml"))
 
 
-def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo):
+def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo, memory="8Gi"):
     """Generate PMTiles job.
     
     Uses the optimized GeoParquet from convert job as input (includes ID column).
@@ -756,8 +756,8 @@ rclone copy /tmp/$DATASET.pmtiles nrp:{bucket}/
 rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
 """],
                         "resources": {
-                            "requests": {"cpu": "4", "memory": "8Gi"},
-                            "limits": {"cpu": "4", "memory": "8Gi"}
+                            "requests": {"cpu": "4", "memory": memory},
+                            "limits": {"cpu": "4", "memory": memory}
                         }
                     }],
                     "volumes": [

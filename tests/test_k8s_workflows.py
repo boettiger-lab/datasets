@@ -184,6 +184,26 @@ class TestWorkflowGeneration:
             command = job["spec"]["template"]["spec"]["containers"][0]["command"]
             command_str = str(command)
             assert "--chunk-size 51" in command_str
+
+    @pytest.mark.timeout(5)
+    def test_pmtiles_job_memory(self):
+        """Test that pmtiles job uses specified memory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                hex_memory="16Gi"
+            )
+            
+            pmtiles_file = Path(tmpdir) / "test-ds-pmtiles.yaml"
+            with open(pmtiles_file) as f:
+                job = yaml.safe_load(f)
+                
+            resources = job["spec"]["template"]["spec"]["containers"][0]["resources"]
+            assert resources["requests"]["memory"] == "16Gi"
+            assert resources["limits"]["memory"] == "16Gi"
     
     @pytest.mark.timeout(5)
     def test_workflow_rbac(self):
