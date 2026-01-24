@@ -162,7 +162,8 @@ def generate_dataset_workflow(
     hex_memory: str = "8Gi",
     max_parallelism: int = 50,
     max_completions: int = 200,
-    intermediate_chunk_size: int = 10
+    intermediate_chunk_size: int = 10,
+    row_group_size: int = 100000
 ):
     """
     Generate complete workflow for a dataset.
@@ -205,7 +206,7 @@ def generate_dataset_workflow(
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
     
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer, memory=hex_memory)
+    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size)
     
     # Generate pmtiles job
     _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo)
@@ -613,14 +614,15 @@ echo "Bucket setup complete!"
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-setup-bucket.yaml"))
 
 
-def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None, memory="8Gi"):
+def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000):
     """Generate GeoParquet conversion job."""
     # Build the conversion command with optional layer parameter
     layer_flag = f" \\\n  --layer {layer}" if layer else ""
     convert_cmd = f"""set -e
 cng-convert-to-parquet \\
   {source_url} \\
-  s3://{bucket}/{dataset_name}.parquet{layer_flag}
+  s3://{bucket}/{dataset_name}.parquet \\
+  --row-group-size {row_group_size}{layer_flag}
 """
     
     job_spec = {

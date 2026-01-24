@@ -71,6 +71,7 @@ def main():
     workflow_parser.add_argument("--max-parallelism", type=int, default=50, help="Maximum parallel hex jobs (default: 50)")
     workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
+    workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
     
     # Raster workflow generation command
     raster_workflow_parser = subparsers.add_parser("raster-workflow", help="Generate complete raster dataset workflow")
@@ -223,6 +224,7 @@ def main():
             max_parallelism=args.max_parallelism,
             max_completions=args.max_completions,
             intermediate_chunk_size=args.intermediate_chunk_size,
+            row_group_size=args.row_group_size,
         )
     
     elif args.command == "raster-workflow":
