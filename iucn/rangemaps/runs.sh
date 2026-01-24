@@ -6,7 +6,7 @@ kubectl delete -f k8s/configmap.yaml
 
 cng-datasets workflow \
   --dataset amphibians \
-  --source-url /vsicurl/https://s3-west.nrp-nautilus.io/public-iucn/raw/rangemaps/AMPHIBIANS.zip \
+  --source-url https://s3-west.nrp-nautilus.io/public-iucn/raw/rangemaps/AMPHIBIANS.zip \
   --bucket public-iucn \
   --h3-resolution 10 \
   --hex-memory 24Gi \

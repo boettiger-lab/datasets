@@ -15,15 +15,85 @@ from .jobs import K8sJobManager
 def _count_source_features(source_url: str) -> int:
     """
     Count features in a source file (shapefile, geopackage, etc.) using GDAL with vsicurl.
+    For .zip files, it downloads, extracts, and counts features in all shapefiles.
     
     Args:
         source_url: HTTP(S) or S3 URL to source vector file
         
     Returns:
-        Number of features in the source file
+        Number of features in the source file(s)
     """
     import subprocess
+    import tempfile
+    import os
+    import shutil
+    import zipfile
+    from urllib.request import urlretrieve
     
+    # Check for zip file
+    if source_url.lower().endswith('.zip'):
+        try:
+            print(f"  Detected zip file, downloading to temporary directory...")
+            temp_dir = tempfile.mkdtemp()
+            local_zip = os.path.join(temp_dir, "download.zip")
+            
+            # Handle S3 vs HTTP
+            download_url = source_url
+            if source_url.startswith('s3://'):
+                 if "nrp-nautilus.io" in source_url or "public-iucn" in source_url:
+                     path = source_url.replace("s3://", "")
+                     download_url = f"https://s3-west.nrp-nautilus.io/{path}"
+            
+            # Strip vsicurl if present (legacy compat)
+            if download_url.startswith('/vsicurl/'):
+                download_url = download_url.replace('/vsicurl/', '')
+            
+            if download_url.startswith('http://') or download_url.startswith('https://') or download_url.startswith('ftp://'):
+                urlretrieve(download_url, local_zip)
+            elif os.path.exists(download_url):
+                shutil.copy(download_url, local_zip)
+            else:
+                 # Try adding file:// scheme if it looks like an absolute path but failed above checks? 
+                 # Or just let urlretrieve try if it has a scheme.
+                 urlretrieve(download_url, local_zip)
+
+            
+            with zipfile.ZipFile(local_zip, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+                
+            # Find all shapefiles
+            total_count = 0
+            shapefiles = []
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file.lower().endswith(".shp"):
+                        shapefiles.append(os.path.join(root, file))
+            
+            if not shapefiles:
+                raise ValueError("No shapefiles found in zip archive")
+                
+            print(f"  Found {len(shapefiles)} shapefiles, counting features...")
+            
+            for shp in shapefiles:
+                result = subprocess.run(
+                    ['ogrinfo', '-so', '-al', shp],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                for line in result.stdout.split('\n'):
+                    if 'Feature Count:' in line:
+                        count = int(line.split(':')[1].strip())
+                        total_count += count
+                        break
+            
+            return total_count
+
+        finally:
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
     # Convert s3:// URLs to https:// for vsicurl
     if source_url.startswith('s3://'):
         path = source_url.replace('s3://', '')

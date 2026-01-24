@@ -660,6 +660,12 @@ def convert_to_parquet(
     
     is_zip = source_url.lower().endswith(".zip")
     
+    if is_zip:
+        # Strip GDAL VSI prefixes if present so we can download the raw file
+        if source_url.startswith('/vsicurl/'):
+            source_url = source_url.replace('/vsicurl/', '')
+
+    
     try:
         temp_dir = None
         source_inputs = []
