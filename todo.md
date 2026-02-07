@@ -137,19 +137,43 @@ This document tracks the completion status of datasets in the boettiger-lab/data
   - ✅ STAC Collection
   - ✅ Column Definitions (Mapping Inequality + Taxa)
 
-### Wetlands (Ramsar & GLWD)
+### Ramsar (Wetlands of International Importance)
 - **Status:** ✅ Complete
-- **Type:** Mixed
+- **Type:** Vector
 - **Bucket:** `public-wetlands`
 - **Formats:**
-  - ✅ PMTiles (Ramsar)
-  - ✅ GeoParquet (Ramsar)
-  - ✅ COG (GLWD)
-  - ✅ H3 Hexagons (Ramsar)
+  - ✅ PMTiles
+  - ✅ GeoParquet
+  - ✅ H3 Hexagons
 - **Documentation:**
-  - ✅ README.md (Detailed Ramsar schema, GLWD summary)
-  - ✅ STAC Collection
-  - ✅ Column Definitions (Ramsar)
+  - ✅ README.md
+  - ✅ STAC Collection (part of wetlands-global)
+  - ✅ Column Definitions
+
+### GLWD (Global Lakes and Wetlands Database)
+- **Status:** ✅ Complete
+- **Type:** Raster
+- **Bucket:** `public-wetlands`
+- **Formats:**
+  - ✅ COG
+  - ❓ H3 Hexagons (Found in glwd/hex?)
+- **Documentation:**
+  - ✅ README.md (part of wetlands-global)
+  - ✅ STAC Collection (part of wetlands-global)
+  - ❌ Column Definitions (Need category codes)
+
+### NWI (National Wetlands Inventory - USA)
+- **Status:** ⚠️ Partial
+- **Type:** Vector
+- **Bucket:** `public-wetlands`
+- **Formats:**
+  - ❌ PMTiles (Not found?)
+  - ❌ GeoParquet (Raw polygons?)
+  - ✅ H3 Hexagons (Found in nwi/hex)
+- **Documentation:**
+  - ❌ README.md
+  - ❌ STAC Collection
+  - ❌ Column Definitions
 
 ### US Census
 - **Status:** ✅ Complete (Spatial Crosswalk)
