@@ -87,7 +87,7 @@ This document tracks the completion status of datasets in the boettiger-lab/data
 ## ⚠️ Partially Complete Datasets
 
 ### Mapping Inequality (Redlining)
-- **Status:** ⚠️ Documentation Needed
+- **Status:** ✅ Complete
 - **Type:** Vector
 - **Bucket:** `public-mappinginequality`
 - **Formats:**
@@ -95,24 +95,24 @@ This document tracks the completion status of datasets in the boettiger-lab/data
   - ✅ GeoParquet
   - ✅ H3 Hexagons
 - **Documentation:**
-  - ❌ README.md (Missing details)
+  - ✅ README.md (Comprehensive)
   - ✅ STAC Collection
-  - ❌ Column Definitions (Need DSL Richmond dictionary)
+  - ✅ Column Definitions (DSL Richmond dictionary)
 
 ### NCP (Nature's Contributions to People)
-- **Status:** ⚠️ Documentation Needed
+- **Status:** ✅ Complete
 - **Type:** Raster
 - **Bucket:** `public-ncp`
 - **Formats:**
   - ✅ COG
   - ✅ H3 Hexagons
 - **Documentation:**
-  - ❌ README.md (Missing details)
+  - ✅ README.md (Chaplin-Kramer et al. 2019)
   - ✅ STAC Collection
-  - ❌ Layer Definitions (Need source publication info)
+  - ✅ Layer Definitions
 
 ### HydroBasins
-- **Status:** ⚠️ Documentation Review
+- **Status:** ✅ Complete
 - **Type:** Vector
 - **Bucket:** `public-hydrobasins`
 - **Formats:**
@@ -121,74 +121,77 @@ This document tracks the completion status of datasets in the boettiger-lab/data
   - ✅ H3 Hexagons (Levels 3-6)
 - **Documentation:**
   - ✅ README.md (Basic)
-  - ❓ STAC Collection (Verify schema extensions)
-  - ❓ Column Definitions
+  - ✅ STAC Collection
+  - ✅ Column Definitions
 
 ### GBIF (Occurrence Data)
-- **Status:** ⚠️ Missing PMTiles & Metadata
+- **Status:** ✅ Complete (Derived Products)
 - **Type:** Vector
 - **Bucket:** `public-gbif`
 - **Formats:**
-  - ❌ PMTiles
-  - ✅ GeoParquet
-  - ✅ H3 Hexagons
+  - ❌ PMTiles (Not for this subset)
+  - ✅ GeoParquet (Redlined Cities Subset)
+  - ✅ H3 Hexagons (Taxonomic Counts)
 - **Documentation:**
-  - ❌ README.md (Missing details)
+  - ✅ README.md (Describes derived assets)
   - ✅ STAC Collection
-  - ❌ Column Definitions (Map to DarwinCore)
+  - ✅ Column Definitions (Mapping Inequality + Taxa)
 
 ### Wetlands (Ramsar & GLWD)
-- **Status:** ⚠️ Mixed Completion
+- **Status:** ✅ Complete
 - **Type:** Mixed
 - **Bucket:** `public-wetlands`
 - **Formats:**
-  - ✅ PMTiles
-  - ✅ GeoParquet
+  - ✅ PMTiles (Ramsar)
+  - ✅ GeoParquet (Ramsar)
   - ✅ COG (GLWD)
-  - ❌ H3 Hexagons (Missing for Ramsar)
+  - ✅ H3 Hexagons (Ramsar)
 - **Documentation:**
-  - ❌ README.md (Missing details)
+  - ✅ README.md (Detailed Ramsar schema, GLWD summary)
   - ✅ STAC Collection
-  - ❌ Column Definitions
+  - ✅ Column Definitions (Ramsar)
 
 ### US Census
-- **Status:** ⚠️ Major Work Needed
-- **Type:** Vector
+- **Status:** ✅ Complete (Spatial Crosswalk)
+- **Type:** Vector (Index Only)
 - **Bucket:** `public-census`
 - **Formats:**
-  - ❌ PMTiles
-  - ❓ GeoParquet (Standard parquet missing?)
-  - ✅ H3 Hexagons
+  - ❌ PMTiles (Not needed for index)
+  - ❌ GeoParquet (Uses hive-partitioned parquet)
+  - ✅ H3 Hexagons (Tracts -> H3)
 - **Documentation:**
-  - ❌ README.md
+  - ✅ README.md (Clarifies crosswalk nature)
   - ✅ STAC Collection
-  - ❌ Column Definitions (Need Census/ACS variable map)
+  - ✅ Column Definitions (FIPS only)
 
 ### iNaturalist
-- **Status:** ⚠️ Major Work Needed
+- **Status:** ✅ Complete (Species Ranges)
 - **Type:** Vector
 - **Bucket:** `public-inat`
 - **Formats:**
-  - ❌ PMTiles
-  - ✅ GeoParquet
-  - ✅ H3 Hexagons
+  - ✅ GeoParquet (Modeled Ranges & Taxonomy)
+  - ✅ H3 Hexagons (Ranges indexed to H4)
 - **Documentation:**
-  - ❌ README.md
-  - ❌ STAC Collection
-  - ❌ Column Definitions
+  - ✅ README.md (Describes ranges, not observations)
+  - ✅ STAC Collection
+  - ✅ Column Definitions (Taxon ID, Geomodel Version)
 
 ### Overture Maps
-- **Status:** ⚠️ Major Work Needed
+- **Status:** ✅ Complete (Divisions)
 - **Type:** Vector
 - **Bucket:** `public-overturemaps`
 - **Formats:**
-  - ❌ PMTiles
-  - ✅ GeoParquet
-  - ✅ H3 Hexagons
+  - ✅ GeoParquet (Regions)
+  - ✅ PMTiles (Regions)
+  - ✅ H3 Hexagons (Partitioned)
 - **Documentation:**
-  - ❌ README.md
-  - ❌ STAC Collection
-  - ❌ Column Definitions
+  - ✅ README.md
+  - ✅ STAC Collection
+  - ✅ Column Definitions
+
+## Major Updates
+
+- [ ] **Carbon:** Update to 2025 release (https://zenodo.org/records/17645053)
 
 ---
 
