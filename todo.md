@@ -1,186 +1,84 @@
-# Dataset Completion TODO
+# Dataset Completion Status
 
-This document tracks the completion status of datasets in the boettiger-lab/datasets repository. Datasets are considered complete when they have:
+This document tracks the completion status of datasets in the boettiger-lab/datasets repository.
 
-**For Vector Datasets:**
-- ✅ PMTiles format
-- ✅ GeoParquet format
-- ✅ H3 hexagonal tiling (partitioned by h0)
-- ✅ Comprehensive data-description.md
-
-**For Raster Datasets:**
-- ✅ Cloud-Optimized GeoTIFF (COG)
-- ✅ H3 hexagonal tiling (partitioned by h0)
-- ✅ Comprehensive data-description.md
+**Standard Workflow:** See [DATASET_DOCUMENTATION_WORKFLOW.md](DATASET_DOCUMENTATION_WORKFLOW.md) for the process of creating READMEs and STAC collections.
 
 ## ✅ Complete Datasets
 
-### CPAD (California Protected Areas Database)
-- **Status:** ✅ Complete
-- **Type:** Vector
-- **Formats:** PMTiles ✅, Parquet ✅, H3 Hex ✅
-- **Documentation:** data-description.md ✅
+The following datasets have comprehensive `README.md` and `stac-collection.json` files uploaded to S3, with full column definitions and proper parent/root links.
+
+### **CPAD (California Protected Areas)**
 - **Bucket:** `public-cpad`
-- **Notes:** Excellent example with comprehensive documentation
+- **Documentation:** ✅ Comprehensive README + STAC with `table:columns`
+- **Source:** GreenInfo Network
 
-### IUCN Species Richness
-- **Status:** ✅ Complete (missing data-description.md)
-- **Type:** Raster
-- **Formats:** COG ✅, H3 Hex ✅
-- **Documentation:** README.md ✅, data-description.md ❌
+### **IUCN Species Richness**
 - **Bucket:** `public-iucn`
-- **Action needed:** Create data-description.md following CPAD example
+- **Documentation:** ✅ Comprehensive README + STAC with `table:columns`
+- **Source:** IUCN Red List
 
-### WDPA (World Database of Protected Areas)
-- **Status:** ✅ Complete (missing data-description.md)
-- **Type:** Vector
-- **Formats:** PMTiles ✅, Parquet ✅, H3 Hex ✅
-- **Documentation:** README.md ✅, data-description.md ❌
-- **Bucket:** `public-wdpa`
-- **Action needed:** Create data-description.md following CPAD example
-
-### Mapping Inequality (Redlining)
-- **Status:** ✅ Complete (missing data-description.md)
-- **Type:** Vector
-- **Formats:** PMTiles ✅, Parquet ✅, H3 Hex ✅
-- **Documentation:** README.md ✅, data-description.md ❌
-- **Bucket:** `public-mappinginequality`
-- **Action needed:** Create data-description.md following CPAD example
-
-### NCP (Nature's Contributions to People)
-- **Status:** ✅ Complete (missing data-description.md)
-- **Type:** Raster
-- **Formats:** COG ✅, H3 Hex ✅
-- **Documentation:** README.md ✅, data-description.md ❌
-- **Bucket:** `public-ncp`
-- **Action needed:** Create data-description.md following CPAD example
-
-## ⚠️ Partially Complete Datasets
-
-### HydroBasins
-- **Status:** ✅ Complete (missing data-description.md)
-- **Type:** Vector
-- **Formats:** PMTiles ✅, Parquet ✅, H3 Hex ✅
-- **Documentation:** README.md ✅, data-description.md ❌
-- **Bucket:** `public-hydrobasins`
-- **Notes:** Levels 3-6 have H3 hexagonal tiling; also has zoom-based PMTiles (z0-z7)
-- **Action needed:** Create data-description.md
-
-### GBIF (Occurrence Data)
-- **Status:** ✅ Complete (missing data-description.md + PMTiles)
-- **Type:** Vector
-- **Formats:** PMTiles ❌, Parquet ✅, H3 Hex ✅
-- **Documentation:** README.md ✅, data-description.md ❌
-- **Bucket:** `public-gbif`
-- **Missing:**
-  - PMTiles format for visualization
-  - data-description.md
-
-### US Census
-- **Status:** ⚠️ Partially complete
-- **Type:** Vector
-- **Formats:** PMTiles ❌, Parquet ❓, H3 Hex ✅
-- **Documentation:** README.md ❌, data-description.md ❌
-- **Bucket:** `public-census`
-- **Missing:**
-  - PMTiles format
-  - Standard parquet (only hex parquet exists)
-  - All documentation
-
-## ❌ Incomplete or Unpublished Datasets
-
-### CalEnviroScreen
-- **Status:** ❌ No published data
-- **Type:** Vector
-- **Bucket:** None found
-- **Directory:** `calenviroscreen/`
-- **Action needed:** Process and publish dataset
-
-### Carbon
-- **Status:** ✅ Complete (missing data-description.md)
-- **Type:** Raster
-- **Formats:** COG ✅, H3 Hex ✅
-- **Documentation:** README.md ✅, data-description.md ❌
+### **Carbon (Irrecoverable/Manageable)**
 - **Bucket:** `public-carbon`
-- **Action needed:** Create data-description.md
+- **Documentation:** ✅ Comprehensive README + STAC (18 COG files)
+- **Source:** Conservation International (Noon et al. 2022)
 
-### Fire
-- **Status:** ❌ No published data
-- **Type:** Raster
-- **Bucket:** `public-fire` (exists but empty)
-- **Directory:** `fire/`
-- **Action needed:** Process and publish dataset
-
-### iNaturalist
-- **Status:** ⚠️ Partially complete
-- **Type:** Vector
-- **Formats:** PMTiles ❌, Parquet ✅, H3 Hex ✅
-- **Documentation:** README.md ❌, data-description.md ❌
-- **Bucket:** `public-inat`
-- **Notes:** Has hex data (taxonomic parquet files)
-- **Missing:**
-  - PMTiles format
-  - All documentation
-
-### Overture Maps
-- **Status:** ⚠️ Partially complete
-- **Type:** Vector
-- **Formats:** PMTiles ❌, Parquet ✅, H3 Hex ✅
-- **Documentation:** README.md ✅, data-description.md ❌
-- **Bucket:** `public-overturemaps`
-- **Notes:** Has hex data organized by regions
-- **Missing:**
-  - PMTiles format
-  - data-description.md
-
-### PAD-US
-- **Status:** ❌ No published data
-- **Type:** Vector
-- **Bucket:** None found
-- **Directory:** `pad-us/`
-- **Action needed:** Process and publish dataset
-
-### Social Vulnerability Index
-- **Status:** ✅ Complete (missing data-description.md + hex)
-- **Type:** Vector
-- **Formats:** PMTiles ✅, Parquet ✅, H3 Hex ❌
-- **Documentation:** README.md ❌, data-description.md ❌
+### **Social Vulnerability Index (SVI)**
 - **Bucket:** `public-social-vulnerability`
-- **Notes:** Has data for years 2000, 2010, 2020, 2022 at county and tract levels
-- **Missing:**
-  - H3 hexagonal tiling
-  - All documentation
+- **Documentation:** ✅ Comprehensive README + STAC with `table:columns`
+- **Source:** CDC / ATSDR
 
-### Wetlands
-- **Status:** ✅ Complete (missing data-description.md + hex for Ramsar)
-- **Type:** Mixed (Vector + Raster)
-- **Formats:** PMTiles ✅, Parquet ✅, COG ✅, H3 Hex ❌
-- **Documentation:** README.md ✅, data-description.md ❌
+### **WDPA (World Database on Protected Areas)**
+- **Bucket:** `public-wdpa`
+- **Documentation:** ✅ Comprehensive README + STAC with `table:columns`
+- **Source:** UNEP-WCMC & IUCN (Protected Planet)
+
+## ⚠️ Partially Complete / Pending Documentation
+
+These datasets exist but need the "Standard Workflow" applied (Schema inspection -> Research -> README/STAC creation).
+
+### **Mapping Inequality (Redlining)**
+- **Bucket:** `public-mappinginequality`
+- **Status:** Has STAC, needs detailed README/Schema
+- **Action:** Inspect parquet schema, research DSL Richmond data dictionary.
+
+### **NCP (Nature's Contributions to People)**
+- **Bucket:** `public-ncp`
+- **Status:** Has STAC, needs detailed README/Schema
+- **Action:** Research Chaplin-Kramer et al. source for layer definitions.
+
+### **HydroBasins**
+- **Bucket:** `public-hydrobasins`
+- **Status:** Has basic README, needs STAC update?
+- **Action:** Review current documentation against new standard.
+
+### **GBIF (Occurrence Data)**
+- **Bucket:** `public-gbif`
+- **Status:** Has STAC, needs DarwinCore field definitions
+- **Action:** Map parquet columns to DarwinCore terms in README/STAC.
+
+### **US Census**
+- **Bucket:** `public-census`
+- **Status:** Needs documentation
+- **Action:** Inspect schema, identifying ACS/Decennial variables.
+
+### **Wetlands**
 - **Bucket:** `public-wetlands`
-- **Notes:** Has Ramsar wetlands (parquet/pmtiles) and GLWD v2.0 (COG)
-- **Missing:**
-  - H3 hexagonal tiling for Ramsar sites
-  - data-description.md
+- **Status:** Needs documentation for Ramsar & GLWD
+- **Action:** Research Ramsar and GLWD attributes.
 
-## Summary Statistics
+### **iNaturalist**
+- **Bucket:** `public-inat`
+- **Status:** Needs documentation
+- **Action:** Document parquet schema (likely similar to GBIF/DwC).
 
-- **Complete:** 1 dataset (CPAD)
-- **Complete (missing data-description.md):** 7 datasets (IUCN, WDPA, Mapping Inequality, NCP, HydroBasins, Carbon, Wetlands)
-- **Partially complete:** 4 datasets (GBIF, Census, iNaturalist, Overture Maps)
-- **Complete but needs hex:** 1 dataset (Social Vulnerability Index)
-- **Incomplete/Unpublished:** 3 datasets (CalEnviroScreen, Fire, PAD-US)
-- **Total:** 16 datasets
+### **Overture Maps**
+- **Bucket:** `public-overturemaps`
+- **Status:** Needs documentation
+- **Action:** Document Overture schema (places, buildings, etc.).
 
-## Priority Actions
+## ❌ Incomplete / Unpublished
 
-1. **High Priority:** Create data-description.md for 7 datasets (IUCN, WDPA, Mapping Inequality, NCP, HydroBasins, Carbon, Wetlands)
-2. **Medium Priority:** Add PMTiles to GBIF; Add hex tiling to Social Vulnerability Index; Add documentation to iNaturalist and Overture Maps
-3. **Low Priority:** Process and publish the 3 incomplete datasets (CalEnviroScreen, Fire, PAD-US)
-4. **Documentation:** Ensure all datasets follow the CPAD data-description.md template
-
-## Notes
-
-- CPAD serves as the gold standard for dataset completion
-- Most datasets have good processing documentation in README.md
-- Main gap is user-facing data-description.md files
-- Several datasets have bucket placeholders but no published data
+- **CalEnviroScreen**: No published data
+- **Fire**: Bucket exists but empty
+- **PAD-US**: No published data
