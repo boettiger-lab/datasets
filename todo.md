@@ -1,81 +1,196 @@
 # Dataset Completion Status
 
-This document tracks the completion status of datasets in the boettiger-lab/datasets repository.
+This document tracks the completion status of datasets in the boettiger-lab/datasets repository. Datasets are considered complete when they have:
 
-**Standard Workflow:** See [DATASET_DOCUMENTATION_WORKFLOW.md](DATASET_DOCUMENTATION_WORKFLOW.md) for the process of creating READMEs and STAC collections.
+**File Formats:**
+- ✅ **PMTiles** (for visualization)
+- ✅ **GeoParquet** (for analysis)
+- ✅ **H3 Hexagons** (partitioned by h0)
+- ✅ **Cloud-Optimized GeoTIFF (COG)** (for rasters)
+
+**Documentation & Metadata:**
+- ✅ **README.md** (Comprehensive description & source info)
+- ✅ **STAC Collection** (`stac-collection.json` with correct links)
+- ✅ **Column Definitions** (`table:columns` schema in STAC/README)
+
+**Standard Workflow:** See [DATASET_DOCUMENTATION_WORKFLOW.md](DATASET_DOCUMENTATION_WORKFLOW.md).
+
+---
 
 ## ✅ Complete Datasets
 
-The following datasets have comprehensive `README.md` and `stac-collection.json` files uploaded to S3, with full column definitions and proper parent/root links.
-
-### **CPAD (California Protected Areas)**
+### CPAD (California Protected Areas Database)
+- **Status:** 🌟 Gold Standard
+- **Type:** Vector
 - **Bucket:** `public-cpad`
-- **Documentation:** ✅ Comprehensive README + STAC with `table:columns`
-- **Source:** GreenInfo Network
+- **Formats:**
+  - ✅ PMTiles
+  - ✅ GeoParquet
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ✅ README.md (Comprehensive)
+  - ✅ STAC Collection
+  - ✅ Column Definitions
 
-### **IUCN Species Richness**
+### IUCN Species Richness
+- **Status:** ✅ Complete
+- **Type:** Raster
 - **Bucket:** `public-iucn`
-- **Documentation:** ✅ Comprehensive README + STAC with `table:columns`
-- **Source:** IUCN Red List
+- **Formats:**
+  - ✅ COG (14 layers)
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ✅ README.md (Comprehensive)
+  - ✅ STAC Collection
+  - ✅ Column Definitions (Richness, Threatened, Range-Weighted)
 
-### **Carbon (Irrecoverable/Manageable)**
-- **Bucket:** `public-carbon`
-- **Documentation:** ✅ Comprehensive README + STAC (18 COG files)
-- **Source:** Conservation International (Noon et al. 2022)
-
-### **Social Vulnerability Index (SVI)**
-- **Bucket:** `public-social-vulnerability`
-- **Documentation:** ✅ Comprehensive README + STAC with `table:columns`
-- **Source:** CDC / ATSDR
-
-### **WDPA (World Database on Protected Areas)**
+### WDPA (World Database on Protected Areas)
+- **Status:** ✅ Complete
+- **Type:** Vector
 - **Bucket:** `public-wdpa`
-- **Documentation:** ✅ Comprehensive README + STAC with `table:columns`
-- **Source:** UNEP-WCMC & IUCN (Protected Planet)
+- **Formats:**
+  - ✅ PMTiles
+  - ✅ GeoParquet
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ✅ README.md (Comprehensive)
+  - ✅ STAC Collection
+  - ✅ Column Definitions (Full WDPA Dictionary)
 
-## ⚠️ Partially Complete / Pending Documentation
+### Carbon (Irrecoverable/Manageable)
+- **Status:** ✅ Complete
+- **Type:** Raster
+- **Bucket:** `public-carbon`
+- **Formats:**
+  - ✅ COG (18 files)
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ✅ README.md (Detailed Methodology)
+  - ✅ STAC Collection
+  - ✅ Layer Descriptions
 
-These datasets exist but need the "Standard Workflow" applied (Schema inspection -> Research -> README/STAC creation).
+### Social Vulnerability Index (SVI)
+- **Status:** ✅ Complete
+- **Type:** Vector
+- **Bucket:** `public-social-vulnerability`
+- **Formats:**
+  - ✅ PMTiles
+  - ✅ GeoParquet
+  - ❌ H3 Hexagons (Pending processing)
+- **Documentation:**
+  - ✅ README.md (Linked to CDC docs)
+  - ✅ STAC Collection
+  - ✅ Column Definitions (RPL_THEME variables)
 
-### **Mapping Inequality (Redlining)**
+---
+
+## ⚠️ Partially Complete Datasets
+
+### Mapping Inequality (Redlining)
+- **Status:** ⚠️ Documentation Needed
+- **Type:** Vector
 - **Bucket:** `public-mappinginequality`
-- **Status:** Has STAC, needs detailed README/Schema
-- **Action:** Inspect parquet schema, research DSL Richmond data dictionary.
+- **Formats:**
+  - ✅ PMTiles
+  - ✅ GeoParquet
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ❌ README.md (Missing details)
+  - ✅ STAC Collection
+  - ❌ Column Definitions (Need DSL Richmond dictionary)
 
-### **NCP (Nature's Contributions to People)**
+### NCP (Nature's Contributions to People)
+- **Status:** ⚠️ Documentation Needed
+- **Type:** Raster
 - **Bucket:** `public-ncp`
-- **Status:** Has STAC, needs detailed README/Schema
-- **Action:** Research Chaplin-Kramer et al. source for layer definitions.
+- **Formats:**
+  - ✅ COG
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ❌ README.md (Missing details)
+  - ✅ STAC Collection
+  - ❌ Layer Definitions (Need source publication info)
 
-### **HydroBasins**
+### HydroBasins
+- **Status:** ⚠️ Documentation Review
+- **Type:** Vector
 - **Bucket:** `public-hydrobasins`
-- **Status:** Has basic README, needs STAC update?
-- **Action:** Review current documentation against new standard.
+- **Formats:**
+  - ✅ PMTiles (Zoom-based)
+  - ✅ GeoParquet
+  - ✅ H3 Hexagons (Levels 3-6)
+- **Documentation:**
+  - ✅ README.md (Basic)
+  - ❓ STAC Collection (Verify schema extensions)
+  - ❓ Column Definitions
 
-### **GBIF (Occurrence Data)**
+### GBIF (Occurrence Data)
+- **Status:** ⚠️ Missing PMTiles & Metadata
+- **Type:** Vector
 - **Bucket:** `public-gbif`
-- **Status:** Has STAC, needs DarwinCore field definitions
-- **Action:** Map parquet columns to DarwinCore terms in README/STAC.
+- **Formats:**
+  - ❌ PMTiles
+  - ✅ GeoParquet
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ❌ README.md (Missing details)
+  - ✅ STAC Collection
+  - ❌ Column Definitions (Map to DarwinCore)
 
-### **US Census**
-- **Bucket:** `public-census`
-- **Status:** Needs documentation
-- **Action:** Inspect schema, identifying ACS/Decennial variables.
-
-### **Wetlands**
+### Wetlands (Ramsar & GLWD)
+- **Status:** ⚠️ Mixed Completion
+- **Type:** Mixed
 - **Bucket:** `public-wetlands`
-- **Status:** Needs documentation for Ramsar & GLWD
-- **Action:** Research Ramsar and GLWD attributes.
+- **Formats:**
+  - ✅ PMTiles
+  - ✅ GeoParquet
+  - ✅ COG (GLWD)
+  - ❌ H3 Hexagons (Missing for Ramsar)
+- **Documentation:**
+  - ❌ README.md (Missing details)
+  - ✅ STAC Collection
+  - ❌ Column Definitions
 
-### **iNaturalist**
+### US Census
+- **Status:** ⚠️ Major Work Needed
+- **Type:** Vector
+- **Bucket:** `public-census`
+- **Formats:**
+  - ❌ PMTiles
+  - ❓ GeoParquet (Standard parquet missing?)
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ❌ README.md
+  - ✅ STAC Collection
+  - ❌ Column Definitions (Need Census/ACS variable map)
+
+### iNaturalist
+- **Status:** ⚠️ Major Work Needed
+- **Type:** Vector
 - **Bucket:** `public-inat`
-- **Status:** Needs documentation
-- **Action:** Document parquet schema (likely similar to GBIF/DwC).
+- **Formats:**
+  - ❌ PMTiles
+  - ✅ GeoParquet
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ❌ README.md
+  - ❌ STAC Collection
+  - ❌ Column Definitions
 
-### **Overture Maps**
+### Overture Maps
+- **Status:** ⚠️ Major Work Needed
+- **Type:** Vector
 - **Bucket:** `public-overturemaps`
-- **Status:** Needs documentation
-- **Action:** Document Overture schema (places, buildings, etc.).
+- **Formats:**
+  - ❌ PMTiles
+  - ✅ GeoParquet
+  - ✅ H3 Hexagons
+- **Documentation:**
+  - ❌ README.md
+  - ❌ STAC Collection
+  - ❌ Column Definitions
+
+---
 
 ## ❌ Incomplete / Unpublished
 
