@@ -224,3 +224,4 @@ sync/sync-job.yaml
 *.yaml
 *.gdb
 
+node_modules/
