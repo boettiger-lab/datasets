@@ -40,6 +40,81 @@ except ImportError:
     pass
 
 
+# Curved geometry types that DuckDB's WKB parser cannot handle
+_CURVED_GEOMETRY_TYPES = frozenset({
+    'multisurface', 'curvepolygon', 'compoundcurve',
+    'circularstring', 'multicurve',
+})
+
+
+def _detect_and_linearize_if_needed(source_url: str, layer: Optional[str] = None,
+                                     verbose: bool = False) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Check if source has curved geometry types (e.g., MULTISURFACE) that DuckDB
+    can't parse, and if so, linearize using ogr2ogr to a temp GPKG.
+
+    Returns:
+        (new_source, new_layer, temp_dir_to_cleanup)
+        If no linearization needed: (source_url, layer, None)
+    """
+    # Detect geometry type using ogrinfo
+    cmd = ['ogrinfo', '-so']
+    if layer:
+        cmd.extend([source_url, layer])
+    else:
+        cmd.extend(['-al', source_url])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        geom_type = None
+        for line in result.stdout.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('Geometry:') or stripped.startswith('Geometry Type:'):
+                geom_type = stripped.split(':', 1)[1].strip()
+                break
+
+        if geom_type is None:
+            return source_url, layer, None
+
+        # Normalize: "Multi Surface" -> "multisurface"
+        normalized = geom_type.lower().replace(' ', '')
+        is_curved = any(ct in normalized for ct in _CURVED_GEOMETRY_TYPES)
+
+        if not is_curved:
+            if verbose:
+                print(f"  Geometry type '{geom_type}' is linear, no conversion needed")
+            return source_url, layer, None
+
+        # Linearize with ogr2ogr
+        print(f"  Detected curved geometry type: {geom_type}")
+        print(f"  Linearizing with ogr2ogr (CONVERT_TO_LINEAR + PROMOTE_TO_MULTI)...")
+
+        lin_dir = tempfile.mkdtemp(prefix='cng_linearize_')
+        output_path = os.path.join(lin_dir, 'linearized.gpkg')
+
+        ogr_cmd = [
+            'ogr2ogr', '-f', 'GPKG',
+            '-nlt', 'CONVERT_TO_LINEAR',
+            '-nlt', 'PROMOTE_TO_MULTI',
+            output_path, source_url,
+        ]
+        if layer:
+            ogr_cmd.append(layer)
+
+        subprocess.run(ogr_cmd, check=True, capture_output=True, text=True, timeout=7200)
+        print(f"  Linearized to temp GPKG: {output_path}")
+
+        return output_path, None, lin_dir  # GPKG layer param not needed
+
+    except subprocess.TimeoutExpired:
+        print("  Warning: Geometry linearization timed out, proceeding without linearization")
+        return source_url, layer, None
+    except subprocess.CalledProcessError as e:
+        print(f"  Warning: ogr2ogr linearization failed: {e.stderr}")
+        print("  Proceeding without linearization (may fail on curved geometries)")
+        return source_url, layer, None
+
+
 def is_parquet_file(source_url: str) -> bool:
     """
     Check if a source URL points to a parquet file.
@@ -689,6 +764,7 @@ def convert_to_parquet(
     
     try:
         temp_dir = None
+        linearize_dir = None
         source_inputs = []
         
         if is_zip:
@@ -736,6 +812,19 @@ def convert_to_parquet(
             print(f"  Warning: Could not detect source CRS, assuming {target_crs}")
             source_crs = None
         
+        # Step 1b: Linearize curved geometries if needed (e.g., MULTISURFACE -> MULTIPOLYGON)
+        linearized_source, effective_layer, linearize_dir = _detect_and_linearize_if_needed(
+            representative_source, layer=layer, verbose=verbose
+        )
+        if linearize_dir:
+            # Source was linearized to a temp GPKG — update references
+            source_inputs = linearized_source
+            representative_source = linearized_source
+            layer = effective_layer
+            # Re-detect geometry column for the linearized file
+            geom_col = get_geometry_column(linearized_source, layer=effective_layer, verbose=verbose)
+            print(f"  Geometry column (linearized): {geom_col}")
+
         # Step 2: Build read/reproject query
         print("  Building read/reproject query...")
         query = build_read_reproject_query(
@@ -798,6 +887,10 @@ def convert_to_parquet(
             traceback.print_exc()
         raise
     finally:
+        if 'linearize_dir' in locals() and linearize_dir and os.path.exists(linearize_dir):
+             if verbose:
+                 print(f"  Cleaning up linearization temp dir: {linearize_dir}")
+             shutil.rmtree(linearize_dir, ignore_errors=True)
         if 'temp_dir' in locals() and temp_dir and os.path.exists(temp_dir):
              if verbose:
                  print(f"  Cleaning up temporary directory: {temp_dir}")
