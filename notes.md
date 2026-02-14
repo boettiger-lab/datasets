@@ -10,7 +10,53 @@ A python helper package, cng_datasets, creates the kubernetes job yaml and provi
 
 Once processed datasets are made, documentation of each dataset into both markdown and STAC catalog metadata uses an LLM-assisted workflow as described in DATASET_DOCUMENTATION_WORKFLOW.md
 
+I will ask you to better document the process for generating these processed datasets and navigating some of the issues that arise, like OOM pods, as we get deeper in.  Let's try and get started.  
+
+Try processing nrp:public-padus/raw/PADUS4_1Geodatabase.gdb.  
+
+This has multiple layers.  Process the non-spatial layers to normal parquet, and for all multipolygon layers, create hexed versions following the style in this repo using the cng-datasets tool to generate the k8s. 
+
+Your target resolution will be h10. Start be recognizing this is a vector dataset (geodatabase with multipolygon layers), so you will use the relevant vector worfklow.  
+
+you can use local tools like gdal with vsicurl to peek at the layers, e.g. 
+
+```
+ogrinfo /vsicurl/https://s3-west.nrp-nautilus.io/public-padus/raw/PADUS4_1Geodatabase.gdb
+```
+
+likewise on the local system you can use rclone to browse buckets, e.g. 
+
+```
+rclone lsf nrp:public-padus
+rclone lsf nrp:public-cpad
+```
+
+but remember any intensive process should be run as the k8s job, using it's faster network and greater cpu and storage. Figure out and document the right data organization for each of the sub-layers, compare to the example of nrp:public-cpad.  
+
+
+Before we run anything, I want you to write detailed instructions to future agents so that they can read your documentation instead of having to study the source code.  I've noticed you've been looking a lot more at source files than reading markdown documents.  
+
+
+
+
+
+
 This has been an evolving effort, and some early products were processed in less automated ways that may give rise to inconsistencies and need re-processing.  See todo.md
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 Important notes on the Kubernetes cluster:  
@@ -22,4 +68,9 @@ Important notes on the Kubernetes cluster:
 
 Notes on S3 buckets: 
 
-- All the final outputs are on the Ceph S3 system for the k8s cluster.
+- All the final outputs are on the Ceph S3 system for the k8s cluster. 
+- The S3 buckets can be accessed from outside the cluster on the address s3-west.nrp-nautilus.io.  It can also be accessed from inside the cluster, http://rook-ceph-rgw-nautiluss3.rook, much more efficiently.
+
+- For additional availability, we will sync buckets to the source.coop S3 system, but with different bucket names and paths.  
+
+
