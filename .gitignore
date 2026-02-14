@@ -225,3 +225,7 @@ sync/sync-job.yaml
 *.gdb
 
 node_modules/
+
+build/
+*.egg-info/
+node_modules/

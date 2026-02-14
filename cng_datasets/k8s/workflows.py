@@ -12,13 +12,14 @@ import yaml
 from .jobs import K8sJobManager
 
 
-def _count_source_features(source_url: str) -> int:
+def _count_source_features(source_url: str, layer: str = None) -> int:
     """
     Count features in a source file (shapefile, geopackage, etc.) using GDAL with vsicurl.
     For .zip files, it downloads, extracts, and counts features in all shapefiles.
     
     Args:
         source_url: HTTP(S) or S3 URL to source vector file
+        layer: Optional layer name for multi-layer sources (GDB, GPKG)
         
     Returns:
         Number of features in the source file(s)
@@ -106,13 +107,22 @@ def _count_source_features(source_url: str) -> int:
         gdal_path = source_url
     
     # Use ogrinfo to count features
-    # -so: summary only (faster), -al: all layers
-    result = subprocess.run(
-        ['ogrinfo', '-so', '-al', gdal_path],
-        capture_output=True,
-        text=True,
-        check=True
-    )
+    if layer:
+        # Query specific layer for multi-layer sources (GDB, GPKG)
+        result = subprocess.run(
+            ['ogrinfo', '-so', gdal_path, layer],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    else:
+        # -al: all layers (for single-layer sources)
+        result = subprocess.run(
+            ['ogrinfo', '-so', '-al', gdal_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
     
     # Parse output to find "Feature Count: XXXXX"
     for line in result.stdout.split('\n'):
@@ -195,8 +205,8 @@ def generate_dataset_workflow(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Sanitize dataset name for Kubernetes (replace underscores with hyphens)
-    k8s_name = dataset_name.replace('_', '-').lower()
+    # Sanitize dataset name for Kubernetes (replace underscores, slashes with hyphens)
+    k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
     
     # Set defaults for parent resolutions if not provided
     if parent_resolutions is None:
@@ -206,15 +216,15 @@ def generate_dataset_workflow(
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
     
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size)
+    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name)
     
     # Generate pmtiles job
-    _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo, memory=hex_memory)
+    _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name)
     
     # Count features in source file and calculate chunking parameters
     print(f"Counting features in {source_url}...")
     try:
-        total_rows = _count_source_features(source_url)
+        total_rows = _count_source_features(source_url, layer=layer)
         chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
         print(f"  Total features: {total_rows:,}")
         print(f"  Chunk size: {chunk_size:,}")
@@ -231,10 +241,10 @@ def generate_dataset_workflow(
     print(f"  Parent resolutions: {parent_resolutions}")
     
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name)
     
     # Generate repartition job
-    _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo)
+    _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name)
     
     # Generate workflow RBAC (generic for all cng-datasets workflows)
     _generate_workflow_rbac(namespace, output_path)
@@ -614,14 +624,15 @@ echo "Bucket setup complete!"
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-setup-bucket.yaml"))
 
 
-def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000):
+def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None):
     """Generate GeoParquet conversion job."""
+    s3_dataset = s3_dataset or dataset_name
     # Build the conversion command with optional layer parameter
     layer_flag = f" \\\n  --layer {layer}" if layer else ""
     convert_cmd = f"""set -e
 cng-convert-to-parquet \\
   {source_url} \\
-  s3://{bucket}/{dataset_name}.parquet \\
+  s3://{bucket}/{s3_dataset}.parquet \\
   --row-group-size {row_group_size}{layer_flag}
 """
     
@@ -687,13 +698,22 @@ cng-convert-to-parquet \\
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-convert.yaml"))
 
 
-def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo, memory="8Gi"):
+def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo, memory="8Gi", s3_dataset=None):
     """Generate PMTiles job.
     
     Uses the optimized GeoParquet from convert job as input (includes ID column).
     """
+    s3_dataset = s3_dataset or dataset_name
     # Use the converted geoparquet instead of original source
-    geoparquet_url = f"https://s3-west.nrp-nautilus.io/{bucket}/{dataset_name}.parquet"
+    geoparquet_url = f"https://s3-west.nrp-nautilus.io/{bucket}/{s3_dataset}.parquet"
+    
+    # For rclone upload, compute the S3 directory that contains the output file
+    if '/' in s3_dataset:
+        s3_parent_dir = '/'.join(s3_dataset.split('/')[:-1]) + '/'
+    else:
+        s3_parent_dir = ''
+    # basename for temp files and tippecanoe layer name
+    s3_basename = s3_dataset.split('/')[-1]
     
     job_spec = {
         "apiVersion": "batch/v1",
@@ -738,7 +758,7 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
                             {"name": "TMPDIR", "value": "/tmp"},
                             {"name": "BUCKET", "value": bucket},
-                            {"name": "DATASET", "value": dataset_name}
+                            {"name": "DATASET", "value": s3_basename}
                         ],
                         "volumeMounts": [
                             {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
@@ -752,7 +772,7 @@ ogr2ogr -f GeoJSONSeq /tmp/$DATASET.geojsonl /vsicurl/{geoparquet_url} -progress
 tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/$DATASET.geojsonl
 
 # Upload to S3 using rclone
-rclone copy /tmp/$DATASET.pmtiles nrp:{bucket}/
+rclone copy /tmp/$DATASET.pmtiles nrp:{bucket}/{s3_parent_dir}
 rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
 """],
                         "resources": {
@@ -770,12 +790,12 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-pmtiles.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None):
     """Generate H3 hex tiling job.
     
     Args:
         manager: K8sJobManager instance
-        dataset_name: Name of the dataset
+        dataset_name: Name for k8s resources
         bucket: S3 bucket name
         output_path: Path to write YAML files
         git_repo: Git repository URL
@@ -787,14 +807,16 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
         id_column: ID column name (auto-detected if None)
         hex_memory: Memory request/limit (e.g., "8Gi", "16Gi")
         intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays)
+        s3_dataset: S3 path prefix (defaults to dataset_name)
     """
+    s3_dataset = s3_dataset or dataset_name
     # Format parent resolutions as comma-separated string
     parent_res_str = ','.join(map(str, parent_resolutions))
     
     # Build command with optional id-column parameter
     cmd_parts = [
         "set -e",
-        f"cng-datasets vector --input s3://{bucket}/{dataset_name}.parquet --output s3://{bucket}/{dataset_name}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --intermediate-chunk-size {intermediate_chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
+        f"cng-datasets vector --input s3://{bucket}/{s3_dataset}.parquet --output s3://{bucket}/{s3_dataset}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --intermediate-chunk-size {intermediate_chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
     ]
     if id_column:
         cmd_parts[-1] += f" --id-column {id_column}"
@@ -867,8 +889,9 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-hex.yaml"))
 
 
-def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo):
+def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo, s3_dataset=None):
     """Generate repartition job."""
+    s3_dataset = s3_dataset or dataset_name
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -917,7 +940,7 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
                         ],
                         "command": ["bash", "-c", f"""set -e
-cng-datasets repartition --chunks-dir s3://{bucket}/{dataset_name}/chunks --output-dir s3://{bucket}/{dataset_name}/hex --source-parquet s3://{bucket}/{dataset_name}.parquet --cleanup
+cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output-dir s3://{bucket}/{s3_dataset}/hex --source-parquet s3://{bucket}/{s3_dataset}.parquet --cleanup
 """],
                         "resources": {
                             "requests": {"cpu": "4", "memory": "32Gi"},

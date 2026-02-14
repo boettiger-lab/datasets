@@ -1,22 +1,49 @@
-## Local environment
+## Start Here
 
-Remember to activate the `.venv` in the repository root for python commands.
+Read `AGENTS.md` before doing anything. It explains the workflow for processing datasets.
 
-When using GDAL for remote files, remember to use VSI-style operations for efficient streaming.  Use `/vsicurl/` on public URLs over `/vsis3/`
+Do NOT read or modify `cng_datasets/` source code unless you are fixing a bug in the package itself. For processing datasets, you only need the CLI documented in `AGENTS.md` and `README.md`.
 
-## S3
+## Repository Structure
 
-- You are running on a local laptop with access to a kubernetes cluster, Nautilus, which also has it's own s3 bucket system.  
+- `cng_datasets/` — Python package source code (do not modify for dataset processing)
+- `catalog/` — per-dataset configs: k8s YAML, STAC metadata, processing notes
+- `AGENTS.md` — complete instructions for processing datasets
+- `README.md` — package documentation and CLI reference
 
-- Most buckets are already set for anonymous public access. The public S3 endpoint for the NRP cluster is https://s3-west.nrp-nautilus.io.  Be sure to configure "path" style instead of the default "vhost" style URLs for the software.  
+## Local Environment
 
-- Authentication environmental variables are not set by default on the local machine.  For read-only operations anonymous access should be sufficient; be sure to set the endpoint correctly first. 
+Activate the virtualenv: `source .venv/bin/activate`
 
-- Occassionally we will use other S3 endpoints, which will be explicitly referenced.
+The `cng-datasets` CLI is installed in the venv. Use it to generate k8s job YAML files. Do not run processing commands (vector, raster, repartition) locally — those run inside k8s pods.
 
-- Note that jobs that run on k8s, inside the cluster, use an internal s3 endpoint, `rook-ceph-rgw-nautiluss3.rook`.  This is the same s3 storage system, but provides much faster access but only to pods on the k8s cluster.  It uses plain http (no SSL), and path (not vhost) addressing.  The S3 authentication keys are already available as secrets on the k8s cluster under the `aws` secret, load these secrets when necessary for write access or bucket operations. 
+## Kubernetes
 
+- `kubectl` is pre-configured for the NRP Nautilus cluster, namespace `biodiversity`
+- Secrets `aws` and `rclone-config` are already set up in the namespace
+- All jobs use `priorityClassName: opportunistic` (preemptible)
+- The generated YAML handles all k8s configuration — you just apply it
 
-## k8s
+## S3 Storage
 
-- `kubectl` is already configured with the default namespace (biodiversity).  It's the only ns we have permission for and does not need to be set explicitly.  
+This cluster uses Ceph S3 (not AWS). The `cng-datasets` tool handles all S3 configuration automatically in the generated k8s jobs.
+
+For **local read-only access** to public data:
+```
+https://s3-west.nrp-nautilus.io/<bucket>/<path>
+```
+Use path-style URLs, not virtual-hosted-style. No credentials needed for public buckets.
+
+For `rclone`, configure with remote name `nrp`:
+```
+rclone ls nrp:<bucket>/
+```
+
+You do not need to know about internal S3 endpoints — the generated jobs handle this.
+
+## GDAL
+
+For inspecting remote files locally, use VSI-style paths:
+```bash
+ogrinfo /vsicurl/https://s3-west.nrp-nautilus.io/<bucket>/raw/<file>.gdb
+```
