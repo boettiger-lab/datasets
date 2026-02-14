@@ -47,71 +47,63 @@ _CURVED_GEOMETRY_TYPES = frozenset({
 })
 
 
-def _detect_and_linearize_if_needed(source_url: str, layer: Optional[str] = None,
-                                     verbose: bool = False) -> Tuple[str, Optional[str], Optional[str]]:
+def _is_gdb_source(source_url: str) -> bool:
+    """Check if source is a GDAL FileGDB or OpenFileGDB source."""
+    # Strip VSI prefixes to check file extension
+    cleaned = source_url.lower()
+    for prefix in ('/vsicurl/', '/vsis3/', '/vsigzip/'):
+        cleaned = cleaned.replace(prefix, '')
+    return cleaned.rstrip('/').endswith('.gdb')
+
+
+def _linearize_source(source_url: str, layer: Optional[str] = None,
+                      verbose: bool = False) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    Check if source has curved geometry types (e.g., MULTISURFACE) that DuckDB
-    can't parse, and if so, linearize using ogr2ogr to a temp GPKG.
+    Pre-process a vector source through ogr2ogr to linearize curved
+    geometries and promote to multi-type.  This is always applied to
+    GDB sources because the layer metadata can report "Multi Polygon"
+    while individual features silently contain MULTISURFACE WKB types
+    that DuckDB cannot parse.
+
+    For already-linear geometries the ogr2ogr flags are a no-op, so this
+    is safe to apply unconditionally.
 
     Returns:
         (new_source, new_layer, temp_dir_to_cleanup)
-        If no linearization needed: (source_url, layer, None)
+        If linearization is skipped: (source_url, layer, None)
     """
-    # Detect geometry type using ogrinfo
-    cmd = ['ogrinfo', '-so']
+    if not _is_gdb_source(source_url):
+        if verbose:
+            print(f"  Source is not a GDB — skipping linearization")
+        return source_url, layer, None
+
+    print(f"  GDB source detected — linearizing with ogr2ogr "
+          f"(CONVERT_TO_LINEAR + PROMOTE_TO_MULTI)...")
+
+    lin_dir = tempfile.mkdtemp(prefix='cng_linearize_')
+    output_path = os.path.join(lin_dir, 'linearized.gpkg')
+
+    ogr_cmd = [
+        'ogr2ogr', '-f', 'GPKG',
+        '-nlt', 'CONVERT_TO_LINEAR',
+        '-nlt', 'PROMOTE_TO_MULTI',
+        output_path, source_url,
+    ]
     if layer:
-        cmd.extend([source_url, layer])
-    else:
-        cmd.extend(['-al', source_url])
+        ogr_cmd.append(layer)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        geom_type = None
-        for line in result.stdout.split('\n'):
-            stripped = line.strip()
-            if stripped.startswith('Geometry:') or stripped.startswith('Geometry Type:'):
-                geom_type = stripped.split(':', 1)[1].strip()
-                break
-
-        if geom_type is None:
-            return source_url, layer, None
-
-        # Normalize: "Multi Surface" -> "multisurface"
-        normalized = geom_type.lower().replace(' ', '')
-        is_curved = any(ct in normalized for ct in _CURVED_GEOMETRY_TYPES)
-
-        if not is_curved:
-            if verbose:
-                print(f"  Geometry type '{geom_type}' is linear, no conversion needed")
-            return source_url, layer, None
-
-        # Linearize with ogr2ogr
-        print(f"  Detected curved geometry type: {geom_type}")
-        print(f"  Linearizing with ogr2ogr (CONVERT_TO_LINEAR + PROMOTE_TO_MULTI)...")
-
-        lin_dir = tempfile.mkdtemp(prefix='cng_linearize_')
-        output_path = os.path.join(lin_dir, 'linearized.gpkg')
-
-        ogr_cmd = [
-            'ogr2ogr', '-f', 'GPKG',
-            '-nlt', 'CONVERT_TO_LINEAR',
-            '-nlt', 'PROMOTE_TO_MULTI',
-            output_path, source_url,
-        ]
-        if layer:
-            ogr_cmd.append(layer)
-
         subprocess.run(ogr_cmd, check=True, capture_output=True, text=True, timeout=7200)
         print(f"  Linearized to temp GPKG: {output_path}")
-
-        return output_path, None, lin_dir  # GPKG layer param not needed
-
+        return output_path, None, lin_dir
     except subprocess.TimeoutExpired:
-        print("  Warning: Geometry linearization timed out, proceeding without linearization")
+        print("  Warning: ogr2ogr linearization timed out, proceeding with original source")
+        shutil.rmtree(lin_dir, ignore_errors=True)
         return source_url, layer, None
     except subprocess.CalledProcessError as e:
         print(f"  Warning: ogr2ogr linearization failed: {e.stderr}")
-        print("  Proceeding without linearization (may fail on curved geometries)")
+        print("  Proceeding with original source (may fail on curved geometries)")
+        shutil.rmtree(lin_dir, ignore_errors=True)
         return source_url, layer, None
 
 
@@ -813,7 +805,7 @@ def convert_to_parquet(
             source_crs = None
         
         # Step 1b: Linearize curved geometries if needed (e.g., MULTISURFACE -> MULTIPOLYGON)
-        linearized_source, effective_layer, linearize_dir = _detect_and_linearize_if_needed(
+        linearized_source, effective_layer, linearize_dir = _linearize_source(
             representative_source, layer=layer, verbose=verbose
         )
         if linearize_dir:
