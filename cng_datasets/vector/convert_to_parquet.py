@@ -775,10 +775,12 @@ def convert_to_parquet(
     
     is_zip = source_urls[0].lower().endswith(".zip") if not is_multi_source else False
     
+    # Create a clean URL for zip downloads (without mutating the input list)
+    zip_download_url = source_urls[0]
     if is_zip:
         # Strip GDAL VSI prefixes if present so we can download the raw file
-        if source_urls[0].startswith('/vsicurl/'):
-            source_urls[0] = source_urls[0].replace('/vsicurl/', '')
+        if zip_download_url.startswith('/vsicurl/'):
+            zip_download_url = zip_download_url.replace('/vsicurl/', '')
     
     try:
         temp_dir = None
@@ -786,11 +788,11 @@ def convert_to_parquet(
         source_inputs = []
         
         if is_zip:
-            print(f"  Detected Zip archive: {source_urls[0]}")
+            print(f"  Detected Zip archive: {zip_download_url}")
             temp_dir = tempfile.mkdtemp()
             print(f"  Created temporary directory: {temp_dir}")
             
-            download_and_extract(source_urls[0], temp_dir, verbose=verbose)
+            download_and_extract(zip_download_url, temp_dir, verbose=verbose)
             
             shapefiles = find_shapefiles(temp_dir)
             if not shapefiles:
@@ -817,11 +819,12 @@ def convert_to_parquet(
             representative_source = processed_sources[0]
         else:
             # Single non-zip source
-            # Handle HTTP(S) for GDAL/DuckDB ST_Read
-            if source_urls[0].lower().startswith(('http://', 'https://')) and not source_urls[0].startswith('/vsi'):
-                 source_urls[0] = f"/vsicurl/{source_urls[0]}"
-            source_inputs = source_urls[0]
-            representative_source = source_urls[0]
+            # Handle HTTP(S) for GDAL/DuckDB ST_Read (without mutating input list)
+            single_source_url = source_urls[0]
+            if single_source_url.lower().startswith(('http://', 'https://')) and not single_source_url.startswith('/vsi'):
+                single_source_url = f"/vsicurl/{single_source_url}"
+            source_inputs = single_source_url
+            representative_source = single_source_url
 
         # Step 1: Detect source CRS and geometry column
         print("  Detecting source CRS...")
