@@ -59,7 +59,7 @@ def main():
     # Workflow generation command
     workflow_parser = subparsers.add_parser("workflow", help="Generate complete dataset workflow")
     workflow_parser.add_argument("--dataset", required=True, help="Dataset name (e.g., redlining)")
-    workflow_parser.add_argument("--source-url", required=True, help="Source data URL")
+    workflow_parser.add_argument("--source-url", action="append", required=True, dest="source_urls", help="Source data URL (can be specified multiple times for multiple inputs)")
     workflow_parser.add_argument("--bucket", required=True, help="S3 bucket for outputs")
     workflow_parser.add_argument("--output-dir", default="k8s", help="Output directory for YAML files")
     workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
@@ -212,7 +212,7 @@ def main():
         parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
         generate_dataset_workflow(
             dataset_name=args.dataset,
-            source_url=args.source_url,
+            source_urls=args.source_urls,
             bucket=args.bucket,
             output_dir=args.output_dir,
             namespace=args.namespace,

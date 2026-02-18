@@ -683,7 +683,7 @@ def upload_to_s3(local_path: str, s3_destination: str, verbose: bool = True) -> 
 
 
 def convert_to_parquet(
-    source_url: str,
+    source_url: Union[str, List[str]],
     destination: str,
     compression: str = "ZSTD",
     compression_level: int = 15,
@@ -707,7 +707,7 @@ def convert_to_parquet(
     5. Upload to S3 via rclone if destination is S3
     
     Args:
-        source_url: Source dataset URL (supports s3://, http://, file paths)
+        source_url: Source dataset URL or list of URLs (supports s3://, http://, file paths). Multiple URLs will be merged with UNION ALL.
         destination: Output path (s3:// or local file path)
         compression: Compression algorithm (ZSTD, GZIP, SNAPPY, NONE)
         compression_level: Compression level (1-22 for ZSTD)
@@ -721,10 +721,26 @@ def convert_to_parquet(
         verbose: Print detailed debug information
     """
     # Check if input is already parquet
-    if is_parquet_file(source_url):
+    # Handle list of sources vs single source
+    if isinstance(source_url, list):
+        # Multiple sources provided - handle below
+        is_multi_source = True
+        source_urls = source_url
+        # Use first URL for metadata detection
+        representative_source = source_urls[0]
+    else:
+        is_multi_source = False
+        source_urls = [source_url]
+        representative_source = source_url
+    
+    # Check if all inputs are parquet (special handling)
+    if all(is_parquet_file(url) for url in source_urls):
         # Use parquet-specific processing (no ST_Read)
+        # Note: currently only supports single parquet input
+        if is_multi_source:
+            raise ValueError("Multiple parquet inputs not yet supported. Please merge them first or use vector formats.")
         return process_parquet_input(
-            source_url=source_url,
+            source_url=source_urls[0],
             destination=destination,
             compression=compression,
             compression_level=compression_level,
@@ -737,7 +753,12 @@ def convert_to_parquet(
         )
     
     # Original processing for non-parquet inputs
-    print(f"Converting {source_url}")
+    if is_multi_source:
+        print(f"Converting {len(source_urls)} sources:")
+        for i, url in enumerate(source_urls, 1):
+            print(f"  {i}. {url}")
+    else:
+        print(f"Converting {source_urls[0]}")
     if layer:
         print(f"     layer {layer}")
     print(f"       to {destination}")
@@ -746,13 +767,18 @@ def convert_to_parquet(
         print(f"  Compression: {compression} level {compression_level}")
         print(f"  Row group size: {row_group_size:,}")
     
-    is_zip = source_url.lower().endswith(".zip")
+    # Check if any source is a .zip file
+    has_zip = any(url.lower().endswith(".zip") for url in source_urls)
+    
+    if has_zip and is_multi_source:
+        raise ValueError("Cannot mix .zip files with multiple source URLs. Extract zip files or process separately.")
+    
+    is_zip = source_urls[0].lower().endswith(".zip") if not is_multi_source else False
     
     if is_zip:
         # Strip GDAL VSI prefixes if present so we can download the raw file
-        if source_url.startswith('/vsicurl/'):
-            source_url = source_url.replace('/vsicurl/', '')
-
+        if source_urls[0].startswith('/vsicurl/'):
+            source_urls[0] = source_urls[0].replace('/vsicurl/', '')
     
     try:
         temp_dir = None
@@ -760,11 +786,11 @@ def convert_to_parquet(
         source_inputs = []
         
         if is_zip:
-            print(f"  Detected Zip archive: {source_url}")
+            print(f"  Detected Zip archive: {source_urls[0]}")
             temp_dir = tempfile.mkdtemp()
             print(f"  Created temporary directory: {temp_dir}")
             
-            download_and_extract(source_url, temp_dir, verbose=verbose)
+            download_and_extract(source_urls[0], temp_dir, verbose=verbose)
             
             shapefiles = find_shapefiles(temp_dir)
             if not shapefiles:
@@ -777,12 +803,25 @@ def convert_to_parquet(
             representative_source = shapefiles[0]
             print(f"  Using {os.path.basename(representative_source)} for metadata detection")
             
+        elif is_multi_source:
+            # Multiple non-zip sources
+            print(f"  Processing {len(source_urls)} input files...")
+            processed_sources = []
+            for url in source_urls:
+                # Handle HTTP(S) for GDAL/DuckDB ST_Read
+                if url.lower().startswith(('http://', 'https://')) and not url.startswith('/vsi'):
+                    processed_sources.append(f"/vsicurl/{url}")
+                else:
+                    processed_sources.append(url)
+            source_inputs = processed_sources
+            representative_source = processed_sources[0]
         else:
+            # Single non-zip source
             # Handle HTTP(S) for GDAL/DuckDB ST_Read
-            if source_url.lower().startswith(('http://', 'https://')) and not source_url.startswith('/vsi'):
-                 source_url = f"/vsicurl/{source_url}"
-            source_inputs = source_url
-            representative_source = source_url
+            if source_urls[0].lower().startswith(('http://', 'https://')) and not source_urls[0].startswith('/vsi'):
+                 source_urls[0] = f"/vsicurl/{source_urls[0]}"
+            source_inputs = source_urls[0]
+            representative_source = source_urls[0]
 
         # Step 1: Detect source CRS and geometry column
         print("  Detecting source CRS...")
@@ -910,7 +949,7 @@ Examples:
         """
     )
     
-    parser.add_argument("source", help="Source dataset URL or path")
+    parser.add_argument("source", nargs='+', help="Source dataset URL(s) or path(s). Multiple sources will be merged with UNION ALL.")
     parser.add_argument("destination", help="Output GeoParquet path")
     
     parser.add_argument("--compression", default="ZSTD",
@@ -938,9 +977,12 @@ Examples:
     
     args = parser.parse_args()
     
+    # Handle single vs multiple sources
+    source_inputs = args.source if len(args.source) > 1 else args.source[0]
+    
     try:
         convert_to_parquet(
-            source_url=args.source,
+            source_url=source_inputs,
             destination=args.destination,
             compression=args.compression,
             compression_level=args.compression_level,
