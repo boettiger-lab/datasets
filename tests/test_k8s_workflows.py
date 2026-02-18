@@ -268,6 +268,74 @@ class TestEdgeCases:
             assert output_dir.exists()
             assert (output_dir / "test-ds-convert.yaml").exists()
 
+    @pytest.mark.timeout(10)
+    def test_multi_source_workflow(self, mocker):
+        """Test generating workflow with multiple source URLs."""
+        # Mock feature counting to avoid trying to access non-existent URLs
+        mocker.patch('cng_datasets.k8s.workflows._count_source_features', return_value=10000)
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Test with list of URLs
+            generate_dataset_workflow(
+                dataset_name="multi-test",
+                source_urls=[
+                    "https://example.com/region1.shp",
+                    "https://example.com/region2.shp",
+                    "https://example.com/region3.shp"
+                ],
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                namespace="test-ns"
+            )
+            
+            output_path = Path(tmpdir)
+            convert_file = output_path / "multi-test-convert.yaml"
+            
+            assert convert_file.exists(), "Convert job file should exist"
+            
+            # Verify YAML is valid
+            with open(convert_file) as f:
+                job = yaml.safe_load(f)
+            
+            # Check that the command contains all three source URLs
+            container_spec = job["spec"]["template"]["spec"]["containers"][0]
+            command_str = str(container_spec)
+            
+            assert "region1.shp" in command_str
+            assert "region2.shp" in command_str
+            assert "region3.shp" in command_str
+            
+    @pytest.mark.timeout(10)
+    def test_single_source_as_string(self, mocker):
+        """Test that single source URL as string still works (backwards compatibility)."""
+        # Mock feature counting to avoid trying to access non-existent URLs
+        mocker.patch('cng_datasets.k8s.workflows._count_source_features', return_value=5000)
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Test with single string URL (not a list)
+            generate_dataset_workflow(
+                dataset_name="single-test",
+                source_urls="https://example.com/single.shp",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                namespace="test-ns"
+            )
+            
+            output_path = Path(tmpdir)
+            convert_file = output_path / "single-test-convert.yaml"
+            
+            assert convert_file.exists(), "Convert job file should exist"
+            
+            # Verify YAML is valid
+            with open(convert_file) as f:
+                job = yaml.safe_load(f)
+            
+            # Check that the command contains the source URL
+            container_spec = job["spec"]["template"]["spec"]["containers"][0]
+            command_str = str(container_spec)
+            
+            assert "single.shp" in command_str
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

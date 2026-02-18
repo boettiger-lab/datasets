@@ -5,24 +5,46 @@ Functions for creating complete dataset processing workflows with
 multiple coordinated Kubernetes jobs.
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 import math
 import yaml
 from .jobs import K8sJobManager
 
 
-def _count_source_features(source_url: str, layer: str = None) -> int:
+def _count_source_features(source_urls: Union[str, List[str]], layer: str = None) -> int:
     """
-    Count features in a source file (shapefile, geopackage, etc.) using GDAL with vsicurl.
+    Count features in source file(s) (shapefile, geopackage, etc.) using GDAL with vsicurl.
     For .zip files, it downloads, extracts, and counts features in all shapefiles.
+    
+    Args:
+        source_urls: HTTP(S) or S3 URL(s) to source vector file(s). Can be a single string or list.
+        layer: Optional layer name for multi-layer sources (GDB, GPKG)
+        
+    Returns:
+        Total number of features across all source file(s)
+    """
+    # Normalize to list
+    if isinstance(source_urls, str):
+        source_urls = [source_urls]
+    
+    total_count = 0
+    for source_url in source_urls:
+        total_count += _count_single_source(source_url, layer)
+    
+    return total_count
+
+
+def _count_single_source(source_url: str, layer: str = None) -> int:
+    """
+    Count features in a single source file.
     
     Args:
         source_url: HTTP(S) or S3 URL to source vector file
         layer: Optional layer name for multi-layer sources (GDB, GPKG)
         
     Returns:
-        Number of features in the source file(s)
+        Number of features in the source file
     """
     import subprocess
     import tempfile
@@ -159,8 +181,8 @@ def _calculate_chunking(total_rows: int, max_completions: int = 200, max_paralle
 
 def generate_dataset_workflow(
     dataset_name: str,
-    source_url: str,
-    bucket: str,
+    source_urls: Union[str, List[str]] = None,
+    bucket: str = None,
     output_dir: str = ".",
     namespace: str = "biodiversity",
     image: str = "ghcr.io/boettiger-lab/datasets:latest",
@@ -173,7 +195,9 @@ def generate_dataset_workflow(
     max_parallelism: int = 50,
     max_completions: int = 200,
     intermediate_chunk_size: int = 10,
-    row_group_size: int = 100000
+    row_group_size: int = 100000,
+    # Backwards compatibility: accept source_url (singular)
+    source_url: Union[str, List[str]] = None,
 ):
     """
     Generate complete workflow for a dataset.
@@ -187,7 +211,7 @@ def generate_dataset_workflow(
     
     Args:
         dataset_name: Name of the dataset (e.g., "redlining")
-        source_url: URL to source data file
+        source_urls: URL(s) to source data file(s). Can be a single string or list. Multiple sources will be merged.
         bucket: S3 bucket for outputs
         output_dir: Directory to write YAML files
         namespace: Kubernetes namespace
@@ -200,13 +224,27 @@ def generate_dataset_workflow(
         max_parallelism: Maximum parallelism for hex jobs (default: 50)
         max_completions: Maximum job completions - increase to reduce chunk size (default: 200)
         intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM (default: 10)
+        source_url: (Deprecated) Use source_urls instead. Kept for backwards compatibility.
     """
+    # Handle backwards compatibility for source_url parameter
+    if source_url is not None and source_urls is None:
+        source_urls = source_url
+    elif source_urls is None:
+        raise ValueError("Either source_urls or source_url must be provided")
+    
+    if bucket is None:
+        raise ValueError("bucket parameter is required")
+    
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Sanitize dataset name for Kubernetes (replace underscores, slashes with hyphens)
     k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
+    
+    # Normalize source_urls to list
+    if isinstance(source_urls, str):
+        source_urls = [source_urls]
     
     # Set defaults for parent resolutions if not provided
     if parent_resolutions is None:
@@ -216,15 +254,18 @@ def generate_dataset_workflow(
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
     
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_url, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name)
+    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name)
     
-    # Generate pmtiles job
-    _generate_pmtiles_job(manager, k8s_name, source_url, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name)
+    # Generate pmtiles job (uses converted parquet, not source)
+    _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name)
     
-    # Count features in source file and calculate chunking parameters
-    print(f"Counting features in {source_url}...")
+    # Count features in source file(s) and calculate chunking parameters
+    if len(source_urls) > 1:
+        print(f"Counting features in {len(source_urls)} sources...")
+    else:
+        print(f"Counting features in {source_urls[0]}...")
     try:
-        total_rows = _count_source_features(source_url, layer=layer)
+        total_rows = _count_source_features(source_urls, layer=layer)
         chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
         print(f"  Total features: {total_rows:,}")
         print(f"  Chunk size: {chunk_size:,}")
@@ -251,8 +292,10 @@ def generate_dataset_workflow(
     
     # Build generation command for documentation
     parent_res_str = ','.join(map(str, parent_resolutions))
+    # Format source URLs for command recreation
+    source_urls_str = ' '.join([f'--source-url {url}' for url in source_urls])
     gen_command = (f"cng-datasets workflow --dataset {dataset_name} "
-                   f"--source-url {source_url} --bucket {bucket} "
+                   f"{source_urls_str} --bucket {bucket} "
                    f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
     
     # Generate ConfigMap YAML from job files
@@ -624,14 +667,22 @@ echo "Bucket setup complete!"
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-setup-bucket.yaml"))
 
 
-def _generate_convert_job(manager, dataset_name, source_url, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None):
+def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None):
     """Generate GeoParquet conversion job."""
     s3_dataset = s3_dataset or dataset_name
+    
+    # Normalize to list
+    if isinstance(source_urls, str):
+        source_urls = [source_urls]
+    
+    # Build source URLs string (one per line for readability)
+    sources_str = " \\\n  ".join(source_urls)
+    
     # Build the conversion command with optional layer parameter
     layer_flag = f" \\\n  --layer {layer}" if layer else ""
     convert_cmd = f"""set -e
 cng-convert-to-parquet \\
-  {source_url} \\
+  {sources_str} \\
   s3://{bucket}/{s3_dataset}.parquet \\
   --row-group-size {row_group_size}{layer_flag}
 """

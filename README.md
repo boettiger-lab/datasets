@@ -48,6 +48,17 @@ This generates YAML files for a 5-step pipeline:
 4. **hex** — computes H3 cell assignments in parallel pods
 5. **repartition** — consolidates hex chunks into hive-partitioned layout
 
+**Multiple sources:** Add `--source-url` multiple times to merge datasets:
+
+```bash
+cng-datasets workflow \
+  --dataset merged-regions \
+  --source-url https://example.com/region1.shp \
+  --source-url https://example.com/region2.shp \
+  --source-url https://example.com/region3.shp \
+  --bucket my-bucket
+```
+
 Apply them:
 
 ```bash
