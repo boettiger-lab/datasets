@@ -39,6 +39,14 @@ RUN uv pip install "numpy<2" pip
 # Install the package with uv for fast resolution (GDAL already available from system)
 RUN uv pip install -e "."
 
+# Fix PROJ_LIB path: gdal:ubuntu-full installs proj.db at a non-standard location
+# (e.g. /usr/local/gdal-internal/share/proj). Create a symlink at the canonical
+# path so that PROJ_LIB=/usr/local/share/proj always resolves correctly.
+RUN mkdir -p /usr/local/share && \
+    PROJ_DIR=$(find /usr -name "proj.db" 2>/dev/null | head -1 | xargs -r dirname) && \
+    [ -n "${PROJ_DIR}" ] && [ "${PROJ_DIR}" != "/usr/local/share/proj" ] && \
+    ln -sfn "${PROJ_DIR}" /usr/local/share/proj || true
+
 # Set Python to run in unbuffered mode (recommended for containers)
 ENV PYTHONUNBUFFERED=1
 
