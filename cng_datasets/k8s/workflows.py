@@ -451,6 +451,12 @@ def _generate_raster_hex_job(
             "parallelism": max_parallelism,
             "completionMode": "Indexed",
             "backoffLimit": 0,
+            "podFailurePolicy": {
+                "rules": [{
+                    "action": "Ignore",
+                    "onPodConditions": [{"type": "DisruptionTarget"}]
+                }]
+            },
             "ttlSecondsAfterFinished": 10800,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-hex"}},
@@ -885,7 +891,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
             "completions": completions,
             "parallelism": parallelism,
             "completionMode": "Indexed",
-            "backoffLimitPerIndex": 3,
+            "backoffLimit": 0,
             "podFailurePolicy": {
                 "rules": [{
                     "action": "Ignore",
