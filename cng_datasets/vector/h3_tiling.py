@@ -386,7 +386,7 @@ class H3VectorProcessor:
         
         # Use local /tmp for fast batch processing, then copy to final destination
         local_output = f"/tmp/h3_output_{chunk_id:06d}.parquet"
-        final_output = f"{self.output_url}/chunk_{chunk_id:06d}.parquet"
+        final_output = f"{self.output_url.rstrip('/')}/chunk_{chunk_id:06d}.parquet"
         
         for batch_id in range(num_batches):
             batch_offset = batch_id * self.intermediate_chunk_size

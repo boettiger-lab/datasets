@@ -106,7 +106,7 @@ def repartition_by_h0(
     result.to_parquet(f'{local_dir}/', partition_by='h0')
     
     print('Uploading partitioned data to S3...')
-    con.read_parquet(f'{local_dir}/**/*.parquet').to_parquet(f'{output_dir}/', partition_by='h0')
+    con.read_parquet(f'{local_dir}/**/*.parquet').to_parquet(f'{output_dir.rstrip("/")}/', partition_by='h0')
     
     print('Cleaning up local directory...')
     shutil.rmtree(local_dir)
