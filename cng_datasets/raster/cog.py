@@ -429,7 +429,7 @@ class RasterProcessor:
         where_clause = f"WHERE Z != {self.nodata_value}" if self.nodata_value is not None else ""
         
         # Generate H3 cells with parent resolutions
-        output_path = f"{self.output_parquet_path}/h0={h0_cell}/data_0.parquet"
+        output_path = f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"
         
         # Create output directory if it doesn't exist
         output_dir = os.path.dirname(output_path)
