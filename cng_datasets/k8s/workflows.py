@@ -823,7 +823,7 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
                         "command": ["bash", "-c", f"""set -e
 # Use optimized GeoParquet (has ID column) from convert job
 # GDAL can read parquet via vsicurl
-ogr2ogr -f GeoJSONSeq /tmp/$DATASET.geojsonl /vsicurl/{geoparquet_url} -progress
+ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$DATASET.geojsonl /vsicurl/{geoparquet_url} -progress
 
 # Generate PMTiles from GeoJSONSeq
 tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/$DATASET.geojsonl

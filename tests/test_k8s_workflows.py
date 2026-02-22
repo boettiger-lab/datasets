@@ -206,6 +206,26 @@ class TestWorkflowGeneration:
             assert resources["limits"]["memory"] == "16Gi"
     
     @pytest.mark.timeout(5)
+    def test_pmtiles_job_wrapdateline(self):
+        """Test that pmtiles job includes -wrapdateline flag to handle antimeridian-crossing geometries."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+
+            pmtiles_file = Path(tmpdir) / "test-ds-pmtiles.yaml"
+            with open(pmtiles_file) as f:
+                job = yaml.safe_load(f)
+
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"]
+            command_str = str(command)
+            assert "-wrapdateline" in command_str
+            assert "-datelineoffset 15" in command_str
+
+    @pytest.mark.timeout(5)
     def test_workflow_rbac(self):
         """Test RBAC configuration is generated."""
         with tempfile.TemporaryDirectory() as tmpdir:
