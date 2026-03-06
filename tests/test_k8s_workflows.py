@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from cng_datasets.k8s import generate_dataset_workflow, K8sJobManager
+from cng_datasets.k8s.workflows import generate_raster_workflow
 
 
 class TestK8sJobManager:
@@ -355,6 +356,261 @@ class TestEdgeCases:
             command_str = str(container_spec)
             
             assert "single.shp" in command_str
+
+
+class TestRasterWorkflowGeneration:
+    """Tests for generate_raster_workflow(), especially the multi-tile mosaic path."""
+
+    SOURCE_URL = "https://example.com/tile.tif"
+    TILE_URLS = [
+        "https://example.com/zone12-tile1.tif",
+        "https://example.com/zone12-tile2.tif",
+        "https://example.com/zone13-tile1.tif",
+    ]
+
+    def _load_yaml(self, path):
+        with open(path) as f:
+            return yaml.safe_load(f)
+
+    @pytest.mark.timeout(5)
+    def test_single_url_no_preprocess_job(self):
+        """Single source URL → no preprocess-cog.yaml should be generated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-raster",
+                source_urls=self.SOURCE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            assert not (Path(tmpdir) / "test-raster-preprocess-cog.yaml").exists()
+            assert (Path(tmpdir) / "test-raster-hex.yaml").exists()
+
+    @pytest.mark.timeout(5)
+    def test_multi_url_generates_preprocess_job(self):
+        """Multiple source URLs → preprocess-cog.yaml should be generated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            assert (Path(tmpdir) / "test-mosaic-preprocess-cog.yaml").exists()
+            assert (Path(tmpdir) / "test-mosaic-hex.yaml").exists()
+
+    @pytest.mark.timeout(5)
+    def test_target_extent_triggers_preprocess(self):
+        """Single URL + target_extent → preprocess-cog.yaml should be generated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-clip",
+                source_urls=self.SOURCE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                target_extent=(-111.1, 40.9, -104.0, 45.1),
+            )
+            assert (Path(tmpdir) / "test-clip-preprocess-cog.yaml").exists()
+
+    @pytest.mark.timeout(5)
+    def test_band_triggers_preprocess(self):
+        """Single URL + band → preprocess-cog.yaml should be generated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-band",
+                source_urls=self.SOURCE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                band=4,
+            )
+            assert (Path(tmpdir) / "test-band-preprocess-cog.yaml").exists()
+
+    @pytest.mark.timeout(5)
+    def test_preprocess_job_all_input_urls_present(self):
+        """Preprocess job command must include all source tile URLs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            job = self._load_yaml(Path(tmpdir) / "test-mosaic-preprocess-cog.yaml")
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            for url in self.TILE_URLS:
+                assert url in command_str, f"Expected tile URL {url!r} in preprocess command"
+
+    @pytest.mark.timeout(5)
+    def test_preprocess_job_output_cog_url(self):
+        """Preprocess job command must reference the correct S3 output COG URL."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="my-bucket",
+                output_dir=tmpdir,
+            )
+            job = self._load_yaml(Path(tmpdir) / "test-mosaic-preprocess-cog.yaml")
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "s3://my-bucket/test-mosaic-cog.tif" in command_str
+
+    @pytest.mark.timeout(5)
+    def test_preprocess_job_custom_cog_name(self):
+        """output_cog_name overrides the default COG filename."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="my-bucket",
+                output_dir=tmpdir,
+                output_cog_name="custom-name.tif",
+            )
+            job = self._load_yaml(Path(tmpdir) / "test-mosaic-preprocess-cog.yaml")
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "s3://my-bucket/custom-name.tif" in command_str
+
+    @pytest.mark.timeout(5)
+    def test_preprocess_job_resources(self):
+        """Preprocess job must request sufficient CPU/memory/storage for mosaicking."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            job = self._load_yaml(Path(tmpdir) / "test-mosaic-preprocess-cog.yaml")
+            resources = job["spec"]["template"]["spec"]["containers"][0]["resources"]
+            assert resources["requests"]["cpu"] == "8"
+            assert resources["requests"]["memory"] == "32Gi"
+            assert resources["requests"]["ephemeral-storage"] == "200Gi"
+
+    @pytest.mark.timeout(5)
+    def test_preprocess_job_target_extent_flag(self):
+        """target_extent should appear in preprocess job command as --target-extent."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-clip",
+                source_urls=self.SOURCE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                target_extent=(-111.1, 40.9, -104.0, 45.1),
+            )
+            job = self._load_yaml(Path(tmpdir) / "test-clip-preprocess-cog.yaml")
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--target-extent" in command_str
+            assert "-111.1" in command_str
+            assert "45.1" in command_str
+
+    @pytest.mark.timeout(5)
+    def test_preprocess_job_band_flag(self):
+        """band should appear in preprocess job command as --band."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-band",
+                source_urls=self.SOURCE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                band=4,
+            )
+            job = self._load_yaml(Path(tmpdir) / "test-band-preprocess-cog.yaml")
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--band 4" in command_str
+
+    @pytest.mark.timeout(5)
+    def test_hex_job_reads_from_cog_when_preprocess(self):
+        """When preprocess is needed, hex job should read from the intermediate COG, not source URLs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="my-bucket",
+                output_dir=tmpdir,
+            )
+            hex_job = self._load_yaml(Path(tmpdir) / "test-mosaic-hex.yaml")
+            command_str = str(hex_job["spec"]["template"]["spec"]["containers"][0]["command"])
+            # Hex job should reference the intermediate COG, not individual tile URLs
+            assert "s3://my-bucket/test-mosaic-cog.tif" in command_str
+            for url in self.TILE_URLS:
+                assert url not in command_str, f"Hex job should not reference source tile {url!r}"
+
+    @pytest.mark.timeout(5)
+    def test_hex_job_reads_from_source_when_no_preprocess(self):
+        """When no preprocess needed, hex job should reference the source URL directly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-raster",
+                source_urls=self.SOURCE_URL,
+                bucket="my-bucket",
+                output_dir=tmpdir,
+            )
+            hex_job = self._load_yaml(Path(tmpdir) / "test-raster-hex.yaml")
+            command_str = str(hex_job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert self.SOURCE_URL in command_str
+
+    @pytest.mark.timeout(5)
+    def test_raster_workflow_backwards_compat_string(self):
+        """source_urls accepts a plain string for backwards compatibility."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="compat-test",
+                source_urls="https://example.com/data.tif",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            assert (Path(tmpdir) / "compat-test-hex.yaml").exists()
+            assert not (Path(tmpdir) / "compat-test-preprocess-cog.yaml").exists()
+
+    @pytest.mark.timeout(5)
+    def test_configmap_includes_preprocess_step(self):
+        """ConfigMap workflow script should reference the preprocess-cog job when needed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            configmap = self._load_yaml(Path(tmpdir) / "configmap.yaml")
+            script = str(configmap)
+            assert "preprocess-cog" in script
+
+    @pytest.mark.timeout(5)
+    def test_configmap_excludes_preprocess_step_for_single_url(self):
+        """ConfigMap workflow script should NOT reference preprocess-cog for single-URL case."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-raster",
+                source_urls=self.SOURCE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            configmap = self._load_yaml(Path(tmpdir) / "configmap.yaml")
+            script = str(configmap)
+            assert "preprocess-cog" not in script
+
+    @pytest.mark.timeout(5)
+    def test_preprocess_job_no_gpu_affinity(self):
+        """Preprocess job must avoid GPU nodes (CPU-only GDAL workload)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            job = self._load_yaml(Path(tmpdir) / "test-mosaic-preprocess-cog.yaml")
+            affinity = job["spec"]["template"]["spec"]["affinity"]
+            selector_terms = (
+                affinity["nodeAffinity"]
+                ["requiredDuringSchedulingIgnoredDuringExecution"]
+                ["nodeSelectorTerms"]
+            )
+            exprs = [e for term in selector_terms for e in term.get("matchExpressions", [])]
+            gpu_expr = next(
+                (e for e in exprs if "pci-10de" in e.get("key", "")), None
+            )
+            assert gpu_expr is not None, "Should have GPU node avoidance affinity"
+            assert gpu_expr["operator"] == "NotIn"
 
 
 if __name__ == "__main__":

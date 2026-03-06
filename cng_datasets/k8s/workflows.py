@@ -332,7 +332,7 @@ def generate_dataset_workflow(
 
 def generate_raster_workflow(
     dataset_name: str,
-    source_url: str,
+    source_urls: Union[str, List[str]],
     bucket: str,
     output_dir: str = ".",
     namespace: str = "biodiversity",
@@ -344,80 +344,219 @@ def generate_raster_workflow(
     nodata_value: Optional[float] = None,
     hex_memory: str = "32Gi",
     max_parallelism: int = 61,
+    target_extent: Optional[tuple] = None,
+    target_resolution: Optional[float] = None,
+    band: Optional[int] = None,
+    output_cog_name: Optional[str] = None,
+    # backwards compat
+    source_url: Optional[str] = None,
 ):
     """
     Generate complete workflow for a raster dataset.
-    
-    Creates all necessary Kubernetes job configurations for processing
-    a raster dataset:
-    1. Setup bucket
-    2. H3 hexagonal tiling (partitioned by h0)
-    
+
+    Creates all necessary Kubernetes job configurations:
+    - Single source URL: setup-bucket → hex
+    - Multiple source URLs (or target_extent/band): setup-bucket → preprocess-cog → hex
+
+    The preprocess-cog step mosaics tiles (handling mixed CRS such as multiple UTM
+    zones), optionally clips to target_extent, and writes a single WGS84 COG to S3
+    that the hex job then reads.
+
     Args:
-        dataset_name: Name of the dataset
-        source_url: URL to source COG file
+        dataset_name: Name of the dataset (e.g., "wyoming/rap-arte")
+        source_urls: URL(s) to source raster tile(s). Repeat for multi-tile mosaics.
         bucket: S3 bucket for outputs
         output_dir: Directory to write YAML files
         namespace: Kubernetes namespace
         image: Container image to use
-        git_repo: Git repository URL for package source
         h3_resolution: Target H3 resolution for tiling (default: 8)
-        parent_resolutions: List of parent H3 resolutions to include (default: [0])
+        parent_resolutions: List of parent H3 resolutions (default: [0])
         value_column: Name for raster value column (default: "value")
         nodata_value: NoData value to exclude (optional)
-        hex_memory: Memory request/limit for hex job pods (default: "32Gi")
-        max_parallelism: Maximum parallelism for hex jobs (default: 61)
+        hex_memory: Memory per hex pod (default: "32Gi")
+        max_parallelism: Max parallel hex pods (default: 61)
+        target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step
+        target_resolution: Output pixel size in degrees for mosaic step
+        band: Extract single band from multi-band sources (1-indexed) for mosaic step
+        output_cog_name: S3 key for intermediate COG (default: "{k8s_name}-cog.tif")
+        source_url: Deprecated alias for source_urls (single URL).
     """
+    # backwards compat
+    if source_url is not None and source_urls is None:
+        source_urls = source_url
+
+    if isinstance(source_urls, str):
+        source_urls = [source_urls]
+
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Sanitize dataset name for Kubernetes
-    k8s_name = dataset_name.replace('_', '-').lower()
-    
-    # Set defaults for parent resolutions if not provided
+
+    k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
+
     if parent_resolutions is None:
         parent_resolutions = [0]
-    
-    # Generate bucket setup job (must run first)
+
+    # Decide whether a preprocess-cog step is needed
+    needs_preprocess = len(source_urls) > 1 or target_extent is not None or band is not None
+
+    if needs_preprocess:
+        cog_key = output_cog_name or f"{k8s_name}-cog.tif"
+        cog_s3_url = f"s3://{bucket}/{cog_key}"
+        hex_input_url = cog_s3_url
+    else:
+        cog_key = None
+        hex_input_url = source_urls[0]
+
+    # Generate bucket setup job
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
-    
+
+    # Generate preprocess-cog job when needed
+    if needs_preprocess:
+        _generate_cog_preprocess_job(
+            manager, k8s_name, source_urls, cog_s3_url, output_path,
+            target_extent=target_extent,
+            target_resolution=target_resolution,
+            band=band,
+            nodata_value=nodata_value,
+        )
+
     # Generate raster hex tiling job
     _generate_raster_hex_job(
-        manager, k8s_name, source_url, bucket, output_path, git_repo,
+        manager, k8s_name, hex_input_url, bucket, output_path, git_repo,
         h3_resolution, parent_resolutions, value_column, nodata_value,
         hex_memory, max_parallelism
     )
-    
+
     # Generate workflow RBAC
     _generate_workflow_rbac(namespace, output_path)
-    
+
     # Build generation command for documentation
     parent_res_str = ','.join(map(str, parent_resolutions))
+    source_flags = ' '.join(f'--source-url "{u}"' for u in source_urls)
     gen_command = (f"cng-datasets raster-workflow --dataset {dataset_name} "
-                   f"--source-url {source_url} --bucket {bucket} "
+                   f"{source_flags} --bucket {bucket} "
                    f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
-    
-    # Generate ConfigMap YAML
-    _generate_raster_configmap(k8s_name, namespace, output_path, gen_command)
-    
-    # Generate Argo workflow
-    _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir)
-    
+
+    # Generate ConfigMap and orchestrator workflow
+    _generate_raster_configmap(k8s_name, namespace, output_path, gen_command, needs_preprocess)
+    _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir, needs_preprocess)
+
     print(f"\n✓ Generated raster workflow for {dataset_name}")
     print(f"\nFiles created in {output_dir}:")
     print(f"  - {k8s_name}-setup-bucket.yaml")
+    if needs_preprocess:
+        print(f"  - {k8s_name}-preprocess-cog.yaml  (mosaic {len(source_urls)} tiles → {cog_key})")
     print(f"  - {k8s_name}-hex.yaml")
     print(f"  - workflow-rbac.yaml")
     print(f"  - configmap.yaml")
     print(f"  - workflow.yaml")
     print(f"\nTo run:")
-    print(f"  # One-time RBAC setup")
-    print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
-    print(f"")
-    print(f"  # Apply all workflow files")
-    print(f"  kubectl apply -f {output_dir}/configmap.yaml")
-    print(f"  kubectl apply -f {output_dir}/workflow.yaml")
+    print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml  # one-time")
+    print(f"  kubectl apply -f {output_dir}/configmap.yaml -f {output_dir}/workflow.yaml")
+
+
+def _generate_cog_preprocess_job(
+    manager, dataset_name, source_urls, output_cog_url, output_path,
+    target_extent=None, target_resolution=None, band=None, nodata_value=None,
+):
+    """Generate a k8s job that mosaics multiple raster tiles into a single COG on S3."""
+    # Build --input flags (one per tile)
+    input_flags = "\n  ".join(f'--input "{u}" \\' for u in source_urls)
+
+    optional_flags = ""
+    if target_extent is not None:
+        xmin, ymin, xmax, ymax = target_extent
+        optional_flags += f'\n  --target-extent "{xmin},{ymin},{xmax},{ymax}" \\'
+    if target_resolution is not None:
+        optional_flags += f"\n  --target-resolution {target_resolution} \\"
+    if band is not None:
+        optional_flags += f"\n  --band {band} \\"
+    if nodata_value is not None:
+        optional_flags += f"\n  --nodata {nodata_value} \\"
+
+    command_str = f"""set -e
+
+# Locate PROJ database
+PROJ_DB=$(find /usr /opt -name "proj.db" 2>/dev/null | head -1)
+if [ -n "$PROJ_DB" ]; then
+  export PROJ_DATA="$(dirname $PROJ_DB)"
+  export PROJ_LIB="$PROJ_DATA"
+fi
+
+echo "Mosaicking {len(source_urls)} tiles → {output_cog_url}"
+
+cng-datasets raster \\
+  {input_flags}
+  --output-cog "{output_cog_url}" \\
+  --target-crs EPSG:4326 \\
+  --resampling bilinear{optional_flags}
+
+echo "✓ Preprocess COG complete: {output_cog_url}"
+"""
+
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": f"{dataset_name}-preprocess-cog",
+            "labels": {"k8s-app": f"{dataset_name}-preprocess-cog"},
+        },
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 1,
+            "ttlSecondsAfterFinished": 86400,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-preprocess-cog"}},
+                "spec": {
+                    "priorityClassName": "opportunistic",
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [{
+                                    "matchExpressions": [{
+                                        "key": "feature.node.kubernetes.io/pci-10de.present",
+                                        "operator": "NotIn",
+                                        "values": ["true"],
+                                    }]
+                                }]
+                            }
+                        }
+                    },
+                    "restartPolicy": "Never",
+                    "volumes": [
+                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
+                    ],
+                    "containers": [{
+                        "name": "preprocess-cog",
+                        "image": "ghcr.io/boettiger-lab/datasets:latest",
+                        "imagePullPolicy": "Always",
+                        "env": [
+                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
+                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
+                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
+                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
+                            {"name": "AWS_HTTPS", "value": "false"},
+                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
+                            {"name": "GDAL_CACHEMAX", "value": "4096"},
+                            {"name": "GDAL_HTTP_TIMEOUT", "value": "60"},
+                            {"name": "GDAL_HTTP_MAX_RETRY", "value": "5"},
+                        ],
+                        "volumeMounts": [
+                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+                        ],
+                        "command": ["bash", "-c", command_str],
+                        "resources": {
+                            "requests": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "200Gi"},
+                            "limits": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "200Gi"},
+                        },
+                    }],
+                },
+            },
+        },
+    }
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-preprocess-cog.yaml"))
 
 
 def _generate_raster_hex_job(
@@ -505,47 +644,66 @@ def _generate_raster_hex_job(
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-hex.yaml"))
 
 
-def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command):
+def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command, needs_preprocess=False):
     """Generate ConfigMap for raster workflow."""
     import yaml
-    
-    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-hex.yaml"]
+
+    job_files = [f"{dataset_name}-setup-bucket.yaml"]
+    if needs_preprocess:
+        job_files.append(f"{dataset_name}-preprocess-cog.yaml")
+    job_files.append(f"{dataset_name}-hex.yaml")
+
     data = {}
-    
     for job_file in job_files:
         file_path = output_path / job_file
         if file_path.exists():
             with open(file_path, 'r') as f:
                 data[job_file] = f.read()
-    
+
     configmap = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {
             "name": f"{dataset_name}-yamls",
-            "namespace": namespace
+            "namespace": namespace,
         },
-        "data": data
+        "data": data,
     }
-    
+
     with open(output_path / "configmap.yaml", "w") as f:
         f.write("# Auto-generated ConfigMap for raster workflow\n")
         f.write(f"# Generation command: {gen_command}\n")
         yaml.dump(configmap, f, default_flow_style=False)
 
 
-def _generate_raster_argo_workflow(dataset_name, namespace, output_path, output_dir):
+def _generate_raster_argo_workflow(dataset_name, namespace, output_path, output_dir, needs_preprocess=False):
     """Generate orchestrator job for raster workflow."""
     import yaml
-    
+
     configmap_name = f"{dataset_name}-yamls"
-    
+
+    preprocess_steps = ""
+    cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-hex {dataset_name}-workflow"
+    if needs_preprocess:
+        preprocess_steps = f"""
+# Step 1: Preprocess — mosaic tiles into a single COG on S3
+echo "Step 1: Preprocessing COG mosaic..."
+kubectl apply -f /yamls/{dataset_name}-preprocess-cog.yaml -n {namespace}
+
+echo "Waiting for preprocess-cog (may take 30-60 min for large tile sets)..."
+kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-preprocess-cog -n {namespace}
+"""
+        hex_step_num = "2"
+        cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-preprocess-cog {dataset_name}-hex {dataset_name}-workflow"
+    else:
+        hex_step_num = "1"
+
     workflow_job = {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": f"{dataset_name}-workflow",
-            "namespace": namespace
+            "namespace": namespace,
         },
         "spec": {
             "template": {
@@ -556,47 +714,41 @@ def _generate_raster_argo_workflow(dataset_name, namespace, output_path, output_
                         "name": "workflow",
                         "image": "bitnami/kubectl:latest",
                         "command": ["bash", "-c"],
-                        "args": [f"""
-set -e
+                        "args": [f"""set -e
 
 echo "Starting {dataset_name} raster workflow..."
 
 # Step 0: Setup bucket
 echo "Step 0: Setting up bucket..."
 kubectl apply -f /yamls/{dataset_name}-setup-bucket.yaml -n {namespace}
-
-echo "Waiting for bucket setup..."
 kubectl wait --for=condition=complete --timeout=600s job/{dataset_name}-setup-bucket -n {namespace}
-
-# Step 1: Hex tiling
-echo "Step 1: H3 hexagonal tiling..."
+{preprocess_steps}
+# Step {hex_step_num}: H3 hexagonal tiling
+echo "Step {hex_step_num}: H3 hexagonal tiling..."
 kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
-
-echo "Waiting for hex tiling..."
 kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
 
 echo "✓ Workflow complete!"
-echo ""
 echo "Clean up with:"
-echo "  kubectl delete jobs {dataset_name}-setup-bucket {dataset_name}-hex {dataset_name}-workflow -n {namespace}"
+echo "  kubectl delete jobs {cleanup_jobs} -n {namespace}"
 echo "  kubectl delete configmap {configmap_name} -n {namespace}"
 """],
                         "resources": {
                             "requests": {"cpu": "500m", "memory": "512Mi"},
-                            "limits": {"cpu": "500m", "memory": "512Mi"}
+                            "limits": {"cpu": "500m", "memory": "512Mi"},
                         },
-                        "volumeMounts": [{"name": "yamls", "mountPath": "/yamls"}]
+                        "volumeMounts": [{"name": "yamls", "mountPath": "/yamls"}],
                     }],
                     "volumes": [{
                         "name": "yamls",
-                        "configMap": {"name": configmap_name}
-                    }]
+                        "configMap": {"name": configmap_name},
+                    }],
                 }
             },
-            "ttlSecondsAfterFinished": 10800
-        }
+            "ttlSecondsAfterFinished": 10800,
+        },
     }
-    
+
     with open(output_path / "workflow.yaml", "w") as f:
         yaml.dump(workflow_job, f, default_flow_style=False)
 

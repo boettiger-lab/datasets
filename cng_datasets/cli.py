@@ -29,7 +29,8 @@ def main():
     
     # Raster processing command
     raster_parser = subparsers.add_parser("raster", help="Process raster datasets")
-    raster_parser.add_argument("--input", required=True, help="Input raster file (local or /vsis3/ URL)")
+    raster_parser.add_argument("--input", required=True, action="append", dest="inputs",
+                               help="Input raster file (local or /vsicurl/ URL). Repeat for multiple tiles to mosaic.")
     raster_parser.add_argument("--output-cog", help="Output COG file path")
     raster_parser.add_argument("--output-parquet", help="Output parquet directory (e.g., s3://bucket/dataset/hex/)")
     raster_parser.add_argument("--resolution", type=int, help="H3 resolution (auto-detected if not specified)")
@@ -40,6 +41,10 @@ def main():
     raster_parser.add_argument("--compression", default="deflate", help="COG compression (deflate, lzw, zstd)")
     raster_parser.add_argument("--blocksize", type=int, default=512, help="COG block size (default: 512)")
     raster_parser.add_argument("--resampling", default="nearest", help="Resampling method (default: nearest)")
+    raster_parser.add_argument("--target-crs", default="EPSG:4326", help="Output CRS for mosaic (default: EPSG:4326)")
+    raster_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in target CRS (mosaic only)")
+    raster_parser.add_argument("--target-resolution", type=float, help="Output pixel size in target CRS units (mosaic only)")
+    raster_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (mosaic only)")
     
     # Repartition command
     repartition_parser = subparsers.add_parser("repartition", help="Repartition chunks by h0")
@@ -76,7 +81,8 @@ def main():
     # Raster workflow generation command
     raster_workflow_parser = subparsers.add_parser("raster-workflow", help="Generate complete raster dataset workflow")
     raster_workflow_parser.add_argument("--dataset", required=True, help="Dataset name")
-    raster_workflow_parser.add_argument("--source-url", required=True, help="Source COG URL")
+    raster_workflow_parser.add_argument("--source-url", required=True, action="append", dest="source_urls",
+                                        help="Source raster URL. Repeat for multiple tiles to mosaic.")
     raster_workflow_parser.add_argument("--bucket", required=True, help="S3 bucket for outputs")
     raster_workflow_parser.add_argument("--output-dir", default="k8s", help="Output directory for YAML files")
     raster_workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace")
@@ -86,6 +92,10 @@ def main():
     raster_workflow_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
+    raster_workflow_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in EPSG:4326 (multi-tile only)")
+    raster_workflow_parser.add_argument("--target-resolution", type=float, help="Output pixel size in degrees (multi-tile only)")
+    raster_workflow_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (multi-tile only)")
+    raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif)")
     
     # Sync job generation command
     sync_job_parser = subparsers.add_parser("sync-job", help="Generate Kubernetes job for syncing between S3 locations")
@@ -136,37 +146,59 @@ def main():
         )
     
     elif args.command == "raster":
-        from .raster import RasterProcessor
-        
+        from .raster import RasterProcessor, create_mosaic_cog
+
         # Parse parent resolutions
         parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
-        
-        processor = RasterProcessor(
-            input_path=args.input,
-            output_cog_path=args.output_cog,
-            output_parquet_path=args.output_parquet,
-            h3_resolution=args.resolution,
-            parent_resolutions=parent_res,
-            h0_index=args.h0_index,
-            value_column=args.value_column,
-            nodata_value=args.nodata,
-            compression=args.compression,
-            blocksize=args.blocksize,
-            resampling=args.resampling,
-        )
-        
-        # Create COG if output path specified
-        if args.output_cog:
-            processor.create_cog()
-        
-        # Process to H3 parquet if output path specified
-        if args.output_parquet:
-            if args.h0_index is not None:
-                # Process single h0 region
-                processor.process_h0_region()
-            else:
-                # Process all h0 regions
-                processor.process_all_h0_regions()
+
+        # Parse optional mosaic parameters
+        target_extent = None
+        if getattr(args, 'target_extent', None):
+            parts = [float(x) for x in args.target_extent.split(',')]
+            target_extent = tuple(parts)
+
+        input_path = args.inputs if len(args.inputs) > 1 else args.inputs[0]
+
+        # If multiple inputs and only --output-cog requested, use create_mosaic_cog directly
+        if isinstance(input_path, list) and args.output_cog and not args.output_parquet:
+            create_mosaic_cog(
+                source_urls=input_path,
+                output_path=args.output_cog,
+                target_crs=getattr(args, 'target_crs', 'EPSG:4326'),
+                target_extent=target_extent,
+                target_resolution=getattr(args, 'target_resolution', None),
+                band=getattr(args, 'band', None),
+                nodata=args.nodata,
+                resampling=args.resampling,
+                compression=args.compression,
+            )
+        else:
+            processor = RasterProcessor(
+                input_path=input_path,
+                output_cog_path=args.output_cog,
+                output_parquet_path=args.output_parquet,
+                h3_resolution=args.resolution,
+                parent_resolutions=parent_res,
+                h0_index=args.h0_index,
+                value_column=args.value_column,
+                nodata_value=args.nodata,
+                compression=args.compression,
+                blocksize=args.blocksize,
+                resampling=args.resampling,
+                target_crs=getattr(args, 'target_crs', 'EPSG:4326'),
+                target_extent=target_extent,
+                target_resolution=getattr(args, 'target_resolution', None),
+                band=getattr(args, 'band', None),
+            )
+
+            if args.output_cog:
+                processor.create_cog()
+
+            if args.output_parquet:
+                if args.h0_index is not None:
+                    processor.process_h0_region()
+                else:
+                    processor.process_all_h0_regions()
     
     elif args.command == "repartition":
         from .vector import repartition_by_h0
@@ -231,9 +263,14 @@ def main():
         from .k8s import generate_raster_workflow
         # Parse parent resolutions
         parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
+        # Parse optional mosaic parameters
+        target_extent = None
+        if getattr(args, 'target_extent', None):
+            parts = [float(x) for x in args.target_extent.split(',')]
+            target_extent = tuple(parts)
         generate_raster_workflow(
             dataset_name=args.dataset,
-            source_url=args.source_url,
+            source_urls=args.source_urls,
             bucket=args.bucket,
             output_dir=args.output_dir,
             namespace=args.namespace,
@@ -243,6 +280,10 @@ def main():
             nodata_value=args.nodata,
             hex_memory=args.hex_memory,
             max_parallelism=args.max_parallelism,
+            target_extent=target_extent,
+            target_resolution=getattr(args, 'target_resolution', None),
+            band=getattr(args, 'band', None),
+            output_cog_name=getattr(args, 'output_cog_name', None),
         )
     
     elif args.command == "storage":

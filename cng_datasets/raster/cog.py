@@ -5,9 +5,10 @@ Tools for converting raster datasets to COG format and subsequently
 to H3-indexed parquet files partitioned by h0 cells.
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import os
 import math
+import tempfile
 import duckdb
 from osgeo import gdal, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
@@ -139,6 +140,145 @@ def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
     return best_res
 
 
+def create_mosaic_cog(
+    source_urls: List[str],
+    output_path: str,
+    target_crs: str = "EPSG:4326",
+    target_extent: Optional[tuple] = None,
+    target_resolution: Optional[float] = None,
+    band: Optional[int] = None,
+    nodata: Optional[float] = None,
+    resampling: str = "bilinear",
+    compression: str = "deflate",
+) -> str:
+    """
+    Mosaic multiple raster tiles (potentially in different CRS) into a single COG.
+
+    Handles the common case where source data is distributed as per-UTM-zone tiles
+    (e.g. RAP 10m products across zones 12 and 13 for Wyoming). Groups tiles by CRS,
+    warps each group to the target CRS, merges, then writes a Cloud-Optimized GeoTIFF.
+
+    Args:
+        source_urls: List of tile paths/URLs (local, /vsicurl/, s3://).
+                     Tiles may be in mixed CRS (e.g. multiple UTM zones).
+        output_path: Destination path for the COG (local path or s3://).
+        target_crs: Output CRS (default: EPSG:4326).
+        target_extent: Clip extent as (xmin, ymin, xmax, ymax) in target_crs.
+                       If None, uses the union of all tile extents.
+        target_resolution: Output pixel size in target_crs units (e.g. 0.0001 for ~10m
+                           in degrees). If None, derived from the finest source tile.
+        band: Extract a single band from multi-band sources (1-indexed). If None,
+              all bands are preserved.
+        nodata: NoData value for output. If None, inherited from source tiles.
+        resampling: Resampling algorithm for warping (default: bilinear).
+        compression: COG compression (deflate, lzw, zstd).
+
+    Returns:
+        output_path (echoed back for chaining)
+    """
+    if not source_urls:
+        raise ValueError("source_urls must not be empty")
+
+    print(f"Creating mosaic COG from {len(source_urls)} source tile(s)...")
+
+    # Resolve VSI paths for all sources
+    vsi_urls = [_ensure_vsi_path(u, use_public_endpoint=True) for u in source_urls]
+
+    # Group tiles by their CRS authority string (e.g. "EPSG:32612")
+    crs_groups: dict = {}
+    for vsi_url in vsi_urls:
+        ds = gdal.Open(vsi_url)
+        if ds is None:
+            print(f"  ⚠ Could not open {vsi_url}, skipping")
+            continue
+        srs = osr.SpatialReference(wkt=ds.GetProjection())
+        srs.AutoIdentifyEPSG()
+        epsg = srs.GetAuthorityCode(None)
+        crs_key = f"EPSG:{epsg}" if epsg else srs.ExportToProj4()
+        ds = None
+        crs_groups.setdefault(crs_key, []).append(vsi_url)
+
+    if not crs_groups:
+        raise RuntimeError("No readable source tiles found")
+
+    print(f"  CRS groups: { {k: len(v) for k, v in crs_groups.items()} }")
+
+    workdir = tempfile.mkdtemp(prefix="mosaic_cog_")
+    try:
+        warped_paths = []
+
+        warp_kwargs = dict(
+            dstSRS=target_crs,
+            resampleAlg=resampling,
+            multithread=True,
+            format="GTiff",
+            creationOptions=["COMPRESS=NONE", "BIGTIFF=IF_SAFER"],
+        )
+        if target_extent is not None:
+            xmin, ymin, xmax, ymax = target_extent
+            warp_kwargs["outputBounds"] = (xmin, ymin, xmax, ymax)
+            warp_kwargs["outputBoundsSRS"] = target_crs
+        if target_resolution is not None:
+            warp_kwargs["xRes"] = target_resolution
+            warp_kwargs["yRes"] = target_resolution
+        if nodata is not None:
+            warp_kwargs["srcNodata"] = nodata
+            warp_kwargs["dstNodata"] = nodata
+
+        for i, (crs_key, tiles) in enumerate(crs_groups.items()):
+            print(f"  Building VRT for {crs_key} ({len(tiles)} tiles)...")
+            vrt_path = os.path.join(workdir, f"group_{i}.vrt")
+            vrt_ds = gdal.BuildVRT(vrt_path, tiles, bandList=[band] if band else None)
+            if vrt_ds is None:
+                raise RuntimeError(f"gdal.BuildVRT failed for CRS group {crs_key}")
+            vrt_ds = None  # flush
+
+            warped_path = os.path.join(workdir, f"warped_{i}.tif")
+            print(f"  Warping {crs_key} → {target_crs}...")
+            result = gdal.Warp(warped_path, vrt_path, **warp_kwargs)
+            if result is None:
+                raise RuntimeError(f"gdal.Warp failed for CRS group {crs_key}: {gdal.GetLastErrorMsg()}")
+            result = None
+            warped_paths.append(warped_path)
+
+        # Merge all warped groups into a final VRT
+        print(f"  Merging {len(warped_paths)} warped group(s)...")
+        merged_vrt = os.path.join(workdir, "merged.vrt")
+        build_vrt_opts = {}
+        if nodata is not None:
+            build_vrt_opts["srcNodata"] = nodata
+            build_vrt_opts["VRTNodata"] = nodata
+        merged_ds = gdal.BuildVRT(merged_vrt, warped_paths, **build_vrt_opts)
+        if merged_ds is None:
+            raise RuntimeError(f"gdal.BuildVRT failed for merge: {gdal.GetLastErrorMsg()}")
+        merged_ds = None
+
+        # Write final COG
+        print(f"  Writing COG → {output_path}...")
+        cog_output = _ensure_vsi_path(output_path)
+        translate_opts = gdal.TranslateOptions(
+            format="COG",
+            creationOptions=[
+                f"COMPRESS={compression.upper()}",
+                "PREDICTOR=YES",
+                "OVERVIEW_RESAMPLING=AVERAGE",
+                "BIGTIFF=IF_SAFER",
+                "NUM_THREADS=ALL_CPUS",
+            ],
+        )
+        result = gdal.Translate(cog_output, merged_vrt, options=translate_opts)
+        if result is None:
+            raise RuntimeError(f"gdal.Translate (COG) failed: {gdal.GetLastErrorMsg()}")
+        result = None
+
+        print(f"  ✓ Mosaic COG created: {output_path}")
+        return output_path
+
+    finally:
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 class RasterProcessor:
     """
     Process raster datasets into cloud-native formats.
@@ -150,7 +290,7 @@ class RasterProcessor:
     
     def __init__(
         self,
-        input_path: str,
+        input_path: Union[str, List[str]],
         output_cog_path: Optional[str] = None,
         output_parquet_path: Optional[str] = None,
         h3_resolution: Optional[int] = None,
@@ -162,28 +302,61 @@ class RasterProcessor:
         blocksize: int = 512,
         resampling: str = "nearest",
         nodata_value: Optional[float] = None,
+        target_crs: str = "EPSG:4326",
+        target_extent: Optional[tuple] = None,
+        target_resolution: Optional[float] = None,
+        band: Optional[int] = None,
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the raster processor.
-        
+
         Args:
-            input_path: Path to input raster file (local or /vsis3/ URL)
+            input_path: Path(s) to input raster file(s). A single string or a list of
+                        tile URLs/paths (possibly in mixed CRS — they will be mosaicked
+                        and reprojected to target_crs before processing).
             output_cog_path: Path for output COG file (optional)
             output_parquet_path: Base path for output parquet (e.g., s3://bucket/dataset/hex/)
             h3_resolution: Target H3 resolution (auto-detected if None)
             parent_resolutions: List of parent resolutions to include (e.g., [9, 8, 0])
             h0_index: Specific h0 cell index to process (0-121), or None for all
-            h0_grid_path: Path to h0 grid parquet file (default: s3://public-grids/hex/h0-valid.parquet)
+            h0_grid_path: Path to h0 grid parquet file
             value_column: Name for the raster value column in parquet
             compression: Compression method for COG (deflate, lzw, zstd, etc.)
             blocksize: Block size for COG tiling
             resampling: Resampling method (nearest, bilinear, cubic, etc.)
             nodata_value: NoData value to exclude from H3 conversion
+            target_crs: CRS for output (default: EPSG:4326); used when mosaicking
+            target_extent: Clip extent (xmin, ymin, xmax, ymax) in target_crs; used when mosaicking
+            target_resolution: Output pixel size in target_crs units; used when mosaicking
+            band: Extract a single band from multi-band sources (1-indexed); used when mosaicking
             read_credentials: Dict with AWS credentials for reading
             write_credentials: Dict with AWS credentials for writing
         """
+        # If a list of tiles is provided, mosaic them into a temp COG first
+        self._mosaic_tmpdir = None
+        if isinstance(input_path, list):
+            if len(input_path) == 1:
+                input_path = input_path[0]
+            else:
+                import tempfile
+                self._mosaic_tmpdir = tempfile.mkdtemp(prefix="raster_processor_")
+                mosaic_path = os.path.join(self._mosaic_tmpdir, "mosaic.tif")
+                print(f"Multiple input tiles detected ({len(input_path)}), mosaicking to temp COG...")
+                create_mosaic_cog(
+                    source_urls=input_path,
+                    output_path=mosaic_path,
+                    target_crs=target_crs,
+                    target_extent=target_extent,
+                    target_resolution=target_resolution,
+                    band=band,
+                    nodata=nodata_value,
+                    resampling=resampling,
+                    compression=compression,
+                )
+                input_path = mosaic_path
+
         # Use public endpoint for input reads
         self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=True)
         self.output_cog_path = output_cog_path
