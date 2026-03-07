@@ -568,15 +568,20 @@ def _generate_raster_hex_job(
     parent_res_str = ','.join(map(str, parent_resolutions))
     
     # Build command
-    cmd_parts = [
-        "set -e",
-        f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column}"
-    ]
-    
+    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column}"
     if nodata_value is not None:
-        cmd_parts[-1] += f" --nodata {nodata_value}"
-        
-    command_str = "\n".join(cmd_parts)
+        cng_cmd += f" --nodata {nodata_value}"
+
+    command_str = f"""set -e
+
+# Locate PROJ database dynamically to avoid version mismatches
+PROJ_DB=$(find /usr /opt -name "proj.db" 2>/dev/null | head -1)
+if [ -n "$PROJ_DB" ]; then
+  export PROJ_DATA="$(dirname $PROJ_DB)"
+  export PROJ_LIB="$PROJ_DATA"
+fi
+
+{cng_cmd}"""
     
     job_spec = {
         "apiVersion": "batch/v1",
@@ -627,7 +632,6 @@ def _generate_raster_hex_job(
                             {"name": "AWS_HTTPS", "value": "false"},
                             {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
                             {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
-                            {"name": "PROJ_LIB", "value": "/usr/local/share/proj"},
                             {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
                             {"name": "BUCKET", "value": bucket}
                         ],
