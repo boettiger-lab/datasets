@@ -16,6 +16,42 @@ from cng_datasets.storage.s3 import configure_s3_credentials
 # Set GDAL to use exceptions for better error handling
 gdal.UseExceptions()
 
+def _configure_proj():
+    """Find a PROJ database with the correct schema version and configure GDAL to use it.
+
+    The container may have multiple proj.db files from different PROJ installations.
+    We use sqlite3 to check the schema minor version and pick one that is >=6,
+    which is required by PROJ 9.x.
+    """
+    import sqlite3
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["find", "/usr", "/opt", "/root", "-name", "proj.db"],
+            capture_output=True, text=True, timeout=10
+        )
+        candidates = [p for p in result.stdout.strip().split("\n") if p]
+        for path in candidates:
+            try:
+                conn = sqlite3.connect(path)
+                row = conn.execute(
+                    "SELECT value FROM metadata WHERE key='DATABASE.LAYOUT.VERSION.MINOR'"
+                ).fetchone()
+                conn.close()
+                if row and int(row[0]) >= 6:
+                    proj_dir = os.path.dirname(path)
+                    os.environ["PROJ_DATA"] = proj_dir
+                    os.environ["PROJ_LIB"] = proj_dir
+                    gdal.SetConfigOption("PROJ_DATA", proj_dir)
+                    return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+_configure_proj()
+
 
 def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     """Convert path to appropriate GDAL VSI notation.
