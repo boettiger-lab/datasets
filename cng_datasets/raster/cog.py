@@ -91,8 +91,8 @@ def detect_nodata_value(raster_path: str, verbose: bool = True) -> Optional[floa
     Returns:
         NoData value if found, None otherwise
     """
-    # Use public endpoint for single-file reads
-    raster_path = _ensure_vsi_path(raster_path, use_public_endpoint=True)
+    # Use internal endpoint so this works both inside and outside the cluster
+    raster_path = _ensure_vsi_path(raster_path, use_public_endpoint=False)
     ds = gdal.Open(raster_path)
     if ds is None:
         raise ValueError(f"Could not open raster: {raster_path}")
@@ -128,8 +128,8 @@ def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
     Returns:
         Recommended H3 resolution (0-15)
     """
-    # Use public endpoint for single-file reads
-    raster_path = _ensure_vsi_path(raster_path, use_public_endpoint=True)
+    # Use internal endpoint so this works both inside and outside the cluster
+    raster_path = _ensure_vsi_path(raster_path, use_public_endpoint=False)
     ds = gdal.Open(raster_path)
     if ds is None:
         raise ValueError(f"Could not open raster: {raster_path}")
@@ -591,13 +591,17 @@ class RasterProcessor:
         xyz_file = f"/tmp/raster_{h0_index}.xyz"
         
         print(f"  Extracting region with gdal.Warp...")
+        # Allow partial reprojection so h0 cutlines that extend outside the
+        # source raster's projection domain (e.g. Albers-projected COGs) still
+        # produce valid output for the overlap region.
+        gdal.SetConfigOption('OGR_ENABLE_PARTIAL_REPROJECTION', 'TRUE')
         warp_options = gdal.WarpOptions(
             dstSRS='EPSG:4326',
             cutlineWKT=h0_geom_wkt,
             cropToCutline=True,
             format='XYZ',
         )
-        
+
         result = gdal.Warp(xyz_file, self.input_path, options=warp_options)
         
         if result is None:
