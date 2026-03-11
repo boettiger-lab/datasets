@@ -10,7 +10,7 @@ import os
 import math
 import tempfile
 import duckdb
-from osgeo import gdal, osr
+from osgeo import gdal, ogr, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
 
 # Set GDAL to use exceptions for better error handling
@@ -77,6 +77,8 @@ def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
         else:
             # Use /vsis3/ for writes and multi-file operations
             return f"/vsis3/{path[5:]}"
+    if path.startswith("https://") or path.startswith("http://"):
+        return f"/vsicurl/{path}"
     return path
 
 
@@ -443,6 +445,9 @@ class RasterProcessor:
         
         # Set up DuckDB connection
         self.con = self._setup_duckdb()
+
+        # Pre-compute source raster bounds in EPSG:4326 for fast h0 intersection checks
+        self._src_bounds_4326 = self._compute_src_bounds_4326()
     
     def _setup_duckdb(self) -> duckdb.DuckDBPyConnection:
         """Set up DuckDB connection with extensions."""
@@ -463,7 +468,39 @@ class RasterProcessor:
         configure_s3_credentials(con)
         
         return con
-    
+
+    def _compute_src_bounds_4326(self) -> tuple:
+        """Return (xmin, ymin, xmax, ymax) of the source raster in EPSG:4326."""
+        ds = gdal.Open(self.input_path)
+        if ds is None:
+            raise ValueError(f"Could not open raster to compute bounds: {self.input_path}")
+        gt = ds.GetGeoTransform()
+        xmin = gt[0]
+        xmax = gt[0] + gt[1] * ds.RasterXSize
+        ymax = gt[3]
+        ymin = gt[3] + gt[5] * ds.RasterYSize
+        src_srs = osr.SpatialReference()
+        src_srs.ImportFromWkt(ds.GetProjection())
+        ds = None
+
+        tgt_srs = osr.SpatialReference()
+        tgt_srs.ImportFromEPSG(4326)
+        tgt_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+        if src_srs.IsSame(tgt_srs):
+            return (min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
+
+        transform = osr.CoordinateTransformation(src_srs, tgt_srs)
+        corners = [
+            transform.TransformPoint(xmin, ymin),
+            transform.TransformPoint(xmin, ymax),
+            transform.TransformPoint(xmax, ymin),
+            transform.TransformPoint(xmax, ymax),
+        ]
+        lons = [c[0] for c in corners]
+        lats = [c[1] for c in corners]
+        return (min(lons), min(lats), max(lons), max(lats))
+
     def create_cog(
         self,
         output_path: Optional[str] = None,
@@ -584,12 +621,21 @@ class RasterProcessor:
             
         h0_geom_wkt = h0_result['geom_wkt'].iloc[0]
         h0_cell = h0_result['h0'].iloc[0]
-        
+
         print(f"  h0 cell: {h0_cell}")
-        
+
+        # Skip h0 cells with no overlap with the source raster to avoid writing
+        # enormous empty XYZ files (can be TBs for high-resolution rasters).
+        h0_geom = ogr.CreateGeometryFromWkt(h0_geom_wkt)
+        h0_env = h0_geom.GetEnvelope()  # (xmin, xmax, ymin, ymax)
+        src = self._src_bounds_4326   # (xmin, ymin, xmax, ymax)
+        if src[2] < h0_env[0] or src[0] > h0_env[1] or src[3] < h0_env[2] or src[1] > h0_env[3]:
+            print(f"  ℹ No overlap between source raster and h0 cell {h0_index}, skipping")
+            return None
+
         # Extract region to XYZ using GDAL
         xyz_file = f"/tmp/raster_{h0_index}.xyz"
-        
+
         print(f"  Extracting region with gdal.Warp...")
         # Allow partial reprojection so h0 cutlines that extend outside the
         # source raster's projection domain (e.g. Albers-projected COGs) still
