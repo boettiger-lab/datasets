@@ -634,7 +634,7 @@ class RasterProcessor:
             if parent_res < self.h3_resolution:
                 col_name = f"h{parent_res}"
                 parent_cols.append(col_name)
-                parent_exprs.append(f"h3_latlng_to_cell_string(Y, X, {parent_res}) AS {col_name}")
+                parent_exprs.append(f"h3_latlng_to_cell(Y, X, {parent_res}) AS {col_name}")
         
         parent_sql = ', ' + ', '.join(parent_exprs) if parent_exprs else ''
         
@@ -652,7 +652,7 @@ class RasterProcessor:
             COPY (
                 SELECT 
                     Z AS {self.value_column},
-                    h3_latlng_to_cell_string(Y, X, {self.h3_resolution}) AS {h3_col}
+                    h3_latlng_to_cell(Y, X, {self.h3_resolution}) AS {h3_col}
                     {parent_sql}
                 FROM xyz_table
                 {where_clause}
