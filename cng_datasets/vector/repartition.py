@@ -45,7 +45,14 @@ def repartition_by_h0(
     os.makedirs(local_dir, exist_ok=True)
     
     # Read chunks (sparse format: ID_column, h10, h9, h8, h0)
-    chunks = con.read_parquet(f'{chunks_dir}/*.parquet')
+    try:
+        chunks = con.read_parquet(f'{chunks_dir}/*.parquet')
+    except Exception as e:
+        raise RuntimeError(
+            f"No parquet files found in chunks directory '{chunks_dir}'. "
+            f"The hex job may have produced no output (all cells empty?). "
+            f"Original error: {e}"
+        ) from e
     chunk_cols = chunks.columns
     
     # Identify ID column in chunks
@@ -119,7 +126,17 @@ def repartition_by_h0(
     
     print('Writing to local directory with h0 partitioning...')
     result.to_parquet(f'{local_dir}/', partition_by='h0')
-    
+
+    local_files = [
+        f for root, _, files in os.walk(local_dir)
+        for f in files if f.endswith('.parquet')
+    ]
+    if not local_files:
+        raise RuntimeError(
+            f"No parquet files written to '{local_dir}' — all chunks appear to be empty. "
+            f"Check that the hex job in '{chunks_dir}' produced non-empty output."
+        )
+
     print('Uploading partitioned data to S3...')
     con.read_parquet(f'{local_dir}/**/*.parquet').to_parquet(f'{output_dir.rstrip("/")}/', partition_by='h0')
     

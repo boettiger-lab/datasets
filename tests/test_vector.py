@@ -822,7 +822,46 @@ class TestRepartitionWithAttributeJoin:
             assert 'Name' in result_df.columns, f"Name not in joined result! Columns: {result_df.columns}"
             assert 'h8' in result_df.columns
             assert len(result_df) > 0
-            
+
             con.close()
+
+    @pytest.mark.timeout(10)
+    def test_repartition_raises_on_empty_chunks_dir(self):
+        """repartition_by_h0 should raise a clear RuntimeError when chunks dir has no parquet files (issue #10)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty_chunks_dir = f"{tmpdir}/empty_chunks"
+            os.makedirs(empty_chunks_dir)
+            output_dir = f"{tmpdir}/output"
+
+            with pytest.raises(RuntimeError, match="No parquet files found"):
+                repartition_by_h0(
+                    chunks_dir=empty_chunks_dir,
+                    output_dir=output_dir,
+                    cleanup=False,
+                )
+
+    @pytest.mark.timeout(30)
+    def test_repartition_raises_on_empty_chunk_output(self):
+        """repartition_by_h0 should raise a clear RuntimeError when chunks exist but write no rows (issue #10)."""
+        import duckdb as _duckdb
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunks_dir = f"{tmpdir}/chunks"
+            os.makedirs(chunks_dir)
+            output_dir = f"{tmpdir}/output"
+
+            # Write a parquet chunk with zero rows (schema only)
+            _con = _duckdb.connect()
+            _con.execute(
+                f"COPY (SELECT 1 AS _cng_fid, 0 AS h10, 0 AS h0 WHERE false) "
+                f"TO '{chunks_dir}/chunk.parquet' (FORMAT PARQUET)"
+            )
+            _con.close()
+
+            with pytest.raises(RuntimeError, match="empty"):
+                repartition_by_h0(
+                    chunks_dir=chunks_dir,
+                    output_dir=output_dir,
+                    cleanup=False,
+                )
 
 
