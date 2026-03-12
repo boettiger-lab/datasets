@@ -374,7 +374,7 @@ class TestRasterToH3Conversion:
 
 class TestH3EdgeLengths:
     """Test that H3 edge length values are correct."""
-    
+
     @pytest.mark.timeout(5)
     def test_h3_edge_length_values(self):
         """Verify H3 edge lengths match official values from h3geo.org."""
@@ -397,7 +397,7 @@ class TestH3EdgeLengths:
             14: 0.001546100,
             15: 0.000584169,
         }
-        
+
         # Just verify that we use reasonable values
         # This is a weak test but ensures we're in the right ballpark
         for res, expected_km in official_edge_lengths_km.items():
@@ -405,18 +405,214 @@ class TestH3EdgeLengths:
             # Verify order of magnitude is reasonable
             assert expected_m > 0, f"Edge length for h{res} should be positive"
             assert expected_m < 10_000_000, f"Edge length for h{res} should be less than 10,000km"
-    
+
     @pytest.mark.timeout(10)
     def test_resolution_detection_logic(self):
         """Test that resolution detection uses correct edge length comparisons."""
         from cng_datasets.raster.cog import detect_optimal_h3_resolution
-        
+
         # We can't easily test without creating rasters, but we can verify
         # the function exists and has the right signature
         import inspect
         sig = inspect.signature(detect_optimal_h3_resolution)
         assert 'raster_path' in sig.parameters
         assert sig.return_annotation == int or str(sig.return_annotation) == 'int'
+
+
+class TestH3Downsampling:
+    """Test that gdal.Warp downsamples to H3 resolution."""
+
+    @pytest.mark.timeout(5)
+    def test_h3_res_to_degrees_monotonic(self):
+        """Finer H3 resolutions should yield smaller pixel sizes."""
+        from cng_datasets.raster.cog import _h3_res_to_degrees
+
+        prev = _h3_res_to_degrees(0)
+        for res in range(1, 16):
+            cur = _h3_res_to_degrees(res)
+            assert cur < prev, f"h{res} ({cur}) should be smaller than h{res-1} ({prev})"
+            prev = cur
+
+    @pytest.mark.timeout(5)
+    def test_h3_res_to_degrees_known_values(self):
+        """Spot-check a few resolutions against expected degree values."""
+        from cng_datasets.raster.cog import _h3_res_to_degrees
+
+        # h8 edge ≈ 531 m → ~0.0048°, h10 edge ≈ 76 m → ~0.00068°
+        h8 = _h3_res_to_degrees(8)
+        assert 0.003 < h8 < 0.007, f"h8 pixel size {h8} out of expected range"
+
+        h10 = _h3_res_to_degrees(10)
+        assert 0.0004 < h10 < 0.001, f"h10 pixel size {h10} out of expected range"
+
+    @requires_gdal_array
+    @pytest.mark.timeout(60)
+    def test_warp_downsamples_high_res_raster(self):
+        """A high-res raster warped at h8 should produce far fewer rows than source pixels."""
+        from cng_datasets.raster.cog import _h3_res_to_degrees
+
+        # Create a 200x200 raster at 0.0001° (~11 m) covering a 0.02°×0.02° patch.
+        # Source pixels: 40,000.  At h8 (~0.0048°) the output grid should be
+        # roughly (0.02/0.0048)^2 ≈ 17 pixels — orders of magnitude fewer.
+        width, height = 200, 200
+        xmin, ymin = -105.0, 42.0
+        src_pixel = 0.0001
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = os.path.join(tmp, "hires.tif")
+            driver = gdal.GetDriverByName("GTiff")
+            ds = driver.Create(src_path, width, height, 1, gdal.GDT_Float32)
+            ds.SetGeoTransform([xmin, src_pixel, 0, ymin + height * src_pixel, 0, -src_pixel])
+            srs = osr.SpatialReference()
+            srs.ImportFromEPSG(4326)
+            ds.SetProjection(srs.ExportToWkt())
+            band = ds.GetRasterBand(1)
+            data = np.arange(width * height, dtype=np.float32).reshape(height, width)
+            band.WriteArray(data)
+            band.FlushCache()
+            ds = None
+
+            # Warp WITH downsampling (h8)
+            pixel_size = _h3_res_to_degrees(8)
+            xyz_ds_path = os.path.join(tmp, "downsampled.xyz")
+            extent = (xmin, ymin, xmin + width * src_pixel, ymin + height * src_pixel)
+            opts = gdal.WarpOptions(
+                dstSRS="EPSG:4326",
+                outputBounds=extent,
+                xRes=pixel_size,
+                yRes=pixel_size,
+                resampleAlg=gdal.GRA_Average,
+                format="XYZ",
+            )
+            result = gdal.Warp(xyz_ds_path, src_path, options=opts)
+            assert result is not None
+            result = None
+
+            # Warp WITHOUT downsampling (native resolution)
+            xyz_native_path = os.path.join(tmp, "native.xyz")
+            opts_native = gdal.WarpOptions(
+                dstSRS="EPSG:4326",
+                outputBounds=extent,
+                format="XYZ",
+            )
+            result = gdal.Warp(xyz_native_path, src_path, options=opts_native)
+            assert result is not None
+            result = None
+
+            ds_size = os.path.getsize(xyz_ds_path)
+            native_size = os.path.getsize(xyz_native_path)
+
+            # The downsampled file should be at least 10× smaller
+            assert ds_size < native_size / 10, (
+                f"Downsampled XYZ ({ds_size} bytes) should be much smaller "
+                f"than native ({native_size} bytes)"
+            )
+
+    @requires_gdal_array
+    @pytest.mark.timeout(60)
+    def test_warp_average_resampling_produces_mean(self):
+        """GRA_Average should produce the mean of source pixels, not nearest."""
+        from cng_datasets.raster.cog import _h3_res_to_degrees
+
+        # 4x4 raster with known values, downsampled to ~1 output pixel.
+        width, height = 4, 4
+        xmin, ymin = -105.0, 42.0
+        src_pixel = 0.001  # each pixel ~0.001°
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = os.path.join(tmp, "uniform.tif")
+            driver = gdal.GetDriverByName("GTiff")
+            ds = driver.Create(src_path, width, height, 1, gdal.GDT_Float32)
+            ds.SetGeoTransform([xmin, src_pixel, 0, ymin + height * src_pixel, 0, -src_pixel])
+            srs = osr.SpatialReference()
+            srs.ImportFromEPSG(4326)
+            ds.SetProjection(srs.ExportToWkt())
+            # Values: 10, 20, 30, 40 ... average = 25
+            data = np.array([
+                [10, 20, 30, 40],
+                [10, 20, 30, 40],
+                [10, 20, 30, 40],
+                [10, 20, 30, 40],
+            ], dtype=np.float32)
+            ds.GetRasterBand(1).WriteArray(data)
+            ds.GetRasterBand(1).FlushCache()
+            ds = None
+
+            extent = (xmin, ymin, xmin + width * src_pixel, ymin + height * src_pixel)
+            # Use a large pixel size so everything collapses to ~1 pixel
+            pixel_size = 0.005
+            xyz_path = os.path.join(tmp, "avg.xyz")
+            opts = gdal.WarpOptions(
+                dstSRS="EPSG:4326",
+                outputBounds=extent,
+                xRes=pixel_size,
+                yRes=pixel_size,
+                resampleAlg=gdal.GRA_Average,
+                format="XYZ",
+            )
+            result = gdal.Warp(xyz_path, src_path, options=opts)
+            assert result is not None
+            result = None
+
+            # Read the XYZ output — should be 1 (or very few) row(s).
+            # The value should be a blend of the source pixels (10, 20, 30, 40),
+            # not one of those exact values (which would indicate nearest-neighbor).
+            with open(xyz_path) as f:
+                lines = [l.strip() for l in f if l.strip()]
+            assert len(lines) >= 1
+            val = float(lines[0].split()[2])
+            assert val not in (10.0, 20.0, 30.0, 40.0), (
+                f"Got exact source value {val}; expected a blended average"
+            )
+            assert 10.0 <= val <= 40.0, f"Averaged value {val} outside source range"
+
+    @requires_gdal_array
+    @pytest.mark.timeout(60)
+    def test_no_downsample_when_source_coarser(self):
+        """When source pixels are coarser than H3 cell size, output ≈ source size."""
+        from cng_datasets.raster.cog import _h3_res_to_degrees
+
+        # 10x10 raster at 0.01° (~1 km) pixels, warp at h10 (~0.0007°).
+        # xRes < source pixel size, so GDAL upsamples — output should be
+        # larger than input (more rows), confirming no data is lost.
+        width, height = 10, 10
+        xmin, ymin = -105.0, 42.0
+        src_pixel = 0.01
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = os.path.join(tmp, "coarse.tif")
+            driver = gdal.GetDriverByName("GTiff")
+            ds = driver.Create(src_path, width, height, 1, gdal.GDT_Float32)
+            ds.SetGeoTransform([xmin, src_pixel, 0, ymin + height * src_pixel, 0, -src_pixel])
+            srs = osr.SpatialReference()
+            srs.ImportFromEPSG(4326)
+            ds.SetProjection(srs.ExportToWkt())
+            data = np.ones((height, width), dtype=np.float32) * 42.0
+            ds.GetRasterBand(1).WriteArray(data)
+            ds.GetRasterBand(1).FlushCache()
+            ds = None
+
+            pixel_size = _h3_res_to_degrees(10)  # ~0.0007°, finer than 0.01°
+            xyz_path = os.path.join(tmp, "coarse_out.xyz")
+            extent = (xmin, ymin, xmin + width * src_pixel, ymin + height * src_pixel)
+            opts = gdal.WarpOptions(
+                dstSRS="EPSG:4326",
+                outputBounds=extent,
+                xRes=pixel_size,
+                yRes=pixel_size,
+                resampleAlg=gdal.GRA_Average,
+                format="XYZ",
+            )
+            result = gdal.Warp(xyz_path, src_path, options=opts)
+            assert result is not None
+            result = None
+
+            with open(xyz_path) as f:
+                lines = [l.strip() for l in f if l.strip()]
+            # Should produce MORE rows than source pixels (upsampled)
+            assert len(lines) > width * height, (
+                f"Expected more rows than source ({width*height}), got {len(lines)}"
+            )
 
 
 @requires_gdal_array

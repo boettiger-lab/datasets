@@ -10,7 +10,6 @@ import os
 import math
 import tempfile
 import duckdb
-import h3
 from osgeo import gdal, ogr, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
 
@@ -60,7 +59,14 @@ def _h3_res_to_degrees(h3_resolution: int) -> float:
     Uses the equatorial approximation (1° ≈ 111,320 m) which slightly
     over-samples at higher latitudes — acceptable for mean aggregation.
     """
-    edge_m = h3.average_hexagon_edge_length(h3_resolution, unit='m')
+    # Average H3 edge lengths in km (from h3geo.org/docs/core-library/restable)
+    _H3_EDGE_KM = {
+        0: 1281.256011, 1: 483.0568391, 2: 182.5129565, 3: 68.97922179,
+        4: 26.07175968, 5: 9.854090990, 6: 3.724532667, 7: 1.406475763,
+        8: 0.531414010, 9: 0.200786148, 10: 0.075863783, 11: 0.028663897,
+        12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169,
+    }
+    edge_m = _H3_EDGE_KM[h3_resolution] * 1000
     return edge_m / 111320.0
 
 
