@@ -481,13 +481,10 @@ class RasterProcessor:
         ymin = gt[3] + gt[5] * ds.RasterYSize
         src_srs = osr.SpatialReference()
         src_srs.ImportFromWkt(ds.GetProjection())
+        src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         ds = None
 
-        tgt_srs = osr.SpatialReference()
-        tgt_srs.ImportFromEPSG(4326)
-        tgt_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-
-        if src_srs.IsSame(tgt_srs):
+        if src_srs.IsGeographic():
             return (min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
 
         transform = osr.CoordinateTransformation(src_srs, tgt_srs)
