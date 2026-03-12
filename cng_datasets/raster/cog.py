@@ -481,6 +481,7 @@ class RasterProcessor:
         ymin = gt[3] + gt[5] * ds.RasterYSize
         src_srs = osr.SpatialReference()
         src_srs.ImportFromWkt(ds.GetProjection())
+        src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         ds = None
 
         tgt_srs = osr.SpatialReference()
