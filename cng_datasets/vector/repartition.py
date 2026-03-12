@@ -87,6 +87,7 @@ def repartition_by_h0(
         _raw = duckdb.connect()
         try:
             _raw.execute("INSTALL httpfs; LOAD httpfs")
+            configure_s3_credentials(_raw)
             desc = _raw.execute(f"DESCRIBE SELECT * FROM read_parquet('{source_parquet}')").fetchdf()
         finally:
             _raw.close()
