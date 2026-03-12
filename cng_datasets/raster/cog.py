@@ -470,11 +470,11 @@ class RasterProcessor:
             
             if h3_resolution != detected_resolution:
                 if h3_resolution < detected_resolution:
-                    print(f"ℹ Using finer resolution h{h3_resolution} (user specified) instead of detected h{detected_resolution}")
-                    print(f"  Note: Finer resolution will create more H3 cells and larger output files")
-                else:
                     print(f"ℹ Using coarser resolution h{h3_resolution} (user specified) instead of detected h{detected_resolution}")
                     print(f"  Note: Coarser resolution will aggregate more pixels per H3 cell")
+                else:
+                    print(f"ℹ Using finer resolution h{h3_resolution} (user specified) instead of detected h{detected_resolution}")
+                    print(f"  Note: Finer resolution will create more H3 cells and larger output files")
             else:
                 print(f"✓ Using h{h3_resolution} (matches auto-detected resolution)")
         
