@@ -638,10 +638,21 @@ class RasterProcessor:
         # source raster's projection domain (e.g. Albers-projected COGs) still
         # produce valid output for the overlap region.
         gdal.SetConfigOption('OGR_ENABLE_PARTIAL_REPROJECTION', 'TRUE')
+
+        # Clamp output to the intersection of the h0 cell bbox and the source
+        # raster bbox. Without outputBounds, cropToCutline uses the full h0
+        # cell extent (can be 50°×50° = 250 billion pixels at 0.0001° res).
+        # h0_env from GetEnvelope() is (xmin, xmax, ymin, ymax).
+        inter_xmin = max(src[0], h0_env[0])
+        inter_ymin = max(src[1], h0_env[2])
+        inter_xmax = min(src[2], h0_env[1])
+        inter_ymax = min(src[3], h0_env[3])
+
         warp_options = gdal.WarpOptions(
             dstSRS='EPSG:4326',
             cutlineWKT=h0_geom_wkt,
             cropToCutline=True,
+            outputBounds=(inter_xmin, inter_ymin, inter_xmax, inter_ymax),
             format='XYZ',
         )
 
