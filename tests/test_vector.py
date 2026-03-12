@@ -804,13 +804,18 @@ class TestRepartitionWithAttributeJoin:
             
             # Test attribute join manually (since full repartition has issues with local paths)
             import ibis
+            # Use raw duckdb to get column names — ibis cannot parse GEOMETRY(OGC:CRS84)
+            # types written by DuckDB 1.5+.
+            raw_con = duckdb.connect()
+            desc = raw_con.execute(f"DESCRIBE SELECT * FROM read_parquet('{test_parquet}')").fetchdf()
+            raw_con.close()
+            source_cols = [c for c in desc['column_name'].tolist() if c != 'Geometry']
+
             ibis_con = ibis.duckdb.connect()
             chunks = ibis_con.read_parquet(f'{chunks_dir}/*.parquet')
-            source = ibis_con.read_parquet(test_parquet)
-            
-            # Verify join works
-            source_cols = [c for c in source.columns if c != 'Geometry']
-            result = chunks.inner_join(source.select(source_cols), 'ObjectID')
+            quoted = ', '.join(f'"{c}"' for c in source_cols)
+            ibis_con.raw_sql(f"CREATE OR REPLACE VIEW _source_attrs AS SELECT {quoted} FROM read_parquet('{test_parquet}')")
+            result = chunks.inner_join(ibis_con.table('_source_attrs'), 'ObjectID')
             result_df = result.execute()
             
             assert 'ObjectID' in result_df.columns, f"ObjectID not in joined result! Columns: {result_df.columns}"
