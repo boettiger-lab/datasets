@@ -126,9 +126,37 @@ class TestRasterProcessor:
         band.FlushCache()
         
         ds = None
-        
+
         return raster_path
-    
+
+    @pytest.fixture
+    def large_raster(self, temp_dir):
+        """
+        Create a 512x512 raster large enough to trigger overview generation.
+
+        GDAL's BuildOverviews only writes levels where the overview dimension
+        exceeds the block size; at least 512x512 is needed to get level-2 overviews
+        with the default 256-pixel block size.
+        """
+        from osgeo import gdal, osr
+
+        width, height = 512, 512
+        xmin, ymin = -122.0, 37.0
+        pixel_size = 0.001  # ~111 m per pixel
+        raster_path = os.path.join(temp_dir, 'large_raster.tif')
+
+        driver = gdal.GetDriverByName('GTiff')
+        ds = driver.Create(raster_path, width, height, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([xmin, pixel_size, 0, ymin + height * pixel_size, 0, -pixel_size])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        data = np.arange(width * height, dtype=np.float32).reshape(height, width)
+        ds.GetRasterBand(1).WriteArray(data)
+        ds.GetRasterBand(1).FlushCache()
+        ds = None
+        return raster_path
+
     @pytest.mark.timeout(30)
     def test_detect_nodata_value(self, small_raster):
         """Test NoData value detection from raster metadata."""
@@ -199,9 +227,35 @@ class TestRasterProcessor:
         
         # Note: Small images (10x10) may not have overviews as they're already small
         # The COG driver automatically determines if overviews are needed
-        
+
         ds = None
-    
+
+    @pytest.mark.timeout(60)
+    def test_create_cog_has_overviews(self, large_raster, temp_dir):
+        """COG created from a 512x512 raster must have internal overviews (issue #25).
+
+        Without overviews, gdal.Warp at coarser H3 resolutions reads every source
+        pixel (potentially billions of HTTP range requests), making processing
+        infeasibly slow.
+        """
+        from cng_datasets.raster import create_cog
+
+        output_cog = os.path.join(temp_dir, 'test_cog_overviews.tif')
+        create_cog(
+            input_path=large_raster,
+            output_path=output_cog,
+            compression='deflate',
+            blocksize=256,
+        )
+
+        ds = gdal.Open(output_cog)
+        assert ds is not None
+        band = ds.GetRasterBand(1)
+        assert band.GetOverviewCount() > 0, (
+            "COG must have internal overviews for efficient GDAL downsampling"
+        )
+        ds = None
+
     @pytest.mark.timeout(60)
     def test_raster_processor_init(self, small_raster):
         """Test RasterProcessor initialization."""
