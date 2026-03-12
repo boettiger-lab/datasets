@@ -224,6 +224,78 @@ rclone delete nrp:bucket-name/dataset.parquet
 rclone purge nrp:bucket-name/hex/
 ```
 
+## Armada Backend (Experimental)
+
+[Armada](https://nrp.ai/documentation/userdocs/running/scheduling/) is the NRP's multi-cluster batch job scheduler. It provides fair-use queuing across namespaces and can schedule more jobs than the namespace pod limit allows by drip-feeding pods to the cluster as resources free up.
+
+### When to Use Armada
+
+- You need to **queue multiple dataset workflows** and have them scheduled fairly
+- You want to **exceed the 200-pod cap** per workflow (Armada queues excess jobs)
+- You want jobs visible in the [Armada Lookout dashboard](https://armada-lookout.nrp-nautilus.io)
+
+### Prerequisites
+
+Install `armadactl` from the [Armada releases page](https://github.com/armadaproject/armada/releases) and place the [`.armadactl.yaml`](https://nrp.ai/documentation/userdocs/running/scheduling/) config in your home directory.
+
+### Generate Armada Workflow
+
+Add `--backend armada` to any workflow command:
+
+```bash
+# Vector workflow
+cng-datasets workflow \
+  --dataset my-dataset \
+  --source-url https://example.com/data.gpkg \
+  --bucket public-my-dataset \
+  --backend armada \
+  --output-dir my-dataset/
+
+# Raster workflow
+cng-datasets raster-workflow \
+  --dataset my-raster \
+  --source-url https://example.com/data.tif \
+  --bucket public-my-raster \
+  --backend armada \
+  --output-dir my-raster/
+```
+
+This generates the standard k8s Job YAMLs **plus** `armada-*.yaml` files in Armada submission format.
+
+### Submit to Armada
+
+Submit each step in order, waiting for completion between steps:
+
+```bash
+armadactl submit my-dataset/armada-my-dataset-setup-bucket.yaml
+# wait for completion in Lookout UI
+armadactl submit my-dataset/armada-my-dataset-convert.yaml
+# wait for completion
+armadactl submit my-dataset/armada-my-dataset-hex.yaml
+# wait for completion (this is the long parallel step)
+armadactl submit my-dataset/armada-my-dataset-repartition.yaml
+```
+
+Monitor progress at https://armada-lookout.nrp-nautilus.io
+
+### How It Works
+
+- **Single-pod steps** (setup-bucket, convert, pmtiles, repartition) become one Armada job each
+- **Indexed parallel steps** (hex) are expanded into N individual Armada jobs (one per chunk), each with the chunk index baked into the command. For vector workflows this is up to 200+ jobs; for raster workflows, 122 (one per H3 h0 region)
+- The k8s `priorityClassName: opportunistic` maps to `armada-preemptible`
+- All existing k8s Job YAMLs are still generated alongside the Armada files, so you can switch between backends without regenerating
+
+### Differences from Standard k8s Backend
+
+| Aspect | `--backend k8s` (default) | `--backend armada` |
+|--------|--------------------------|-------------------|
+| Submission | `kubectl apply` | `armadactl submit` |
+| Orchestration | Automated (workflow pod) | Manual (submit steps in order) |
+| Parallel hex jobs | Single k8s Indexed Job | N individual Armada jobs |
+| Pod limit | Bounded by namespace quota | Armada queues excess jobs |
+| Monitoring | `kubectl logs` | Lookout UI |
+| Priority class | `opportunistic` | `armada-preemptible` |
+
 ## Advanced Usage
 
 ### Custom Resource Limits

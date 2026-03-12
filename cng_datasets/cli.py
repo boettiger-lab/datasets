@@ -77,6 +77,7 @@ def main():
     workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
+    workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     
     # Raster workflow generation command
     raster_workflow_parser = subparsers.add_parser("raster-workflow", help="Generate complete raster dataset workflow")
@@ -96,6 +97,7 @@ def main():
     raster_workflow_parser.add_argument("--target-resolution", type=float, help="Output pixel size in degrees (multi-tile only)")
     raster_workflow_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (multi-tile only)")
     raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif)")
+    raster_workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     
     # Sync job generation command
     sync_job_parser = subparsers.add_parser("sync-job", help="Generate Kubernetes job for syncing between S3 locations")
@@ -257,6 +259,7 @@ def main():
             max_completions=args.max_completions,
             intermediate_chunk_size=args.intermediate_chunk_size,
             row_group_size=args.row_group_size,
+            backend=args.backend,
         )
     
     elif args.command == "raster-workflow":
@@ -284,6 +287,7 @@ def main():
             target_resolution=getattr(args, 'target_resolution', None),
             band=getattr(args, 'band', None),
             output_cog_name=getattr(args, 'output_cog_name', None),
+            backend=args.backend,
         )
     
     elif args.command == "storage":

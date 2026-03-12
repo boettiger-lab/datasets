@@ -10,6 +10,7 @@ from pathlib import Path
 import math
 import yaml
 from .jobs import K8sJobManager
+from .armada import convert_workflow_to_armada
 
 
 def _count_source_features(source_urls: Union[str, List[str]], layer: str = None) -> int:
@@ -196,6 +197,7 @@ def generate_dataset_workflow(
     max_completions: int = 200,
     intermediate_chunk_size: int = 10,
     row_group_size: int = 100000,
+    backend: str = "k8s",
     # Backwards compatibility: accept source_url (singular)
     source_url: Union[str, List[str]] = None,
 ):
@@ -304,30 +306,48 @@ def generate_dataset_workflow(
     # Generate Argo workflow with ConfigMap-based approach
     _generate_argo_workflow(k8s_name, namespace, output_path, output_dir)
     
-    print(f"\n✓ Generated complete workflow for {dataset_name}")
-    print(f"\nFiles created in {output_dir}:")
-    print(f"  - {k8s_name}-setup-bucket.yaml")
-    print(f"  - {k8s_name}-convert.yaml")
-    print(f"  - {k8s_name}-pmtiles.yaml")
-    print(f"  - {k8s_name}-hex.yaml")
-    print(f"  - {k8s_name}-repartition.yaml")
-    print(f"  - workflow-rbac.yaml (generic, reusable)")
-    print(f"  - configmap.yaml (job configs)")
-    print(f"  - workflow.yaml (orchestrator)")
-    print(f"\nTo run:")
-    print(f"  # One-time RBAC setup")
-    print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
-    print(f"")
-    print(f"  # Apply all workflow files (safe to re-run)")
-    print(f"  kubectl apply -f {output_dir}/configmap.yaml")
-    print(f"  kubectl apply -f {output_dir}/workflow.yaml")
-    print(f"")
-    print(f"  # Monitor progress")
-    print(f"  kubectl logs -f job/{k8s_name}-workflow")
-    print(f"")
-    print(f"  # Clean up")
-    print(f"  kubectl delete -f {output_dir}/workflow.yaml")
-    print(f"  kubectl delete -f {output_dir}/configmap.yaml")
+    if backend == "armada":
+        armada_files = convert_workflow_to_armada(
+            k8s_yaml_dir=str(output_path),
+            dataset_name=k8s_name,
+            queue=namespace,
+        )
+        print(f"\n✓ Generated Armada workflow for {dataset_name}")
+        print(f"\nArmada files created in {output_dir}:")
+        for f in armada_files:
+            print(f"  - {Path(f).name}")
+        print(f"\nTo run (submit each step in order):")
+        steps = ["setup-bucket", "convert", "pmtiles", "hex", "repartition"]
+        for step in steps:
+            armada_file = output_path / f"armada-{k8s_name}-{step}.yaml"
+            if armada_file.exists():
+                print(f"  armadactl submit {output_dir}/armada-{k8s_name}-{step}.yaml")
+        print(f"\nMonitor at: https://armada-lookout.nrp-nautilus.io")
+    else:
+        print(f"\n✓ Generated complete workflow for {dataset_name}")
+        print(f"\nFiles created in {output_dir}:")
+        print(f"  - {k8s_name}-setup-bucket.yaml")
+        print(f"  - {k8s_name}-convert.yaml")
+        print(f"  - {k8s_name}-pmtiles.yaml")
+        print(f"  - {k8s_name}-hex.yaml")
+        print(f"  - {k8s_name}-repartition.yaml")
+        print(f"  - workflow-rbac.yaml (generic, reusable)")
+        print(f"  - configmap.yaml (job configs)")
+        print(f"  - workflow.yaml (orchestrator)")
+        print(f"\nTo run:")
+        print(f"  # One-time RBAC setup")
+        print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
+        print(f"")
+        print(f"  # Apply all workflow files (safe to re-run)")
+        print(f"  kubectl apply -f {output_dir}/configmap.yaml")
+        print(f"  kubectl apply -f {output_dir}/workflow.yaml")
+        print(f"")
+        print(f"  # Monitor progress")
+        print(f"  kubectl logs -f job/{k8s_name}-workflow")
+        print(f"")
+        print(f"  # Clean up")
+        print(f"  kubectl delete -f {output_dir}/workflow.yaml")
+        print(f"  kubectl delete -f {output_dir}/configmap.yaml")
 
 
 def generate_raster_workflow(
@@ -348,6 +368,7 @@ def generate_raster_workflow(
     target_resolution: Optional[float] = None,
     band: Optional[int] = None,
     output_cog_name: Optional[str] = None,
+    backend: str = "k8s",
     # backwards compat
     source_url: Optional[str] = None,
 ):
@@ -442,18 +463,37 @@ def generate_raster_workflow(
     _generate_raster_configmap(k8s_name, namespace, output_path, gen_command, needs_preprocess)
     _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir, needs_preprocess)
 
-    print(f"\n✓ Generated raster workflow for {dataset_name}")
-    print(f"\nFiles created in {output_dir}:")
-    print(f"  - {k8s_name}-setup-bucket.yaml")
-    if needs_preprocess:
-        print(f"  - {k8s_name}-preprocess-cog.yaml  (mosaic {len(source_urls)} tiles → {cog_key})")
-    print(f"  - {k8s_name}-hex.yaml")
-    print(f"  - workflow-rbac.yaml")
-    print(f"  - configmap.yaml")
-    print(f"  - workflow.yaml")
-    print(f"\nTo run:")
-    print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml  # one-time")
-    print(f"  kubectl apply -f {output_dir}/configmap.yaml -f {output_dir}/workflow.yaml")
+    if backend == "armada":
+        armada_files = convert_workflow_to_armada(
+            k8s_yaml_dir=str(output_path),
+            dataset_name=k8s_name,
+            queue=namespace,
+        )
+        print(f"\n✓ Generated Armada raster workflow for {dataset_name}")
+        print(f"\nArmada files created in {output_dir}:")
+        for f in armada_files:
+            print(f"  - {Path(f).name}")
+        print(f"\nTo run (submit each step in order):")
+        steps = ["setup-bucket"]
+        if needs_preprocess:
+            steps.append("preprocess-cog")
+        steps.append("hex")
+        for step in steps:
+            print(f"  armadactl submit {output_dir}/armada-{k8s_name}-{step}.yaml")
+        print(f"\nMonitor at: https://armada-lookout.nrp-nautilus.io")
+    else:
+        print(f"\n✓ Generated raster workflow for {dataset_name}")
+        print(f"\nFiles created in {output_dir}:")
+        print(f"  - {k8s_name}-setup-bucket.yaml")
+        if needs_preprocess:
+            print(f"  - {k8s_name}-preprocess-cog.yaml  (mosaic {len(source_urls)} tiles → {cog_key})")
+        print(f"  - {k8s_name}-hex.yaml")
+        print(f"  - workflow-rbac.yaml")
+        print(f"  - configmap.yaml")
+        print(f"  - workflow.yaml")
+        print(f"\nTo run:")
+        print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml  # one-time")
+        print(f"  kubectl apply -f {output_dir}/configmap.yaml -f {output_dir}/workflow.yaml")
 
 
 def _generate_cog_preprocess_job(
