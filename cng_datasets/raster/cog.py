@@ -308,7 +308,26 @@ def create_mosaic_cog(
             raise RuntimeError(f"gdal.BuildVRT failed for merge: {gdal.GetLastErrorMsg()}")
         merged_ds = None
 
-        # Write final COG
+        # Write intermediate GTiff, build overviews, then write final COG.
+        # Writing directly to COG via auto-overview generation is unreliable for S3
+        # output and for large files; the explicit BuildOverviews + COPY_SRC_OVERVIEWS
+        # pattern is the recommended approach for fast GDAL downsampling (issue #25).
+        print(f"  Writing intermediate GTiff...")
+        tmp_tif = os.path.join(workdir, "intermediate.tif")
+        tmp_opts = gdal.TranslateOptions(
+            format="GTiff",
+            creationOptions=["COMPRESS=NONE", "BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS"],
+        )
+        result = gdal.Translate(tmp_tif, merged_vrt, options=tmp_opts)
+        if result is None:
+            raise RuntimeError(f"gdal.Translate (GTiff) failed: {gdal.GetLastErrorMsg()}")
+        result = None
+
+        print(f"  Building overviews...")
+        tmp_ds = gdal.Open(tmp_tif, gdal.GA_Update)
+        tmp_ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32, 64])
+        tmp_ds = None
+
         print(f"  Writing COG → {output_path}...")
         cog_output = _ensure_vsi_path(output_path)
         translate_opts = gdal.TranslateOptions(
@@ -316,12 +335,13 @@ def create_mosaic_cog(
             creationOptions=[
                 f"COMPRESS={compression.upper()}",
                 "PREDICTOR=YES",
+                "COPY_SRC_OVERVIEWS=YES",
                 "OVERVIEW_RESAMPLING=AVERAGE",
                 "BIGTIFF=IF_SAFER",
                 "NUM_THREADS=ALL_CPUS",
             ],
         )
-        result = gdal.Translate(cog_output, merged_vrt, options=translate_opts)
+        result = gdal.Translate(cog_output, tmp_tif, options=translate_opts)
         if result is None:
             raise RuntimeError(f"gdal.Translate (COG) failed: {gdal.GetLastErrorMsg()}")
         result = None
@@ -546,56 +566,71 @@ class RasterProcessor:
         
         print(f"Creating COG: {output_path}")
         print(f"  Input: {self.input_path}")
-        
-        # Translate options for COG
-        # COG driver is always tiled, so no TILED option needed
-        translate_options = {
-            'format': 'COG',
-            'creationOptions': [
-                f'COMPRESS={self.compression.upper()}',
-                f'BLOCKSIZE={self.blocksize}',
-                'BIGTIFF=IF_SAFER',
-                'NUM_THREADS=ALL_CPUS',
-            ]
-        }
-        
-        # Add overview settings
-        if overviews:
-            translate_options['creationOptions'].append(
-                f'RESAMPLING={overview_resampling}'
-            )
-        
+
+        cog_creation_opts = [
+            f'COMPRESS={self.compression.upper()}',
+            f'BLOCKSIZE={self.blocksize}',
+            'BIGTIFF=IF_SAFER',
+            'NUM_THREADS=ALL_CPUS',
+        ]
+
         # Reproject to EPSG:4326 if needed
         ds = gdal.Open(self.input_path)
         if ds is None:
             raise ValueError(f"Could not open input raster: {self.input_path}")
-        
+
         srs = osr.SpatialReference(wkt=ds.GetProjection())
         needs_reprojection = not srs.IsGeographic()
         ds = None
-        
-        if needs_reprojection:
-            print("  Reprojecting to EPSG:4326...")
-            # Use gdalwarp to reproject
-            warp_options = gdal.WarpOptions(
-                dstSRS='EPSG:4326',
-                format='COG',
-                creationOptions=translate_options['creationOptions'],
-                resampleAlg=self.resampling,
-                multithread=True,
-            )
-            result = gdal.Warp(output_path, self.input_path, options=warp_options)
-        else:
-            # Just translate to COG format
+
+        workdir = tempfile.mkdtemp(prefix="create_cog_")
+        try:
+            tmp_tif = os.path.join(workdir, "intermediate.tif")
+
+            if needs_reprojection:
+                print("  Reprojecting to EPSG:4326...")
+                warp_options = gdal.WarpOptions(
+                    dstSRS='EPSG:4326',
+                    format='GTiff',
+                    creationOptions=['COMPRESS=NONE', 'BIGTIFF=IF_SAFER'],
+                    resampleAlg=self.resampling,
+                    multithread=True,
+                )
+                result = gdal.Warp(tmp_tif, self.input_path, options=warp_options)
+            else:
+                result = gdal.Translate(
+                    tmp_tif,
+                    self.input_path,
+                    format='GTiff',
+                    creationOptions=['COMPRESS=NONE', 'BIGTIFF=IF_SAFER'],
+                )
+
+            if result is None:
+                raise RuntimeError(f"Failed to create intermediate GTiff: {gdal.GetLastErrorMsg()}")
+            result = None
+
+            if overviews:
+                print("  Building overviews...")
+                tmp_ds = gdal.Open(tmp_tif, gdal.GA_Update)
+                tmp_ds.BuildOverviews(overview_resampling.upper(), [2, 4, 8, 16, 32, 64])
+                tmp_ds = None
+                cog_creation_opts.append('COPY_SRC_OVERVIEWS=YES')
+                cog_creation_opts.append(f'OVERVIEW_RESAMPLING={overview_resampling.upper()}')
+
+            print(f"  Writing COG...")
             result = gdal.Translate(
                 output_path,
-                self.input_path,
-                **translate_options
+                tmp_tif,
+                format='COG',
+                creationOptions=cog_creation_opts,
             )
-        
+        finally:
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+
         if result is None:
             raise RuntimeError(f"Failed to create COG: {gdal.GetLastErrorMsg()}")
-        
+
         result = None  # Close dataset
         
         print(f"  ✓ COG created: {output_path}")
