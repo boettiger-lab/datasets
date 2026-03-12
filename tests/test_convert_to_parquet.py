@@ -89,12 +89,14 @@ class TestConvertToParquet:
             
             # Verify _cng_fid column was added
             con = duckdb.connect()
-            df = con.execute(f"SELECT * FROM read_parquet('{output_path}')").df()
-            
-            assert '_cng_fid' in df.columns, "Expected _cng_fid column"
-            assert len(df) == 3, "Expected 3 features"
-            assert list(df['_cng_fid']) == [1, 2, 3], "Expected sequential IDs"
-            
+            cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{output_path}')").fetchdf()['column_name'].tolist()
+            count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{output_path}')").fetchone()[0]
+            ids = con.execute(f"SELECT _cng_fid FROM read_parquet('{output_path}') ORDER BY _cng_fid").fetchdf()['_cng_fid'].tolist()
+
+            assert '_cng_fid' in cols, "Expected _cng_fid column"
+            assert count == 3, "Expected 3 features"
+            assert ids == [1, 2, 3], "Expected sequential IDs"
+
             con.close()
             
         finally:
@@ -116,12 +118,13 @@ class TestConvertToParquet:
             
             # Verify file exists and has the existing fid column
             con = duckdb.connect()
-            df = con.execute(f"SELECT * FROM read_parquet('{output_path}')").df()
-            
-            assert 'fid' in df.columns, "Expected existing fid column to be preserved"
-            assert '_cng_fid' not in df.columns, "Should not add _cng_fid when fid exists"
-            assert len(df) == 2, "Expected 2 features"
-            
+            cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{output_path}')").fetchdf()['column_name'].tolist()
+            count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{output_path}')").fetchone()[0]
+
+            assert 'fid' in cols, "Expected existing fid column to be preserved"
+            assert '_cng_fid' not in cols, "Should not add _cng_fid when fid exists"
+            assert count == 2, "Expected 2 features"
+
             con.close()
             
         finally:

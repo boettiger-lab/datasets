@@ -8,6 +8,7 @@ for efficient spatial querying.
 import os
 import shutil
 import subprocess
+import duckdb
 import ibis
 from cng_datasets.storage.s3 import configure_s3_credentials
 from cng_datasets.vector.h3_tiling import identify_id_column
@@ -73,31 +74,45 @@ def repartition_by_h0(
     # If source parquet provided, join back all attributes (except geometry)
     if source_parquet:
         print(f'Joining attributes from {source_parquet}...')
-        
-        # Read source to get column info
-        source = con.read_parquet(source_parquet)
-        source_cols = source.columns
-        
-        # Use helper to find geometry column (case-insensitive)
+
+        # Use raw DuckDB to read schema — ibis cannot parse GEOMETRY(OGC:CRS84) types
+        # introduced in DuckDB 1.5 / spatial extension updates.
+        _raw = duckdb.connect()
+        try:
+            _raw.execute("INSTALL httpfs; LOAD httpfs")
+            desc = _raw.execute(f"DESCRIBE SELECT * FROM read_parquet('{source_parquet}')").fetchdf()
+        finally:
+            _raw.close()
+        source_cols = desc['column_name'].tolist()
+
+        # Use helper to find geometry column (case-insensitive or by GEOMETRY type)
         col_lower_map = {col.lower(): col for col in source_cols}
+        col_types = dict(zip(desc['column_name'], desc['column_type']))
         geom_col = None
         for name in ['geometry', 'geom', 'shape']:
             if name in col_lower_map:
                 geom_col = col_lower_map[name]
                 break
-        
+        if not geom_col:
+            for col, typ in col_types.items():
+                if typ.upper().startswith('GEOMETRY'):
+                    geom_col = col
+                    break
+
         # Verify the chunk ID column exists in source
         if chunk_id_col not in source_cols:
             raise ValueError(f"Chunk ID column '{chunk_id_col}' not found in source parquet. Source columns: {source_cols}")
-        
-        # Select all columns except geometry (keep original ID column name)
+
+        # Select all columns except geometry
         attr_cols = [c for c in source_cols if c != geom_col]
-        
+
         print(f'  Joining on column: {chunk_id_col}')
         print(f'  Adding {len(attr_cols) - 1} attribute columns')
-        
-        # Join chunks with attributes (using the ID column from chunks)
-        result = chunks.inner_join(source.select(attr_cols), chunk_id_col)
+
+        # Register a view of just the attribute columns so ibis never touches the GEOMETRY type
+        quoted = ', '.join(f'"{c}"' for c in attr_cols)
+        con.raw_sql(f"CREATE OR REPLACE VIEW _source_attrs AS SELECT {quoted} FROM read_parquet('{source_parquet}')")
+        result = chunks.inner_join(con.table('_source_attrs'), chunk_id_col)
     else:
         print('No source parquet provided, proceeding without attribute join')
         result = chunks
