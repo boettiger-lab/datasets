@@ -524,6 +524,9 @@ class RasterProcessor:
         if src_srs.IsGeographic():
             return (min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
 
+        tgt_srs = osr.SpatialReference()
+        tgt_srs.ImportFromEPSG(4326)
+        tgt_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         transform = osr.CoordinateTransformation(src_srs, tgt_srs)
         corners = [
             transform.TransformPoint(xmin, ymin),
