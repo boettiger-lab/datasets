@@ -136,7 +136,12 @@ def geom_to_h3_cells(
                    UNNEST(ST_Dump(geom)).geom AS geom 
             FROM t0
         ) 
-        SELECT {col_list}, h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), {zoom}) AS h3id
+        SELECT {col_list},
+               CASE
+                   WHEN ST_GeometryType(geom) = 'POINT'
+                   THEN [h3_latlng_to_cell(ST_Y(geom), ST_X(geom), {zoom})]
+                   ELSE h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), {zoom})
+               END AS h3id
         FROM t1
     '''
     
