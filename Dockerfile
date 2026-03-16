@@ -48,7 +48,7 @@ RUN mkdir -p /usr/local/share && \
     ln -sfn "${PROJ_DIR}" /usr/local/share/proj || true
 
 # Pre-install DuckDB extensions so pods don't need outbound internet access at runtime
-RUN python3 -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL httpfs'); con.execute('INSTALL spatial')"
+RUN python3 -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL httpfs'); con.execute('INSTALL spatial'); con.execute('INSTALL h3 FROM community')"
 
 # Set Python to run in unbuffered mode (recommended for containers)
 ENV PYTHONUNBUFFERED=1
