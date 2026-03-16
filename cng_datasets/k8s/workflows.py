@@ -1022,6 +1022,11 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
 ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$DATASET.geojsonl /vsicurl/{geoparquet_url} -progress
 
 # Generate PMTiles from GeoJSONSeq
+# TIPPECANOE_MAX_THREADS must be a power of 2; Kubernetes nodes can expose
+# non-power-of-2 logical CPU counts which triggers an internal assertion
+# failure "N shards not a power of 2" (felt/tippecanoe#216).
+# Round detected CPU count down to nearest power of 2 to preserve I/O parallelism.
+TIPPECANOE_MAX_THREADS=$(python3 -c "import os; n=os.cpu_count() or 1; print(1<<(n.bit_length()-1))")
 tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/$DATASET.geojsonl
 
 # Upload to S3 using rclone
