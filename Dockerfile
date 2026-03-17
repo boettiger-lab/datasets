@@ -10,9 +10,18 @@ RUN apt-get update && apt-get install -y \
     curl \
     unzip \
     make \
+    g++ \
+    libsqlite3-dev \
+    zlib1g-dev \
     python3-dev \
     python3-numpy \
     && rm -rf /var/lib/apt/lists/*
+
+# Build tippecanoe 2.79.0 from source
+RUN git clone --depth 1 --branch 2.79.0 https://github.com/felt/tippecanoe.git /tmp/tippecanoe \
+    && make -C /tmp/tippecanoe -j$(nproc) \
+    && make -C /tmp/tippecanoe install \
+    && rm -rf /tmp/tippecanoe
 
 # Install AWS CLI
 RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
