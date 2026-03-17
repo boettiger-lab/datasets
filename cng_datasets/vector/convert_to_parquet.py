@@ -56,6 +56,7 @@ def _is_gdb_source(source_url: str) -> bool:
     return cleaned.rstrip('/').endswith('.gdb')
 
 
+
 def _linearize_source(source_url: str, layer: Optional[str] = None,
                       verbose: bool = False) -> Tuple[str, Optional[str], Optional[str]]:
     """
@@ -362,8 +363,9 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
         con.close()
 
 
-def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str], 
-                               target_crs: str, geom_col: str = "geom", layer: Optional[str] = None, verbose: bool = False) -> str:
+def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str],
+                               target_crs: str, geom_col: str = "geom", layer: Optional[str] = None,
+                               verbose: bool = False) -> str:
     """
     Build DuckDB query to read and reproject data. Can handle multiple input files.
     
@@ -374,20 +376,23 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         geom_col: Geometry column name
         layer: Layer name
         verbose: Print debug information
-        
+
     Returns:
         DuckDB SQL query string
     """
     # Determine geometry transformation
     if source_crs and source_crs != target_crs:
         # Need to reproject
-        if is_geographic_crs(target_crs):
-            # ST_Transform outputs lat/lon for geographic CRS, but GeoParquet expects lon/lat
+        if is_geographic_crs(target_crs) and not is_geographic_crs(source_crs):
+            # Projected → geographic: DuckDB's ST_Transform outputs (lat, lon) authority
+            # axis order, but GeoParquet requires (lon, lat). Apply ST_FlipCoordinates.
+            # Geographic → geographic (e.g. EPSG:4269 → EPSG:4326): ST_Transform preserves
+            # traditional (lon, lat) order, so no flip is needed.
             geom_expr = f"ST_FlipCoordinates(ST_Transform({geom_col}, '{source_crs}', '{target_crs}')) AS {geom_col}"
         else:
             geom_expr = f"ST_Transform({geom_col}, '{source_crs}', '{target_crs}') AS {geom_col}"
     else:
-        # No reprojection needed
+        # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
         geom_expr = geom_col
     
     layer_param = f", layer='{layer}'" if layer else ""

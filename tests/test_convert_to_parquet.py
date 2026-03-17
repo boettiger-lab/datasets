@@ -219,6 +219,178 @@ class TestReprojection:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
     
+    @pytest.fixture
+    def sample_nad83_shapefile(self):
+        """
+        Create a shapefile in EPSG:4269 (NAD83) — the CRS used by all Census TIGER files.
+
+        This is the real bug scenario: source is geographic (EPSG:4269), target is
+        EPSG:4326. reprojection is triggered because they differ, and the previous code
+        incorrectly applied ST_FlipCoordinates for all geographic targets — including
+        geographic→geographic transforms where ST_Transform does NOT swap axes.
+        """
+        import subprocess
+        import json
+        import shutil
+
+        wgs84_geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"name": "Area 1"},
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[
+                            [-122.4, 37.8], [-122.4, 37.9],
+                            [-122.3, 37.9], [-122.3, 37.8],
+                            [-122.4, 37.8]
+                        ]]
+                    }
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='_src.geojson', delete=False) as f:
+            json.dump(wgs84_geojson, f)
+            src_path = f.name
+
+        temp_dir = tempfile.mkdtemp()
+        shp_path = os.path.join(temp_dir, 'test_4269.shp')
+
+        try:
+            result = subprocess.run(
+                ['ogr2ogr', '-f', 'ESRI Shapefile', '-t_srs', 'EPSG:4269', shp_path, src_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                pytest.skip(f"Could not create NAD83 test shapefile: {result.stderr}")
+            yield shp_path
+        finally:
+            if os.path.exists(src_path):
+                os.remove(src_path)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
+    def test_nad83_shapefile_to_wgs84_axis_order(self, sample_nad83_shapefile):
+        """
+        EPSG:4269 (NAD83) shapefile → EPSG:4326 must produce (lon, lat) = (X, Y).
+
+        This is the regression test for Census TIGER data. The bug: the old code applied
+        ST_FlipCoordinates for any geographic target CRS, but geographic→geographic
+        ST_Transform does NOT swap axes. The flip incorrectly put latitude values in X.
+        """
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
+            output_path = f.name
+
+        try:
+            convert_to_parquet(
+                source_url=sample_nad83_shapefile,
+                destination=output_path,
+                target_crs="EPSG:4326",
+                verbose=False,
+                progress=False,
+            )
+
+            con = duckdb.connect()
+            con.install_extension('spatial')
+            con.load_extension('spatial')
+
+            result = con.execute(f"""
+                SELECT
+                    MIN(ST_XMin(geom)) as min_x,
+                    MAX(ST_XMax(geom)) as max_x,
+                    MIN(ST_YMin(geom)) as min_y,
+                    MAX(ST_YMax(geom)) as max_y
+                FROM read_parquet('{output_path}')
+            """).fetchone()
+            con.close()
+
+            min_x, max_x, min_y, max_y = result
+
+            # X must be longitude (negative for US west coast), not latitude (~37)
+            assert min_x < -100, (
+                f"X min is {min_x:.2f} — looks like latitude, not longitude. "
+                "Axis swap bug: ST_FlipCoordinates is being applied to a "
+                "geographic→geographic transform that doesn't need it."
+            )
+            assert -123 <= min_x <= -122, f"X min {min_x:.2f} not in expected SF Bay Area lon range"
+            assert -123 <= max_x <= -122, f"X max {max_x:.2f} not in expected SF Bay Area lon range"
+            assert 37 <= min_y <= 39, f"Y min {min_y:.2f} not in expected SF Bay Area lat range"
+            assert 37 <= max_y <= 39, f"Y max {max_y:.2f} not in expected SF Bay Area lat range"
+
+        finally:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+    def test_geojson_coordinate_order_preserved(self):
+        """
+        GeoJSON inputs must NOT have coordinates flipped.
+
+        RFC 7946 mandates (lon, lat) order for GeoJSON, and GDAL's GeoJSON driver
+        honours this. Applying ST_FlipCoordinates to GeoJSON would silently corrupt
+        the output. This test guards against that regression.
+        """
+        import json
+
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {},
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[
+                            [-122.4, 37.8], [-122.4, 37.9],
+                            [-122.3, 37.9], [-122.3, 37.8],
+                            [-122.4, 37.8]
+                        ]]
+                    }
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.geojson', delete=False) as f:
+            json.dump(geojson, f)
+            src_path = f.name
+
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
+            output_path = f.name
+
+        try:
+            convert_to_parquet(
+                source_url=src_path,
+                destination=output_path,
+                target_crs="EPSG:4326",
+                verbose=False,
+                progress=False,
+            )
+
+            con = duckdb.connect()
+            con.install_extension('spatial')
+            con.load_extension('spatial')
+
+            result = con.execute(f"""
+                SELECT MIN(ST_XMin(geom)) as min_x, MIN(ST_YMin(geom)) as min_y
+                FROM read_parquet('{output_path}')
+            """).fetchone()
+            con.close()
+
+            min_x, min_y = result
+            assert min_x < -100, (
+                f"GeoJSON X min is {min_x:.2f} — looks like latitude. "
+                "GeoJSON inputs are being incorrectly flipped."
+            )
+            assert -123 <= min_x <= -122, f"GeoJSON X min {min_x:.2f} not in expected lon range"
+            assert 37 <= min_y <= 39, f"GeoJSON Y min {min_y:.2f} not in expected lat range"
+
+        finally:
+            if os.path.exists(src_path):
+                os.remove(src_path)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
     def test_projected_to_wgs84_reprojection(self, sample_projected_shapefile):
         """
         Test that EPSG:3310 (meters) is correctly reprojected to EPSG:4326 (degrees).
