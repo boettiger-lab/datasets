@@ -131,7 +131,19 @@ def main():
     setup_bucket_parser.add_argument("--verify", action="store_true", help="Verify bucket configuration after setup")
     
     args = parser.parse_args()
-    
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        _dispatch(args)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _dispatch(args):
     if args.command == "vector":
         from .vector import process_vector_chunks
         # Parse parent resolutions from comma-separated string
@@ -320,10 +332,6 @@ def main():
                 print(json.dumps(results, indent=2))
             
             sys.exit(0 if success else 1)
-    
-    else:
-        parser.print_help()
-        sys.exit(1)
 
 
 if __name__ == "__main__":

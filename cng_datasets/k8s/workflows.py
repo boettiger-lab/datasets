@@ -8,9 +8,23 @@ multiple coordinated Kubernetes jobs.
 from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 import math
+import re
 import yaml
 from .jobs import K8sJobManager
 from .armada import convert_workflow_to_armada
+
+
+def _validate_k8s_name(k8s_name: str, original: str) -> None:
+    """Raise ValueError if k8s_name is not a valid Kubernetes resource name."""
+    pattern = re.compile(r'^[a-z0-9][a-z0-9\-]*[a-z0-9]$')
+    if not pattern.match(k8s_name):
+        raise ValueError(
+            f"Dataset name {original!r} produces invalid Kubernetes name {k8s_name!r}.\n"
+            "Kubernetes names must consist of lowercase alphanumeric characters and '-', "
+            "and must start and end with an alphanumeric character.\n"
+            "Common causes: dots ('.'), underscores left after substitution, or starting/ending with '-'.\n"
+            f"Suggested fix: rename using only lowercase letters, digits, hyphens, and '/' as path separator."
+        )
 
 
 def _count_source_features(source_urls: Union[str, List[str]], layer: str = None) -> int:
@@ -243,7 +257,8 @@ def generate_dataset_workflow(
     
     # Sanitize dataset name for Kubernetes (replace underscores, slashes with hyphens)
     k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
-    
+    _validate_k8s_name(k8s_name, dataset_name)
+
     # Normalize source_urls to list
     if isinstance(source_urls, str):
         source_urls = [source_urls]
@@ -414,6 +429,7 @@ def generate_raster_workflow(
     output_path.mkdir(parents=True, exist_ok=True)
 
     k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
+    _validate_k8s_name(k8s_name, dataset_name)
 
     if parent_resolutions is None:
         parent_resolutions = [0]
