@@ -647,7 +647,7 @@ def apply_geoparquet_optimizations(input_path: str, output_path: str,
         print(f"  Applying GeoParquet optimizations...")
     
     # Add bbox column which also ensures proper metadata
-    add_bbox_column(input_path, output_path, verbose=verbose)
+    add_bbox_column(input_path, output_path, verbose=verbose, overwrite=True)
     
     if verbose:
         print(f"  ✓ Applied optimizations")
