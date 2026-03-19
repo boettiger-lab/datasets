@@ -139,7 +139,19 @@ def repartition_by_h0(
         )
 
     print('Uploading partitioned data to S3...')
-    con.read_parquet(f'{local_dir}/**/*.parquet').to_parquet(f'{output_dir.rstrip("/")}/', partition_by='h0')
+    if output_dir.startswith('s3://'):
+        parts = output_dir.replace('s3://', '').split('/', 1)
+        rclone_output = f'nrp:{parts[0]}/{parts[1].rstrip("/")}' if len(parts) == 2 else f'nrp:{parts[0]}'
+        subprocess.run(
+            ['rclone', 'copy', local_dir, rclone_output,
+             '--transfers', '32',
+             '--s3-upload-concurrency', '16',
+             '--s3-chunk-size', '64M',
+             '-P'],
+            check=True,
+        )
+    else:
+        shutil.copytree(local_dir, output_dir.rstrip('/'), dirs_exist_ok=True)
     
     print('Cleaning up local directory...')
     shutil.rmtree(local_dir)
