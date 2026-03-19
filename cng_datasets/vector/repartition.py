@@ -19,23 +19,31 @@ def repartition_by_h0(
     output_dir: str,
     source_parquet: str = None,
     cleanup: bool = True,
+    memory_limit: str = None,
 ) -> None:
     """
     Repartition chunks by h0 for efficient spatial querying.
     Joins back attribute columns from source parquet (without geometry).
-    
+
     Args:
         chunks_dir: S3 URL or local path to chunks directory
         output_dir: S3 URL or local path to output directory
         source_parquet: S3 URL to original parquet (for joining attributes)
         cleanup: Whether to remove chunks directory after repartitioning
+        memory_limit: DuckDB memory limit (e.g. '27GiB'). Falls back to
+            DUCKDB_MEMORY_LIMIT env var. If neither is set, DuckDB auto-detects
+            (which may ignore container cgroup limits).
     """
     print(f"Repartitioning chunks from {chunks_dir} to {output_dir}")
-    
+
     # Set up DuckDB connection with S3 credentials
     con = ibis.duckdb.connect()
     configure_s3_credentials(con)
     con.raw_sql('SET preserve_insertion_order=false')  # saves RAM
+    effective_limit = memory_limit or os.environ.get('DUCKDB_MEMORY_LIMIT')
+    if effective_limit:
+        print(f"Setting DuckDB memory_limit={effective_limit}")
+        con.raw_sql(f"SET memory_limit='{effective_limit}'")
     con.raw_sql('SET http_timeout=1200')
     con.raw_sql('SET http_retries=30')
     con.raw_sql('SET arrow_large_buffer_size=true')

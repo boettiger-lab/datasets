@@ -213,6 +213,7 @@ def generate_dataset_workflow(
     row_group_size: int = 100000,
     backend: str = "k8s",
     repartition_storage: str = "200Gi",
+    repartition_memory: str = "32Gi",
     # Backwards compatibility: accept source_url (singular)
     source_url: Union[str, List[str]] = None,
 ):
@@ -303,7 +304,7 @@ def generate_dataset_workflow(
     _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name)
     
     # Generate repartition job
-    _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage)
+    _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory)
     
     # Generate workflow RBAC (generic for all cng-datasets workflows)
     _generate_workflow_rbac(namespace, output_path)
@@ -1164,7 +1165,23 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-hex.yaml"))
 
 
-def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo, s3_dataset=None, repartition_storage: str = "200Gi"):
+def _duckdb_memory_limit(memory_str: str, fraction: float = 0.85) -> str:
+    """Return a DuckDB memory_limit string that is *fraction* of *memory_str*.
+
+    Parses strings like "32Gi", "8Gi", "512Mi" and returns e.g. "27GiB",
+    keeping DuckDB's preferred "GiB"/"MiB" suffix so the value is unambiguous.
+    Falls back to returning *memory_str* unchanged if it cannot be parsed.
+    """
+    m = re.match(r'^(\d+(?:\.\d+)?)(Gi|Mi|G|M)$', memory_str)
+    if not m:
+        return memory_str
+    value, unit = float(m.group(1)), m.group(2)
+    result = int(value * fraction)
+    duckdb_unit = {"Gi": "GiB", "Mi": "MiB", "G": "GB", "M": "MB"}[unit]
+    return f"{result}{duckdb_unit}"
+
+
+def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo, s3_dataset=None, repartition_storage: str = "200Gi", repartition_memory: str = "32Gi"):
     """Generate repartition job."""
     s3_dataset = s3_dataset or dataset_name
     job_spec = {
@@ -1215,11 +1232,11 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
                             {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
                         ],
                         "command": ["bash", "-c", f"""set -e
-cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output-dir s3://{bucket}/{s3_dataset}/hex --source-parquet s3://{bucket}/{s3_dataset}.parquet --cleanup
+cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output-dir s3://{bucket}/{s3_dataset}/hex --source-parquet s3://{bucket}/{s3_dataset}.parquet --cleanup --memory-limit {_duckdb_memory_limit(repartition_memory)}
 """],
                         "resources": {
-                            "requests": {"cpu": "4", "memory": "32Gi", "ephemeral-storage": repartition_storage},
-                            "limits": {"cpu": "4", "memory": "32Gi", "ephemeral-storage": repartition_storage}
+                            "requests": {"cpu": "4", "memory": repartition_memory, "ephemeral-storage": repartition_storage},
+                            "limits": {"cpu": "4", "memory": repartition_memory, "ephemeral-storage": repartition_storage}
                         }
                     }],
                     "volumes": [

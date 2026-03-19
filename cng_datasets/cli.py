@@ -52,6 +52,7 @@ def main():
     repartition_parser.add_argument("--output-dir", required=True, help="Output directory URL")
     repartition_parser.add_argument("--source-parquet", required=True, help="Source parquet with full attributes")
     repartition_parser.add_argument("--cleanup", action="store_true", default=True, help="Remove chunks after repartitioning")
+    repartition_parser.add_argument("--memory-limit", type=str, default=None, help="DuckDB memory limit (e.g. '27GiB'). Overrides DUCKDB_MEMORY_LIMIT env var.")
     
     # K8s job generation command
     k8s_parser = subparsers.add_parser("k8s", help="Generate Kubernetes job")
@@ -78,6 +79,7 @@ def main():
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
     workflow_parser.add_argument("--repartition-storage", type=str, default="200Gi", help="Ephemeral storage request/limit for repartition job pod (default: 200Gi)")
+    workflow_parser.add_argument("--repartition-memory", type=str, default="32Gi", help="Memory request/limit for repartition job pod (default: 32Gi)")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     
     # Raster workflow generation command
@@ -222,6 +224,7 @@ def _dispatch(args):
             output_dir=args.output_dir,
             source_parquet=args.source_parquet,
             cleanup=args.cleanup,
+            memory_limit=args.memory_limit,
         )
     
     elif args.command == "k8s":
@@ -274,6 +277,7 @@ def _dispatch(args):
             row_group_size=args.row_group_size,
             backend=args.backend,
             repartition_storage=args.repartition_storage,
+            repartition_memory=args.repartition_memory,
         )
     
     elif args.command == "raster-workflow":

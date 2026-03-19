@@ -289,6 +289,27 @@ class TestWorkflowGeneration:
             assert resources["requests"]["ephemeral-storage"] == "400Gi"
             assert resources["limits"]["ephemeral-storage"] == "400Gi"
 
+    @pytest.mark.timeout(5)
+    def test_repartition_job_memory(self):
+        """repartition_memory controls pod memory and DuckDB memory_limit (85%)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                repartition_memory="64Gi",
+            )
+            job_file = Path(tmpdir) / "test-ds-repartition.yaml"
+            with open(job_file) as f:
+                job = yaml.safe_load(f)
+            resources = job["spec"]["template"]["spec"]["containers"][0]["resources"]
+            assert resources["requests"]["memory"] == "64Gi"
+            assert resources["limits"]["memory"] == "64Gi"
+            # DuckDB limit should be 85% = 54GiB
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "--memory-limit 54GiB" in command
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""
