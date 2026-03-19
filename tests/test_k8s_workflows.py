@@ -254,6 +254,41 @@ class TestWorkflowGeneration:
             for doc in docs:
                 assert doc["metadata"]["namespace"] == "custom-ns"
 
+    @pytest.mark.timeout(5)
+    def test_repartition_job_ephemeral_storage(self):
+        """Repartition job must request ephemeral-storage to avoid eviction on large datasets."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            job_file = Path(tmpdir) / "test-ds-repartition.yaml"
+            with open(job_file) as f:
+                job = yaml.safe_load(f)
+            resources = job["spec"]["template"]["spec"]["containers"][0]["resources"]
+            assert resources["requests"]["ephemeral-storage"] == "200Gi"
+            assert resources["limits"]["ephemeral-storage"] == "200Gi"
+
+    @pytest.mark.timeout(5)
+    def test_repartition_job_custom_ephemeral_storage(self):
+        """--repartition-storage should override the default ephemeral-storage value."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                repartition_storage="400Gi",
+            )
+            job_file = Path(tmpdir) / "test-ds-repartition.yaml"
+            with open(job_file) as f:
+                job = yaml.safe_load(f)
+            resources = job["spec"]["template"]["spec"]["containers"][0]["resources"]
+            assert resources["requests"]["ephemeral-storage"] == "400Gi"
+            assert resources["limits"]["ephemeral-storage"] == "400Gi"
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""
