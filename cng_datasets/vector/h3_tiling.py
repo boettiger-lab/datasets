@@ -349,11 +349,30 @@ class H3VectorProcessor:
         intermediate_file = f"/tmp/h3_intermediate_{chunk_id:06d}.parquet"
         
         self.con.execute(f"""
-            COPY ({h3_sql}) 
-            TO '{intermediate_file}' 
+            COPY ({h3_sql})
+            TO '{intermediate_file}'
             (FORMAT PARQUET, COMPRESSION 'ZSTD')
         """)
-        
+
+        # Check for features that produced 0 H3 cells despite having polygon area.
+        # This typically indicates swapped lat/lon coordinates in the input geometry.
+        # Join intermediate file (has id + h3id) back to chunk_table (has id + geom).
+        empty_with_area = self.con.execute(f"""
+            SELECT COUNT(*)
+            FROM read_parquet('{intermediate_file}') AS h
+            JOIN chunk_table AS c ON h."{id_col}" = c."{id_col}"
+            WHERE len(h.h3id) = 0
+              AND ST_GeometryType(c.geom) NOT IN ('POINT', 'MULTIPOINT')
+              AND ST_Area(c.geom) > 0
+        """).fetchone()[0]
+
+        if empty_with_area > 0:
+            raise RuntimeError(
+                f"Chunk {chunk_id}: {empty_with_area} polygon feature(s) produced 0 H3 cells "
+                f"despite having non-zero area. This usually means coordinates are in "
+                f"(lat, lon) order instead of (lon, lat). Check input geometry coordinate order."
+            )
+
         print(f"  ✓ Pass 1 complete: {intermediate_file}")
         return intermediate_file
     
