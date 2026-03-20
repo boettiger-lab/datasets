@@ -568,6 +568,72 @@ class TestVectorProcessing:
             processor.con.close()
 
 
+class TestSwappedCoordinateDetection:
+    """Test that swapped lat/lon coordinates are detected and raise an error."""
+
+    @pytest.mark.timeout(60)
+    def test_correct_coordinates_pass(self):
+        """Polygons with correct (lon, lat) order should process without error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            # Alpine County CA bbox in correct (lon, lat) order
+            con.execute(f"""
+                CREATE TABLE test_data AS
+                SELECT
+                    i as id,
+                    ST_GeomFromText('POLYGON((-120.073331 38.32688, -119.542332 38.32688, -119.542332 38.933324, -120.073331 38.933324, -120.073331 38.32688))') as geom
+                FROM range(3) t(i)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                chunk_size=10,
+            )
+            output_file = processor.process_chunk(0)
+            assert output_file is not None
+            assert Path(output_file).exists()
+            processor.con.close()
+
+    @pytest.mark.timeout(60)
+    def test_swapped_coordinates_raise_error(self):
+        """Polygons with swapped (lat, lon) order should raise RuntimeError, not silently write 0 rows."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            # Alpine County CA bbox with swapped (lat, lon) order — longitudes in lat slot
+            # are outside H3's valid lat range, so h3_polygon_wkt_to_cells returns []
+            con.execute(f"""
+                CREATE TABLE test_data AS
+                SELECT
+                    i as id,
+                    ST_GeomFromText('POLYGON((38.32688 -120.073331, 38.933324 -120.073331, 38.933324 -119.542332, 38.32688 -119.542332, 38.32688 -120.073331))') as geom
+                FROM range(3) t(i)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                chunk_size=10,
+            )
+            with pytest.raises(RuntimeError, match="0 H3 cells"):
+                processor.process_chunk(0)
+            processor.con.close()
+
+
 class TestRepartitionWithAttributeJoin:
     """Test repartition functionality with attribute join."""
     

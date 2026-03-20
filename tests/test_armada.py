@@ -240,12 +240,12 @@ class TestSaveArmadaYaml:
 
 
 class TestConvertWorkflowToArmada:
-    @pytest.mark.timeout(5)
+    @pytest.mark.timeout(30)
     def test_converts_vector_workflow(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
             )
@@ -267,12 +267,12 @@ class TestConvertWorkflowToArmada:
                 assert "jobs" in spec
                 assert len(spec["jobs"]) >= 1
 
-    @pytest.mark.timeout(5)
+    @pytest.mark.timeout(30)
     def test_hex_job_expanded_to_multiple_armada_jobs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
             )
@@ -289,19 +289,19 @@ class TestConvertWorkflowToArmada:
             with open(hex_armada) as f:
                 spec = yaml.safe_load(f)
 
-            # Default fallback: 200 completions -> 200 Armada jobs
-            assert len(spec["jobs"]) == 200
+            # 5-feature fixture -> 5 completions -> 5 Armada jobs
+            assert len(spec["jobs"]) == 5
 
             # No JOB_COMPLETION_INDEX references should remain
             full_text = str(spec)
             assert "JOB_COMPLETION_INDEX" not in full_text
 
-    @pytest.mark.timeout(5)
+    @pytest.mark.timeout(30)
     def test_single_pod_jobs_have_one_armada_job(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
             )
@@ -319,12 +319,12 @@ class TestConvertWorkflowToArmada:
                     spec = yaml.safe_load(f)
                 assert len(spec["jobs"]) == 1, f"{step} should have exactly 1 Armada job"
 
-    @pytest.mark.timeout(5)
+    @pytest.mark.timeout(30)
     def test_skips_non_job_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
             )
@@ -342,12 +342,12 @@ class TestConvertWorkflowToArmada:
 
 
 class TestWorkflowBackendFlag:
-    @pytest.mark.timeout(5)
+    @pytest.mark.timeout(30)
     def test_backend_k8s_produces_standard_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 backend="k8s",
@@ -357,12 +357,12 @@ class TestWorkflowBackendFlag:
             # No armada files
             assert not list(Path(tmpdir).glob("armada-*.yaml"))
 
-    @pytest.mark.timeout(5)
+    @pytest.mark.timeout(30)
     def test_backend_armada_produces_armada_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://example.com/data.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 backend="armada",

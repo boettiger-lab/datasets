@@ -47,7 +47,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN uv pip install "numpy<2" pip
 
 # Install the package with uv for fast resolution (GDAL already available from system)
-RUN uv pip install -e "."
+# Include pytest and pytest-timeout so tests can run inside the container without extra installs
+RUN uv pip install -e "." pytest pytest-timeout pytest-mock
 
 # Fix PROJ_LIB path: gdal:ubuntu-full installs proj.db at a non-standard location
 # (e.g. /usr/local/gdal-internal/share/proj). Create a symlink at the canonical
