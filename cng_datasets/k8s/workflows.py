@@ -150,7 +150,8 @@ def _count_single_source(source_url: str, layer: str = None) -> int:
             ['ogrinfo', '-so', gdal_path, layer],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            timeout=30,
         )
     else:
         # -al: all layers (for single-layer sources)
@@ -158,7 +159,8 @@ def _count_single_source(source_url: str, layer: str = None) -> int:
             ['ogrinfo', '-so', '-al', gdal_path],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            timeout=30,
         )
     
     # Parse output to find "Feature Count: XXXXX"
