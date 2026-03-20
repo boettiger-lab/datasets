@@ -83,7 +83,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-dataset",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 namespace="test-ns"
@@ -117,7 +117,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir
             )
@@ -143,7 +143,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir
             )
@@ -153,9 +153,9 @@ class TestWorkflowGeneration:
                 job = yaml.safe_load(f)
                 
             assert job["metadata"]["name"] == "test-ds-hex"
-            # With automatic chunking, when row count fails, we use defaults
-            assert job["spec"]["completions"] == 200  # Default max completions
-            assert job["spec"]["parallelism"] == 50   # Default max parallelism
+            # 5-feature fixture -> chunk_size=1, completions=5, parallelism=5
+            assert job["spec"]["completions"] == 5
+            assert job["spec"]["parallelism"] == 5
             assert job["spec"]["completionMode"] == "Indexed"
     
     @pytest.mark.timeout(30)
@@ -165,7 +165,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="mappinginequality",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="public-mappinginequality",
                 output_dir=tmpdir
             )
@@ -175,16 +175,15 @@ class TestWorkflowGeneration:
                 job = yaml.safe_load(f)
                 
             assert job["metadata"]["name"] == "mappinginequality-hex"
-            # Should calculate based on actual row count (10,154 rows)
-            # 10,154 / 200 = ~51 per chunk, so 200 completions
-            assert job["spec"]["completions"] == 200
-            assert job["spec"]["parallelism"] == 50
+            # 5-feature fixture -> chunk_size=1, completions=5, parallelism=5
+            assert job["spec"]["completions"] == 5
+            assert job["spec"]["parallelism"] == 5
             assert job["spec"]["completionMode"] == "Indexed"
-            
+
             # Check chunk-size is set correctly
             command = job["spec"]["template"]["spec"]["containers"][0]["command"]
             command_str = str(command)
-            assert "--chunk-size 51" in command_str
+            assert "--chunk-size 1" in command_str
 
     @pytest.mark.timeout(5)
     def test_pmtiles_job_memory(self):
@@ -192,7 +191,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 hex_memory="16Gi"
@@ -212,7 +211,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
             )
@@ -232,7 +231,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 namespace="custom-ns"
@@ -260,7 +259,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
             )
@@ -277,7 +276,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 repartition_storage="400Gi",
@@ -295,7 +294,7 @@ class TestWorkflowGeneration:
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 repartition_memory="64Gi",
@@ -321,7 +320,7 @@ class TestEdgeCases:
             # Should handle this gracefully
             generate_dataset_workflow(
                 dataset_name="my-dataset-2024",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir
             )
@@ -337,7 +336,7 @@ class TestEdgeCases:
             
             generate_dataset_workflow(
                 dataset_name="test-ds",
-                source_url="https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=str(output_dir)
             )
