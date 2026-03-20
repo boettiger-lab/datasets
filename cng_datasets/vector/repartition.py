@@ -128,41 +128,72 @@ def repartition_by_h0(
         # Register a view of just the attribute columns so ibis never touches the GEOMETRY type
         quoted = ', '.join(f'"{c}"' for c in attr_cols)
         con.raw_sql(f"CREATE OR REPLACE VIEW _source_attrs AS SELECT {quoted} FROM read_parquet('{source_parquet}')")
-        result = chunks.inner_join(con.table('_source_attrs'), chunk_id_col)
+        join_sql = (
+            f"SELECT s.*, c.* EXCLUDE (\"{chunk_id_col}\")"
+            f" FROM read_parquet('{chunks_dir}/*.parquet') c"
+            f" INNER JOIN _source_attrs s ON c.\"{chunk_id_col}\" = s.\"{chunk_id_col}\""
+            f" WHERE c.h0 = {{h0}}"
+        )
     else:
         print('No source parquet provided, proceeding without attribute join')
-        result = chunks
-    
-    print('Writing to local directory with h0 partitioning...')
-    result.to_parquet(f'{local_dir}/', partition_by='h0')
-
-    local_files = [
-        f for root, _, files in os.walk(local_dir)
-        for f in files if f.endswith('.parquet')
-    ]
-    if not local_files:
-        raise RuntimeError(
-            f"No parquet files written to '{local_dir}' — all chunks appear to be empty. "
-            f"Check that the hex job in '{chunks_dir}' produced non-empty output."
+        join_sql = (
+            f"SELECT * FROM read_parquet('{chunks_dir}/*.parquet') WHERE h0 = {{h0}}"
         )
 
-    print('Uploading partitioned data to S3...')
+    # Get distinct h0 values
+    h0_vals = con.raw_sql(
+        f"SELECT DISTINCT h0 FROM read_parquet('{chunks_dir}/*.parquet') ORDER BY h0"
+    ).fetchall()
+    if not h0_vals:
+        raise RuntimeError(
+            f"No parquet files found in chunks directory '{chunks_dir}'. "
+            f"The hex job may have produced no output (all cells empty?)."
+        )
+
+    print(f'Writing {len(h0_vals)} h0 partitions one at a time (bounded memory)...')
+
+    # Determine rclone output path once
     if output_dir.startswith('s3://'):
         parts = output_dir.replace('s3://', '').split('/', 1)
         rclone_output = f'nrp:{parts[0]}/{parts[1].rstrip("/")}' if len(parts) == 2 else f'nrp:{parts[0]}'
-        subprocess.run(
-            ['rclone', 'copy', local_dir, rclone_output,
-             '--transfers', '32',
-             '--s3-upload-concurrency', '16',
-             '--s3-chunk-size', '64M',
-             '-P'],
-            check=True,
-        )
     else:
-        shutil.copytree(local_dir, output_dir.rstrip('/'), dirs_exist_ok=True)
-    
+        rclone_output = None
+
+    any_written = False
+    for (h0,) in h0_vals:
+        local_partition = os.path.join(local_dir, f'h0={h0}')
+        os.makedirs(local_partition, exist_ok=True)
+        local_file = os.path.join(local_partition, 'data_0.parquet')
+
+        con.raw_sql(
+            f"COPY ({join_sql.format(h0=h0)}) TO '{local_file}'"
+            f" (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
+
+        if rclone_output:
+            subprocess.run(
+                ['rclone', 'copy', local_partition, f'{rclone_output}/h0={h0}/',
+                 '--transfers', '32',
+                 '--s3-upload-concurrency', '16',
+                 '--s3-chunk-size', '64M'],
+                check=True,
+            )
+        else:
+            dest = os.path.join(output_dir.rstrip('/'), f'h0={h0}')
+            shutil.copytree(local_partition, dest, dirs_exist_ok=True)
+
+        shutil.rmtree(local_partition)
+        any_written = True
+        print(f'  h0={h0} done')
+
+    if not any_written:
+        raise RuntimeError(
+            f"No partitions written — all chunks appear to be empty. "
+            f"Check that the hex job in '{chunks_dir}' produced non-empty output."
+        )
+
     print('Cleaning up local directory...')
-    shutil.rmtree(local_dir)
+    shutil.rmtree(local_dir, ignore_errors=True)
     
     print('✓ Repartitioning complete!')
     
