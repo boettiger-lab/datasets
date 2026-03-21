@@ -629,9 +629,47 @@ class TestSwappedCoordinateDetection:
                 h3_resolution=8,
                 chunk_size=10,
             )
-            with pytest.raises(RuntimeError, match="0 H3 cells"):
+            with pytest.raises(RuntimeError, match="outside the valid latitude range"):
                 processor.process_chunk(0)
             processor.con.close()
+
+    @pytest.mark.timeout(60)
+    def test_small_polygon_warns_not_raises(self):
+        """
+        Polygons smaller than one H3 cell at the target resolution should produce 0
+        cells but NOT raise a RuntimeError (issue #51).  The chunk should still
+        succeed and the processor should print a warning.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            # A tiny polygon (~0.0001 km²) in correct (lon, lat) order.
+            # At H3 resolution 8 (cell area ~0.74 km²) this produces 0 cells.
+            con.execute(f"""
+                CREATE TABLE test_data AS
+                SELECT
+                    i as id,
+                    ST_GeomFromText('POLYGON((-122.4 37.8, -122.4001 37.8, -122.4001 37.8001, -122.4 37.8001, -122.4 37.8))') as geom
+                FROM range(3) t(i)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                chunk_size=10,
+            )
+            # Must not raise — small polygons should be skipped with a warning
+            output_file = processor.process_chunk(0)
+            processor.con.close()
+            # Output file is created (may be empty if all features are skipped,
+            # but the process must complete without error)
+            assert output_file is not None
 
 
 class TestRepartitionWithAttributeJoin:

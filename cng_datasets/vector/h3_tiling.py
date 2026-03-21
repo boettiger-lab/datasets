@@ -355,22 +355,39 @@ class H3VectorProcessor:
         """)
 
         # Check for features that produced 0 H3 cells despite having polygon area.
-        # This typically indicates swapped lat/lon coordinates in the input geometry.
+        # Two distinct causes:
+        #   1. Swapped (lat, lon) coordinates → Y values outside valid lat range [-90, 90]
+        #      → raise RuntimeError (bad input data)
+        #   2. Polygon smaller than a single H3 cell at the target resolution
+        #      → valid input, just warn and continue
         # Join intermediate file (has id + h3id) back to chunk_table (has id + geom).
-        empty_with_area = self.con.execute(f"""
-            SELECT COUNT(*)
+        swapped, small = self.con.execute(f"""
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE ST_YMin(c.geom) < -90 OR ST_YMax(c.geom) > 90
+                ) AS swapped_coords,
+                COUNT(*) FILTER (
+                    WHERE ST_YMin(c.geom) >= -90 AND ST_YMax(c.geom) <= 90
+                ) AS too_small
             FROM read_parquet('{intermediate_file}') AS h
             JOIN chunk_table AS c ON h."{id_col}" = c."{id_col}"
             WHERE len(h.h3id) = 0
               AND ST_GeometryType(c.geom) NOT IN ('POINT', 'MULTIPOINT')
               AND ST_Area(c.geom) > 0
-        """).fetchone()[0]
+        """).fetchone()
 
-        if empty_with_area > 0:
+        if swapped > 0:
             raise RuntimeError(
-                f"Chunk {chunk_id}: {empty_with_area} polygon feature(s) produced 0 H3 cells "
-                f"despite having non-zero area. This usually means coordinates are in "
-                f"(lat, lon) order instead of (lon, lat). Check input geometry coordinate order."
+                f"Chunk {chunk_id}: {swapped} polygon feature(s) produced 0 H3 cells "
+                f"and have Y coordinates outside the valid latitude range [-90, 90]. "
+                f"This indicates coordinates are in (lat, lon) order instead of (lon, lat). "
+                f"Check input geometry coordinate order."
+            )
+        if small > 0:
+            print(
+                f"  Warning: {small} polygon feature(s) in chunk {chunk_id} produced 0 H3 cells "
+                f"at resolution {self.h3_resolution} — polygons are smaller than one H3 cell "
+                f"and will be skipped."
             )
 
         print(f"  ✓ Pass 1 complete: {intermediate_file}")
