@@ -1,12 +1,15 @@
 """Unit tests for convert_to_parquet with GeoParquet validation."""
 
+import json
 import pytest
 import tempfile
 import os
 from pathlib import Path
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-from cng_datasets.vector.convert_to_parquet import convert_to_parquet
+from cng_datasets.vector.convert_to_parquet import convert_to_parquet, apply_geoparquet_optimizations
 
 
 class TestConvertToParquet:
@@ -450,9 +453,127 @@ class TestReprojection:
                 WHERE NOT ST_IsValid(geom)
             """).fetchone()[0]
             assert invalid_count == 0, f"Found {invalid_count} invalid geometries"
-            
+
             con.close()
-            
+
         finally:
             if os.path.exists(output_path):
                 os.remove(output_path)
+
+
+class TestMGeometryBboxFix:
+    """
+    Regression tests for issue #50: bbox step fails when DuckDB omits GeoParquet
+    metadata for Measured (M) geometry types (e.g. 3D Measured MultiPoint).
+
+    When the parquet file has a geometry column named 'geom' but no GeoParquet
+    metadata, find_primary_geometry_column() falls back to 'geometry', causing
+    a Binder Error in the bbox SQL.  apply_geoparquet_optimizations(geom_col=...)
+    must override this auto-detection.
+    """
+
+    def _make_parquet_with_wrong_primary_column(self, path: str) -> None:
+        """
+        Write a parquet file with a GEOMETRY column called 'geom' but GeoParquet
+        metadata that incorrectly sets primary_column to 'geometry'.
+
+        This simulates what happens for M-geometry shapefiles where DuckDB writes
+        GeoParquet metadata but with the wrong primary_column value, causing
+        find_primary_geometry_column() to return 'geometry' instead of 'geom'.
+        """
+        import struct
+
+        con = duckdb.connect()
+        con.install_extension("spatial")
+        con.load_extension("spatial")
+
+        # Use a tiny GeoJSON string to get a real GEOMETRY-typed column named 'geom'
+        geojson = '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"id":1},"geometry":{"type":"Point","coordinates":[-122.4,37.8]}}]}'
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".geojson", delete=False) as f:
+            f.write(geojson)
+            gjson_path = f.name
+
+        try:
+            # Write via DuckDB — this produces correct GeoParquet metadata (primary_column='geom')
+            con.execute(f"""
+                COPY (SELECT * FROM ST_Read('{gjson_path}'))
+                TO '{path}' (FORMAT PARQUET)
+            """)
+        finally:
+            os.remove(gjson_path)
+            con.close()
+
+        # Patch the GeoParquet metadata to simulate the bug:
+        # change primary_column from 'geom' to 'geometry' (wrong name)
+        table = pq.read_table(path)
+        existing_meta = table.schema.metadata or {}
+        if b"geo" in existing_meta:
+            geo = json.loads(existing_meta[b"geo"])
+        else:
+            geo = {"version": "1.1.0", "columns": {}}
+        # Simulate wrong primary_column — this is what triggers the Binder Error
+        geo["primary_column"] = "geometry"
+        new_meta = dict(existing_meta)
+        new_meta[b"geo"] = json.dumps(geo).encode()
+        table = table.replace_schema_metadata(new_meta)
+        pq.write_table(table, path)
+
+    def test_apply_geoparquet_optimizations_with_geom_col_override(self):
+        """
+        apply_geoparquet_optimizations(geom_col='geom') must succeed on a parquet
+        file whose geometry column is 'geom' but has no GeoParquet metadata.
+
+        Without the fix, find_primary_geometry_column falls back to 'geometry' and
+        the bbox SQL raises: Binder Error: Referenced column "geometry" not found.
+        """
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            input_path = f.name
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            output_path = f.name
+
+        try:
+            self._make_parquet_with_wrong_primary_column(input_path)
+
+            # This must not raise — the geom_col override bypasses wrong auto-detection
+            apply_geoparquet_optimizations(input_path, output_path, geom_col="geom")
+
+            # Verify output has a bbox column (the critical result of the fix)
+            out_schema = pq.read_schema(output_path)
+            assert "bbox" in out_schema.names, (
+                "Output parquet must have a 'bbox' column after optimization"
+            )
+
+            # Verify the geometry column is still present
+            assert "geom" in out_schema.names, (
+                "Output must still contain the 'geom' geometry column"
+            )
+
+        finally:
+            for p in (input_path, output_path):
+                if os.path.exists(p):
+                    os.remove(p)
+
+    def test_apply_geoparquet_optimizations_without_override_fails_on_wrong_metadata(self):
+        """
+        Without geom_col override, optimizations on a file whose GeoParquet metadata
+        has primary_column='geometry' but the actual column is 'geom' should raise
+        a Binder Error (pre-fix behavior documented here as regression guard).
+        """
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            input_path = f.name
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            output_path = f.name
+
+        try:
+            self._make_parquet_with_wrong_primary_column(input_path)
+
+            # Without the override, geoparquet_io reads primary_column='geometry'
+            # from the (patched) metadata and emits SQL referencing column 'geometry',
+            # which does not exist → Binder Error.
+            with pytest.raises(Exception, match="geometry|Binder|not found"):
+                apply_geoparquet_optimizations(input_path, output_path)
+
+        finally:
+            for p in (input_path, output_path):
+                if os.path.exists(p):
+                    os.remove(p)

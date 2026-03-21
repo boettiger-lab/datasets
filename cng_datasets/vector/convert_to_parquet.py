@@ -629,26 +629,42 @@ def write_with_duckdb(query: str, output_path: str,
 
 
 def apply_geoparquet_optimizations(input_path: str, output_path: str,
+                                    geom_col: Optional[str] = None,
                                     verbose: bool = False) -> None:
     """
     Apply geoparquet-io optimizations to an existing parquet file.
-    
+
     This adds proper GeoParquet 1.1 metadata and optimizations.
-    
+
     Args:
         input_path: Input parquet file
         output_path: Output parquet file (can be same as input for in-place)
+        geom_col: Geometry column name. When provided, overrides auto-detection in
+            geoparquet_io, which is necessary for geometry types (e.g. Measured/M) where
+            DuckDB does not write GeoParquet metadata and auto-detection falls back to
+            the wrong default column name "geometry".
         verbose: Print debug information
     """
-    # Import the actual function from the module
+    import geoparquet_io.core.add_bbox_column as _bbox_mod
     from geoparquet_io.core.add_bbox_column import add_bbox_column
-    
+
     if verbose:
         print(f"  Applying GeoParquet optimizations...")
-    
-    # Add bbox column which also ensures proper metadata
-    add_bbox_column(input_path, output_path, verbose=verbose, overwrite=True)
-    
+
+    if geom_col is not None:
+        # Temporarily override find_primary_geometry_column so add_bbox_column uses
+        # the known column name rather than reading (potentially absent) GeoParquet
+        # metadata. This is needed when DuckDB omits geo metadata for unusual geometry
+        # types such as Measured (M) geometries converted to MultiPoint Z.
+        _orig = _bbox_mod.find_primary_geometry_column
+        _bbox_mod.find_primary_geometry_column = lambda path, verbose=False: geom_col
+        try:
+            add_bbox_column(input_path, output_path, verbose=verbose, overwrite=True)
+        finally:
+            _bbox_mod.find_primary_geometry_column = _orig
+    else:
+        add_bbox_column(input_path, output_path, verbose=verbose, overwrite=True)
+
     if verbose:
         print(f"  ✓ Applied optimizations")
 
@@ -893,12 +909,12 @@ def convert_to_parquet(
             
             try:
                 # Write data
-                write_with_duckdb(query, tmp_path, compression, compression_level, 
+                write_with_duckdb(query, tmp_path, compression, compression_level,
                                  row_group_size, verbose)
-                
+
                 # Apply GeoParquet optimizations in-place
-                apply_geoparquet_optimizations(tmp_path, tmp_path, verbose)
-                
+                apply_geoparquet_optimizations(tmp_path, tmp_path, geom_col=geom_col, verbose=verbose)
+
                 # Upload to S3
                 upload_to_s3(tmp_path, destination, verbose=progress)
                 
@@ -909,10 +925,10 @@ def convert_to_parquet(
             # Write directly to destination
             write_with_duckdb(query, destination, compression, compression_level,
                             row_group_size, verbose)
-            
+
             # Apply GeoParquet optimizations in-place
-            apply_geoparquet_optimizations(destination, destination, verbose)
-        
+            apply_geoparquet_optimizations(destination, destination, geom_col=geom_col, verbose=verbose)
+
         if verbose:
             print("✓ Conversion completed successfully!")
             
