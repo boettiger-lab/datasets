@@ -18,9 +18,64 @@ All cluster-specific values in generated Kubernetes job specs default to NRP Nau
 | `priority_class` | `opportunistic` | Kubernetes `priorityClassName`; set to `""` to omit the field |
 | `node_affinity` | `gpu-avoid` | `gpu-avoid` adds NRP NFD GPU-avoidance rule; `none` omits affinity entirely |
 
+### Profile Files (recommended for repeated use)
+
+A profile is a YAML file containing cluster-specific values. Use `--profile` to load one; explicit flags override individual profile values.
+
+**Built-in profiles** ship with the package:
+
+| Name | Cluster |
+|------|---------|
+| `nrp` | NRP Nautilus (default when no profile is given) |
+
+**Resolution order** for `--profile <name>`:
+1. Treat as a file path if it ends in `.yaml`/`.yml` or contains `/`
+2. `~/.config/cng-datasets/profiles/<name>.yaml`
+3. Built-in package profiles
+
+#### Writing a custom profile
+
+```yaml
+# ~/.config/cng-datasets/profiles/my-cluster.yaml
+name: my-cluster          # display-only, not used by the tool
+s3_endpoint: minio.my-cluster.svc.cluster.local
+s3_public_endpoint: minio.my-cluster.io
+s3_secret_name: minio-credentials
+rclone_secret_name: minio-rclone-config
+rclone_remote: minio
+priority_class: ""        # omit priorityClassName
+node_affinity: none       # omit node affinity
+```
+
+#### Using a profile via CLI
+
+```bash
+# Use a named profile from ~/.config/cng-datasets/profiles/
+cng-datasets workflow \
+  --dataset redlining \
+  --source-url https://example.com/data.gpkg \
+  --bucket public-redlining \
+  --profile my-cluster
+
+# Or pass a path directly
+cng-datasets workflow \
+  --dataset redlining \
+  --source-url https://example.com/data.gpkg \
+  --bucket public-redlining \
+  --profile ./profiles/my-cluster.yaml
+
+# Override a single field from the profile
+cng-datasets workflow \
+  --dataset redlining \
+  --source-url https://example.com/data.gpkg \
+  --bucket public-redlining \
+  --profile my-cluster \
+  --s3-secret-name redlining-specific-creds
+```
+
 ### CLI Flags
 
-Pass any combination of flags to `cng-datasets workflow` or `cng-datasets raster-workflow`:
+Pass any combination of flags without a profile for one-off overrides:
 
 ```bash
 # NRP Nautilus (default — no flags needed)
@@ -29,7 +84,7 @@ cng-datasets workflow \
   --source-url https://example.com/data.gpkg \
   --bucket public-redlining
 
-# MinIO on a private cluster
+# MinIO on a private cluster (all flags)
 cng-datasets workflow \
   --dataset redlining \
   --source-url https://example.com/data.gpkg \
@@ -41,62 +96,47 @@ cng-datasets workflow \
   --rclone-remote minio \
   --priority-class "" \
   --node-affinity none
-
-# AWS S3 (no internal endpoint, no GPU affinity needed)
-cng-datasets workflow \
-  --dataset redlining \
-  --source-url https://example.com/data.gpkg \
-  --bucket my-aws-bucket \
-  --s3-endpoint s3.amazonaws.com \
-  --s3-public-endpoint s3.amazonaws.com \
-  --priority-class "" \
-  --node-affinity none
 ```
 
 ### Python API
 
-The same parameters are keyword arguments on `generate_dataset_workflow` and `generate_raster_workflow`:
+The same `profile` parameter and per-field kwargs are available on `generate_dataset_workflow` and `generate_raster_workflow`:
 
 ```python
-from cng_datasets.k8s import generate_dataset_workflow, generate_raster_workflow
+from cng_datasets.k8s import generate_dataset_workflow, load_profile, cluster_config_from_args
 
-# Vector workflow targeting MinIO
+# Using a profile file
 generate_dataset_workflow(
     dataset_name="redlining",
     source_urls="https://example.com/data.gpkg",
     bucket="my-bucket",
     output_dir="k8s/",
-    s3_endpoint="minio.my-cluster.svc.cluster.local",
-    s3_public_endpoint="minio.my-cluster.io",
-    s3_secret_name="minio-credentials",
-    rclone_secret_name="minio-rclone-config",
-    rclone_remote="minio",
-    priority_class="",      # omit priorityClassName
-    node_affinity="none",   # omit node affinity
+    profile="my-cluster",           # name or path
+    s3_secret_name="per-bucket-key", # override one field
 )
 
-# Raster workflow — same flags apply
-generate_raster_workflow(
-    dataset_name="wyoming/rap-arte",
-    source_urls="https://example.com/rap.tif",
-    bucket="my-bucket",
-    output_dir="k8s/",
-    s3_endpoint="minio.my-cluster.svc.cluster.local",
-    s3_secret_name="minio-credentials",
+# Build a ClusterConfig programmatically
+cfg = cluster_config_from_args(
+    profile="my-cluster",
+    s3_secret_name="per-bucket-key",  # non-None values win over profile
 )
+
+# Inspect a profile
+values = load_profile("my-cluster")
+print(values)
 ```
 
 ### ClusterConfig Dataclass
 
-For programmatic use, `ClusterConfig` holds all settings with NRP defaults:
+For direct programmatic use, `ClusterConfig` holds all settings with NRP defaults:
 
 ```python
-from cng_datasets.k8s.workflows import ClusterConfig
+from cng_datasets.k8s import ClusterConfig
 
 # Default NRP config
 cfg = ClusterConfig()
 
-# Custom cluster
+# Custom cluster (all fields explicit)
 cfg = ClusterConfig(
     s3_endpoint="minio.my-cluster.svc.cluster.local",
     s3_public_endpoint="minio.my-cluster.io",
@@ -107,8 +147,6 @@ cfg = ClusterConfig(
     node_affinity="none",
 )
 ```
-
-> **Note:** YAML-based cluster profile files are not yet supported. If you find yourself repeating the same flags for a second cluster, open an issue — profile files are the natural next step.
 
 ### Per-Bucket Credential Scoping
 

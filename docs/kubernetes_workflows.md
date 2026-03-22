@@ -131,7 +131,33 @@ All cluster-specific values default to NRP Nautilus. Override any of them to tar
 | `--priority-class` | `opportunistic` | Kubernetes `priorityClassName`; pass `""` to omit the field entirely |
 | `--node-affinity` | `gpu-avoid` | `gpu-avoid` adds an NRP NFD rule to avoid GPU nodes; `none` omits affinity |
 
-#### Example: MinIO on a different cluster
+#### Example: Using a profile file
+
+Save cluster settings once, reuse across datasets:
+
+```yaml
+# ~/.config/cng-datasets/profiles/my-cluster.yaml
+s3_endpoint: minio.my-cluster.svc.cluster.local
+s3_public_endpoint: minio.my-cluster.io
+s3_secret_name: minio-credentials
+rclone_secret_name: minio-rclone-config
+rclone_remote: minio
+priority_class: ""
+node_affinity: none
+```
+
+```bash
+cng-datasets workflow \
+  --dataset my-dataset \
+  --source-url https://example.com/data.gpkg \
+  --bucket my-bucket \
+  --profile my-cluster \
+  --output-dir my-dataset/
+```
+
+Individual flags override profile values when both are given.
+
+#### Example: MinIO without a profile file
 
 ```bash
 cng-datasets workflow \

@@ -82,13 +82,14 @@ def main():
     workflow_parser.add_argument("--repartition-memory", type=str, default="32Gi", help="Memory request/limit for repartition job pod (default: 32Gi)")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     # Cluster/storage configuration flags
-    workflow_parser.add_argument("--s3-endpoint", default="rook-ceph-rgw-nautiluss3.rook", help="Internal S3 endpoint for jobs (default: rook-ceph-rgw-nautiluss3.rook)")
-    workflow_parser.add_argument("--s3-public-endpoint", default="s3-west.nrp-nautilus.io", help="Public S3 endpoint (default: s3-west.nrp-nautilus.io)")
-    workflow_parser.add_argument("--s3-secret-name", default="aws", help="Kubernetes secret name for S3 credentials (default: aws)")
-    workflow_parser.add_argument("--rclone-secret-name", default="rclone-config", help="Kubernetes secret name for rclone config (default: rclone-config)")
-    workflow_parser.add_argument("--rclone-remote", default="nrp", help="Rclone remote name used in setup-bucket and pmtiles jobs (default: nrp)")
-    workflow_parser.add_argument("--priority-class", default="opportunistic", help="Kubernetes priority class (default: opportunistic, use empty string to omit)")
-    workflow_parser.add_argument("--node-affinity", default="gpu-avoid", choices=["gpu-avoid", "none"], help="Node affinity rule: 'gpu-avoid' (default NRP GPU avoidance) or 'none' (no affinity)")
+    workflow_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file. Explicit flags below override profile values.")
+    workflow_parser.add_argument("--s3-endpoint", default=None, metavar="HOST", help="Internal S3 endpoint for jobs (default from profile, or rook-ceph-rgw-nautiluss3.rook)")
+    workflow_parser.add_argument("--s3-public-endpoint", default=None, metavar="HOST", help="Public S3 endpoint (default from profile, or s3-west.nrp-nautilus.io)")
+    workflow_parser.add_argument("--s3-secret-name", default=None, metavar="SECRET", help="Kubernetes secret name for S3 credentials (default from profile, or 'aws')")
+    workflow_parser.add_argument("--rclone-secret-name", default=None, metavar="SECRET", help="Kubernetes secret name for rclone config (default from profile, or 'rclone-config')")
+    workflow_parser.add_argument("--rclone-remote", default=None, metavar="REMOTE", help="Rclone remote name for setup-bucket and pmtiles (default from profile, or 'nrp')")
+    workflow_parser.add_argument("--priority-class", default=None, metavar="CLASS", help="Kubernetes priorityClassName; '' to omit (default from profile, or 'opportunistic')")
+    workflow_parser.add_argument("--node-affinity", default=None, choices=["gpu-avoid", "none"], help="Node affinity: 'gpu-avoid' (NRP GPU avoidance) or 'none' to omit (default from profile)")
 
     # Raster workflow generation command
     raster_workflow_parser = subparsers.add_parser("raster-workflow", help="Generate complete raster dataset workflow")
@@ -110,13 +111,14 @@ def main():
     raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif)")
     raster_workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     # Cluster/storage configuration flags
-    raster_workflow_parser.add_argument("--s3-endpoint", default="rook-ceph-rgw-nautiluss3.rook", help="Internal S3 endpoint for jobs (default: rook-ceph-rgw-nautiluss3.rook)")
-    raster_workflow_parser.add_argument("--s3-public-endpoint", default="s3-west.nrp-nautilus.io", help="Public S3 endpoint (default: s3-west.nrp-nautilus.io)")
-    raster_workflow_parser.add_argument("--s3-secret-name", default="aws", help="Kubernetes secret name for S3 credentials (default: aws)")
-    raster_workflow_parser.add_argument("--rclone-secret-name", default="rclone-config", help="Kubernetes secret name for rclone config (default: rclone-config)")
-    raster_workflow_parser.add_argument("--rclone-remote", default="nrp", help="Rclone remote name used in setup-bucket jobs (default: nrp)")
-    raster_workflow_parser.add_argument("--priority-class", default="opportunistic", help="Kubernetes priority class (default: opportunistic, use empty string to omit)")
-    raster_workflow_parser.add_argument("--node-affinity", default="gpu-avoid", choices=["gpu-avoid", "none"], help="Node affinity rule: 'gpu-avoid' (default NRP GPU avoidance) or 'none' (no affinity)")
+    raster_workflow_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file. Explicit flags below override profile values.")
+    raster_workflow_parser.add_argument("--s3-endpoint", default=None, metavar="HOST", help="Internal S3 endpoint for jobs (default from profile, or rook-ceph-rgw-nautiluss3.rook)")
+    raster_workflow_parser.add_argument("--s3-public-endpoint", default=None, metavar="HOST", help="Public S3 endpoint (default from profile, or s3-west.nrp-nautilus.io)")
+    raster_workflow_parser.add_argument("--s3-secret-name", default=None, metavar="SECRET", help="Kubernetes secret name for S3 credentials (default from profile, or 'aws')")
+    raster_workflow_parser.add_argument("--rclone-secret-name", default=None, metavar="SECRET", help="Kubernetes secret name for rclone config (default from profile, or 'rclone-config')")
+    raster_workflow_parser.add_argument("--rclone-remote", default=None, metavar="REMOTE", help="Rclone remote name for setup-bucket (default from profile, or 'nrp')")
+    raster_workflow_parser.add_argument("--priority-class", default=None, metavar="CLASS", help="Kubernetes priorityClassName; '' to omit (default from profile, or 'opportunistic')")
+    raster_workflow_parser.add_argument("--node-affinity", default=None, choices=["gpu-avoid", "none"], help="Node affinity: 'gpu-avoid' (NRP GPU avoidance) or 'none' to omit (default from profile)")
 
     # Sync job generation command
     sync_job_parser = subparsers.add_parser("sync-job", help="Generate Kubernetes job for syncing between S3 locations")
@@ -294,6 +296,7 @@ def _dispatch(args):
             backend=args.backend,
             repartition_storage=args.repartition_storage,
             repartition_memory=args.repartition_memory,
+            profile=args.profile,
             s3_endpoint=args.s3_endpoint,
             s3_public_endpoint=args.s3_public_endpoint,
             s3_secret_name=args.s3_secret_name,
@@ -302,7 +305,7 @@ def _dispatch(args):
             priority_class=args.priority_class,
             node_affinity=args.node_affinity,
         )
-    
+
     elif args.command == "raster-workflow":
         from .k8s import generate_raster_workflow
         # Parse parent resolutions
@@ -329,6 +332,7 @@ def _dispatch(args):
             band=getattr(args, 'band', None),
             output_cog_name=getattr(args, 'output_cog_name', None),
             backend=args.backend,
+            profile=args.profile,
             s3_endpoint=args.s3_endpoint,
             s3_public_endpoint=args.s3_public_endpoint,
             s3_secret_name=args.s3_secret_name,
@@ -337,7 +341,7 @@ def _dispatch(args):
             priority_class=args.priority_class,
             node_affinity=args.node_affinity,
         )
-    
+
     elif args.command == "storage":
         if args.storage_command == "cors":
             from .storage import configure_bucket_cors

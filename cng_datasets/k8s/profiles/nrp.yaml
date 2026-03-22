@@ -1,0 +1,10 @@
+# Built-in cluster profile: NRP Nautilus (default)
+# https://nrp.ai/
+name: nrp-nautilus
+s3_endpoint: rook-ceph-rgw-nautiluss3.rook
+s3_public_endpoint: s3-west.nrp-nautilus.io
+s3_secret_name: aws
+rclone_secret_name: rclone-config
+rclone_remote: nrp
+priority_class: opportunistic
+node_affinity: gpu-avoid

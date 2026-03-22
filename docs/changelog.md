@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Multi-cluster configuration** (`ClusterConfig`): all NRP-specific values in generated Kubernetes job specs are now overridable via CLI flags (`--s3-endpoint`, `--s3-public-endpoint`, `--s3-secret-name`, `--rclone-secret-name`, `--rclone-remote`, `--priority-class`, `--node-affinity`) and matching keyword arguments on `generate_dataset_workflow` / `generate_raster_workflow`. All defaults equal the current hardcoded NRP values — existing commands produce identical YAML without changes.
+- **YAML cluster profiles** (`--profile`): save cluster settings in a YAML file and reuse them across datasets. Profile resolution: explicit file path → `~/.config/cng-datasets/profiles/<name>.yaml` → built-in package profiles. The built-in `nrp` profile captures the NRP Nautilus defaults. Explicit CLI flags override individual profile values.
 - **Per-bucket credential scoping**: `--s3-secret-name` lets each workflow reference a dedicated Kubernetes secret, limiting job S3 access to a single bucket.
 - **Configurable node affinity**: `--node-affinity none` omits the NRP-specific NFD GPU-avoidance rule for clusters that don't use Node Feature Discovery labels.
 - **Configurable priority class**: `--priority-class ""` omits `priorityClassName` for clusters without NRP/Armada priority classes.
+- `load_profile()` and `cluster_config_from_args()` exported from `cng_datasets.k8s` for programmatic use.
 - Eliminated duplicated S3 env-var blocks across all six job generators via shared `_s3_env_vars()` and `_apply_scheduling()` helpers.
 
 ## [0.1.1] - 2026-01-01
