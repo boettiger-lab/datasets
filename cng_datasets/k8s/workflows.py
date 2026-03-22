@@ -5,6 +5,7 @@ Functions for creating complete dataset processing workflows with
 multiple coordinated Kubernetes jobs.
 """
 
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 import math
@@ -12,6 +13,68 @@ import re
 import yaml
 from .jobs import K8sJobManager
 from .armada import convert_workflow_to_armada
+
+
+@dataclass
+class ClusterConfig:
+    """Configuration for a target Kubernetes cluster and S3 backend.
+
+    All values default to the NRP Nautilus cluster, preserving backwards
+    compatibility. Override individual fields to target a different cluster.
+    """
+    # S3 endpoints
+    s3_endpoint: str = "rook-ceph-rgw-nautiluss3.rook"
+    s3_public_endpoint: str = "s3-west.nrp-nautilus.io"
+    # K8s secret names
+    s3_secret_name: str = "aws"
+    rclone_secret_name: str = "rclone-config"
+    # Rclone remote name used in setup-bucket and pmtiles jobs
+    rclone_remote: str = "nrp"
+    # Priority class (empty string = omit from spec)
+    priority_class: str = "opportunistic"
+    # Node affinity: "gpu-avoid" (default NRP rule) or "none" (disable)
+    node_affinity: str = "gpu-avoid"
+
+
+def _s3_env_vars(config: ClusterConfig) -> List[Dict[str, Any]]:
+    """Build S3 environment variables for job specs from cluster config."""
+    return [
+        {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": config.s3_secret_name, "key": "AWS_ACCESS_KEY_ID"}}},
+        {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": config.s3_secret_name, "key": "AWS_SECRET_ACCESS_KEY"}}},
+        {"name": "AWS_S3_ENDPOINT", "value": config.s3_endpoint},
+        {"name": "AWS_PUBLIC_ENDPOINT", "value": config.s3_public_endpoint},
+        {"name": "AWS_HTTPS", "value": "false"},
+        {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
+    ]
+
+
+def _node_affinity_spec(config: ClusterConfig) -> Optional[Dict[str, Any]]:
+    """Return the affinity dict for pod specs, or None to omit affinity."""
+    if config.node_affinity == "none":
+        return None
+    # Default: avoid NVIDIA GPU nodes (NRP NFD label)
+    return {
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [{
+                    "matchExpressions": [{
+                        "key": "feature.node.kubernetes.io/pci-10de.present",
+                        "operator": "NotIn",
+                        "values": ["true"],
+                    }]
+                }]
+            }
+        }
+    }
+
+
+def _apply_scheduling(pod_spec: Dict[str, Any], config: ClusterConfig) -> None:
+    """Mutate pod_spec in place: add priorityClassName and affinity from config."""
+    if config.priority_class:
+        pod_spec["priorityClassName"] = config.priority_class
+    affinity = _node_affinity_spec(config)
+    if affinity is not None:
+        pod_spec["affinity"] = affinity
 
 
 def _validate_k8s_name(k8s_name: str, original: str) -> None:
@@ -216,6 +279,14 @@ def generate_dataset_workflow(
     backend: str = "k8s",
     repartition_storage: str = "200Gi",
     repartition_memory: str = "32Gi",
+    # Cluster/storage configuration
+    s3_endpoint: str = "rook-ceph-rgw-nautiluss3.rook",
+    s3_public_endpoint: str = "s3-west.nrp-nautilus.io",
+    s3_secret_name: str = "aws",
+    rclone_secret_name: str = "rclone-config",
+    rclone_remote: str = "nrp",
+    priority_class: str = "opportunistic",
+    node_affinity: str = "gpu-avoid",
     # Backwards compatibility: accept source_url (singular)
     source_url: Union[str, List[str]] = None,
 ):
@@ -251,14 +322,24 @@ def generate_dataset_workflow(
         source_urls = source_url
     elif source_urls is None:
         raise ValueError("Either source_urls or source_url must be provided")
-    
+
     if bucket is None:
         raise ValueError("bucket parameter is required")
-    
+
+    config = ClusterConfig(
+        s3_endpoint=s3_endpoint,
+        s3_public_endpoint=s3_public_endpoint,
+        s3_secret_name=s3_secret_name,
+        rclone_secret_name=rclone_secret_name,
+        rclone_remote=rclone_remote,
+        priority_class=priority_class,
+        node_affinity=node_affinity,
+    )
+
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Sanitize dataset name for Kubernetes (replace underscores, slashes with hyphens)
     k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
     _validate_k8s_name(k8s_name, dataset_name)
@@ -266,19 +347,19 @@ def generate_dataset_workflow(
     # Normalize source_urls to list
     if isinstance(source_urls, str):
         source_urls = [source_urls]
-    
+
     # Set defaults for parent resolutions if not provided
     if parent_resolutions is None:
         parent_resolutions = [9, 8, 0]
-    
+
     # Generate bucket setup job (must run first)
-    _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
-    
+    _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo, config)
+
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name)
-    
+    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config)
+
     # Generate pmtiles job (uses converted parquet, not source)
-    _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name)
+    _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config)
     
     # Count features in source file(s) and calculate chunking parameters
     if len(source_urls) > 1:
@@ -303,10 +384,10 @@ def generate_dataset_workflow(
     print(f"  Parent resolutions: {parent_resolutions}")
     
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name)
-    
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, config=config)
+
     # Generate repartition job
-    _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory)
+    _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory, config=config)
     
     # Generate workflow RBAC (generic for all cng-datasets workflows)
     _generate_workflow_rbac(namespace, output_path)
@@ -388,6 +469,14 @@ def generate_raster_workflow(
     band: Optional[int] = None,
     output_cog_name: Optional[str] = None,
     backend: str = "k8s",
+    # Cluster/storage configuration
+    s3_endpoint: str = "rook-ceph-rgw-nautiluss3.rook",
+    s3_public_endpoint: str = "s3-west.nrp-nautilus.io",
+    s3_secret_name: str = "aws",
+    rclone_secret_name: str = "rclone-config",
+    rclone_remote: str = "nrp",
+    priority_class: str = "opportunistic",
+    node_affinity: str = "gpu-avoid",
     # backwards compat
     source_url: Optional[str] = None,
 ):
@@ -428,6 +517,16 @@ def generate_raster_workflow(
     if isinstance(source_urls, str):
         source_urls = [source_urls]
 
+    config = ClusterConfig(
+        s3_endpoint=s3_endpoint,
+        s3_public_endpoint=s3_public_endpoint,
+        s3_secret_name=s3_secret_name,
+        rclone_secret_name=rclone_secret_name,
+        rclone_remote=rclone_remote,
+        priority_class=priority_class,
+        node_affinity=node_affinity,
+    )
+
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -450,7 +549,7 @@ def generate_raster_workflow(
         hex_input_url = source_urls[0]
 
     # Generate bucket setup job
-    _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo)
+    _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo, config)
 
     # Generate preprocess-cog job when needed
     if needs_preprocess:
@@ -460,13 +559,14 @@ def generate_raster_workflow(
             target_resolution=target_resolution,
             band=band,
             nodata_value=nodata_value,
+            config=config,
         )
 
     # Generate raster hex tiling job
     _generate_raster_hex_job(
         manager, k8s_name, hex_input_url, bucket, output_path, git_repo,
         h3_resolution, parent_resolutions, value_column, nodata_value,
-        hex_memory, max_parallelism
+        hex_memory, max_parallelism, config=config,
     )
 
     # Generate workflow RBAC
@@ -519,8 +619,11 @@ def generate_raster_workflow(
 def _generate_cog_preprocess_job(
     manager, dataset_name, source_urls, output_cog_url, output_path,
     target_extent=None, target_resolution=None, band=None, nodata_value=None,
+    config: ClusterConfig = None,
 ):
     """Generate a k8s job that mosaics multiple raster tiles into a single COG on S3."""
+    if config is None:
+        config = ClusterConfig()
     # Build --input flags (one per tile)
     input_flags = "\n  ".join(f'--input "{u}" \\' for u in source_urls)
 
@@ -555,6 +658,31 @@ cng-datasets raster \\
 echo "✓ Preprocess COG complete: {output_cog_url}"
 """
 
+    pod_spec = {
+        "restartPolicy": "Never",
+        "volumes": [
+            {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
+        ],
+        "containers": [{
+            "name": "preprocess-cog",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [
+                {"name": "GDAL_CACHEMAX", "value": "4096"},
+                {"name": "GDAL_HTTP_TIMEOUT", "value": "60"},
+                {"name": "GDAL_HTTP_MAX_RETRY", "value": "5"},
+            ],
+            "volumeMounts": [
+                {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+            ],
+            "command": ["bash", "-c", command_str],
+            "resources": {
+                "requests": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "200Gi"},
+                "limits": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "200Gi"},
+            },
+        }],
+    }
+    _apply_scheduling(pod_spec, config)
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -569,50 +697,7 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
             "ttlSecondsAfterFinished": 86400,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-preprocess-cog"}},
-                "spec": {
-                    "priorityClassName": "opportunistic",
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [{
-                                    "matchExpressions": [{
-                                        "key": "feature.node.kubernetes.io/pci-10de.present",
-                                        "operator": "NotIn",
-                                        "values": ["true"],
-                                    }]
-                                }]
-                            }
-                        }
-                    },
-                    "restartPolicy": "Never",
-                    "volumes": [
-                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
-                    ],
-                    "containers": [{
-                        "name": "preprocess-cog",
-                        "image": "ghcr.io/boettiger-lab/datasets:latest",
-                        "imagePullPolicy": "Always",
-                        "env": [
-                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
-                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
-                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
-                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
-                            {"name": "AWS_HTTPS", "value": "false"},
-                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "GDAL_CACHEMAX", "value": "4096"},
-                            {"name": "GDAL_HTTP_TIMEOUT", "value": "60"},
-                            {"name": "GDAL_HTTP_MAX_RETRY", "value": "5"},
-                        ],
-                        "volumeMounts": [
-                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
-                        ],
-                        "command": ["bash", "-c", command_str],
-                        "resources": {
-                            "requests": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "200Gi"},
-                            "limits": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "200Gi"},
-                        },
-                    }],
-                },
+                "spec": pod_spec,
             },
         },
     }
@@ -622,9 +707,11 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
 def _generate_raster_hex_job(
     manager, dataset_name, source_url, bucket, output_path, git_repo,
     h3_resolution, parent_resolutions, value_column, nodata_value,
-    hex_memory, max_parallelism
+    hex_memory, max_parallelism, config: ClusterConfig = None,
 ):
     """Generate raster H3 hex tiling job."""
+    if config is None:
+        config = ClusterConfig()
     parent_res_str = ','.join(map(str, parent_resolutions))
     
     # Build command
@@ -643,6 +730,25 @@ fi
 
 {cng_cmd}"""
     
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "hex-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [
+                {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
+                {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
+                {"name": "BUCKET", "value": bucket}
+            ],
+            "command": ["bash", "-c", command_str],
+            "resources": {
+                "requests": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": "250Gi"},
+                "limits": {"cpu": "4", "memory": hex_memory}
+            }
+        }]
+    }
+    _apply_scheduling(pod_spec, config)
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -664,44 +770,7 @@ fi
             "ttlSecondsAfterFinished": 10800,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-hex"}},
-                "spec": {
-                    "priorityClassName": "opportunistic",
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [{
-                                    "matchExpressions": [{
-                                        "key": "feature.node.kubernetes.io/pci-10de.present",
-                                        "operator": "NotIn",
-                                        "values": ["true"]
-                                    }]
-                                }]
-                            }
-                        }
-                    },
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "hex-task",
-                        "image": "ghcr.io/boettiger-lab/datasets:latest",
-                        "imagePullPolicy": "Always",
-                        "env": [
-                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
-                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
-                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
-                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
-                            {"name": "AWS_HTTPS", "value": "false"},
-                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
-                            {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
-                            {"name": "BUCKET", "value": bucket}
-                        ],
-                        "command": ["bash", "-c", command_str],
-                        "resources": {
-                            "requests": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": "250Gi"},
-                            "limits": {"cpu": "4", "memory": hex_memory}
-                        }
-                    }]
-                }
+                "spec": pod_spec,
             }
         }
     }
@@ -817,8 +886,41 @@ echo "  kubectl delete configmap {configmap_name} -n {namespace}"
         yaml.dump(workflow_job, f, default_flow_style=False)
 
 
-def _generate_setup_bucket_job(manager, dataset_name, bucket, output_path, git_repo):
+def _generate_setup_bucket_job(manager, dataset_name, bucket, output_path, git_repo, config: ClusterConfig = None):
     """Generate S3 bucket setup job with public access and CORS."""
+    if config is None:
+        config = ClusterConfig()
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "setup-bucket-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [
+                {"name": "BUCKET", "value": bucket}
+            ],
+            "volumeMounts": [
+                {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+            ],
+            "command": ["bash", "-c", f"""set -e
+echo "Setting up bucket with public access and CORS..."
+cng-datasets storage setup-bucket \\
+  --bucket "${{BUCKET}}" \\
+  --remote {config.rclone_remote} \\
+  --verify
+
+echo "Bucket setup complete!"
+"""],
+            "resources": {
+                "requests": {"cpu": "1", "memory": "2Gi"},
+                "limits": {"cpu": "1", "memory": "2Gi"}
+            }
+        }],
+        "volumes": [
+            {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
+        ]
+    }
+    _apply_scheduling(pod_spec, config)
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -833,66 +935,19 @@ def _generate_setup_bucket_job(manager, dataset_name, bucket, output_path, git_r
             "ttlSecondsAfterFinished": 10800,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-setup-bucket"}},
-                "spec": {
-                    "priorityClassName": "opportunistic",
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [{
-                                    "matchExpressions": [{
-                                        "key": "feature.node.kubernetes.io/pci-10de.present",
-                                        "operator": "NotIn",
-                                        "values": ["true"]
-                                    }]
-                                }]
-                            }
-                        }
-                    },
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "setup-bucket-task",
-                        "image": "ghcr.io/boettiger-lab/datasets:latest",
-                        "imagePullPolicy": "Always",
-                        "env": [
-                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
-                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
-                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
-                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
-                            {"name": "AWS_HTTPS", "value": "false"},
-                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "BUCKET", "value": bucket}
-                        ],
-                        "volumeMounts": [
-                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
-                        ],
-                        "command": ["bash", "-c", f"""set -e
-echo "Setting up bucket with public access and CORS..."
-cng-datasets storage setup-bucket \\
-  --bucket "${{BUCKET}}" \\
-  --remote nrp \\
-  --verify
-
-echo "Bucket setup complete!"
-"""],
-                        "resources": {
-                            "requests": {"cpu": "1", "memory": "2Gi"},
-                            "limits": {"cpu": "1", "memory": "2Gi"}
-                        }
-                    }],
-                    "volumes": [
-                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
-                    ]
-                }
+                "spec": pod_spec,
             }
         }
     }
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-setup-bucket.yaml"))
 
 
-def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None):
+def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None, config: ClusterConfig = None):
     """Generate GeoParquet conversion job."""
+    if config is None:
+        config = ClusterConfig()
     s3_dataset = s3_dataset or dataset_name
-    
+
     # Normalize to list
     if isinstance(source_urls, str):
         source_urls = [source_urls]
@@ -909,6 +964,29 @@ cng-convert-to-parquet \\
   --row-group-size {row_group_size}{layer_flag}
 """
     
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "convert-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [
+                {"name": "BUCKET", "value": bucket}
+            ],
+            "volumeMounts": [
+                {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+            ],
+            "command": ["bash", "-c", convert_cmd],
+            "resources": {
+                "requests": {"cpu": "4", "memory": memory},
+                "limits": {"cpu": "4", "memory": memory}
+            }
+        }],
+        "volumes": [
+            {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
+        ]
+    }
+    _apply_scheduling(pod_spec, config)
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -923,62 +1001,23 @@ cng-convert-to-parquet \\
             "ttlSecondsAfterFinished": 10800,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-convert"}},
-                "spec": {
-                    "priorityClassName": "opportunistic",
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [{
-                                    "matchExpressions": [{
-                                        "key": "feature.node.kubernetes.io/pci-10de.present",
-                                        "operator": "NotIn",
-                                        "values": ["true"]
-                                    }]
-                                }]
-                            }
-                        }
-                    },
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "convert-task",
-                        "image": "ghcr.io/boettiger-lab/datasets:latest",
-                        "imagePullPolicy": "Always",
-                        "env": [
-                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
-                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
-                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
-                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
-                            {"name": "AWS_HTTPS", "value": "false"},
-                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "BUCKET", "value": bucket}
-                        ],
-                        "volumeMounts": [
-                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
-                        ],
-                        "command": ["bash", "-c", convert_cmd],
-                        "resources": {
-                            "requests": {"cpu": "4", "memory": memory},
-                            "limits": {"cpu": "4", "memory": memory}
-                        }
-                    }],
-                    "volumes": [
-                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
-                    ]
-                }
+                "spec": pod_spec,
             }
         }
     }
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-convert.yaml"))
 
 
-def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo, memory="8Gi", s3_dataset=None):
+def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo, memory="8Gi", s3_dataset=None, config: ClusterConfig = None):
     """Generate PMTiles job.
-    
+
     Uses the optimized GeoParquet from convert job as input (includes ID column).
     """
+    if config is None:
+        config = ClusterConfig()
     s3_dataset = s3_dataset or dataset_name
     # Use the converted geoparquet instead of original source
-    geoparquet_url = f"https://s3-west.nrp-nautilus.io/{bucket}/{s3_dataset}.parquet"
+    geoparquet_url = f"https://{config.s3_public_endpoint}/{bucket}/{s3_dataset}.parquet"
     
     # For rclone upload, compute the S3 directory that contains the output file
     if '/' in s3_dataset:
@@ -988,6 +1027,47 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
     # basename for temp files and tippecanoe layer name
     s3_basename = s3_dataset.split('/')[-1]
     
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "pmtiles-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [
+                {"name": "TMPDIR", "value": "/tmp"},
+                {"name": "BUCKET", "value": bucket},
+                {"name": "DATASET", "value": s3_basename}
+            ],
+            "volumeMounts": [
+                {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+            ],
+            "command": ["bash", "-c", f"""set -e
+# Use optimized GeoParquet (has ID column) from convert job
+# GDAL can read parquet via vsicurl
+ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$DATASET.geojsonl /vsicurl/{geoparquet_url} -progress
+
+# Generate PMTiles from GeoJSONSeq
+# TIPPECANOE_MAX_THREADS must be a power of 2; Kubernetes nodes can expose
+# non-power-of-2 logical CPU counts which triggers an internal assertion
+# failure "N shards not a power of 2" (felt/tippecanoe#216).
+# Round detected CPU count down to nearest power of 2 to preserve I/O parallelism.
+TIPPECANOE_MAX_THREADS=$(python3 -c "import os; n=os.cpu_count() or 1; print(1<<(n.bit_length()-1))")
+tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/$DATASET.geojsonl
+
+# Upload to S3 using rclone
+rclone copy /tmp/$DATASET.pmtiles {config.rclone_remote}:{bucket}/{s3_parent_dir}
+rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
+"""],
+            "resources": {
+                "requests": {"cpu": "4", "memory": memory},
+                "limits": {"cpu": "4", "memory": memory}
+            }
+        }],
+        "volumes": [
+            {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
+        ]
+    }
+    _apply_scheduling(pod_spec, config)
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1002,73 +1082,14 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
             "ttlSecondsAfterFinished": 10800,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-pmtiles"}},
-                "spec": {
-                    "priorityClassName": "opportunistic",
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [{
-                                    "matchExpressions": [{
-                                        "key": "feature.node.kubernetes.io/pci-10de.present",
-                                        "operator": "NotIn",
-                                        "values": ["true"]
-                                    }]
-                                }]
-                            }
-                        }
-                    },
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "pmtiles-task",
-                        "image": "ghcr.io/boettiger-lab/datasets:latest",
-                        "imagePullPolicy": "Always",
-                        "env": [
-                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
-                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
-                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
-                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
-                            {"name": "AWS_HTTPS", "value": "false"},
-                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "TMPDIR", "value": "/tmp"},
-                            {"name": "BUCKET", "value": bucket},
-                            {"name": "DATASET", "value": s3_basename}
-                        ],
-                        "volumeMounts": [
-                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
-                        ],
-                        "command": ["bash", "-c", f"""set -e
-# Use optimized GeoParquet (has ID column) from convert job
-# GDAL can read parquet via vsicurl
-ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$DATASET.geojsonl /vsicurl/{geoparquet_url} -progress
-
-# Generate PMTiles from GeoJSONSeq
-# TIPPECANOE_MAX_THREADS must be a power of 2; Kubernetes nodes can expose
-# non-power-of-2 logical CPU counts which triggers an internal assertion
-# failure "N shards not a power of 2" (felt/tippecanoe#216).
-# Round detected CPU count down to nearest power of 2 to preserve I/O parallelism.
-TIPPECANOE_MAX_THREADS=$(python3 -c "import os; n=os.cpu_count() or 1; print(1<<(n.bit_length()-1))")
-tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/$DATASET.geojsonl
-
-# Upload to S3 using rclone
-rclone copy /tmp/$DATASET.pmtiles nrp:{bucket}/{s3_parent_dir}
-rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
-"""],
-                        "resources": {
-                            "requests": {"cpu": "4", "memory": memory},
-                            "limits": {"cpu": "4", "memory": memory}
-                        }
-                    }],
-                    "volumes": [
-                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
-                    ]
-                }
+                "spec": pod_spec,
             }
         }
     }
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-pmtiles.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, config: ClusterConfig = None):
     """Generate H3 hex tiling job.
     
     Args:
@@ -1087,6 +1108,8 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
         intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays)
         s3_dataset: S3 path prefix (defaults to dataset_name)
     """
+    if config is None:
+        config = ClusterConfig()
     s3_dataset = s3_dataset or dataset_name
     # Format parent resolutions as comma-separated string
     parent_res_str = ','.join(map(str, parent_resolutions))
@@ -1101,6 +1124,25 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     
     command_str = "\n".join(cmd_parts)
     
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "hex-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [
+                {"name": "TMPDIR", "value": "/tmp"},
+                {"name": "BUCKET", "value": bucket},
+                {"name": "DATASET", "value": dataset_name}
+            ],
+            "command": ["bash", "-c", command_str],
+            "resources": {
+                "requests": {"cpu": "4", "memory": hex_memory},
+                "limits": {"cpu": "4", "memory": hex_memory}
+            }
+        }]
+    }
+    _apply_scheduling(pod_spec, config)
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1122,45 +1164,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
             "ttlSecondsAfterFinished": 10800,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-hex"}},
-                "spec": {
-                    "priorityClassName": "opportunistic",
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [{
-                                    "matchExpressions": [{
-                                        "key": "feature.node.kubernetes.io/pci-10de.present",
-                                        "operator": "NotIn",
-                                        "values": ["true"]
-                                    }]
-                                }]
-                            }
-                        }
-                    },
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "hex-task",
-                        "image": "ghcr.io/boettiger-lab/datasets:latest",
-                        "imagePullPolicy": "Always",
-
-                        "env": [
-                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
-                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
-                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
-                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
-                            {"name": "AWS_HTTPS", "value": "false"},
-                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "TMPDIR", "value": "/tmp"},
-                            {"name": "BUCKET", "value": bucket},
-                            {"name": "DATASET", "value": dataset_name}
-                        ],
-                        "command": ["bash", "-c", command_str],
-                        "resources": {
-                            "requests": {"cpu": "4", "memory": hex_memory},
-                            "limits": {"cpu": "4", "memory": hex_memory}
-                        }
-                    }]
-                }
+                "spec": pod_spec,
             }
         }
     }
@@ -1183,9 +1187,37 @@ def _duckdb_memory_limit(memory_str: str, fraction: float = 0.85) -> str:
     return f"{result}{duckdb_unit}"
 
 
-def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo, s3_dataset=None, repartition_storage: str = "200Gi", repartition_memory: str = "32Gi"):
+def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo, s3_dataset=None, repartition_storage: str = "200Gi", repartition_memory: str = "32Gi", config: ClusterConfig = None):
     """Generate repartition job."""
+    if config is None:
+        config = ClusterConfig()
     s3_dataset = s3_dataset or dataset_name
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "repartition-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [
+                {"name": "TMPDIR", "value": "/tmp"},
+                {"name": "BUCKET", "value": bucket}
+            ],
+            "volumeMounts": [
+                {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+            ],
+            "command": ["bash", "-c", f"""set -e
+cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output-dir s3://{bucket}/{s3_dataset}/hex --source-parquet s3://{bucket}/{s3_dataset}.parquet --cleanup --memory-limit {_duckdb_memory_limit(repartition_memory)}
+"""],
+            "resources": {
+                "requests": {"cpu": "4", "memory": repartition_memory, "ephemeral-storage": repartition_storage},
+                "limits": {"cpu": "4", "memory": repartition_memory, "ephemeral-storage": repartition_storage}
+            }
+        }],
+        "volumes": [
+            {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
+        ]
+    }
+    _apply_scheduling(pod_spec, config)
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1200,51 +1232,7 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
             "ttlSecondsAfterFinished": 10800,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-repartition"}},
-                "spec": {
-                    "priorityClassName": "opportunistic",
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [{
-                                    "matchExpressions": [{
-                                        "key": "feature.node.kubernetes.io/pci-10de.present",
-                                        "operator": "NotIn",
-                                        "values": ["true"]
-                                    }]
-                                }]
-                            }
-                        }
-                    },
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "repartition-task",
-                        "image": "ghcr.io/boettiger-lab/datasets:latest",
-                        "imagePullPolicy": "Always",
-                        "env": [
-                            {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}},
-                            {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": "aws", "key": "AWS_SECRET_ACCESS_KEY"}}},
-                            {"name": "AWS_S3_ENDPOINT", "value": "rook-ceph-rgw-nautiluss3.rook"},
-                            {"name": "AWS_PUBLIC_ENDPOINT", "value": "s3-west.nrp-nautilus.io"},
-                            {"name": "AWS_HTTPS", "value": "false"},
-                            {"name": "AWS_VIRTUAL_HOSTING", "value": "FALSE"},
-                            {"name": "TMPDIR", "value": "/tmp"},
-                            {"name": "BUCKET", "value": bucket}
-                        ],
-                        "volumeMounts": [
-                            {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
-                        ],
-                        "command": ["bash", "-c", f"""set -e
-cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output-dir s3://{bucket}/{s3_dataset}/hex --source-parquet s3://{bucket}/{s3_dataset}.parquet --cleanup --memory-limit {_duckdb_memory_limit(repartition_memory)}
-"""],
-                        "resources": {
-                            "requests": {"cpu": "4", "memory": repartition_memory, "ephemeral-storage": repartition_storage},
-                            "limits": {"cpu": "4", "memory": repartition_memory, "ephemeral-storage": repartition_storage}
-                        }
-                    }],
-                    "volumes": [
-                        {"name": "rclone-config", "secret": {"secretName": "rclone-config"}}
-                    ]
-                }
+                "spec": pod_spec,
             }
         }
     }

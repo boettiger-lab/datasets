@@ -2,6 +2,137 @@
 
 Configure credentials and settings for cloud storage and processing.
 
+## Cluster Configuration
+
+All cluster-specific values in generated Kubernetes job specs default to NRP Nautilus. Every flag has a default equal to the current hardcoded value, so existing commands continue to produce identical YAML without any changes.
+
+### Available Settings
+
+| Setting | Default (NRP Nautilus) | Description |
+|---------|----------------------|-------------|
+| `s3_endpoint` | `rook-ceph-rgw-nautiluss3.rook` | Internal S3 endpoint injected into every job pod as `AWS_S3_ENDPOINT` |
+| `s3_public_endpoint` | `s3-west.nrp-nautilus.io` | Public-facing endpoint used in PMTiles URL construction |
+| `s3_secret_name` | `aws` | Kubernetes secret providing `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` |
+| `rclone_secret_name` | `rclone-config` | Kubernetes secret providing the rclone configuration file |
+| `rclone_remote` | `nrp` | Rclone remote name used in setup-bucket and PMTiles upload commands |
+| `priority_class` | `opportunistic` | Kubernetes `priorityClassName`; set to `""` to omit the field |
+| `node_affinity` | `gpu-avoid` | `gpu-avoid` adds NRP NFD GPU-avoidance rule; `none` omits affinity entirely |
+
+### CLI Flags
+
+Pass any combination of flags to `cng-datasets workflow` or `cng-datasets raster-workflow`:
+
+```bash
+# NRP Nautilus (default — no flags needed)
+cng-datasets workflow \
+  --dataset redlining \
+  --source-url https://example.com/data.gpkg \
+  --bucket public-redlining
+
+# MinIO on a private cluster
+cng-datasets workflow \
+  --dataset redlining \
+  --source-url https://example.com/data.gpkg \
+  --bucket my-bucket \
+  --s3-endpoint minio.my-cluster.svc.cluster.local \
+  --s3-public-endpoint minio.my-cluster.io \
+  --s3-secret-name minio-credentials \
+  --rclone-secret-name minio-rclone-config \
+  --rclone-remote minio \
+  --priority-class "" \
+  --node-affinity none
+
+# AWS S3 (no internal endpoint, no GPU affinity needed)
+cng-datasets workflow \
+  --dataset redlining \
+  --source-url https://example.com/data.gpkg \
+  --bucket my-aws-bucket \
+  --s3-endpoint s3.amazonaws.com \
+  --s3-public-endpoint s3.amazonaws.com \
+  --priority-class "" \
+  --node-affinity none
+```
+
+### Python API
+
+The same parameters are keyword arguments on `generate_dataset_workflow` and `generate_raster_workflow`:
+
+```python
+from cng_datasets.k8s import generate_dataset_workflow, generate_raster_workflow
+
+# Vector workflow targeting MinIO
+generate_dataset_workflow(
+    dataset_name="redlining",
+    source_urls="https://example.com/data.gpkg",
+    bucket="my-bucket",
+    output_dir="k8s/",
+    s3_endpoint="minio.my-cluster.svc.cluster.local",
+    s3_public_endpoint="minio.my-cluster.io",
+    s3_secret_name="minio-credentials",
+    rclone_secret_name="minio-rclone-config",
+    rclone_remote="minio",
+    priority_class="",      # omit priorityClassName
+    node_affinity="none",   # omit node affinity
+)
+
+# Raster workflow — same flags apply
+generate_raster_workflow(
+    dataset_name="wyoming/rap-arte",
+    source_urls="https://example.com/rap.tif",
+    bucket="my-bucket",
+    output_dir="k8s/",
+    s3_endpoint="minio.my-cluster.svc.cluster.local",
+    s3_secret_name="minio-credentials",
+)
+```
+
+### ClusterConfig Dataclass
+
+For programmatic use, `ClusterConfig` holds all settings with NRP defaults:
+
+```python
+from cng_datasets.k8s.workflows import ClusterConfig
+
+# Default NRP config
+cfg = ClusterConfig()
+
+# Custom cluster
+cfg = ClusterConfig(
+    s3_endpoint="minio.my-cluster.svc.cluster.local",
+    s3_public_endpoint="minio.my-cluster.io",
+    s3_secret_name="minio-credentials",
+    rclone_secret_name="minio-rclone-config",
+    rclone_remote="minio",
+    priority_class="",
+    node_affinity="none",
+)
+```
+
+> **Note:** YAML-based cluster profile files are not yet supported. If you find yourself repeating the same flags for a second cluster, open an issue — profile files are the natural next step.
+
+### Per-Bucket Credential Scoping
+
+By default all jobs in a namespace share a single `aws` secret. Use `--s3-secret-name` to point jobs at per-bucket credentials, limiting each job's S3 access to one bucket:
+
+```bash
+# 1. Create a scoped secret for this bucket (on NRP Ceph, generate a sub-user key
+#    restricted to public-redlining; on AWS, use an IAM policy scoped to the bucket)
+kubectl create secret generic s3-creds-redlining \
+  --from-literal=AWS_ACCESS_KEY_ID=<bucket-key> \
+  --from-literal=AWS_SECRET_ACCESS_KEY=<bucket-secret> \
+  -n biodiversity
+
+# 2. Generate workflow using that scoped secret
+cng-datasets workflow \
+  --dataset redlining \
+  --source-url https://example.com/data.gpkg \
+  --bucket public-redlining \
+  --s3-secret-name s3-creds-redlining \
+  --output-dir k8s/
+```
+
+Each job pod now carries only the credentials for `public-redlining`. A misconfigured or compromised job cannot access other buckets in the namespace.
+
 ## S3 Credentials
 
 The toolkit supports multiple authentication methods for S3 access.

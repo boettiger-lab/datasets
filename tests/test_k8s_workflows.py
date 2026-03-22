@@ -668,5 +668,176 @@ class TestRasterWorkflowGeneration:
             assert gpu_expr["operator"] == "NotIn"
 
 
+FIXTURE_URL = "https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg"
+
+
+class TestClusterConfig:
+    """Test cluster configuration customization."""
+
+    def _all_env_vars(self, job):
+        return job["spec"]["template"]["spec"]["containers"][0]["env"]
+
+    def _env_value(self, env_list, name):
+        for e in env_list:
+            if e["name"] == name:
+                return e.get("value") or e.get("valueFrom")
+        return None
+
+    @pytest.mark.timeout(5)
+    def test_default_config_produces_nrp_values(self):
+        """Default config should produce the same NRP-specific values as before."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="cfg-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            job = yaml.safe_load(open(Path(tmpdir) / "cfg-test-convert.yaml"))
+        env = self._all_env_vars(job)
+        assert self._env_value(env, "AWS_S3_ENDPOINT") == "rook-ceph-rgw-nautiluss3.rook"
+        assert self._env_value(env, "AWS_PUBLIC_ENDPOINT") == "s3-west.nrp-nautilus.io"
+        assert self._env_value(env, "AWS_ACCESS_KEY_ID") == {"secretKeyRef": {"name": "aws", "key": "AWS_ACCESS_KEY_ID"}}
+
+    @pytest.mark.timeout(5)
+    def test_custom_s3_endpoint(self):
+        """--s3-endpoint should propagate to all job specs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="cfg-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                s3_endpoint="minio.my-cluster.local",
+                s3_public_endpoint="s3.my-cluster.io",
+            )
+            for job_file in ["cfg-test-convert.yaml", "cfg-test-hex.yaml", "cfg-test-repartition.yaml"]:
+                job = yaml.safe_load(open(Path(tmpdir) / job_file))
+                env = self._all_env_vars(job)
+                assert self._env_value(env, "AWS_S3_ENDPOINT") == "minio.my-cluster.local", job_file
+                assert self._env_value(env, "AWS_PUBLIC_ENDPOINT") == "s3.my-cluster.io", job_file
+
+    @pytest.mark.timeout(5)
+    def test_custom_s3_secret_name(self):
+        """--s3-secret-name should change the secretKeyRef in all job specs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="cfg-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                s3_secret_name="my-bucket-creds",
+            )
+            for job_file in ["cfg-test-convert.yaml", "cfg-test-hex.yaml"]:
+                job = yaml.safe_load(open(Path(tmpdir) / job_file))
+                env = self._all_env_vars(job)
+                ref = self._env_value(env, "AWS_ACCESS_KEY_ID")
+                assert ref["secretKeyRef"]["name"] == "my-bucket-creds", job_file
+
+    @pytest.mark.timeout(5)
+    def test_custom_rclone_secret_name(self):
+        """--rclone-secret-name should change the volume secretName in setup-bucket and repartition."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="cfg-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                rclone_secret_name="my-rclone-secret",
+            )
+            for job_file in ["cfg-test-setup-bucket.yaml", "cfg-test-repartition.yaml"]:
+                job = yaml.safe_load(open(Path(tmpdir) / job_file))
+                volumes = job["spec"]["template"]["spec"]["volumes"]
+                rclone_vol = next(v for v in volumes if v["name"] == "rclone-config")
+                assert rclone_vol["secret"]["secretName"] == "my-rclone-secret", job_file
+
+    @pytest.mark.timeout(5)
+    def test_custom_rclone_remote(self):
+        """--rclone-remote should appear in setup-bucket command and pmtiles upload."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="cfg-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                rclone_remote="my-remote",
+            )
+            setup_job = yaml.safe_load(open(Path(tmpdir) / "cfg-test-setup-bucket.yaml"))
+            cmd = str(setup_job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--remote my-remote" in cmd
+
+            pmtiles_job = yaml.safe_load(open(Path(tmpdir) / "cfg-test-pmtiles.yaml"))
+            cmd = str(pmtiles_job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "my-remote:" in cmd
+
+    @pytest.mark.timeout(5)
+    def test_custom_priority_class(self):
+        """--priority-class should appear in all pod specs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="cfg-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                priority_class="standard",
+            )
+            for job_file in ["cfg-test-convert.yaml", "cfg-test-hex.yaml"]:
+                job = yaml.safe_load(open(Path(tmpdir) / job_file))
+                pod_spec = job["spec"]["template"]["spec"]
+                assert pod_spec.get("priorityClassName") == "standard", job_file
+
+    @pytest.mark.timeout(5)
+    def test_empty_priority_class_omits_field(self):
+        """Empty --priority-class should omit priorityClassName from pod specs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="cfg-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                priority_class="",
+            )
+            job = yaml.safe_load(open(Path(tmpdir) / "cfg-test-convert.yaml"))
+            pod_spec = job["spec"]["template"]["spec"]
+            assert "priorityClassName" not in pod_spec
+
+    @pytest.mark.timeout(5)
+    def test_node_affinity_none_omits_affinity(self):
+        """--node-affinity none should omit affinity from all pod specs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="cfg-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                node_affinity="none",
+            )
+            for job_file in ["cfg-test-convert.yaml", "cfg-test-hex.yaml", "cfg-test-repartition.yaml"]:
+                job = yaml.safe_load(open(Path(tmpdir) / job_file))
+                pod_spec = job["spec"]["template"]["spec"]
+                assert "affinity" not in pod_spec, f"{job_file} should not have affinity"
+
+    @pytest.mark.timeout(5)
+    def test_raster_workflow_custom_config(self):
+        """Raster workflow should also respect cluster config overrides."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="raster-cfg",
+                source_urls="https://example.com/tile.tif",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                s3_endpoint="minio.internal",
+                s3_secret_name="minio-creds",
+                node_affinity="none",
+            )
+            hex_job = yaml.safe_load(open(Path(tmpdir) / "raster-cfg-hex.yaml"))
+            env = self._all_env_vars(hex_job)
+            assert self._env_value(env, "AWS_S3_ENDPOINT") == "minio.internal"
+            ref = self._env_value(env, "AWS_ACCESS_KEY_ID")
+            assert ref["secretKeyRef"]["name"] == "minio-creds"
+            pod_spec = hex_job["spec"]["template"]["spec"]
+            assert "affinity" not in pod_spec
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
