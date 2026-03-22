@@ -555,10 +555,7 @@ def process_parquet_input(
                 
                 write_with_duckdb(query, tmp_path, compression, compression_level,
                                 row_group_size, verbose)
-                
-                # Apply GeoParquet optimizations in-place
-                apply_geoparquet_optimizations(tmp_path, tmp_path, verbose)
-                
+
                 # Upload to S3
                 upload_to_s3(tmp_path, destination, verbose=progress)
                 
@@ -569,9 +566,6 @@ def process_parquet_input(
             # Write directly to destination
             write_with_duckdb(query, destination, compression, compression_level,
                             row_group_size, verbose)
-            
-            # Apply GeoParquet optimizations in-place
-            apply_geoparquet_optimizations(destination, destination, verbose)
         
         print("✓ Parquet processing completed successfully!")
         
@@ -912,9 +906,6 @@ def convert_to_parquet(
                 write_with_duckdb(query, tmp_path, compression, compression_level,
                                  row_group_size, verbose)
 
-                # Apply GeoParquet optimizations in-place
-                apply_geoparquet_optimizations(tmp_path, tmp_path, geom_col=geom_col, verbose=verbose)
-
                 # Upload to S3
                 upload_to_s3(tmp_path, destination, verbose=progress)
                 
@@ -925,9 +916,6 @@ def convert_to_parquet(
             # Write directly to destination
             write_with_duckdb(query, destination, compression, compression_level,
                             row_group_size, verbose)
-
-            # Apply GeoParquet optimizations in-place
-            apply_geoparquet_optimizations(destination, destination, geom_col=geom_col, verbose=verbose)
 
         if verbose:
             print("✓ Conversion completed successfully!")
