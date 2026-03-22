@@ -1,0 +1,3 @@
+# Un-ignore YAML files in this directory — they are bundled package data,
+# not generated workflow files (which are excluded by the root *.yaml rule).
+!*.yaml

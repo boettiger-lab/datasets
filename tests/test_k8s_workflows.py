@@ -7,7 +7,7 @@ import yaml
 from pathlib import Path
 import pytest
 
-from cng_datasets.k8s import generate_dataset_workflow, K8sJobManager
+from cng_datasets.k8s import generate_dataset_workflow, K8sJobManager, load_profile, cluster_config_from_args, ClusterConfig
 from cng_datasets.k8s.workflows import generate_raster_workflow
 
 
@@ -837,6 +837,155 @@ class TestClusterConfig:
             assert ref["secretKeyRef"]["name"] == "minio-creds"
             pod_spec = hex_job["spec"]["template"]["spec"]
             assert "affinity" not in pod_spec
+
+
+class TestProfileLoading:
+    """Tests for load_profile() and cluster_config_from_args()."""
+
+    @pytest.mark.timeout(5)
+    def test_load_builtin_nrp_profile(self):
+        """Built-in 'nrp' profile loads and has expected NRP values."""
+        profile = load_profile("nrp")
+        assert profile["s3_endpoint"] == "rook-ceph-rgw-nautiluss3.rook"
+        assert profile["s3_public_endpoint"] == "s3-west.nrp-nautilus.io"
+        assert profile["s3_secret_name"] == "aws"
+        assert profile["rclone_remote"] == "nrp"
+        assert profile["priority_class"] == "opportunistic"
+        assert profile["node_affinity"] == "gpu-avoid"
+
+    @pytest.mark.timeout(5)
+    def test_load_profile_from_path(self):
+        """load_profile() accepts a path to a YAML file."""
+        profile_data = {
+            "name": "test-cluster",
+            "s3_endpoint": "minio.test.local",
+            "s3_public_endpoint": "minio.test.io",
+            "s3_secret_name": "test-creds",
+            "rclone_remote": "test",
+            "priority_class": "",
+            "node_affinity": "none",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            yaml.dump(profile_data, f)
+            profile_path = f.name
+
+        profile = load_profile(profile_path)
+        assert profile["s3_endpoint"] == "minio.test.local"
+        assert profile["s3_secret_name"] == "test-creds"
+        assert profile["node_affinity"] == "none"
+        # 'name' key should be stripped (not a ClusterConfig field)
+        assert "name" not in profile
+
+    @pytest.mark.timeout(5)
+    def test_load_profile_unknown_name_raises(self):
+        """load_profile() raises FileNotFoundError for unknown profile names."""
+        with pytest.raises(FileNotFoundError, match="not found"):
+            load_profile("nonexistent-cluster")
+
+    @pytest.mark.timeout(5)
+    def test_load_profile_from_user_dir(self, tmp_path, monkeypatch):
+        """load_profile() finds profiles in the user config directory."""
+        import cng_datasets.k8s.workflows as wf_module
+        user_profiles = tmp_path / "profiles"
+        user_profiles.mkdir()
+        (user_profiles / "my-cluster.yaml").write_text(
+            "s3_endpoint: s3.my-org.internal\nrclone_remote: my-org\n"
+        )
+        monkeypatch.setattr(wf_module, "_USER_PROFILES_DIR", user_profiles)
+
+        profile = load_profile("my-cluster")
+        assert profile["s3_endpoint"] == "s3.my-org.internal"
+        assert profile["rclone_remote"] == "my-org"
+
+    @pytest.mark.timeout(5)
+    def test_cluster_config_from_args_no_profile(self):
+        """cluster_config_from_args with no profile uses ClusterConfig defaults."""
+        cfg = cluster_config_from_args()
+        assert cfg == ClusterConfig()
+
+    @pytest.mark.timeout(5)
+    def test_cluster_config_from_args_profile_only(self):
+        """Profile values are applied when no CLI overrides are given."""
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            yaml.dump({"s3_endpoint": "minio.example.com", "rclone_remote": "example"}, f)
+            path = f.name
+
+        cfg = cluster_config_from_args(profile=path)
+        assert cfg.s3_endpoint == "minio.example.com"
+        assert cfg.rclone_remote == "example"
+        # Fields not in profile stay at ClusterConfig defaults
+        assert cfg.s3_secret_name == "aws"
+
+    @pytest.mark.timeout(5)
+    def test_cluster_config_from_args_cli_overrides_profile(self):
+        """Explicit CLI flags (non-None) override profile values."""
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            yaml.dump({"s3_endpoint": "minio.example.com", "rclone_remote": "example"}, f)
+            path = f.name
+
+        cfg = cluster_config_from_args(
+            profile=path,
+            s3_endpoint="override.example.com",   # explicit — should win
+            rclone_remote=None,                    # None — profile value wins
+        )
+        assert cfg.s3_endpoint == "override.example.com"
+        assert cfg.rclone_remote == "example"
+
+    @pytest.mark.timeout(5)
+    def test_workflow_with_profile_flag(self):
+        """generate_dataset_workflow respects the profile parameter."""
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            yaml.dump({
+                "s3_endpoint": "minio.profile.local",
+                "s3_secret_name": "profile-creds",
+                "node_affinity": "none",
+            }, f)
+            profile_path = f.name
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="profile-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                profile=profile_path,
+            )
+            job = yaml.safe_load(open(Path(tmpdir) / "profile-test-convert.yaml"))
+
+        env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+        env_map = {e["name"]: e.get("value") or e.get("valueFrom") for e in env}
+        assert env_map["AWS_S3_ENDPOINT"] == "minio.profile.local"
+        assert env_map["AWS_ACCESS_KEY_ID"]["secretKeyRef"]["name"] == "profile-creds"
+        assert "affinity" not in job["spec"]["template"]["spec"]
+
+    @pytest.mark.timeout(5)
+    def test_workflow_cli_flag_overrides_profile(self):
+        """An explicit CLI flag beats a profile value for the same field."""
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            yaml.dump({"s3_endpoint": "minio.profile.local"}, f)
+            profile_path = f.name
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="override-test",
+                source_url=FIXTURE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                profile=profile_path,
+                s3_endpoint="explicit.override.io",   # should win over profile
+            )
+            job = yaml.safe_load(open(Path(tmpdir) / "override-test-convert.yaml"))
+
+        env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+        env_map = {e["name"]: e.get("value") for e in env if "value" in e}
+        assert env_map["AWS_S3_ENDPOINT"] == "explicit.override.io"
+
+    @pytest.mark.timeout(5)
+    def test_builtin_nrp_profile_matches_defaults(self):
+        """Loading the 'nrp' profile produces the same config as bare ClusterConfig()."""
+        cfg_default = ClusterConfig()
+        cfg_nrp = cluster_config_from_args(profile="nrp")
+        assert cfg_nrp == cfg_default
 
 
 if __name__ == "__main__":

@@ -55,6 +55,9 @@ cng-convert-to-parquet = "cng_datasets.vector.convert_to_parquet:main"
 where = ["."]
 include = ["cng_datasets*"]
 
+[tool.setuptools.package-data]
+"cng_datasets.k8s.profiles" = ["*.yaml"]
+
 [tool.black]
 line-length = 100
 target-version = ['py39', 'py310', 'py311', 'py312']

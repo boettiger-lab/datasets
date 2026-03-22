@@ -14,6 +14,12 @@ import yaml
 from .jobs import K8sJobManager
 from .armada import convert_workflow_to_armada
 
+# Keys that ClusterConfig accepts (used for profile validation)
+_CONFIG_KEYS = {
+    "s3_endpoint", "s3_public_endpoint", "s3_secret_name",
+    "rclone_secret_name", "rclone_remote", "priority_class", "node_affinity",
+}
+
 
 @dataclass
 class ClusterConfig:
@@ -21,6 +27,8 @@ class ClusterConfig:
 
     All values default to the NRP Nautilus cluster, preserving backwards
     compatibility. Override individual fields to target a different cluster.
+
+    Can be constructed from a profile file via :func:`load_profile`.
     """
     # S3 endpoints
     s3_endpoint: str = "rook-ceph-rgw-nautiluss3.rook"
@@ -34,6 +42,91 @@ class ClusterConfig:
     priority_class: str = "opportunistic"
     # Node affinity: "gpu-avoid" (default NRP rule) or "none" (disable)
     node_affinity: str = "gpu-avoid"
+
+
+# Built-in profiles directory (ships with the package)
+_BUILTIN_PROFILES_DIR = Path(__file__).parent / "profiles"
+
+# User profile directory
+_USER_PROFILES_DIR = Path.home() / ".config" / "cng-datasets" / "profiles"
+
+
+def load_profile(name_or_path: str) -> Dict[str, Any]:
+    """Load a cluster profile and return its values as a dict.
+
+    Resolution order:
+    1. Treat as a file path if it ends in ``.yaml`` / ``.yml`` or contains
+       a path separator — resolved relative to the current working directory.
+    2. ``~/.config/cng-datasets/profiles/<name>.yaml``
+    3. Built-in profiles shipped with the package (currently: ``nrp``).
+
+    Args:
+        name_or_path: Built-in profile name (e.g. ``"nrp"``) or path to a
+            YAML file (e.g. ``"./my-cluster.yaml"``).
+
+    Returns:
+        Dict of config values from the profile.  Unknown keys are ignored.
+
+    Raises:
+        FileNotFoundError: If no profile matching the name or path is found.
+        ValueError: If the profile YAML is invalid.
+    """
+    p = Path(name_or_path)
+
+    # Explicit path: ends with .yaml/.yml or contains a separator
+    candidates: List[Path] = []
+    if name_or_path.endswith((".yaml", ".yml")) or "/" in name_or_path or "\\" in name_or_path:
+        candidates.append(p if p.is_absolute() else Path.cwd() / p)
+    else:
+        # Named profile: user dir first, then built-in
+        candidates.append(_USER_PROFILES_DIR / f"{name_or_path}.yaml")
+        candidates.append(_BUILTIN_PROFILES_DIR / f"{name_or_path}.yaml")
+
+    for candidate in candidates:
+        if candidate.exists():
+            with open(candidate) as f:
+                data = yaml.safe_load(f) or {}
+            # Strip the display-only 'name' key, keep only ClusterConfig fields
+            return {k: v for k, v in data.items() if k in _CONFIG_KEYS}
+
+    raise FileNotFoundError(
+        f"Cluster profile {name_or_path!r} not found.\n"
+        f"Searched:\n" + "\n".join(f"  {c}" for c in candidates) + "\n"
+        f"Built-in profiles: {[p.stem for p in _BUILTIN_PROFILES_DIR.glob('*.yaml')]}\n"
+        f"To create a custom profile, write a YAML file to "
+        f"{_USER_PROFILES_DIR}/<name>.yaml"
+    )
+
+
+def cluster_config_from_args(
+    profile: Optional[str] = None,
+    **cli_overrides,
+) -> "ClusterConfig":
+    """Build a ClusterConfig by merging a profile with explicit CLI overrides.
+
+    Precedence (highest to lowest):
+    1. Values in ``cli_overrides`` that are not ``None``
+    2. Values from the profile file (if ``profile`` is given)
+    3. ``ClusterConfig`` field defaults (NRP Nautilus values)
+
+    Args:
+        profile: Profile name or path, or ``None`` to use bare defaults.
+        **cli_overrides: Keyword arguments matching ``ClusterConfig`` field
+            names.  Pass ``None`` for any flag the user did not explicitly set.
+
+    Returns:
+        A fully-populated :class:`ClusterConfig`.
+    """
+    base: Dict[str, Any] = {}
+    if profile is not None:
+        base = load_profile(profile)
+
+    # Apply non-None CLI overrides on top of profile values
+    for key, value in cli_overrides.items():
+        if key in _CONFIG_KEYS and value is not None:
+            base[key] = value
+
+    return ClusterConfig(**base)
 
 
 def _s3_env_vars(config: ClusterConfig) -> List[Dict[str, Any]]:
@@ -279,14 +372,16 @@ def generate_dataset_workflow(
     backend: str = "k8s",
     repartition_storage: str = "200Gi",
     repartition_memory: str = "32Gi",
-    # Cluster/storage configuration
-    s3_endpoint: str = "rook-ceph-rgw-nautiluss3.rook",
-    s3_public_endpoint: str = "s3-west.nrp-nautilus.io",
-    s3_secret_name: str = "aws",
-    rclone_secret_name: str = "rclone-config",
-    rclone_remote: str = "nrp",
-    priority_class: str = "opportunistic",
-    node_affinity: str = "gpu-avoid",
+    # Cluster/storage configuration — all default to None so explicit values
+    # can be distinguished from "not set" when merging with a profile.
+    profile: Optional[str] = None,
+    s3_endpoint: Optional[str] = None,
+    s3_public_endpoint: Optional[str] = None,
+    s3_secret_name: Optional[str] = None,
+    rclone_secret_name: Optional[str] = None,
+    rclone_remote: Optional[str] = None,
+    priority_class: Optional[str] = None,
+    node_affinity: Optional[str] = None,
     # Backwards compatibility: accept source_url (singular)
     source_url: Union[str, List[str]] = None,
 ):
@@ -326,7 +421,8 @@ def generate_dataset_workflow(
     if bucket is None:
         raise ValueError("bucket parameter is required")
 
-    config = ClusterConfig(
+    config = cluster_config_from_args(
+        profile=profile,
         s3_endpoint=s3_endpoint,
         s3_public_endpoint=s3_public_endpoint,
         s3_secret_name=s3_secret_name,
@@ -469,14 +565,16 @@ def generate_raster_workflow(
     band: Optional[int] = None,
     output_cog_name: Optional[str] = None,
     backend: str = "k8s",
-    # Cluster/storage configuration
-    s3_endpoint: str = "rook-ceph-rgw-nautiluss3.rook",
-    s3_public_endpoint: str = "s3-west.nrp-nautilus.io",
-    s3_secret_name: str = "aws",
-    rclone_secret_name: str = "rclone-config",
-    rclone_remote: str = "nrp",
-    priority_class: str = "opportunistic",
-    node_affinity: str = "gpu-avoid",
+    # Cluster/storage configuration — all default to None so explicit values
+    # can be distinguished from "not set" when merging with a profile.
+    profile: Optional[str] = None,
+    s3_endpoint: Optional[str] = None,
+    s3_public_endpoint: Optional[str] = None,
+    s3_secret_name: Optional[str] = None,
+    rclone_secret_name: Optional[str] = None,
+    rclone_remote: Optional[str] = None,
+    priority_class: Optional[str] = None,
+    node_affinity: Optional[str] = None,
     # backwards compat
     source_url: Optional[str] = None,
 ):
@@ -517,7 +615,8 @@ def generate_raster_workflow(
     if isinstance(source_urls, str):
         source_urls = [source_urls]
 
-    config = ClusterConfig(
+    config = cluster_config_from_args(
+        profile=profile,
         s3_endpoint=s3_endpoint,
         s3_public_endpoint=s3_public_endpoint,
         s3_secret_name=s3_secret_name,
