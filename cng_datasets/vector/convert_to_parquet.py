@@ -7,7 +7,7 @@ Simple workflow:
 2. Read data with DuckDB ST_Read
 3. Add ID column if needed
 4. Reproject if needed (ST_Transform + ST_FlipCoordinates)
-5. Write locally with geoparquet-io optimizations
+5. Write GeoParquet with DuckDB COPY (DuckDB 1.5+ writes geo metadata natively)
 6. Upload to S3 via rclone if needed
 """
 
@@ -25,19 +25,6 @@ import duckdb
 import geopandas as gpd
 from urllib.request import urlretrieve
 from urllib.parse import urlparse
-
-# Monkeypatch geoparquet-io to ensure internal connections set arrow_large_buffer_size=true
-# This fixes Arrow Appender overflow errors on large geospatial datasets
-try:
-    import geoparquet_io.core.common
-    _original_get_duckdb_connection = geoparquet_io.core.common.get_duckdb_connection
-    def _patched_get_duckdb_connection(*args, **kwargs):
-        con = _original_get_duckdb_connection(*args, **kwargs)
-        con.execute("SET arrow_large_buffer_size=true")
-        return con
-    geoparquet_io.core.common.get_duckdb_connection = _patched_get_duckdb_connection
-except ImportError:
-    pass
 
 
 # Curved geometry types that DuckDB's WKB parser cannot handle
@@ -566,7 +553,7 @@ def process_parquet_input(
             # Write directly to destination
             write_with_duckdb(query, destination, compression, compression_level,
                             row_group_size, verbose)
-        
+
         print("✓ Parquet processing completed successfully!")
         
     except Exception as e:
@@ -621,46 +608,6 @@ def write_with_duckdb(query: str, output_path: str,
     finally:
         con.close()
 
-
-def apply_geoparquet_optimizations(input_path: str, output_path: str,
-                                    geom_col: Optional[str] = None,
-                                    verbose: bool = False) -> None:
-    """
-    Apply geoparquet-io optimizations to an existing parquet file.
-
-    This adds proper GeoParquet 1.1 metadata and optimizations.
-
-    Args:
-        input_path: Input parquet file
-        output_path: Output parquet file (can be same as input for in-place)
-        geom_col: Geometry column name. When provided, overrides auto-detection in
-            geoparquet_io, which is necessary for geometry types (e.g. Measured/M) where
-            DuckDB does not write GeoParquet metadata and auto-detection falls back to
-            the wrong default column name "geometry".
-        verbose: Print debug information
-    """
-    import geoparquet_io.core.add_bbox_column as _bbox_mod
-    from geoparquet_io.core.add_bbox_column import add_bbox_column
-
-    if verbose:
-        print(f"  Applying GeoParquet optimizations...")
-
-    if geom_col is not None:
-        # Temporarily override find_primary_geometry_column so add_bbox_column uses
-        # the known column name rather than reading (potentially absent) GeoParquet
-        # metadata. This is needed when DuckDB omits geo metadata for unusual geometry
-        # types such as Measured (M) geometries converted to MultiPoint Z.
-        _orig = _bbox_mod.find_primary_geometry_column
-        _bbox_mod.find_primary_geometry_column = lambda path, verbose=False: geom_col
-        try:
-            add_bbox_column(input_path, output_path, verbose=verbose, overwrite=True)
-        finally:
-            _bbox_mod.find_primary_geometry_column = _orig
-    else:
-        add_bbox_column(input_path, output_path, verbose=verbose, overwrite=True)
-
-    if verbose:
-        print(f"  ✓ Applied optimizations")
 
 
 def upload_to_s3(local_path: str, s3_destination: str, verbose: bool = True) -> None:
@@ -718,7 +665,7 @@ def convert_to_parquet(
     1. Detect source CRS using GDAL
     2. Check if ID column exists or needs creation
     3. Build DuckDB query to read, add ID, and reproject
-    4. Write GeoParquet locally with geoparquet-io optimizations
+    4. Write GeoParquet with DuckDB COPY
     5. Upload to S3 via rclone if destination is S3
     
     Args:

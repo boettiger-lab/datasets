@@ -157,6 +157,272 @@ class TestConvertToParquet:
                 os.remove(output_path)
 
 
+class TestGeoParquetCRS:
+    """Test that DuckDB 1.5 writes correct CRS metadata in GeoParquet output."""
+
+    def test_wgs84_geojson_has_geo_metadata_with_crs(self):
+        """
+        GeoJSON (WGS84) → GeoParquet should produce valid geo metadata.
+
+        DuckDB 1.5 writes CRS as PROJJSON in the 'geo' key. For OGC:CRS84/WGS84,
+        the CRS field may be omitted (it's the GeoParquet default), which is valid.
+        """
+        import json
+        import pyarrow.parquet as pq
+
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"name": "test"},
+                "geometry": {"type": "Point", "coordinates": [-122.4, 37.8]}
+            }]
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.geojson', delete=False) as f:
+            json.dump(geojson, f)
+            src_path = f.name
+
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
+            output_path = f.name
+
+        try:
+            convert_to_parquet(
+                source_url=src_path,
+                destination=output_path,
+                target_crs="EPSG:4326",
+                verbose=False,
+                progress=False,
+            )
+
+            metadata = pq.read_metadata(output_path)
+            schema_metadata = metadata.schema.to_arrow_schema().metadata
+            assert b'geo' in schema_metadata, "Missing 'geo' metadata key in GeoParquet output"
+
+            geo = json.loads(schema_metadata[b'geo'])
+            assert 'columns' in geo, "geo metadata missing 'columns' key"
+
+            # Find the geometry column entry
+            geom_cols = geo['columns']
+            assert len(geom_cols) > 0, "No geometry columns in geo metadata"
+
+            col_name = list(geom_cols.keys())[0]
+            col_meta = geom_cols[col_name]
+            assert col_meta.get('encoding') == 'WKB', f"Expected WKB encoding, got {col_meta.get('encoding')}"
+
+            # CRS for WGS84 may be omitted (GeoParquet default) or present as PROJJSON
+            crs = col_meta.get('crs')
+            if crs is not None:
+                assert isinstance(crs, dict), f"CRS should be PROJJSON dict, got {type(crs)}"
+                # PROJJSON should have a type field
+                assert 'type' in crs, f"PROJJSON CRS missing 'type': {crs}"
+
+        finally:
+            for p in [src_path, output_path]:
+                if os.path.exists(p):
+                    os.remove(p)
+
+    def test_projected_crs_written_to_metadata(self):
+        """
+        EPSG:3310 → EPSG:4326 reprojection must write CRS metadata.
+
+        After reprojection to WGS84, the output CRS should reflect EPSG:4326/OGC:CRS84.
+        Since this is the GeoParquet default, CRS may be absent (valid) or present as PROJJSON.
+        """
+        import subprocess
+        import json
+        import shutil
+        import pyarrow.parquet as pq
+
+        wgs84_geojson = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"name": "test"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-122.4, 37.8], [-122.4, 37.9],
+                        [-122.3, 37.9], [-122.3, 37.8],
+                        [-122.4, 37.8]
+                    ]]
+                }
+            }]
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='_src.geojson', delete=False) as f:
+            json.dump(wgs84_geojson, f)
+            src_path = f.name
+
+        temp_dir = tempfile.mkdtemp()
+        shp_path = os.path.join(temp_dir, 'test_3310.shp')
+
+        try:
+            result = subprocess.run(
+                ['ogr2ogr', '-f', 'ESRI Shapefile', '-t_srs', 'EPSG:3310', shp_path, src_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                pytest.skip(f"Could not create projected test data: {result.stderr}")
+
+            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
+                output_path = f.name
+
+            convert_to_parquet(
+                source_url=shp_path,
+                destination=output_path,
+                target_crs="EPSG:4326",
+                verbose=False,
+                progress=False,
+            )
+
+            metadata = pq.read_metadata(output_path)
+            schema_metadata = metadata.schema.to_arrow_schema().metadata
+            assert b'geo' in schema_metadata, "Missing 'geo' metadata after reprojection"
+
+            geo = json.loads(schema_metadata[b'geo'])
+            col_name = list(geo['columns'].keys())[0]
+            col_meta = geo['columns'][col_name]
+
+            # Geometry type should be present
+            assert 'geometry_types' in col_meta, "Missing geometry_types in geo metadata"
+
+            # CRS either absent (default WGS84) or valid PROJJSON
+            crs = col_meta.get('crs')
+            if crs is not None:
+                assert isinstance(crs, dict), f"CRS should be PROJJSON dict, got {type(crs)}"
+
+        finally:
+            for p in [src_path]:
+                if os.path.exists(p):
+                    os.remove(p)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            if 'output_path' in locals() and os.path.exists(output_path):
+                os.remove(output_path)
+
+    def test_nad83_reprojection_preserves_geo_metadata(self):
+        """
+        EPSG:4269 (NAD83) → EPSG:4326 must produce geo metadata.
+
+        This is the Census TIGER data scenario: geographic→geographic reprojection.
+        """
+        import subprocess
+        import json
+        import shutil
+        import pyarrow.parquet as pq
+
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"name": "test"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-122.4, 37.8], [-122.4, 37.9],
+                        [-122.3, 37.9], [-122.3, 37.8],
+                        [-122.4, 37.8]
+                    ]]
+                }
+            }]
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='_src.geojson', delete=False) as f:
+            json.dump(geojson, f)
+            src_path = f.name
+
+        temp_dir = tempfile.mkdtemp()
+        shp_path = os.path.join(temp_dir, 'test_4269.shp')
+
+        try:
+            result = subprocess.run(
+                ['ogr2ogr', '-f', 'ESRI Shapefile', '-t_srs', 'EPSG:4269', shp_path, src_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                pytest.skip(f"Could not create NAD83 test data: {result.stderr}")
+
+            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
+                output_path = f.name
+
+            convert_to_parquet(
+                source_url=shp_path,
+                destination=output_path,
+                target_crs="EPSG:4326",
+                verbose=False,
+                progress=False,
+            )
+
+            metadata = pq.read_metadata(output_path)
+            schema_metadata = metadata.schema.to_arrow_schema().metadata
+            assert b'geo' in schema_metadata, "Missing 'geo' metadata for NAD83→WGS84"
+
+            geo = json.loads(schema_metadata[b'geo'])
+            assert 'columns' in geo
+            assert len(geo['columns']) > 0, "No geometry columns in geo metadata"
+
+        finally:
+            for p in [src_path]:
+                if os.path.exists(p):
+                    os.remove(p)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            if 'output_path' in locals() and os.path.exists(output_path):
+                os.remove(output_path)
+
+    def test_no_bbox_struct_column_in_output(self):
+        """
+        Verify output does NOT contain a bbox struct column.
+
+        DuckDB 1.5 uses native parquet row-group statistics for spatial filtering
+        via the && operator, making the bbox struct column unnecessary. The bbox
+        column causes friction in downstream tools (e.g., must be dropped for
+        GeoJSON export).
+        """
+        import json
+
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"name": "test"},
+                "geometry": {"type": "Point", "coordinates": [-122.4, 37.8]}
+            }]
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.geojson', delete=False) as f:
+            json.dump(geojson, f)
+            src_path = f.name
+
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
+            output_path = f.name
+
+        try:
+            convert_to_parquet(
+                source_url=src_path,
+                destination=output_path,
+                verbose=False,
+                progress=False,
+            )
+
+            con = duckdb.connect()
+            cols = con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{output_path}')"
+            ).fetchdf()['column_name'].tolist()
+            con.close()
+
+            assert 'bbox' not in cols, (
+                "Output contains a 'bbox' struct column. DuckDB 1.5 uses native "
+                "parquet row-group statistics instead — the bbox column should not be added."
+            )
+
+        finally:
+            for p in [src_path, output_path]:
+                if os.path.exists(p):
+                    os.remove(p)
+
+
 class TestReprojection:
     """Test reprojection functionality - critical for catching projection bugs."""
     
