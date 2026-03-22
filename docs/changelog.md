@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Multi-cluster configuration** (`ClusterConfig`): all NRP-specific values in generated Kubernetes job specs are now overridable via CLI flags (`--s3-endpoint`, `--s3-public-endpoint`, `--s3-secret-name`, `--rclone-secret-name`, `--rclone-remote`, `--priority-class`, `--node-affinity`) and matching keyword arguments on `generate_dataset_workflow` / `generate_raster_workflow`. All defaults equal the current hardcoded NRP values — existing commands produce identical YAML without changes.
+- **Per-bucket credential scoping**: `--s3-secret-name` lets each workflow reference a dedicated Kubernetes secret, limiting job S3 access to a single bucket.
+- **Configurable node affinity**: `--node-affinity none` omits the NRP-specific NFD GPU-avoidance rule for clusters that don't use Node Feature Discovery labels.
+- **Configurable priority class**: `--priority-class ""` omits `priorityClassName` for clusters without NRP/Armada priority classes.
+- Eliminated duplicated S3 env-var blocks across all six job generators via shared `_s3_env_vars()` and `_apply_scheduling()` helpers.
+
 ## [0.1.1] - 2026-01-01
 
 ### Added

@@ -102,7 +102,7 @@ kubectl apply -f my-dataset/repartition-job.yaml
 
 **Resolution Reference:**
 - h12: ~3m (building-level)
-- h11: ~10m (lot-level)  
+- h11: ~10m (lot-level)
 - h10: ~15m (street-level) - **default**
 - h9: ~50m (block-level)
 - h8: ~175m (neighborhood)
@@ -116,6 +116,82 @@ kubectl apply -f my-dataset/repartition-job.yaml
 ```
 
 All jobs and RBAC use the specified namespace.
+
+### Cluster and Storage Configuration
+
+All cluster-specific values default to NRP Nautilus. Override any of them to target a different cluster or S3 backend — existing commands produce identical YAML without any changes.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--s3-endpoint` | `rook-ceph-rgw-nautiluss3.rook` | Internal S3 endpoint used by job pods |
+| `--s3-public-endpoint` | `s3-west.nrp-nautilus.io` | Public endpoint (used in PMTiles URL construction) |
+| `--s3-secret-name` | `aws` | Kubernetes secret holding `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` |
+| `--rclone-secret-name` | `rclone-config` | Kubernetes secret holding the rclone config file |
+| `--rclone-remote` | `nrp` | Rclone remote name used in setup-bucket and PMTiles upload |
+| `--priority-class` | `opportunistic` | Kubernetes `priorityClassName`; pass `""` to omit the field entirely |
+| `--node-affinity` | `gpu-avoid` | `gpu-avoid` adds an NRP NFD rule to avoid GPU nodes; `none` omits affinity |
+
+#### Example: MinIO on a different cluster
+
+```bash
+cng-datasets workflow \
+  --dataset my-dataset \
+  --source-url https://example.com/data.gpkg \
+  --bucket my-bucket \
+  --s3-endpoint minio.my-cluster.svc.cluster.local \
+  --s3-public-endpoint minio.my-cluster.io \
+  --s3-secret-name minio-credentials \
+  --rclone-secret-name minio-rclone-config \
+  --rclone-remote minio \
+  --priority-class "" \
+  --node-affinity none \
+  --output-dir my-dataset/
+```
+
+#### Example: Per-bucket credential scoping
+
+Use separate S3 credentials for each dataset bucket to limit the blast radius of any single job:
+
+```bash
+# Create a scoped secret for this specific bucket
+kubectl create secret generic s3-creds-my-dataset \
+  --from-literal=AWS_ACCESS_KEY_ID=<bucket-specific-key> \
+  --from-literal=AWS_SECRET_ACCESS_KEY=<bucket-specific-secret> \
+  -n biodiversity
+
+# Generate workflow using the scoped secret
+cng-datasets workflow \
+  --dataset my-dataset \
+  --source-url https://example.com/data.gpkg \
+  --bucket public-my-dataset \
+  --s3-secret-name s3-creds-my-dataset \
+  --output-dir my-dataset/
+```
+
+Jobs will use only the credentials for `public-my-dataset`, with no access to other buckets.
+
+#### Example: Using from Python
+
+The same options are available when calling `generate_dataset_workflow` or `generate_raster_workflow` directly:
+
+```python
+from cng_datasets.k8s import generate_dataset_workflow
+
+generate_dataset_workflow(
+    dataset_name="my-dataset",
+    source_urls="https://example.com/data.gpkg",
+    bucket="my-bucket",
+    output_dir="my-dataset/",
+    # Override cluster defaults
+    s3_endpoint="minio.my-cluster.svc.cluster.local",
+    s3_public_endpoint="minio.my-cluster.io",
+    s3_secret_name="minio-credentials",
+    rclone_secret_name="minio-rclone-config",
+    rclone_remote="minio",
+    priority_class="",        # omit priorityClassName
+    node_affinity="none",     # omit affinity
+)
+```
 
 ### Chunking Behavior
 

@@ -81,7 +81,15 @@ def main():
     workflow_parser.add_argument("--repartition-storage", type=str, default="200Gi", help="Ephemeral storage request/limit for repartition job pod (default: 200Gi)")
     workflow_parser.add_argument("--repartition-memory", type=str, default="32Gi", help="Memory request/limit for repartition job pod (default: 32Gi)")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
-    
+    # Cluster/storage configuration flags
+    workflow_parser.add_argument("--s3-endpoint", default="rook-ceph-rgw-nautiluss3.rook", help="Internal S3 endpoint for jobs (default: rook-ceph-rgw-nautiluss3.rook)")
+    workflow_parser.add_argument("--s3-public-endpoint", default="s3-west.nrp-nautilus.io", help="Public S3 endpoint (default: s3-west.nrp-nautilus.io)")
+    workflow_parser.add_argument("--s3-secret-name", default="aws", help="Kubernetes secret name for S3 credentials (default: aws)")
+    workflow_parser.add_argument("--rclone-secret-name", default="rclone-config", help="Kubernetes secret name for rclone config (default: rclone-config)")
+    workflow_parser.add_argument("--rclone-remote", default="nrp", help="Rclone remote name used in setup-bucket and pmtiles jobs (default: nrp)")
+    workflow_parser.add_argument("--priority-class", default="opportunistic", help="Kubernetes priority class (default: opportunistic, use empty string to omit)")
+    workflow_parser.add_argument("--node-affinity", default="gpu-avoid", choices=["gpu-avoid", "none"], help="Node affinity rule: 'gpu-avoid' (default NRP GPU avoidance) or 'none' (no affinity)")
+
     # Raster workflow generation command
     raster_workflow_parser = subparsers.add_parser("raster-workflow", help="Generate complete raster dataset workflow")
     raster_workflow_parser.add_argument("--dataset", required=True, help="Dataset name")
@@ -101,7 +109,15 @@ def main():
     raster_workflow_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (multi-tile only)")
     raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif)")
     raster_workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
-    
+    # Cluster/storage configuration flags
+    raster_workflow_parser.add_argument("--s3-endpoint", default="rook-ceph-rgw-nautiluss3.rook", help="Internal S3 endpoint for jobs (default: rook-ceph-rgw-nautiluss3.rook)")
+    raster_workflow_parser.add_argument("--s3-public-endpoint", default="s3-west.nrp-nautilus.io", help="Public S3 endpoint (default: s3-west.nrp-nautilus.io)")
+    raster_workflow_parser.add_argument("--s3-secret-name", default="aws", help="Kubernetes secret name for S3 credentials (default: aws)")
+    raster_workflow_parser.add_argument("--rclone-secret-name", default="rclone-config", help="Kubernetes secret name for rclone config (default: rclone-config)")
+    raster_workflow_parser.add_argument("--rclone-remote", default="nrp", help="Rclone remote name used in setup-bucket jobs (default: nrp)")
+    raster_workflow_parser.add_argument("--priority-class", default="opportunistic", help="Kubernetes priority class (default: opportunistic, use empty string to omit)")
+    raster_workflow_parser.add_argument("--node-affinity", default="gpu-avoid", choices=["gpu-avoid", "none"], help="Node affinity rule: 'gpu-avoid' (default NRP GPU avoidance) or 'none' (no affinity)")
+
     # Sync job generation command
     sync_job_parser = subparsers.add_parser("sync-job", help="Generate Kubernetes job for syncing between S3 locations")
     sync_job_parser.add_argument("--job-name", required=True, help="Job name")
@@ -278,6 +294,13 @@ def _dispatch(args):
             backend=args.backend,
             repartition_storage=args.repartition_storage,
             repartition_memory=args.repartition_memory,
+            s3_endpoint=args.s3_endpoint,
+            s3_public_endpoint=args.s3_public_endpoint,
+            s3_secret_name=args.s3_secret_name,
+            rclone_secret_name=args.rclone_secret_name,
+            rclone_remote=args.rclone_remote,
+            priority_class=args.priority_class,
+            node_affinity=args.node_affinity,
         )
     
     elif args.command == "raster-workflow":
@@ -306,6 +329,13 @@ def _dispatch(args):
             band=getattr(args, 'band', None),
             output_cog_name=getattr(args, 'output_cog_name', None),
             backend=args.backend,
+            s3_endpoint=args.s3_endpoint,
+            s3_public_endpoint=args.s3_public_endpoint,
+            s3_secret_name=args.s3_secret_name,
+            rclone_secret_name=args.rclone_secret_name,
+            rclone_remote=args.rclone_remote,
+            priority_class=args.priority_class,
+            node_affinity=args.node_affinity,
         )
     
     elif args.command == "storage":
