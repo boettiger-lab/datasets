@@ -412,6 +412,33 @@ class TestEdgeCases:
             
             assert "single.shp" in command_str
 
+    @pytest.mark.timeout(10)
+    def test_feature_count_fallback_uses_conservative_chunk_size(self, mocker):
+        """When feature counting fails, chunk_size should be large enough to cover large datasets."""
+        mocker.patch(
+            'cng_datasets.k8s.workflows._count_source_features',
+            side_effect=Exception("ogrinfo timed out after 30 seconds")
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="fallback-test",
+                source_urls="https://example.com/large.gdb",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                max_completions=200,
+            )
+
+            hex_file = Path(tmpdir) / "fallback-test-hex.yaml"
+            with open(hex_file) as f:
+                job = yaml.safe_load(f)
+
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            # With max_completions=200, fallback total_rows=200*1000=200000,
+            # so chunk_size=ceil(200000/200)=1000 — not the old silently-small 50.
+            assert "--chunk-size 50" not in command_str
+            assert "--chunk-size 1000" in command_str
+
 
 class TestRasterWorkflowGeneration:
     """Tests for generate_raster_workflow(), especially the multi-tile mosaic path."""
