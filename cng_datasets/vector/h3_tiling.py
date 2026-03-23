@@ -118,7 +118,22 @@ def geom_to_h3_cells(
     
     # Build column list for SELECT statements, quoting column names to handle spaces
     col_list = ', '.join([f'"{col}"' for col in keep_cols])
-    
+
+    # Warn if the dataset contains point geometries — each point resolves to a single
+    # H3 cell at the requested resolution, which may aggregate nearby points at coarse
+    # resolutions and discards sub-cell coordinate precision.
+    point_count = con.execute(f"""
+        SELECT COUNT(*) FROM {table_name}
+        WHERE ST_GeometryType({geom_col}) IN ('POINT', 'MULTIPOINT')
+    """).fetchone()[0]
+    if point_count > 0:
+        print(
+            f"  Warning: {point_count} point/multipoint geometries detected. "
+            f"Each point will be resolved to a single H3 cell at resolution {zoom}. "
+            "Sub-cell coordinate precision is lost, and nearby points at coarse "
+            "resolutions may map to the same cell. Document this in the STAC metadata."
+        )
+
     # Convert to multi-polygons and unnest, then generate H3 cells
     # The geometry is already GEOMETRY type in DuckDB spatial extension
     sql = f'''
