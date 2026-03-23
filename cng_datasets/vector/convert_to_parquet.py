@@ -33,6 +33,12 @@ _CURVED_GEOMETRY_TYPES = frozenset({
     'circularstring', 'multicurve',
 })
 
+# Substrings that indicate M or Z coordinates in an ogrinfo geometry-type line.
+# DuckDB's spatial extension stores these as BLOB rather than GEOMETRY, which
+# breaks reprojection, bbox computation, hex aggregation, and PMTiles export.
+# Flattening to 2D with ogr2ogr before ST_Read avoids the BLOB issue entirely.
+_NON_2D_GEOMETRY_PATTERNS = ('3d ', 'measured', ' z', ' m', 'z,', 'm,')
+
 
 def _is_gdb_source(source_url: str) -> bool:
     """Check if source is a GDAL FileGDB or OpenFileGDB source."""
@@ -42,6 +48,71 @@ def _is_gdb_source(source_url: str) -> bool:
         cleaned = cleaned.replace(prefix, '')
     return cleaned.rstrip('/').endswith('.gdb')
 
+
+
+def _has_non_2d_geometry(source_url: str, layer: Optional[str] = None) -> bool:
+    """
+    Return True if the source contains measured (M) or 3D (Z) geometry.
+
+    DuckDB's spatial extension reads M/Z geometry as BLOB rather than GEOMETRY,
+    which silently breaks downstream reprojection, bbox stats, hex aggregation,
+    and PMTiles export.  Detecting this upfront lets us route the source through
+    ogr2ogr -dim XY before passing it to DuckDB.
+    """
+    cmd = ['ogrinfo', '-al', '-so', source_url]
+    if layer:
+        cmd.append(layer)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        for line in result.stdout.splitlines():
+            if line.strip().startswith('Geometry:'):
+                geom_type = line.split(':', 1)[1].strip().lower()
+                if any(pat in geom_type for pat in _NON_2D_GEOMETRY_PATTERNS):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _flatten_to_2d(source_inputs: Union[str, List[str]], layer: Optional[str] = None,
+                   verbose: bool = False) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Flatten measured/3D geometries to strictly 2D using ``ogr2ogr -dim XY``.
+
+    All inputs (single file or list) are merged into one temp GPKG so that the
+    rest of the pipeline always sees a single, DuckDB-readable source with a
+    proper GEOMETRY column instead of BLOB.
+
+    Returns:
+        (new_source_path, new_layer, temp_dir_to_cleanup)
+        On failure returns (source_inputs, layer, None) and prints a warning.
+    """
+    print("  Non-2D geometry detected — flattening to 2D with ogr2ogr (-dim XY)...")
+
+    flat_dir = tempfile.mkdtemp(prefix='cng_flatten_')
+    output_path = os.path.join(flat_dir, 'flattened.gpkg')
+
+    sources = [source_inputs] if isinstance(source_inputs, str) else list(source_inputs)
+
+    try:
+        for i, src in enumerate(sources):
+            ogr_cmd = ['ogr2ogr', '-f', 'GPKG', '-dim', 'XY']
+            if i > 0:
+                ogr_cmd.append('-append')
+            ogr_cmd += [output_path, src]
+            if layer:
+                ogr_cmd.append(layer)
+            subprocess.run(ogr_cmd, check=True, capture_output=True, text=True, timeout=7200)
+
+        if verbose:
+            print(f"  Flattened to temp GPKG: {output_path}")
+        return output_path, None, flat_dir
+
+    except subprocess.CalledProcessError as e:
+        print(f"  Warning: ogr2ogr flatten to 2D failed: {e.stderr}")
+        print("  Proceeding with original source (may produce BLOB geometry column)")
+        shutil.rmtree(flat_dir, ignore_errors=True)
+        return source_inputs, layer, None
 
 
 def _linearize_source(source_url: str, layer: Optional[str] = None,
@@ -818,6 +889,22 @@ def convert_to_parquet(
             geom_col = get_geometry_column(linearized_source, layer=effective_layer, verbose=verbose)
             print(f"  Geometry column (linearized): {geom_col}")
 
+        # Step 1c: Flatten measured/3D (M/Z) geometries to 2D.
+        # DuckDB stores M/Z geometry as BLOB rather than GEOMETRY, which silently
+        # breaks reprojection and all downstream steps.  Pre-process with ogr2ogr
+        # -dim XY so DuckDB sees a standard 2D GEOMETRY column.
+        flatten_dir = None
+        if _has_non_2d_geometry(representative_source, layer=layer):
+            flattened_source, flat_layer, flatten_dir = _flatten_to_2d(
+                source_inputs, layer=layer, verbose=verbose
+            )
+            if flatten_dir:
+                source_inputs = flattened_source
+                representative_source = flattened_source
+                layer = flat_layer
+                geom_col = get_geometry_column(flattened_source, layer=flat_layer, verbose=verbose)
+                print(f"  Geometry column (flattened): {geom_col}")
+
         # Step 2: Build read/reproject query
         print("  Building read/reproject query...")
         query = build_read_reproject_query(
@@ -878,6 +965,10 @@ def convert_to_parquet(
              if verbose:
                  print(f"  Cleaning up linearization temp dir: {linearize_dir}")
              shutil.rmtree(linearize_dir, ignore_errors=True)
+        if 'flatten_dir' in locals() and flatten_dir and os.path.exists(flatten_dir):
+             if verbose:
+                 print(f"  Cleaning up flatten temp dir: {flatten_dir}")
+             shutil.rmtree(flatten_dir, ignore_errors=True)
         if 'temp_dir' in locals() and temp_dir and os.path.exists(temp_dir):
              if verbose:
                  print(f"  Cleaning up temporary directory: {temp_dir}")
