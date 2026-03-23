@@ -471,9 +471,11 @@ def generate_dataset_workflow(
         print(f"  Parallelism: {parallelism}")
     except Exception as e:
         # Fall back to default values if counting fails (e.g., in tests or if file doesn't exist yet)
-        print(f"  Warning: Could not count features ({e}). Using default chunking parameters.")
-        total_rows = 10000  # Default assumption
+        print(f"  Warning: Could not count features ({e}). Using conservative chunking parameters.")
+        total_rows = max_completions * 1000  # Conservative: covers up to max_completions*1000 features
         chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
+        print(f"  Warning: feature count unknown — defaults cover at most {total_rows:,} features (chunk_size={chunk_size}).")
+        print(f"  If your dataset is larger, set --chunk-size manually.")
         print(f"  Using defaults: chunk_size={chunk_size}, completions={completions}, parallelism={parallelism}")
     
     print(f"  H3 resolution: {h3_resolution}")
