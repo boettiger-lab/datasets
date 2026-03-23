@@ -657,6 +657,131 @@ class TestReprojection:
             if os.path.exists(output_path):
                 os.remove(output_path)
 
+    @pytest.fixture
+    def sample_3d_point_shapefile(self):
+        """
+        Create a shapefile whose geometry type is reported as '3D Point' (has Z coords).
+
+        DuckDB's spatial extension reads M/Z geometry as BLOB rather than GEOMETRY,
+        which silently breaks reprojection, hex aggregation, and PMTiles export.
+        This fixture reproduces that scenario so we can verify the flatten-to-2D
+        pre-processing step fixes it end-to-end.
+        """
+        import json
+        import shutil
+        import subprocess
+
+        # GeoJSON allows Z coordinates in the coordinate arrays (RFC 7946 §3.1.1).
+        # ogr2ogr will produce a "3D Point" shapefile from this input.
+        geojson_3d = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"name": "A"},
+                    "geometry": {"type": "Point", "coordinates": [-122.4, 37.8, 100.0]},
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"name": "B"},
+                    "geometry": {"type": "Point", "coordinates": [-122.5, 37.9, 200.0]},
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"name": "C"},
+                    "geometry": {"type": "Point", "coordinates": [-122.6, 38.0, 300.0]},
+                },
+            ],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix="_3d.geojson", delete=False) as f:
+            json.dump(geojson_3d, f)
+            src_path = f.name
+
+        temp_dir = tempfile.mkdtemp()
+        shp_path = os.path.join(temp_dir, "test_3d_point.shp")
+
+        try:
+            result = subprocess.run(
+                ["ogr2ogr", "-f", "ESRI Shapefile", shp_path, src_path],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                pytest.skip(f"Could not create 3D test shapefile: {result.stderr}")
+            yield shp_path
+        finally:
+            if os.path.exists(src_path):
+                os.remove(src_path)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
+    def test_3d_geometry_flattened_to_2d(self, sample_3d_point_shapefile):
+        """
+        Shapefiles with 3D (Z) geometry must convert successfully and produce a
+        proper GEOMETRY column — not BLOB — in the output GeoParquet.
+
+        Regression test for GitHub issue #50: DuckDB's spatial extension stores
+        M/Z geometry types as BLOB rather than GEOMETRY, breaking reprojection,
+        hex aggregation, and PMTiles export.  The fix is to pre-process with
+        ogr2ogr -dim XY before passing the source to DuckDB.
+        """
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            output_path = f.name
+
+        try:
+            convert_to_parquet(
+                source_url=sample_3d_point_shapefile,
+                destination=output_path,
+                target_crs="EPSG:4326",
+                verbose=False,
+                progress=False,
+            )
+
+            con = duckdb.connect()
+            con.install_extension("spatial")
+            con.load_extension("spatial")
+
+            # Verify row count — 0 rows would indicate the BLOB/reprojection bug
+            row_count = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{output_path}')"
+            ).fetchone()[0]
+            assert row_count == 3, (
+                f"Expected 3 rows, got {row_count}. "
+                "0 rows typically means the geometry was stored as BLOB and "
+                "ST_Transform silently produced no output."
+            )
+
+            # Verify the geometry column is typed as GEOMETRY, not BLOB
+            schema = con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{output_path}')"
+            ).fetchall()
+            geom_col_type = next(
+                (row[1] for row in schema if row[0] == "geom"), None
+            )
+            assert geom_col_type is not None and geom_col_type.startswith("GEOMETRY"), (
+                f"Expected geom column type GEOMETRY (or GEOMETRY(...)), got {geom_col_type!r}. "
+                "BLOB means 3D/measured geometry was not flattened before writing."
+            )
+
+            # Verify coordinates are in valid lon/lat range (SF Bay Area)
+            result = con.execute(f"""
+                SELECT
+                    MIN(ST_XMin(geom)) as min_x,
+                    MAX(ST_XMax(geom)) as max_x,
+                    MIN(ST_YMin(geom)) as min_y,
+                    MAX(ST_YMax(geom)) as max_y
+                FROM read_parquet('{output_path}')
+            """).fetchone()
+            min_x, max_x, min_y, max_y = result
+            assert -123 <= min_x <= -122, f"X min {min_x:.2f} not in expected lon range"
+            assert 37 <= min_y <= 39, f"Y min {min_y:.2f} not in expected lat range"
+
+            con.close()
+
+        finally:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
     def test_projected_to_wgs84_reprojection(self, sample_projected_shapefile):
         """
         Test that EPSG:3310 (meters) is correctly reprojected to EPSG:4326 (degrees).
