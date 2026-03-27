@@ -267,8 +267,8 @@ class TestWorkflowGeneration:
             with open(job_file) as f:
                 job = yaml.safe_load(f)
             resources = job["spec"]["template"]["spec"]["containers"][0]["resources"]
-            assert resources["requests"]["ephemeral-storage"] == "200Gi"
-            assert resources["limits"]["ephemeral-storage"] == "200Gi"
+            assert resources["requests"]["ephemeral-storage"] == "50Gi"
+            assert resources["limits"]["ephemeral-storage"] == "50Gi"
 
     @pytest.mark.timeout(5)
     def test_repartition_job_custom_ephemeral_storage(self):
@@ -564,7 +564,7 @@ class TestRasterWorkflowGeneration:
             resources = job["spec"]["template"]["spec"]["containers"][0]["resources"]
             assert resources["requests"]["cpu"] == "8"
             assert resources["requests"]["memory"] == "32Gi"
-            assert resources["requests"]["ephemeral-storage"] == "200Gi"
+            assert resources["requests"]["ephemeral-storage"] == "50Gi"
 
     @pytest.mark.timeout(5)
     def test_preprocess_job_target_extent_flag(self):
