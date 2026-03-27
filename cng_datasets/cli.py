@@ -78,7 +78,8 @@ def main():
     workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
-    workflow_parser.add_argument("--repartition-storage", type=str, default="200Gi", help="Ephemeral storage request/limit for repartition job pod (default: 200Gi)")
+    workflow_parser.add_argument("--hex-storage", type=str, default="10Gi", help="Ephemeral storage request/limit per hex job pod (default: 10Gi)")
+    workflow_parser.add_argument("--repartition-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for repartition job pod (default: 50Gi)")
     workflow_parser.add_argument("--repartition-memory", type=str, default="32Gi", help="Memory request/limit for repartition job pod (default: 32Gi)")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     # Cluster/storage configuration flags
@@ -105,6 +106,8 @@ def main():
     raster_workflow_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
+    raster_workflow_parser.add_argument("--hex-storage", type=str, default="20Gi", help="Ephemeral storage request/limit per hex job pod (default: 20Gi)")
+    raster_workflow_parser.add_argument("--cog-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for COG preprocess job pod (default: 50Gi)")
     raster_workflow_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in EPSG:4326 (multi-tile only)")
     raster_workflow_parser.add_argument("--target-resolution", type=float, help="Output pixel size in degrees (multi-tile only)")
     raster_workflow_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (multi-tile only)")
@@ -294,6 +297,7 @@ def _dispatch(args):
             intermediate_chunk_size=args.intermediate_chunk_size,
             row_group_size=args.row_group_size,
             backend=args.backend,
+            hex_storage=args.hex_storage,
             repartition_storage=args.repartition_storage,
             repartition_memory=args.repartition_memory,
             profile=args.profile,
@@ -327,6 +331,8 @@ def _dispatch(args):
             nodata_value=args.nodata,
             hex_memory=args.hex_memory,
             max_parallelism=args.max_parallelism,
+            hex_storage=args.hex_storage,
+            cog_storage=args.cog_storage,
             target_extent=target_extent,
             target_resolution=getattr(args, 'target_resolution', None),
             band=getattr(args, 'band', None),

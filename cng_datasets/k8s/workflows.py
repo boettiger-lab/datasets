@@ -370,7 +370,8 @@ def generate_dataset_workflow(
     intermediate_chunk_size: int = 10,
     row_group_size: int = 100000,
     backend: str = "k8s",
-    repartition_storage: str = "200Gi",
+    hex_storage: str = "10Gi",
+    repartition_storage: str = "50Gi",
     repartition_memory: str = "32Gi",
     # Cluster/storage configuration — all default to None so explicit values
     # can be distinguished from "not set" when merging with a profile.
@@ -482,7 +483,7 @@ def generate_dataset_workflow(
     print(f"  Parent resolutions: {parent_resolutions}")
     
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, config=config)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config)
 
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory, config=config)
@@ -562,6 +563,8 @@ def generate_raster_workflow(
     nodata_value: Optional[float] = None,
     hex_memory: str = "32Gi",
     max_parallelism: int = 61,
+    hex_storage: str = "20Gi",
+    cog_storage: str = "50Gi",
     target_extent: Optional[tuple] = None,
     target_resolution: Optional[float] = None,
     band: Optional[int] = None,
@@ -660,6 +663,7 @@ def generate_raster_workflow(
             target_resolution=target_resolution,
             band=band,
             nodata_value=nodata_value,
+            cog_storage=cog_storage,
             config=config,
         )
 
@@ -667,7 +671,7 @@ def generate_raster_workflow(
     _generate_raster_hex_job(
         manager, k8s_name, hex_input_url, bucket, output_path, git_repo,
         h3_resolution, parent_resolutions, value_column, nodata_value,
-        hex_memory, max_parallelism, config=config,
+        hex_memory, max_parallelism, hex_storage=hex_storage, config=config,
     )
 
     # Generate workflow RBAC
@@ -720,7 +724,7 @@ def generate_raster_workflow(
 def _generate_cog_preprocess_job(
     manager, dataset_name, source_urls, output_cog_url, output_path,
     target_extent=None, target_resolution=None, band=None, nodata_value=None,
-    config: ClusterConfig = None,
+    cog_storage="50Gi", config: ClusterConfig = None,
 ):
     """Generate a k8s job that mosaics multiple raster tiles into a single COG on S3."""
     if config is None:
@@ -778,8 +782,8 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
             ],
             "command": ["bash", "-c", command_str],
             "resources": {
-                "requests": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "200Gi"},
-                "limits": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "200Gi"},
+                "requests": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": cog_storage},
+                "limits": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": cog_storage},
             },
         }],
     }
@@ -808,7 +812,7 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
 def _generate_raster_hex_job(
     manager, dataset_name, source_url, bucket, output_path, git_repo,
     h3_resolution, parent_resolutions, value_column, nodata_value,
-    hex_memory, max_parallelism, config: ClusterConfig = None,
+    hex_memory, max_parallelism, hex_storage="20Gi", config: ClusterConfig = None,
 ):
     """Generate raster H3 hex tiling job."""
     if config is None:
@@ -844,8 +848,8 @@ fi
             ],
             "command": ["bash", "-c", command_str],
             "resources": {
-                "requests": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": "250Gi"},
-                "limits": {"cpu": "4", "memory": hex_memory}
+                "requests": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": hex_storage},
+                "limits": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": hex_storage}
             }
         }]
     }
@@ -1190,7 +1194,7 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-pmtiles.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, config: ClusterConfig = None):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None):
     """Generate H3 hex tiling job.
     
     Args:
@@ -1238,8 +1242,8 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
             ],
             "command": ["bash", "-c", command_str],
             "resources": {
-                "requests": {"cpu": "4", "memory": hex_memory},
-                "limits": {"cpu": "4", "memory": hex_memory}
+                "requests": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": hex_storage},
+                "limits": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": hex_storage}
             }
         }]
     }
@@ -1288,7 +1292,7 @@ def _duckdb_memory_limit(memory_str: str, fraction: float = 0.85) -> str:
     return f"{result}{duckdb_unit}"
 
 
-def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo, s3_dataset=None, repartition_storage: str = "200Gi", repartition_memory: str = "32Gi", config: ClusterConfig = None):
+def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo, s3_dataset=None, repartition_storage: str = "50Gi", repartition_memory: str = "32Gi", config: ClusterConfig = None):
     """Generate repartition job."""
     if config is None:
         config = ClusterConfig()
