@@ -313,6 +313,143 @@ class TestH3Functions:
         con.close()
 
 
+class TestLineGeometryH3:
+    """Test H3 cell generation for LineString geometries via buffer."""
+
+    @pytest.mark.timeout(10)
+    def test_linestring_produces_h3_cells(self):
+        """A simple LineString should produce H3 cells via buffer."""
+        con = setup_duckdb_connection()
+        con.execute("""
+            CREATE TABLE test_line AS
+            SELECT
+                1 as id,
+                ST_GeomFromText('LINESTRING(-122.5 37.7, -122.4 37.8)') as geom
+        """)
+
+        sql = geom_to_h3_cells(con, "test_line", zoom=8)
+        result = con.execute(f"SELECT * FROM ({sql})").fetchdf()
+
+        assert len(result) > 0, "LineString should produce at least one H3 cell"
+        assert 'h3id' in result.columns
+        assert 'id' in result.columns
+        con.close()
+
+    @pytest.mark.timeout(10)
+    def test_linestring_cells_are_continuous(self):
+        """H3 cells along a line should form a connected set (no gaps)."""
+        con = setup_duckdb_connection()
+        # A straight-ish line spanning several H3 res-8 cells
+        con.execute("""
+            CREATE TABLE test_line AS
+            SELECT
+                1 as id,
+                ST_GeomFromText('LINESTRING(-122.5 37.7, -122.3 37.7)') as geom
+        """)
+
+        sql = geom_to_h3_cells(con, "test_line", zoom=8)
+        result = con.execute(f"""
+            SELECT DISTINCT UNNEST(h3id) AS cell FROM ({sql})
+        """).fetchdf()
+
+        cells = set(result['cell'].tolist())
+        assert len(cells) >= 2, "Line spanning ~20 km should cover multiple H3 res-8 cells"
+
+        # Check connectivity: every cell should have at least one neighbor in the set
+        for cell in cells:
+            neighbors = set(
+                con.execute(f"SELECT UNNEST(h3_grid_disk({cell}::UBIGINT, 1))::UBIGINT").fetchdf().iloc[:, 0].tolist()
+            )
+            assert len(neighbors & cells) >= 2, (
+                f"Cell {cell} has no neighbors in the set — gap in coverage"
+            )
+        con.close()
+
+    @pytest.mark.timeout(10)
+    def test_multilinestring_produces_h3_cells(self):
+        """MultiLineString should also produce H3 cells."""
+        con = setup_duckdb_connection()
+        con.execute("""
+            CREATE TABLE test_mline AS
+            SELECT
+                1 as id,
+                ST_GeomFromText('MULTILINESTRING((-122.5 37.7, -122.4 37.8), (-122.3 37.75, -122.2 37.85))') as geom
+        """)
+
+        sql = geom_to_h3_cells(con, "test_mline", zoom=8)
+        result = con.execute(f"SELECT * FROM ({sql})").fetchdf()
+
+        assert len(result) > 0, "MultiLineString should produce H3 cells"
+        con.close()
+
+    @pytest.mark.timeout(15)
+    def test_linestring_end_to_end_processing(self):
+        """Test full H3VectorProcessor pipeline with LineString data."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            con.execute(f"""
+                CREATE TABLE test_data AS
+                SELECT
+                    i as id,
+                    ST_GeomFromText(
+                        'LINESTRING(-122.5 37.7, -122.4 37.75, -122.3 37.8)'
+                    ) as geom
+                FROM range(3) t(i)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                parent_resolutions=[0],
+                chunk_size=10,
+            )
+            output_file = processor.process_chunk(0)
+
+            assert output_file is not None
+            assert Path(output_file).exists()
+
+            result_con = setup_duckdb_connection()
+            result = result_con.execute(f"SELECT * FROM read_parquet('{output_file}')").fetchdf()
+
+            assert 'h8' in result.columns
+            assert 'h0' in result.columns
+            assert 'id' in result.columns
+            # Each of the 3 lines should produce cells
+            assert len(result['id'].unique()) == 3
+            assert len(result) >= 3, "Each line should produce at least one cell"
+
+            result_con.close()
+            processor.con.close()
+
+    @pytest.mark.timeout(10)
+    def test_mixed_geometry_types(self):
+        """Mixed polygon + line geometries should both produce H3 cells."""
+        con = setup_duckdb_connection()
+        con.execute("""
+            CREATE TABLE test_mixed AS
+            SELECT 1 as id,
+                   ST_GeomFromText('POLYGON((-122.5 37.7, -122.4 37.7, -122.4 37.8, -122.5 37.8, -122.5 37.7))') as geom
+            UNION ALL
+            SELECT 2 as id,
+                   ST_GeomFromText('LINESTRING(-122.3 37.7, -122.2 37.8)') as geom
+        """)
+
+        sql = geom_to_h3_cells(con, "test_mixed", zoom=8)
+        result = con.execute(f"SELECT * FROM ({sql})").fetchdf()
+
+        ids_with_cells = set(result['id'].tolist())
+        assert 1 in ids_with_cells, "Polygon should produce H3 cells"
+        assert 2 in ids_with_cells, "LineString should produce H3 cells"
+        con.close()
+
+
 class TestVectorProcessing:
     """Test complete vector processing workflows."""
     

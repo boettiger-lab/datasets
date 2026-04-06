@@ -328,6 +328,57 @@ def _count_single_source(source_url: str, layer: str = None) -> int:
     raise ValueError("Could not find feature count in ogrinfo output")
 
 
+def _detect_geometry_type(source_urls: Union[str, List[str]], layer: str = None) -> str:
+    """Detect the predominant geometry type from source file(s).
+
+    Returns one of 'point', 'line', 'polygon', or 'unknown'.  Uses the
+    first source URL only (multi-source datasets are expected to share
+    geometry type).
+    """
+    import subprocess
+
+    url = source_urls[0] if isinstance(source_urls, list) else source_urls
+
+    # Convert s3:// to https:// for vsicurl
+    if url.startswith('s3://'):
+        path = url.replace('s3://', '')
+        url = f"https://s3-west.nrp-nautilus.io/{path}"
+
+    if url.startswith('http://') or url.startswith('https://'):
+        gdal_path = f"/vsicurl/{url}"
+    else:
+        gdal_path = url
+
+    try:
+        cmd = ['ogrinfo', '-so', gdal_path]
+        if layer:
+            cmd.append(layer)
+        else:
+            cmd.append('-al')
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        output = result.stdout.lower()
+
+        if 'line string' in output or 'linestring' in output or 'multi line string' in output:
+            return 'line'
+        if 'point' in output or 'multi point' in output:
+            return 'point'
+        if 'polygon' in output or 'multi polygon' in output:
+            return 'polygon'
+    except Exception:
+        pass
+
+    return 'unknown'
+
+
+# Default H3 resolutions per geometry type
+_DEFAULT_H3_RESOLUTION = {
+    'point': 10,
+    'polygon': 10,
+    'line': 8,
+    'unknown': 10,
+}
+
+
 def _calculate_chunking(total_rows: int, max_completions: int = 200, max_parallelism: int = 50) -> tuple[int, int, int]:
     """
     Calculate optimal chunk size, completions, and parallelism.
@@ -360,7 +411,7 @@ def generate_dataset_workflow(
     namespace: str = "biodiversity",
     image: str = "ghcr.io/boettiger-lab/datasets:latest",
     git_repo: str = "https://github.com/boettiger-lab/datasets.git",
-    h3_resolution: int = 10,
+    h3_resolution: Optional[int] = None,
     parent_resolutions: Optional[List[int]] = None,
     id_column: Optional[str] = None,
     layer: Optional[str] = None,
@@ -388,14 +439,14 @@ def generate_dataset_workflow(
 ):
     """
     Generate complete workflow for a dataset.
-    
+
     Creates all necessary Kubernetes job configurations for processing
     a geospatial dataset through the standard pipeline:
     1. Convert to GeoParquet
     2. Generate PMTiles
     3. H3 hexagonal tiling
     4. Repartition by h0
-    
+
     Args:
         dataset_name: Name of the dataset (e.g., "redlining")
         source_urls: URL(s) to source data file(s). Can be a single string or list. Multiple sources will be merged.
@@ -404,7 +455,8 @@ def generate_dataset_workflow(
         namespace: Kubernetes namespace
         image: Container image to use
         git_repo: Git repository URL for package source
-        h3_resolution: Target H3 resolution for tiling (default: 10)
+        h3_resolution: Target H3 resolution for tiling. Auto-detected if None
+            (10 for polygons/points, 8 for lines).
         parent_resolutions: List of parent H3 resolutions to include (default: [9, 8, 0])
         id_column: ID column name (auto-detected if not specified)
         hex_memory: Memory request/limit for hex job pods (default: "8Gi")
@@ -444,6 +496,14 @@ def generate_dataset_workflow(
     # Normalize source_urls to list
     if isinstance(source_urls, str):
         source_urls = [source_urls]
+
+    # Auto-detect geometry type and set H3 resolution default if not specified
+    if h3_resolution is None:
+        geom_type = _detect_geometry_type(source_urls, layer=layer)
+        h3_resolution = _DEFAULT_H3_RESOLUTION.get(geom_type, 10)
+        print(f"  Detected geometry type: {geom_type} — using H3 resolution {h3_resolution}")
+        if geom_type == 'line':
+            print(f"  Line geometries will be buffered before H3 polyfill for continuous cell coverage.")
 
     # Set defaults for parent resolutions if not provided
     if parent_resolutions is None:
