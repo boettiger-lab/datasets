@@ -434,6 +434,24 @@ class RasterProcessor:
 
         # Use public endpoint for input reads
         self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=True)
+
+        # Warn if input is in a projected CRS — reprojection to EPSG:4326 will happen
+        # internally, but a projected input can cause silent failures if PROJ is misconfigured.
+        _ds = gdal.Open(self.input_path)
+        if _ds is not None:
+            _srs = osr.SpatialReference(wkt=_ds.GetProjection())
+            _ds = None
+            if not _srs.IsGeographic():
+                _srs.AutoIdentifyEPSG()
+                _epsg = _srs.GetAuthorityCode(None)
+                _crs_name = f"EPSG:{_epsg}" if _epsg else _srs.GetName() or "unknown projected CRS"
+                print(
+                    f"⚠ Input raster is in a projected CRS ({_crs_name}), not WGS84/EPSG:4326.\n"
+                    f"  It will be reprojected to EPSG:4326 during processing.\n"
+                    f"  For best results, reproject first: "
+                    f"gdalwarp -t_srs EPSG:4326 input.tif output-wgs84.tif"
+                )
+
         self.output_cog_path = output_cog_path
         self.output_parquet_path = output_parquet_path
         self.h0_index = h0_index
