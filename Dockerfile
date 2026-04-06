@@ -50,13 +50,13 @@ RUN uv pip install "numpy<2" pip
 # Include pytest and pytest-timeout so tests can run inside the container without extra installs
 RUN uv pip install -e "." pytest pytest-timeout pytest-mock
 
-# Fix PROJ_LIB path: gdal:ubuntu-full installs proj.db at a non-standard location
-# (e.g. /usr/local/gdal-internal/share/proj). Create a symlink at the canonical
-# path so that PROJ_LIB=/usr/local/share/proj always resolves correctly.
-RUN mkdir -p /usr/local/share && \
-    PROJ_DIR=$(find /usr -name "proj.db" 2>/dev/null | head -1 | xargs -r dirname) && \
-    [ -n "${PROJ_DIR}" ] && [ "${PROJ_DIR}" != "/usr/local/share/proj" ] && \
-    ln -sfn "${PROJ_DIR}" /usr/local/share/proj || true
+# Point PROJ CLI tools to pyproj's bundled proj.db (version-matched to installed GDAL).
+# Fixes: system proj.db (version 3) is incompatible with GDAL 3.13+ (requires >= 7),
+# which breaks CLI gdalwarp/gdal_translate CRS transforms. Python osgeo.gdal is unaffected
+# because pyproj finds its own data directory regardless of PROJ_LIB.
+RUN ln -sfn $(python3 -c "import pyproj; print(pyproj.datadir.get_data_dir())") /usr/local/share/proj
+ENV PROJ_DATA=/usr/local/share/proj
+ENV PROJ_LIB=/usr/local/share/proj
 
 # Pre-install DuckDB extensions so pods don't need outbound internet access at runtime
 RUN python3 -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL httpfs'); con.execute('INSTALL spatial'); con.execute('INSTALL h3 FROM community')"
