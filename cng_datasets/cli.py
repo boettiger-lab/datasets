@@ -69,7 +69,7 @@ def main():
     workflow_parser.add_argument("--bucket", required=True, help="S3 bucket for outputs")
     workflow_parser.add_argument("--output-dir", default="k8s", help="Output directory for YAML files")
     workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
-    workflow_parser.add_argument("--h3-resolution", type=int, default=10, help="Target H3 resolution (default: 10)")
+    workflow_parser.add_argument("--h3-resolution", type=int, default=None, help="Target H3 resolution (default: auto — 10 for polygons/points, 8 for lines)")
     workflow_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
     workflow_parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
     workflow_parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")

@@ -1,15 +1,35 @@
 """
 H3 hexagonal tiling utilities for vector datasets.
 
-This module provides functions to convert polygon and point geometries
-into H3 hexagonal cells at specified resolutions, with support for
-chunked processing of large datasets.
+This module provides functions to convert polygon, point, and line
+geometries into H3 hexagonal cells at specified resolutions, with
+support for chunked processing of large datasets.
 """
 
 from typing import Optional, List, Dict, Any, Tuple
 import duckdb
+import math
 import os
 from cng_datasets.storage.s3 import configure_s3_credentials
+
+
+# Average H3 edge lengths in km (from h3geo.org/docs/core-library/restable)
+_H3_EDGE_KM = {
+    0: 1281.256011, 1: 483.0568391, 2: 182.5129565, 3: 68.97922179,
+    4: 26.07175968, 5: 9.854090990, 6: 3.724532667, 7: 1.406475763,
+    8: 0.531414010, 9: 0.200786148, 10: 0.075863783, 11: 0.028663897,
+    12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169,
+}
+
+
+def _h3_edge_length_degrees(resolution: int) -> float:
+    """Return the H3 edge length in degrees for a given resolution.
+
+    Uses the equatorial approximation (1 deg ~ 111.32 km) which
+    slightly over-buffers at higher latitudes — the safe direction
+    for a spatial index.
+    """
+    return _H3_EDGE_KM[resolution] / 111.32
 
 
 def identify_id_column(
@@ -119,13 +139,17 @@ def geom_to_h3_cells(
     # Build column list for SELECT statements, quoting column names to handle spaces
     col_list = ', '.join([f'"{col}"' for col in keep_cols])
 
-    # Warn if the dataset contains point geometries — each point resolves to a single
-    # H3 cell at the requested resolution, which may aggregate nearby points at coarse
-    # resolutions and discards sub-cell coordinate precision.
-    point_count = con.execute(f"""
-        SELECT COUNT(*) FROM {table_name}
-        WHERE ST_GeometryType({geom_col}) IN ('POINT', 'MULTIPOINT')
-    """).fetchone()[0]
+    # Detect geometry types present in the table
+    type_counts = con.execute(f"""
+        SELECT ST_GeometryType({geom_col}) AS gtype, COUNT(*) AS cnt
+        FROM {table_name}
+        GROUP BY gtype
+    """).fetchall()
+    type_map = {row[0]: row[1] for row in type_counts}
+
+    point_count = sum(type_map.get(t, 0) for t in ('POINT', 'MULTIPOINT'))
+    line_count = sum(type_map.get(t, 0) for t in ('LINESTRING', 'MULTILINESTRING'))
+
     if point_count > 0:
         print(
             f"  Warning: {point_count} point/multipoint geometries detected. "
@@ -134,23 +158,39 @@ def geom_to_h3_cells(
             "resolutions may map to the same cell. Document this in the STAC metadata."
         )
 
+    # For line geometries, buffer to a thin polygon so h3_polygon_wkt_to_cells
+    # can identify every H3 cell the line passes through.  Buffer width = H3
+    # edge length in degrees (equatorial approximation; slightly over-buffers
+    # at higher latitudes, which is the safe direction for a spatial index).
+    buffer_deg = _h3_edge_length_degrees(zoom)
+
+    if line_count > 0:
+        print(
+            f"  Line geometries detected ({line_count} features). "
+            f"Buffering by {buffer_deg:.6f} deg (~H3 edge length at res {zoom}) "
+            f"before H3 polyfill to ensure continuous cell coverage."
+        )
+
     # Convert to multi-polygons and unnest, then generate H3 cells
     # The geometry is already GEOMETRY type in DuckDB spatial extension
+    # Line geometries are buffered into polygons before polyfill.
     sql = f'''
         WITH t0 AS (
             SELECT {col_list},
-                   CASE 
-                       WHEN ST_GeometryType({geom_col}) = 'POLYGON' 
+                   CASE
+                       WHEN ST_GeometryType({geom_col}) IN ('LINESTRING', 'MULTILINESTRING')
+                       THEN ST_Multi(ST_Buffer(ST_Force2D({geom_col}), {buffer_deg}))
+                       WHEN ST_GeometryType({geom_col}) = 'POLYGON'
                        THEN ST_Multi({geom_col})
                        ELSE {geom_col}
                    END AS geom
             FROM {table_name}
         ),
         t1 AS (
-            SELECT {col_list}, 
-                   UNNEST(ST_Dump(geom)).geom AS geom 
+            SELECT {col_list},
+                   UNNEST(ST_Dump(geom)).geom AS geom
             FROM t0
-        ) 
+        )
         SELECT {col_list},
                CASE
                    WHEN ST_GeometryType(geom) = 'POINT'
@@ -159,7 +199,7 @@ def geom_to_h3_cells(
                END AS h3id
         FROM t1
     '''
-    
+
     return sql
 
 
