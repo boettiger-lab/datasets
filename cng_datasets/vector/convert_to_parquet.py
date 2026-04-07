@@ -287,53 +287,66 @@ def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = F
         return None
 
 
-def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> str:
+_GEOM_COLUMN_NAMES = {'geom', 'geometry', 'shape', 'wkb_geometry'}
+
+
+def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> Tuple[str, bool]:
     """
     Get the name of the geometry column as seen by DuckDB.
-    
+
+    DuckDB's ST_Read returns GEOMETRY for most sources but returns BLOB for some
+    geometry types (e.g. MULTIPOINT, M/Z variants).  When the column is typed as
+    BLOB the caller must wrap it in ST_GeomFromWKB() before writing so that DuckDB
+    emits a proper GEOMETRY column with GeoParquet metadata.
+
     Args:
         source_url: Source dataset URL
         layer: Layer name
         verbose: Print debug information
-        
+
     Returns:
-        Geometry column name (defaulting to 'geom')
+        Tuple of (column_name, is_wkb_blob) where is_wkb_blob is True when
+        the column is typed BLOB and needs ST_GeomFromWKB() casting.
     """
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
     con.execute("SET arrow_large_buffer_size=true")
-    
+
     try:
         layer_param = f", layer='{layer}'" if layer else ""
         query = f"DESCRIBE SELECT * FROM ST_Read('{source_url}'{layer_param}) LIMIT 0"
-        
+
         columns = con.execute(query).fetchall()
-        
-        # Look for geometry type
+
+        # First pass: proper GEOMETRY column
         for col_name, col_type, *_ in columns:
             if col_type == 'GEOMETRY':
                 if verbose:
                     print(f"  Detected geometry column: {col_name}")
-                return col_name
-                
-        # Fallback for when type info isn't clear (though ST_Read usually returns GEOMETRY)
-        col_names = [c[0].lower() for c in columns]
-        if 'geom' in col_names:
-            return 'geom'
-        if 'geometry' in col_names:
-            return 'geometry'
-        if 'shape' in col_names:
-            return 'shape'
-            
+                return col_name, False
+
+        # Second pass: BLOB column with a geometry-like name (e.g. MULTIPOINT sources)
+        for col_name, col_type, *_ in columns:
+            if col_type == 'BLOB' and col_name.lower() in _GEOM_COLUMN_NAMES:
+                if verbose:
+                    print(f"  Detected geometry column as BLOB (needs WKB cast): {col_name}")
+                return col_name, True
+
+        # Fallback: name-based detection (type unknown)
+        col_map = {c[0].lower(): c[0] for c in columns}
+        for name in ('geom', 'geometry', 'shape'):
+            if name in col_map:
+                return col_map[name], False
+
         if verbose:
             print("  Warning: Could not detect geometry column, defaulting to 'geom'")
-        return "geom"
-        
+        return "geom", False
+
     except Exception as e:
         if verbose:
             print(f"Warning: Geometry column detection failed: {e}")
-        return "geom"
+        return "geom", False
     finally:
         con.close()
 
@@ -423,10 +436,10 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
 
 def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str],
                                target_crs: str, geom_col: str = "geom", layer: Optional[str] = None,
-                               verbose: bool = False) -> str:
+                               verbose: bool = False, geom_is_blob: bool = False) -> str:
     """
     Build DuckDB query to read and reproject data. Can handle multiple input files.
-    
+
     Args:
         source_inputs: Source dataset URL or list of file paths
         source_crs: Source CRS (None = no reprojection needed)
@@ -434,10 +447,17 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         geom_col: Geometry column name
         layer: Layer name
         verbose: Print debug information
+        geom_is_blob: When True the geometry column is typed BLOB (e.g. MULTIPOINT sources)
+            and must be cast to GEOMETRY via ST_GeomFromWKB() before any spatial operation.
 
     Returns:
         DuckDB SQL query string
     """
+    # When geometry is a BLOB (e.g. MULTIPOINT) we must cast it first so that
+    # downstream operations (ST_Transform, COPY TO parquet) see a GEOMETRY column
+    # and DuckDB writes proper GeoParquet metadata.
+    raw_geom = f"ST_GeomFromWKB({geom_col})" if geom_is_blob else geom_col
+
     # Determine geometry transformation
     if source_crs and source_crs != target_crs:
         # Need to reproject
@@ -446,12 +466,12 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
             # axis order, but GeoParquet requires (lon, lat). Apply ST_FlipCoordinates.
             # Geographic → geographic (e.g. EPSG:4269 → EPSG:4326): ST_Transform preserves
             # traditional (lon, lat) order, so no flip is needed.
-            geom_expr = f"ST_FlipCoordinates(ST_Transform({geom_col}, '{source_crs}', '{target_crs}')) AS {geom_col}"
+            geom_expr = f"ST_FlipCoordinates(ST_Transform({raw_geom}, '{source_crs}', '{target_crs}')) AS {geom_col}"
         else:
-            geom_expr = f"ST_Transform({geom_col}, '{source_crs}', '{target_crs}') AS {geom_col}"
+            geom_expr = f"ST_Transform({raw_geom}, '{source_crs}', '{target_crs}') AS {geom_col}"
     else:
         # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
-        geom_expr = geom_col
+        geom_expr = f"{raw_geom} AS {geom_col}" if geom_is_blob else geom_col
     
     layer_param = f", layer='{layer}'" if layer else ""
     
@@ -861,10 +881,10 @@ def convert_to_parquet(
         source_crs = detect_crs(representative_source, layer=layer, verbose=verbose)
         
         print("  Detecting geometry column...")
-        geom_col = get_geometry_column(representative_source, layer=layer, verbose=verbose)
-        
-        print(f"  Geometry column: {geom_col}")
-        
+        geom_col, geom_is_blob = get_geometry_column(representative_source, layer=layer, verbose=verbose)
+
+        print(f"  Geometry column: {geom_col}" + (" (BLOB — will cast via ST_GeomFromWKB)" if geom_is_blob else ""))
+
         needs_reprojection = False
         if source_crs:
             if source_crs != target_crs:
@@ -875,7 +895,7 @@ def convert_to_parquet(
         else:
             print(f"  Warning: Could not detect source CRS, assuming {target_crs}")
             source_crs = None
-        
+
         # Step 1b: Linearize curved geometries if needed (e.g., MULTISURFACE -> MULTIPOLYGON)
         linearized_source, effective_layer, linearize_dir = _linearize_source(
             representative_source, layer=layer, verbose=verbose
@@ -886,7 +906,7 @@ def convert_to_parquet(
             representative_source = linearized_source
             layer = effective_layer
             # Re-detect geometry column for the linearized file
-            geom_col = get_geometry_column(linearized_source, layer=effective_layer, verbose=verbose)
+            geom_col, geom_is_blob = get_geometry_column(linearized_source, layer=effective_layer, verbose=verbose)
             print(f"  Geometry column (linearized): {geom_col}")
 
         # Step 1c: Flatten measured/3D (M/Z) geometries to 2D.
@@ -902,7 +922,7 @@ def convert_to_parquet(
                 source_inputs = flattened_source
                 representative_source = flattened_source
                 layer = flat_layer
-                geom_col = get_geometry_column(flattened_source, layer=flat_layer, verbose=verbose)
+                geom_col, geom_is_blob = get_geometry_column(flattened_source, layer=flat_layer, verbose=verbose)
                 print(f"  Geometry column (flattened): {geom_col}")
 
         # Step 2: Build read/reproject query
@@ -913,7 +933,8 @@ def convert_to_parquet(
             target_crs,
             geom_col=geom_col,
             layer=layer,
-            verbose=verbose
+            verbose=verbose,
+            geom_is_blob=geom_is_blob,
         )
         
         # Step 3: Check ID column and wrap query if needed

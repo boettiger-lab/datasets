@@ -847,3 +847,116 @@ class TestReprojection:
         finally:
             if os.path.exists(output_path):
                 os.remove(output_path)
+
+
+class TestMultipointGeometry:
+    """Regression tests for MULTIPOINT sources producing BLOB instead of GEOMETRY (#61)."""
+
+    @pytest.fixture
+    def sample_multipoint_gpkg(self):
+        """
+        Create a GeoPackage with MULTIPOINT geometry.
+
+        DuckDB's ST_Read returns BLOB (not GEOMETRY) for MULTIPOINT sources, which
+        causes the output parquet to lack GeoParquet metadata and breaks PMTiles export.
+        """
+        import shutil
+        import subprocess
+        import json as _json
+
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"name": "A", "value": 1},
+                    "geometry": {
+                        "type": "MultiPoint",
+                        "coordinates": [[-122.4, 37.8], [-122.5, 37.9]],
+                    },
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"name": "B", "value": 2},
+                    "geometry": {
+                        "type": "MultiPoint",
+                        "coordinates": [[-122.6, 38.0], [-122.7, 38.1]],
+                    },
+                },
+            ],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".geojson", delete=False) as f:
+            _json.dump(geojson, f)
+            src_path = f.name
+
+        tmp_dir = tempfile.mkdtemp()
+        gpkg_path = os.path.join(tmp_dir, "multipoint.gpkg")
+
+        try:
+            result = subprocess.run(
+                ["ogr2ogr", "-f", "GPKG", gpkg_path, src_path],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                pytest.skip(f"Could not create MULTIPOINT test GeoPackage: {result.stderr}")
+            yield gpkg_path
+        finally:
+            if os.path.exists(src_path):
+                os.remove(src_path)
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+
+    def test_multipoint_produces_geometry_column(self, sample_multipoint_gpkg):
+        """
+        MULTIPOINT sources must produce a GEOMETRY column (not BLOB) in output GeoParquet.
+
+        Regression test for #61: DuckDB's ST_Read returns BLOB for MULTIPOINT geometry;
+        the fix is to detect the BLOB column and cast via ST_GeomFromWKB() so that DuckDB
+        writes proper GeoParquet column metadata.
+        """
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            output_path = f.name
+
+        try:
+            convert_to_parquet(
+                source_url=sample_multipoint_gpkg,
+                destination=output_path,
+                target_crs="EPSG:4326",
+                verbose=False,
+                progress=False,
+            )
+
+            con = duckdb.connect()
+            con.install_extension("spatial")
+            con.load_extension("spatial")
+
+            # geom must be GEOMETRY, not BLOB
+            schema = con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{output_path}')"
+            ).fetchall()
+            geom_col_type = next((row[1] for row in schema if row[0] == "geom"), None)
+            assert geom_col_type is not None and geom_col_type.startswith("GEOMETRY"), (
+                f"Expected GEOMETRY column, got {geom_col_type!r}. "
+                "BLOB means GeoParquet metadata is missing and PMTiles export will fail."
+            )
+
+            # Correct feature count
+            row_count = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{output_path}')"
+            ).fetchone()[0]
+            assert row_count == 2, f"Expected 2 rows, got {row_count}"
+
+            # Geometry type round-trips correctly
+            geom_types = {
+                row[0]
+                for row in con.execute(
+                    f"SELECT DISTINCT ST_GeometryType(geom) FROM read_parquet('{output_path}')"
+                ).fetchall()
+            }
+            assert geom_types == {"MULTIPOINT"}, f"Unexpected geometry types: {geom_types}"
+
+            con.close()
+        finally:
+            if os.path.exists(output_path):
+                os.remove(output_path)
