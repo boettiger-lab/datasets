@@ -103,11 +103,16 @@ class TestConvertToParquet:
             if os.path.exists(output_path):
                 os.remove(output_path)
     
-    def test_convert_preserves_existing_id_column(self, sample_geojson_with_id):
-        """Test that conversion preserves existing fid column."""
+    def test_convert_preserves_source_id_and_adds_cng_fid(self, sample_geojson_with_id):
+        """_cng_fid is always created even when source already has a 'fid' column.
+
+        Source ID columns like 'fid' may identify features/geometries rather than rows
+        (e.g. multiple rows per site sharing the same fid). _cng_fid is additive and
+        the source column is preserved unchanged.
+        """
         with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
             output_path = f.name
-        
+
         try:
             convert_to_parquet(
                 source_url=sample_geojson_with_id,
@@ -115,18 +120,21 @@ class TestConvertToParquet:
                 force_id=True,
                 progress=False
             )
-            
-            # Verify file exists and has the existing fid column
+
             con = duckdb.connect()
             cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{output_path}')").fetchdf()['column_name'].tolist()
             count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{output_path}')").fetchone()[0]
 
-            assert 'fid' in cols, "Expected existing fid column to be preserved"
-            assert '_cng_fid' not in cols, "Should not add _cng_fid when fid exists"
+            assert 'fid' in cols, "Source fid column must be preserved"
+            assert '_cng_fid' in cols, "_cng_fid must always be created as a row-unique key"
             assert count == 2, "Expected 2 features"
 
+            # _cng_fid must be unique per row
+            ids = con.execute(f"SELECT _cng_fid FROM read_parquet('{output_path}') ORDER BY _cng_fid").fetchdf()['_cng_fid'].tolist()
+            assert ids == list(range(1, count + 1)), f"_cng_fid must be 1..N, got {ids}"
+
             con.close()
-            
+
         finally:
             if os.path.exists(output_path):
                 os.remove(output_path)
