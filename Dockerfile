@@ -50,11 +50,43 @@ RUN uv pip install "numpy<2" pip
 # Include pytest and pytest-timeout so tests can run inside the container without extra installs
 RUN uv pip install -e "." pytest pytest-timeout pytest-mock
 
-# Point PROJ CLI tools to pyproj's bundled proj.db (version-matched to installed GDAL).
-# Fixes: system proj.db (version 3) is incompatible with GDAL 3.13+ (requires >= 7),
-# which breaks CLI gdalwarp/gdal_translate CRS transforms. Python osgeo.gdal is unaffected
-# because pyproj finds its own data directory regardless of PROJ_LIB.
-RUN ln -sfn $(python3 -c "import pyproj; print(pyproj.datadir.get_data_dir())") /usr/local/share/proj
+# Point PROJ CLI tools to the highest-versioned proj.db on the system.
+# The gdal:ubuntu-full image ships GDAL 3.13 with a compatible PROJ (requires
+# DATABASE.LAYOUT.VERSION.MINOR >= 7), but the Ubuntu system proj-data package
+# installs an older proj.db that takes precedence. Find the best one and set
+# PROJ_DATA/PROJ_LIB so both CLI gdalwarp and Python osgeo use it.
+RUN python3 - <<'EOF'
+import sqlite3, glob, os
+
+def get_minor_version(db):
+    try:
+        row = sqlite3.connect(db).execute(
+            "SELECT value FROM metadata WHERE key='DATABASE.LAYOUT.VERSION.MINOR'"
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+proj_dbs = glob.glob('/usr/**/proj.db', recursive=True) + \
+           glob.glob('/opt/**/proj.db', recursive=True)
+if not proj_dbs:
+    raise RuntimeError("No proj.db found on the system")
+
+best_db = max(proj_dbs, key=get_minor_version)
+best_dir = os.path.dirname(best_db)
+best_ver = get_minor_version(best_db)
+print(f"Best proj.db: {best_db} (version {best_ver})")
+
+target = '/usr/local/share/proj'
+if os.path.islink(target) or os.path.exists(target):
+    os.remove(target)
+os.makedirs('/usr/local/share', exist_ok=True)
+if best_dir != target:
+    os.symlink(best_dir, target)
+    print(f"Symlinked {target} -> {best_dir}")
+else:
+    print(f"{target} already contains best proj.db")
+EOF
 ENV PROJ_DATA=/usr/local/share/proj
 ENV PROJ_LIB=/usr/local/share/proj
 
