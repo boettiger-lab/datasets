@@ -647,12 +647,15 @@ def generate_raster_workflow(
     Generate complete workflow for a raster dataset.
 
     Creates all necessary Kubernetes job configurations:
-    - Single source URL: setup-bucket → hex
+    - Single COG source URL: setup-bucket → hex
+    - Single non-COG source URL: setup-bucket → preprocess-cog → hex  (auto-detected)
     - Multiple source URLs (or target_extent/band): setup-bucket → preprocess-cog → hex
 
-    The preprocess-cog step mosaics tiles (handling mixed CRS such as multiple UTM
-    zones), optionally clips to target_extent, and writes a single WGS84 COG to S3
-    that the hex job then reads.
+    The preprocess-cog step mosaics/converts tiles (handling mixed CRS such as multiple
+    UTM zones), optionally clips to target_extent, and writes a single WGS84 COG to S3
+    that the hex job then reads.  Non-COG sources are automatically detected and converted
+    because GDAL must scan the entire file per pod without COG block/overview structure,
+    causing catastrophic slowdowns on large rasters.
 
     Args:
         dataset_name: Name of the dataset (e.g., "wyoming/rap-arte")
@@ -703,6 +706,15 @@ def generate_raster_workflow(
 
     # Decide whether a preprocess-cog step is needed
     needs_preprocess = len(source_urls) > 1 or target_extent is not None or band is not None
+
+    # For single-source case, check if the source is already a COG.  Non-COG rasters
+    # force GDAL to scan the entire file for every hex pod, causing catastrophic slowdowns
+    # (e.g. GHS-POP 10.9 GB stalled 32+ hours per pod vs 25 min after COG conversion).
+    if not needs_preprocess:
+        from cng_datasets.raster.cog import is_cog
+        if not is_cog(source_urls[0]):
+            print(f"  ⚠ Source raster is not a COG — adding preprocess-cog step to convert before hex tiling")
+            needs_preprocess = True
 
     if needs_preprocess:
         cog_key = output_cog_name or f"{k8s_name}-cog.tif"

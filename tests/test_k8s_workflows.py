@@ -643,6 +643,26 @@ class TestRasterWorkflowGeneration:
             assert not (Path(tmpdir) / "compat-test-preprocess-cog.yaml").exists()
 
     @pytest.mark.timeout(5)
+    def test_non_cog_single_url_triggers_preprocess(self):
+        """Single non-COG source URL should auto-trigger preprocess-cog step."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("cng_datasets.raster.cog.is_cog", return_value=False):
+                generate_raster_workflow(
+                    dataset_name="test-noncog",
+                    source_urls=self.SOURCE_URL,
+                    bucket="test-bucket",
+                    output_dir=tmpdir,
+                )
+            assert (Path(tmpdir) / "test-noncog-preprocess-cog.yaml").exists()
+            assert (Path(tmpdir) / "test-noncog-hex.yaml").exists()
+            # Hex job should read from the intermediate COG, not the raw source
+            job = self._load_yaml(Path(tmpdir) / "test-noncog-hex.yaml")
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "s3://test-bucket/test-noncog-cog.tif" in command_str
+            assert self.SOURCE_URL not in command_str
+
+    @pytest.mark.timeout(5)
     def test_configmap_includes_preprocess_step(self):
         """ConfigMap workflow script should reference the preprocess-cog job when needed."""
         with tempfile.TemporaryDirectory() as tmpdir:
