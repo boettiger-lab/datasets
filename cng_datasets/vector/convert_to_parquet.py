@@ -378,58 +378,61 @@ def is_geographic_crs(crs: str) -> bool:
     return False
 
 
-def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Optional[str] = None, 
+def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Optional[str] = None,
                     force_id: bool = True, verbose: bool = False) -> Tuple[bool, str]:
     """
-    Check if we need to create an ID column.
-    
+    Check if we need to create a synthetic _cng_fid row identifier.
+
+    _cng_fid is always created as a monotonically increasing integer that is
+    guaranteed unique per row.  Source columns such as 'fid' or 'objectid' are
+    preserved unchanged — _cng_fid is additive.  Relying on source ID columns
+    is unsafe because they may be feature/geometry identifiers rather than row
+    identifiers (e.g. a dataset with multiple rows per site all sharing the same
+    fid), which breaks the repartition join.
+
     Args:
         source_url: Source dataset URL
         layer: Layer name for multi-layer datasets (e.g., GDB)
-        id_column: Specific ID column name to use
-        force_id: Create _cng_fid if no suitable ID exists
+        id_column: Explicit column name to use instead of _cng_fid (must exist in source)
+        force_id: Unused; kept for backwards compatibility (always True in practice)
         verbose: Print debug information
-        
+
     Returns:
-        (needs_id, id_column_name) tuple
+        (needs_id, id_column_name) tuple where needs_id=True means the caller
+        should call add_id_column_query() to prepend the synthetic ID.
     """
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
     con.execute("SET arrow_large_buffer_size=true")
-    
+
     try:
-        # Read just the schema - ST_Read handles URLs directly
         layer_param = f", layer='{layer}'" if layer else ""
         columns = con.execute(f"""
             DESCRIBE SELECT * FROM ST_Read('{source_url}'{layer_param}) LIMIT 0
         """).fetchall()
-        
+
         column_names = [col[0].lower() for col in columns]
-        
-        # If user specified an ID column, check if it exists
+
+        # If user explicitly specified an ID column, use it (no synthetic ID needed)
         if id_column:
             if id_column.lower() in column_names:
-                return False, id_column  # Use existing column
+                return False, id_column
             else:
                 raise ValueError(f"Specified ID column '{id_column}' not found in source data")
-        
-        # Look for common ID column names
-        common_ids = ['id', 'fid', 'objectid', 'gid', 'uid']
-        for id_name in common_ids:
-            if id_name in column_names:
-                if verbose:
-                    print(f"  Found existing ID column: {id_name}")
-                return False, id_name
-        
-        # No ID found - create one if force_id is True
-        if force_id:
+
+        # If the source already has _cng_fid (e.g. re-processing), don't duplicate it
+        if '_cng_fid' in column_names:
             if verbose:
-                print("  No ID column found - will create _cng_fid")
-            return True, "_cng_fid"
-        else:
-            raise ValueError("No ID column found and force_id=False")
-            
+                print("  Source already has _cng_fid — skipping synthetic ID creation")
+            return False, "_cng_fid"
+
+        # Always create a fresh _cng_fid — source ID columns (fid, objectid, etc.) are
+        # not reliable as row keys and are preserved as-is alongside _cng_fid.
+        if verbose:
+            print("  Creating synthetic _cng_fid row identifier")
+        return True, "_cng_fid"
+
     finally:
         con.close()
 
