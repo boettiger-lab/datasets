@@ -99,6 +99,38 @@ def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     return path
 
 
+def is_cog(url: str) -> bool:
+    """Check if a raster is a Cloud-Optimized GeoTIFF.
+
+    Returns True if the raster has tiled blocks and internal overviews (COG structure).
+    Returns True (fail-safe) if the file cannot be opened — avoids unnecessary preprocess
+    steps when network access is unavailable at workflow-generation time.
+    Returns False only when the file is confirmed to be non-COG.
+
+    Args:
+        url: Path to raster file (s3://, https://, or local path).
+
+    Returns:
+        True if COG (or unverifiable), False if confirmed non-COG.
+    """
+    try:
+        vsi_path = _ensure_vsi_path(url, use_public_endpoint=True)
+        ds = gdal.Open(vsi_path)
+        if ds is None:
+            return True  # Can't check — assume COG
+        band = ds.GetRasterBand(1)
+        # Must have internal overviews
+        if band.GetOverviewCount() == 0:
+            return False
+        # Must have tiled (not stripped) blocks
+        block_x, _ = band.GetBlockSize()
+        if block_x == ds.RasterXSize:  # stripped layout
+            return False
+        return True
+    except Exception:
+        return True  # Can't check — assume COG
+
+
 def detect_nodata_value(raster_path: str, verbose: bool = True) -> Optional[float]:
     """
     Detect NoData value from raster metadata.
@@ -330,6 +362,9 @@ def create_mosaic_cog(
 
         print(f"  Writing COG → {output_path}...")
         cog_output = _ensure_vsi_path(output_path)
+        # COG driver requires random-write access; /vsis3/ needs this config option.
+        if cog_output.startswith("/vsis3/"):
+            gdal.SetConfigOption("CPL_VSIL_USE_TEMP_FILE_FOR_RANDOM_WRITE", "YES")
         translate_opts = gdal.TranslateOptions(
             format="COG",
             creationOptions=[
@@ -639,8 +674,12 @@ class RasterProcessor:
                 cog_creation_opts.append(f'OVERVIEW_RESAMPLING={overview_resampling.upper()}')
 
             print(f"  Writing COG...")
+            vsi_output = _ensure_vsi_path(output_path)
+            # COG driver requires random-write access; /vsis3/ needs this config option.
+            if vsi_output.startswith("/vsis3/"):
+                gdal.SetConfigOption("CPL_VSIL_USE_TEMP_FILE_FOR_RANDOM_WRITE", "YES")
             result = gdal.Translate(
-                output_path,
+                vsi_output,
                 tmp_tif,
                 format='COG',
                 creationOptions=cog_creation_opts,
