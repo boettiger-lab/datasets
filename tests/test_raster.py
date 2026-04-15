@@ -260,16 +260,30 @@ class TestRasterProcessor:
     def test_raster_processor_init(self, small_raster):
         """Test RasterProcessor initialization."""
         from cng_datasets.raster import RasterProcessor
-        
+
         processor = RasterProcessor(
             input_path=small_raster,
             h3_resolution=6,
             parent_resolutions=[5, 0],
         )
-        
+
         assert processor.h3_resolution == 6
         assert processor.parent_resolutions == [5, 0]
         assert processor.con is not None
+        # Default hex resampling preserves existing behavior for continuous rasters
+        assert processor.hex_resampling == "average"
+
+    @pytest.mark.timeout(60)
+    def test_raster_processor_hex_resampling_mode(self, small_raster):
+        """Categorical datasets should be able to opt into mode resampling (issue #80)."""
+        from cng_datasets.raster import RasterProcessor
+
+        processor = RasterProcessor(
+            input_path=small_raster,
+            h3_resolution=6,
+            hex_resampling="mode",
+        )
+        assert processor.hex_resampling == "mode"
     
     @pytest.mark.timeout(60)
     def test_raster_processor_auto_detect(self, small_raster):
@@ -619,6 +633,71 @@ class TestH3Downsampling:
                 f"Got exact source value {val}; expected a blended average"
             )
             assert 10.0 <= val <= 40.0, f"Averaged value {val} outside source range"
+
+    @requires_gdal_array
+    @pytest.mark.timeout(60)
+    def test_warp_mode_resampling_preserves_categorical_classes(self):
+        """Regression test for issue #80: mode resampling must not blend class codes.
+
+        GRA_Average on categorical data (e.g. land cover class codes {40, 50}) yields
+        meaningless interpolated values (45) that don't map to any real class. GRA_Mode
+        picks the most frequent source class, preserving categorical semantics.
+        """
+        # Categorical raster: checkerboard of class 40 and class 50. Any output
+        # pixel covering a mixed region will average to 45 under GRA_Average but
+        # must remain in {40, 50} under GRA_Mode.
+        width, height = 8, 8
+        xmin, ymin = -105.0, 42.0
+        src_pixel = 0.001
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = os.path.join(tmp, "categorical.tif")
+            driver = gdal.GetDriverByName("GTiff")
+            ds = driver.Create(src_path, width, height, 1, gdal.GDT_Int16)
+            ds.SetGeoTransform([xmin, src_pixel, 0, ymin + height * src_pixel, 0, -src_pixel])
+            srs = osr.SpatialReference()
+            srs.ImportFromEPSG(4326)
+            ds.SetProjection(srs.ExportToWkt())
+            # Alternating 40/50 checkerboard
+            data = np.where(
+                (np.indices((height, width)).sum(axis=0) % 2) == 0, 40, 50
+            ).astype(np.int16)
+            ds.GetRasterBand(1).WriteArray(data)
+            ds.GetRasterBand(1).FlushCache()
+            ds = None
+
+            extent = (xmin, ymin, xmin + width * src_pixel, ymin + height * src_pixel)
+            # Downsample by ~4x so each output pixel mixes source pixels
+            pixel_size = 0.004
+
+            def warp(alg, out_name):
+                out_path = os.path.join(tmp, out_name)
+                result = gdal.Warp(out_path, src_path, options=gdal.WarpOptions(
+                    dstSRS="EPSG:4326",
+                    outputBounds=extent,
+                    xRes=pixel_size,
+                    yRes=pixel_size,
+                    resampleAlg=alg,
+                    format="XYZ",
+                ))
+                assert result is not None
+                result = None
+                with open(out_path) as f:
+                    return [float(l.split()[2]) for l in f if l.strip()]
+
+            avg_vals = warp("average", "avg.xyz")
+            mode_vals = warp("mode", "mode.xyz")
+
+            # Average produces the bug: 45 appears
+            assert any(abs(v - 45.0) < 0.5 for v in avg_vals), (
+                "Expected averaging to produce invalid class code ~45 from {40,50}"
+            )
+            # Mode preserves canonical class codes only
+            for v in mode_vals:
+                assert v in (40.0, 50.0), (
+                    f"Mode resampling produced non-canonical class {v}; "
+                    f"must be one of {{40, 50}}"
+                )
 
     @requires_gdal_array
     @pytest.mark.timeout(60)

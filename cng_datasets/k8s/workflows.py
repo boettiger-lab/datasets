@@ -621,6 +621,7 @@ def generate_raster_workflow(
     parent_resolutions: Optional[List[int]] = None,
     value_column: str = "value",
     nodata_value: Optional[float] = None,
+    hex_resampling: str = "average",
     hex_memory: str = "32Gi",
     max_parallelism: int = 61,
     hex_storage: str = "20Gi",
@@ -668,6 +669,9 @@ def generate_raster_workflow(
         parent_resolutions: List of parent H3 resolutions (default: [0])
         value_column: Name for raster value column (default: "value")
         nodata_value: NoData value to exclude (optional)
+        hex_resampling: Resampling method for H3 hex downsampling (default: "average").
+            Use "mode" for categorical rasters (land cover, classifications) to
+            preserve class codes — averaging yields meaningless non-canonical values.
         hex_memory: Memory per hex pod (default: "32Gi")
         max_parallelism: Max parallel hex pods (default: 61)
         target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step
@@ -743,7 +747,8 @@ def generate_raster_workflow(
     _generate_raster_hex_job(
         manager, k8s_name, hex_input_url, bucket, output_path, git_repo,
         h3_resolution, parent_resolutions, value_column, nodata_value,
-        hex_memory, max_parallelism, hex_storage=hex_storage, config=config,
+        hex_memory, max_parallelism, hex_storage=hex_storage,
+        hex_resampling=hex_resampling, config=config,
     )
 
     # Generate workflow RBAC
@@ -884,15 +889,16 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
 def _generate_raster_hex_job(
     manager, dataset_name, source_url, bucket, output_path, git_repo,
     h3_resolution, parent_resolutions, value_column, nodata_value,
-    hex_memory, max_parallelism, hex_storage="20Gi", config: ClusterConfig = None,
+    hex_memory, max_parallelism, hex_storage="20Gi",
+    hex_resampling: str = "average", config: ClusterConfig = None,
 ):
     """Generate raster H3 hex tiling job."""
     if config is None:
         config = ClusterConfig()
     parent_res_str = ','.join(map(str, parent_resolutions))
-    
+
     # Build command
-    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column}"
+    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
     if nodata_value is not None:
         cng_cmd += f" --nodata {nodata_value}"
 

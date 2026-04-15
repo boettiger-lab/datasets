@@ -411,6 +411,7 @@ class RasterProcessor:
         compression: str = "deflate",
         blocksize: int = 512,
         resampling: str = "nearest",
+        hex_resampling: str = "average",
         nodata_value: Optional[float] = None,
         target_crs: str = "EPSG:4326",
         target_extent: Optional[tuple] = None,
@@ -435,7 +436,12 @@ class RasterProcessor:
             value_column: Name for the raster value column in parquet
             compression: Compression method for COG (deflate, lzw, zstd, etc.)
             blocksize: Block size for COG tiling
-            resampling: Resampling method (nearest, bilinear, cubic, etc.)
+            resampling: Resampling method for COG creation (default: "nearest")
+            hex_resampling: Resampling method for H3 hex downsampling step
+                (default: "average"). Use "mode" for categorical rasters
+                (land cover, classifications) to preserve class codes; averaging
+                produces meaningless values like 45 from {40, 50}. Accepts any
+                GDAL resampling string: nearest, bilinear, cubic, average, mode, etc.
             nodata_value: NoData value to exclude from H3 conversion
             target_crs: CRS for output (default: EPSG:4326); used when mosaicking
             target_extent: Clip extent (xmin, ymin, xmax, ymax) in target_crs; used when mosaicking
@@ -495,6 +501,7 @@ class RasterProcessor:
         self.compression = compression
         self.blocksize = blocksize
         self.resampling = resampling
+        self.hex_resampling = hex_resampling
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
         
@@ -764,6 +771,10 @@ class RasterProcessor:
         # intermediate file stays small (MB instead of GB for hi-res rasters).
         pixel_size = _h3_res_to_degrees(self.h3_resolution)
 
+        # Resampling choice matters here: "average" is appropriate for continuous
+        # rasters (elevation, temperature) but corrupts categorical data (land cover)
+        # by producing non-canonical class codes. Categorical datasets should pass
+        # hex_resampling="mode" so each output pixel is the most frequent source class.
         warp_options = gdal.WarpOptions(
             dstSRS='EPSG:4326',
             cutlineWKT=h0_geom_wkt,
@@ -771,7 +782,7 @@ class RasterProcessor:
             outputBounds=(inter_xmin, inter_ymin, inter_xmax, inter_ymax),
             xRes=pixel_size,
             yRes=pixel_size,
-            resampleAlg=gdal.GRA_Average,
+            resampleAlg=self.hex_resampling,
             format='XYZ',
         )
 
