@@ -630,6 +630,35 @@ class TestRasterWorkflowGeneration:
             assert self.SOURCE_URL in command_str
 
     @pytest.mark.timeout(5)
+    def test_hex_resampling_default_in_hex_command(self):
+        """Hex job command should include --hex-resampling with the default 'average'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-raster",
+                source_urls=self.SOURCE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            hex_job = self._load_yaml(Path(tmpdir) / "test-raster-hex.yaml")
+            command_str = str(hex_job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--hex-resampling average" in command_str
+
+    @pytest.mark.timeout(5)
+    def test_hex_resampling_mode_propagates_to_hex_command(self):
+        """hex_resampling='mode' should appear in the generated hex job command (issue #80)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-categorical",
+                source_urls=self.SOURCE_URL,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                hex_resampling="mode",
+            )
+            hex_job = self._load_yaml(Path(tmpdir) / "test-categorical-hex.yaml")
+            command_str = str(hex_job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--hex-resampling mode" in command_str
+
+    @pytest.mark.timeout(5)
     def test_raster_workflow_backwards_compat_string(self):
         """source_urls accepts a plain string for backwards compatibility."""
         with tempfile.TemporaryDirectory() as tmpdir:

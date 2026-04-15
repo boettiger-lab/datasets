@@ -40,7 +40,11 @@ def main():
     raster_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
     raster_parser.add_argument("--compression", default="deflate", help="COG compression (deflate, lzw, zstd)")
     raster_parser.add_argument("--blocksize", type=int, default=512, help="COG block size (default: 512)")
-    raster_parser.add_argument("--resampling", default="nearest", help="Resampling method (default: nearest)")
+    raster_parser.add_argument("--resampling", default="nearest", help="Resampling method for COG creation (default: nearest)")
+    raster_parser.add_argument("--hex-resampling", default="average",
+                               help="Resampling method for H3 hex downsampling step (default: average). "
+                                    "Use 'mode' for categorical rasters (land cover, classifications); "
+                                    "averaging produces meaningless non-canonical class codes.")
     raster_parser.add_argument("--target-crs", default="EPSG:4326", help="Output CRS for mosaic (default: EPSG:4326)")
     raster_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in target CRS (mosaic only)")
     raster_parser.add_argument("--target-resolution", type=float, help="Output pixel size in target CRS units (mosaic only)")
@@ -104,6 +108,9 @@ def main():
     raster_workflow_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
     raster_workflow_parser.add_argument("--value-column", default="value", help="Name for raster value column")
     raster_workflow_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
+    raster_workflow_parser.add_argument("--hex-resampling", default="average",
+                                        help="Resampling method for H3 hex downsampling step (default: average). "
+                                             "Use 'mode' for categorical rasters (land cover, classifications).")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
     raster_workflow_parser.add_argument("--hex-storage", type=str, default="20Gi", help="Ephemeral storage request/limit per hex job pod (default: 20Gi)")
@@ -223,6 +230,7 @@ def _dispatch(args):
                 compression=args.compression,
                 blocksize=args.blocksize,
                 resampling=args.resampling,
+                hex_resampling=args.hex_resampling,
                 target_crs=getattr(args, 'target_crs', 'EPSG:4326'),
                 target_extent=target_extent,
                 target_resolution=getattr(args, 'target_resolution', None),
@@ -329,6 +337,7 @@ def _dispatch(args):
             parent_resolutions=parent_res,
             value_column=args.value_column,
             nodata_value=args.nodata,
+            hex_resampling=args.hex_resampling,
             hex_memory=args.hex_memory,
             max_parallelism=args.max_parallelism,
             hex_storage=args.hex_storage,
