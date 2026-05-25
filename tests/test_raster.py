@@ -895,5 +895,83 @@ class TestIntegration:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+class TestH3MassConservation:
+    """Issue #84: SUM(value) across output parquet must equal the source raster
+    total, within rounding. Pre-fix, the centroid-assignment of warped pixels
+    produces a ~50% shortfall on this fixture."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        """Local temp directory — the fixture in TestRasterProcessor is class-scoped."""
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def ghs_pop_clip(self):
+        """Path to the committed clipped ghs-pop-2020 tile."""
+        path = Path(__file__).parent / "fixtures" / "ghs_pop_clip.tif"
+        if not path.exists():
+            pytest.skip(f"Fixture not found: {path}")
+        return str(path)
+
+    @requires_gdal
+    def test_h3_aggregation_conserves_mass(self, ghs_pop_clip, temp_dir):
+        """SUM(value) over the output parquet equals the source raster SUM
+        within 1%. Pre-fix this fails by ~50% for ghs-pop-2020."""
+        import rasterio
+        import duckdb
+        from cng_datasets.raster import RasterProcessor
+
+        # Source truth: sum of all valid pixels in the raster.
+        with rasterio.open(ghs_pop_clip) as src:
+            arr = src.read(1, masked=True)
+            raster_sum = float(arr.sum())
+            nodata = src.nodata
+
+        assert raster_sum > 0, "Fixture must contain populated pixels"
+
+        # Run the pipeline.
+        output_dir = os.path.join(temp_dir, "ghs_pop_hex")
+        processor = RasterProcessor(
+            input_path=ghs_pop_clip,
+            output_parquet_path=output_dir,
+            h3_resolution=9,
+            parent_resolutions=[0, 5, 6, 7, 8],
+            value_column="population",
+            hex_resampling="sum",
+            nodata_value=nodata,
+        )
+        outputs = processor.process_all_h0_regions()
+        assert len(outputs) > 0, "Pipeline produced no parquet output"
+
+        # Read back: sum across all h0 partitions.
+        con = duckdb.connect()
+        parquet_glob = os.path.join(output_dir, "h0=*/data_0.parquet")
+        parquet_sum = con.execute(
+            f"SELECT SUM(population) FROM read_parquet('{parquet_glob}')"
+        ).fetchone()[0]
+
+        # Schema invariant: one row per h9 cell (no duplicates).
+        duplicate_count = con.execute(f"""
+            SELECT COUNT(*) FROM (
+                SELECT h9 FROM read_parquet('{parquet_glob}')
+                GROUP BY h9 HAVING COUNT(*) > 1
+            )
+        """).fetchone()[0]
+        assert duplicate_count == 0, (
+            f"Expected one row per h9 cell, found {duplicate_count} duplicate h9 cells. "
+            "Stage 2 must aggregate, not emit per-warped-pixel rows."
+        )
+
+        # Mass conservation: total within 1% of raster truth.
+        relative_error = abs(parquet_sum - raster_sum) / raster_sum
+        assert relative_error < 0.01, (
+            f"Mass conservation violated: raster_sum={raster_sum:.2f}, "
+            f"parquet_sum={parquet_sum:.2f}, relative_error={relative_error:.4f}. "
+            f"Issue #84 regression."
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
