@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     python3-dev \
     python3-numpy \
+    libgeos-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Build tippecanoe 2.79.0 from source

@@ -38,6 +38,8 @@ dev = [
 ]
 raster = [
     "GDAL>=3.11.0",
+    "exactextract>=0.2.0",
+    "rasterio>=1.3.0",
 ]
 docs = [
     "sphinx>=7.0",
