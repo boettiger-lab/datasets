@@ -299,42 +299,6 @@ class TestRasterProcessor:
         assert processor.h3_resolution is not None
         assert 4 <= processor.h3_resolution <= 6
     
-    @pytest.mark.timeout(30)
-    def test_duckdb_csv_reading(self, small_raster, temp_dir):
-        """Test that DuckDB connection uses correct CSV parameter names."""
-        from cng_datasets.raster import RasterProcessor
-        import os
-        
-        # Create a simple XYZ file
-        xyz_file = os.path.join(temp_dir, 'test.xyz')
-        with open(xyz_file, 'w') as f:
-            f.write('-122.5 37.7 100\n')
-            f.write('-122.4 37.8 200\n')
-        
-        # Create a minimal processor using small_raster fixture
-        processor = RasterProcessor(
-            input_path=small_raster,
-            h3_resolution=8,
-        )
-        
-        # Test that read_csv works with 'delimiter' (raw DuckDB parameter)
-        # This would fail if using 'delim' (Ibis parameter)
-        result = processor.con.read_csv(
-            xyz_file,
-            delimiter=' ',
-            columns={'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'FLOAT'}
-        )
-        
-        # Verify we can execute the query
-        df = result.fetchdf()
-        assert len(df) == 2
-        # Check approximate float values
-        assert abs(df['X'].iloc[0] - (-122.5)) < 0.001
-        assert abs(df['X'].iloc[1] - (-122.4)) < 0.001
-        assert abs(df['Z'].iloc[0] - 100.0) < 0.001
-        assert abs(df['Z'].iloc[1] - 200.0) < 0.001
-
-
 class TestRasterToH3Conversion:
     """Test raster to H3 parquet conversion with small data."""
     

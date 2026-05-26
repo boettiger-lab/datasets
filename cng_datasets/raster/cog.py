@@ -718,7 +718,7 @@ class RasterProcessor:
         h3_col = f"h{self.h3_resolution}"
         # Polyfill h0 -> native cells, then materialize each cell's boundary.
         # The polyfill is bounded by the h0 cell, which caps the number of cells
-        # per call at ~5^(h3_resolution) - comfortably millions at h9 but
+        # per call at ~7^(h3_resolution) - comfortably millions at h9 but
         # tens-of-millions at h11. If memory becomes a concern at fine
         # resolutions, this query can be chunked by an intermediate parent;
         # not done here because current workflows top out at h9-h10.
