@@ -53,23 +53,6 @@ def _configure_proj():
 _configure_proj()
 
 
-def _h3_res_to_degrees(h3_resolution: int) -> float:
-    """Approximate pixel size in degrees for a given H3 resolution.
-
-    Uses the equatorial approximation (1° ≈ 111,320 m) which slightly
-    over-samples at higher latitudes — acceptable for mean aggregation.
-    """
-    # Average H3 edge lengths in km (from h3geo.org/docs/core-library/restable)
-    _H3_EDGE_KM = {
-        0: 1281.256011, 1: 483.0568391, 2: 182.5129565, 3: 68.97922179,
-        4: 26.07175968, 5: 9.854090990, 6: 3.724532667, 7: 1.406475763,
-        8: 0.531414010, 9: 0.200786148, 10: 0.075863783, 11: 0.028663897,
-        12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169,
-    }
-    edge_m = _H3_EDGE_KM[h3_resolution] * 1000
-    return edge_m / 111320.0
-
-
 def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     """Convert path to appropriate GDAL VSI notation.
     
