@@ -711,6 +711,19 @@ class TestH3MassConservation:
             f"Issue #84 regression."
         )
 
+    @requires_gdal
+    def test_hex_resampling_rejects_gdal_values(self, ghs_pop_clip, temp_dir):
+        """Old GDAL-Warp resampling values must error with a clear message."""
+        from cng_datasets.raster import RasterProcessor
+
+        with pytest.raises(ValueError, match="hex_resampling must be one of"):
+            RasterProcessor(
+                input_path=ghs_pop_clip,
+                output_parquet_path=os.path.join(temp_dir, "should_not_run"),
+                h3_resolution=9,
+                hex_resampling="average",
+            )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

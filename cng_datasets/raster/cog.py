@@ -53,6 +53,12 @@ def _configure_proj():
 _configure_proj()
 
 
+# Area-weighted reducers supported by the H3 hex aggregator (#84).
+# Used both for runtime validation in RasterProcessor.__init__ and as
+# argparse `choices=` in the CLI.
+VALID_HEX_REDUCERS = ("sum", "mean", "mode")
+
+
 def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     """Convert path to appropriate GDAL VSI notation.
     
@@ -394,7 +400,7 @@ class RasterProcessor:
         compression: str = "deflate",
         blocksize: int = 512,
         resampling: str = "nearest",
-        hex_resampling: str = "average",
+        hex_resampling: str = "mean",
         nodata_value: Optional[float] = None,
         target_crs: str = "EPSG:4326",
         target_extent: Optional[tuple] = None,
@@ -420,11 +426,11 @@ class RasterProcessor:
             compression: Compression method for COG (deflate, lzw, zstd, etc.)
             blocksize: Block size for COG tiling
             resampling: Resampling method for COG creation (default: "nearest")
-            hex_resampling: Resampling method for H3 hex downsampling step
-                (default: "average"). Use "mode" for categorical rasters
-                (land cover, classifications) to preserve class codes; averaging
-                produces meaningless values like 45 from {40, 50}. Accepts any
-                GDAL resampling string: nearest, bilinear, cubic, average, mode, etc.
+            hex_resampling: Area-weighted reducer for aggregating source
+                pixels into each H3 cell. One of: "sum" (counts/stocks like
+                population), "mean" (intensities like NDVI), "mode" (categorical
+                like land cover). Default: "mean". This replaces the older
+                GDAL-Warp resampling enum (#84).
             nodata_value: NoData value to exclude from H3 conversion
             target_crs: CRS for output (default: EPSG:4326); used when mosaicking
             target_extent: Clip extent (xmin, ymin, xmax, ymax) in target_crs; used when mosaicking
@@ -484,6 +490,16 @@ class RasterProcessor:
         self.compression = compression
         self.blocksize = blocksize
         self.resampling = resampling
+        # Area-weighted aggregation supports only these reducers. Old GDAL-Warp
+        # values (average/near/bilinear/cubic) are rejected; #84 removed the
+        # warp step entirely.
+        if hex_resampling not in VALID_HEX_REDUCERS:
+            raise ValueError(
+                f"hex_resampling must be one of {list(VALID_HEX_REDUCERS)}, "
+                f"got {hex_resampling!r}. The previous GDAL-Warp resampling "
+                f"values (average, near, bilinear, cubic) are no longer supported "
+                f"after #84 — see docs/raster_processing.md for migration."
+            )
         self.hex_resampling = hex_resampling
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
