@@ -823,9 +823,10 @@ class RasterProcessor:
     def process_h0_region(self, h0_index: Optional[int] = None) -> Optional[str]:
         """
         Process a single h0 region to H3-indexed parquet.
-        
-        Extracts the h0 region from the raster, converts to XYZ points,
-        and generates H3 cells with parent resolutions.
+
+        Polyfills the h0 cell to its native-resolution H3 children and
+        area-weighted-aggregates source-raster values into each cell via
+        exactextract. Parent resolutions are added as decoration columns.
         
         Args:
             h0_index: h0 cell index (0-121), uses self.h0_index if None
@@ -857,8 +858,8 @@ class RasterProcessor:
 
         print(f"  h0 cell: {h0_cell}")
 
-        # Skip h0 cells with no overlap with the source raster to avoid writing
-        # enormous empty XYZ files (can be TBs for high-resolution rasters).
+        # Skip h0 cells with no overlap with the source raster — avoids a
+        # full-globe polyfill over a raster that contributes nothing.
         h0_geom = ogr.CreateGeometryFromWkt(h0_geom_wkt)
         h0_env = h0_geom.GetEnvelope()  # (xmin, xmax, ymin, ymax)
         src = self._src_bounds_4326   # (xmin, ymin, xmax, ymax)
@@ -866,110 +867,11 @@ class RasterProcessor:
             print(f"  ℹ No overlap between source raster and h0 cell {h0_index}, skipping")
             return None
 
-        # Extract region to XYZ using GDAL
-        xyz_file = f"/tmp/raster_{h0_index}.xyz"
-
-        print(f"  Extracting region with gdal.Warp...")
-        # Allow partial reprojection so h0 cutlines that extend outside the
-        # source raster's projection domain (e.g. Albers-projected COGs) still
-        # produce valid output for the overlap region.
-        gdal.SetConfigOption('OGR_ENABLE_PARTIAL_REPROJECTION', 'TRUE')
-
-        # Clamp output to the intersection of the h0 cell bbox and the source
-        # raster bbox. Without outputBounds, cropToCutline uses the full h0
-        # cell extent (can be 50°×50° = 250 billion pixels at 0.0001° res).
-        # h0_env from GetEnvelope() is (xmin, xmax, ymin, ymax).
-        inter_xmin = max(src[0], h0_env[0])
-        inter_ymin = max(src[1], h0_env[2])
-        inter_xmax = min(src[2], h0_env[1])
-        inter_ymax = min(src[3], h0_env[3])
-
-        # Downsample to approximately one pixel per H3 cell so the XYZ
-        # intermediate file stays small (MB instead of GB for hi-res rasters).
-        pixel_size = _h3_res_to_degrees(self.h3_resolution)
-
-        # Resampling choice matters here: "average" is appropriate for continuous
-        # rasters (elevation, temperature) but corrupts categorical data (land cover)
-        # by producing non-canonical class codes. Categorical datasets should pass
-        # hex_resampling="mode" so each output pixel is the most frequent source class.
-        warp_options = gdal.WarpOptions(
-            dstSRS='EPSG:4326',
-            cutlineWKT=h0_geom_wkt,
-            cropToCutline=True,
-            outputBounds=(inter_xmin, inter_ymin, inter_xmax, inter_ymax),
-            xRes=pixel_size,
-            yRes=pixel_size,
-            resampleAlg=self.hex_resampling,
-            format='XYZ',
-        )
-
-        result = gdal.Warp(xyz_file, self.input_path, options=warp_options)
-        
-        if result is None:
-            print(f"  ⚠ No data in region {h0_index}")
-            return None
-        
-        result = None
-        
-        # Check if file exists and has data
-        if not os.path.exists(xyz_file) or os.path.getsize(xyz_file) == 0:
-            print(f"  ⚠ No data in region {h0_index}")
-            return None
-        
-        print(f"  Converting XYZ to H3 cells...")
-        
-        # Read XYZ and convert to H3
-        # Note: Raw DuckDB uses 'delimiter', Ibis uses 'delim'
-        xyz_table = self.con.read_csv(
-            xyz_file,
-            delimiter=' ',
-            columns={'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'FLOAT'}
-        )
-        
-        # Build parent resolution columns
-        h3_col = f"h{self.h3_resolution}"
-        parent_cols = []
-        parent_exprs = []
-        
-        for parent_res in sorted(self.parent_resolutions):
-            if parent_res < self.h3_resolution:
-                col_name = f"h{parent_res}"
-                parent_cols.append(col_name)
-                parent_exprs.append(f"h3_latlng_to_cell(Y, X, {parent_res}) AS {col_name}")
-        
-        parent_sql = ', ' + ', '.join(parent_exprs) if parent_exprs else ''
-        
-        # Add nodata filter to WHERE clause if specified
-        where_clause = f"WHERE Z != {self.nodata_value}" if self.nodata_value is not None else ""
-        
-        # Generate H3 cells with parent resolutions
-        output_path = f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"
-        
-        # Create output directory if it doesn't exist
-        output_dir = os.path.dirname(output_path)
-        os.makedirs(output_dir, exist_ok=True)
-        
-        query = f"""
-            COPY (
-                SELECT 
-                    Z AS {self.value_column},
-                    h3_latlng_to_cell(Y, X, {self.h3_resolution}) AS {h3_col}
-                    {parent_sql}
-                FROM xyz_table
-                {where_clause}
-            ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
-        """
-        
-        self.con.execute(query)
-        
-        # Clean up
-        try:
-            os.remove(xyz_file)
-        except Exception as e:
-            print(f"  Warning: Could not remove temp file: {e}")
-        
-        print(f"  ✓ Wrote: {output_path}")
-        return output_path
+        # Area-weighted aggregation into native H3 cells (issue #84).
+        # The previous gdal.Warp + XYZ + centroid-assignment path emitted
+        # one row per warped pixel and lost mass at hex boundaries; replaced
+        # with exact_extract over per-cell polygons.
+        return self._hex_aggregate_h0(h0_geom_wkt, h0_cell)
     
     def process_all_h0_regions(self) -> List[str]:
         """
