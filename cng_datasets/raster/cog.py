@@ -702,7 +702,124 @@ class RasterProcessor:
         
         print(f"  ✓ COG created: {output_path}")
         return output_path
-    
+
+    def _hex_aggregate_h0(self, h0_geom_wkt: str, h0_cell: int) -> Optional[str]:
+        """Area-weighted aggregation of source raster into native H3 cells
+        inside one h0 partition.
+
+        Uses exactextract for fractional-pixel coverage so SUM/mean/mode
+        are mass-conserving regardless of source-pixel vs hex-pitch ratio.
+        Returns the output parquet path, or None if no cells produced values.
+        """
+        import geopandas as gpd
+        import rasterio
+        from shapely import wkt as shapely_wkt
+        from exactextract import exact_extract
+
+        h3_col = f"h{self.h3_resolution}"
+        # Polyfill h0 -> native cells, then materialize each cell's boundary.
+        # The polyfill is bounded by the h0 cell, which caps the number of cells
+        # per call at ~5^(h3_resolution) - comfortably millions at h9 but
+        # tens-of-millions at h11. If memory becomes a concern at fine
+        # resolutions, this query can be chunked by an intermediate parent;
+        # not done here because current workflows top out at h9-h10.
+        cells_df = self.con.execute(f"""
+            WITH native_cells AS (
+                SELECT UNNEST(
+                    h3_polygon_wkt_to_cells('{h0_geom_wkt}', {self.h3_resolution})
+                ) AS cell
+            )
+            SELECT
+                cell AS {h3_col},
+                h3_cell_to_boundary_wkt(cell) AS boundary_wkt
+            FROM native_cells
+        """).fetchdf()
+
+        if len(cells_df) == 0:
+            print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells in polyfill")
+            return None
+
+        cells_df["geometry"] = cells_df["boundary_wkt"].apply(shapely_wkt.loads)
+        gdf = gpd.GeoDataFrame(
+            cells_df.drop(columns=["boundary_wkt"]),
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
+
+        # exactextract needs the raster opened with the right nodata.
+        # Open via rasterio so we can override nodata if the user passed --nodata.
+        with rasterio.open(self.input_path) as rast:
+            needs_vrt = self.nodata_value is not None and rast.nodata != self.nodata_value
+
+        vrt_path = None
+        try:
+            if needs_vrt:
+                vrt_path = f"/tmp/raster_{h0_cell}_nodata.vrt"
+                gdal.Translate(
+                    vrt_path,
+                    self.input_path,
+                    format="VRT",
+                    noData=self.nodata_value,
+                )
+                rast_arg = vrt_path
+            else:
+                rast_arg = self.input_path
+
+            results = exact_extract(
+                rast=rast_arg,
+                vec=gdf,
+                ops=[self.hex_resampling],
+                output="pandas",
+                include_cols=[h3_col],
+            )
+        finally:
+            if vrt_path is not None and os.path.exists(vrt_path):
+                os.remove(vrt_path)
+
+        # exactextract names the output column "{band_label}_{op}". For a
+        # single-band raster the label is "band_1". Normalize to value_column.
+        op_col = [c for c in results.columns if c.endswith(f"_{self.hex_resampling}")]
+        if not op_col:
+            raise RuntimeError(
+                f"exactextract returned no '{self.hex_resampling}' column; "
+                f"got {list(results.columns)}"
+            )
+        results = results.rename(columns={op_col[0]: self.value_column})
+
+        # Drop cells that produced no covered pixels (all-nodata under the cell).
+        results = results[results[self.value_column].notna()]
+        if len(results) == 0:
+            print(f"  ℹ h0 {h0_cell}: no cells produced values (all nodata)")
+            return None
+
+        # Write to DuckDB to add parent columns and emit parquet.
+        self.con.register("hex_values", results)
+
+        parent_exprs = []
+        for parent_res in sorted(self.parent_resolutions):
+            if parent_res < self.h3_resolution:
+                col_name = f"h{parent_res}"
+                parent_exprs.append(
+                    f"h3_cell_to_parent({h3_col}, {parent_res}) AS {col_name}"
+                )
+        parent_sql = ", " + ", ".join(parent_exprs) if parent_exprs else ""
+
+        output_path = (
+            f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"
+        )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        self.con.execute(f"""
+            COPY (
+                SELECT {self.value_column}, {h3_col}{parent_sql}
+                FROM hex_values
+            ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
+        """)
+        self.con.unregister("hex_values")
+
+        print(f"  ✓ Wrote: {output_path} ({len(results)} cells)")
+        return output_path
+
     def process_h0_region(self, h0_index: Optional[int] = None) -> Optional[str]:
         """
         Process a single h0 region to H3-indexed parquet.
