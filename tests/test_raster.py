@@ -270,8 +270,8 @@ class TestRasterProcessor:
         assert processor.h3_resolution == 6
         assert processor.parent_resolutions == [5, 0]
         assert processor.con is not None
-        # Default hex resampling preserves existing behavior for continuous rasters
-        assert processor.hex_resampling == "average"
+        # Default hex resampling is 'mean' for continuous rasters
+        assert processor.hex_resampling == "mean"
 
     @pytest.mark.timeout(60)
     def test_raster_processor_hex_resampling_mode(self, small_raster):
