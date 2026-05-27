@@ -13,6 +13,67 @@ import duckdb
 from osgeo import gdal, ogr, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
 
+
+def _exact_extract_chunk(args):
+    """Worker for chunked-parallel exact_extract over one slice of cells.
+
+    Top-level so it pickles cleanly across processes. Each worker reopens
+    the raster itself (each process has its own /vsicurl/ handle and
+    pixel cache), receives a primitive list of (h3_id, boundary_wkt) pairs,
+    and returns a pandas DataFrame with the op output plus the cell id
+    column as a string (the caller casts back to uint64).
+    """
+    import geopandas as gpd
+    from shapely import wkt as shapely_wkt
+    from exactextract import exact_extract
+
+    raster_path, op_name, chunk_cells = args
+    if not chunk_cells:
+        return None
+
+    geometries = [shapely_wkt.loads(wkt) for _, wkt in chunk_cells]
+    gdf = gpd.GeoDataFrame(
+        {
+            "_h3_str": [str(h) for h, _ in chunk_cells],
+            "geometry": geometries,
+        },
+        crs="EPSG:4326",
+    )
+
+    return exact_extract(
+        rast=raster_path,
+        vec=gdf,
+        ops=[op_name],
+        output="pandas",
+        include_cols=["_h3_str"],
+    )
+
+
+def _cgroup_cpu_count() -> int:
+    """Return the cgroup CPU quota (kubernetes pod limit) or os.cpu_count() fallback.
+
+    os.cpu_count() returns the node's CPU count inside a k8s pod, which
+    over-provisions workers when the pod is limited to e.g. 8 CPU on a
+    64-core node. Read cgroup v2 cpu.max if present.
+    """
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().strip().split()
+            if quota != "max":
+                return max(1, int(int(quota) / int(period)))
+    except (FileNotFoundError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+        if quota > 0:
+            return max(1, int(quota / period))
+    except (FileNotFoundError, ValueError):
+        pass
+    return os.cpu_count() or 1
+
 # Set GDAL to use exceptions for better error handling
 gdal.UseExceptions()
 
@@ -708,12 +769,19 @@ class RasterProcessor:
 
         Uses exactextract for fractional-pixel coverage so SUM/mean/mode
         are mass-conserving regardless of source-pixel vs hex-pitch ratio.
+        Chunks the cell list and runs exact_extract in parallel across
+        worker processes; each worker reopens the raster (private
+        /vsicurl/ handle) and processes its chunk independently.
+
+        Tunables (env vars):
+          CNG_HEX_CHUNK_SIZE — cells per worker call (default 100000)
+          CNG_HEX_WORKERS    — process pool size (default = cgroup CPU quota)
+
         Returns the output parquet path, or None if no cells produced values.
         """
-        import geopandas as gpd
         import rasterio
-        from shapely import wkt as shapely_wkt
-        from exactextract import exact_extract
+        from concurrent.futures import ProcessPoolExecutor
+        import pandas as pd
 
         h3_col = f"h{self.h3_resolution}"
         # Polyfill h0 -> native cells, then materialize each cell's boundary.
@@ -738,15 +806,8 @@ class RasterProcessor:
             print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells in polyfill")
             return None
 
-        cells_df["geometry"] = cells_df["boundary_wkt"].apply(shapely_wkt.loads)
-        gdf = gpd.GeoDataFrame(
-            cells_df.drop(columns=["boundary_wkt"]),
-            geometry="geometry",
-            crs="EPSG:4326",
-        )
-
         # exactextract needs the raster opened with the right nodata.
-        # Open via rasterio so we can override nodata if the user passed --nodata.
+        # Build a VRT once that overrides nodata if needed; workers reuse it.
         with rasterio.open(self.input_path) as rast:
             needs_vrt = self.nodata_value is not None and rast.nodata != self.nodata_value
 
@@ -764,16 +825,35 @@ class RasterProcessor:
             else:
                 rast_arg = self.input_path
 
-            # exactextract's `include_cols` cannot pass through uint64
-            # (the DuckDB h3 cell-id type). Round-trip the column as a string.
-            gdf["_h3_str"] = gdf[h3_col].astype(str)
-            results = exact_extract(
-                rast=rast_arg,
-                vec=gdf.drop(columns=[h3_col]),
-                ops=[self.hex_resampling],
-                output="pandas",
-                include_cols=["_h3_str"],
+            chunk_size = int(os.environ.get("CNG_HEX_CHUNK_SIZE", "100000"))
+            n_workers = int(os.environ.get("CNG_HEX_WORKERS", str(_cgroup_cpu_count())))
+            n_workers = max(1, n_workers)
+
+            # Build chunks as plain Python lists of (h3_id, wkt) pairs.
+            # uint64 + string pickles fast and small; shapely geometries
+            # do not (deserialize is slow), so reconstruct inside workers.
+            cells = list(zip(cells_df[h3_col].tolist(),
+                              cells_df["boundary_wkt"].tolist()))
+            chunks = [cells[i:i + chunk_size] for i in range(0, len(cells), chunk_size)]
+            del cells, cells_df
+
+            args_iter = [(rast_arg, self.hex_resampling, c) for c in chunks]
+            print(
+                f"  exact_extract: {sum(len(c) for c in chunks)} cells in "
+                f"{len(chunks)} chunks (size {chunk_size}) × {n_workers} workers"
             )
+
+            if n_workers == 1 or len(chunks) == 1:
+                chunk_results = [_exact_extract_chunk(a) for a in args_iter]
+            else:
+                with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                    chunk_results = list(ex.map(_exact_extract_chunk, args_iter))
+
+            chunk_results = [r for r in chunk_results if r is not None and len(r) > 0]
+            if not chunk_results:
+                print(f"  ℹ h0 {h0_cell}: no cells produced values (all chunks empty)")
+                return None
+            results = pd.concat(chunk_results, ignore_index=True)
         finally:
             if vrt_path is not None and os.path.exists(vrt_path):
                 os.remove(vrt_path)
