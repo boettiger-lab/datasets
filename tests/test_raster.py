@@ -640,13 +640,15 @@ class TestH3MassConservation:
 
         assert raster_sum > 0, "Fixture must contain populated pixels"
 
-        # Run the pipeline.
+        # Run the pipeline at h7 — the regression (corner-effect mass loss)
+        # surfaces at every resolution, but at h9 the polyfill (~40M cells/h0)
+        # OOMs the 7 GiB GitHub Actions runner. h7 keeps it under ~1 M cells.
         output_dir = os.path.join(temp_dir, "ghs_pop_hex")
         processor = RasterProcessor(
             input_path=ghs_pop_clip,
             output_parquet_path=output_dir,
-            h3_resolution=9,
-            parent_resolutions=[0, 5, 6, 7, 8],
+            h3_resolution=7,
+            parent_resolutions=[0, 5, 6],
             value_column="population",
             hex_resampling="sum",
             nodata_value=nodata,
@@ -680,15 +682,15 @@ class TestH3MassConservation:
             f"SELECT SUM(population) FROM read_parquet('{parquet_glob}')"
         ).fetchone()[0]
 
-        # Schema invariant: one row per h9 cell (no duplicates).
+        # Schema invariant: one row per h7 cell (no duplicates).
         duplicate_count = con.execute(f"""
             SELECT COUNT(*) FROM (
-                SELECT h9 FROM read_parquet('{parquet_glob}')
-                GROUP BY h9 HAVING COUNT(*) > 1
+                SELECT h7 FROM read_parquet('{parquet_glob}')
+                GROUP BY h7 HAVING COUNT(*) > 1
             )
         """).fetchone()[0]
         assert duplicate_count == 0, (
-            f"Expected one row per h9 cell, found {duplicate_count} duplicate h9 cells. "
+            f"Expected one row per h7 cell, found {duplicate_count} duplicate h7 cells. "
             "Stage 2 must aggregate, not emit per-warped-pixel rows."
         )
 
