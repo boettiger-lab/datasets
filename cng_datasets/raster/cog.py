@@ -764,20 +764,29 @@ class RasterProcessor:
             else:
                 rast_arg = self.input_path
 
+            # exactextract's `include_cols` cannot pass through uint64
+            # (the DuckDB h3 cell-id type). Round-trip the column as a string.
+            gdf["_h3_str"] = gdf[h3_col].astype(str)
             results = exact_extract(
                 rast=rast_arg,
-                vec=gdf,
+                vec=gdf.drop(columns=[h3_col]),
                 ops=[self.hex_resampling],
                 output="pandas",
-                include_cols=[h3_col],
+                include_cols=["_h3_str"],
             )
         finally:
             if vrt_path is not None and os.path.exists(vrt_path):
                 os.remove(vrt_path)
 
-        # exactextract names the output column "{band_label}_{op}". For a
-        # single-band raster the label is "band_1". Normalize to value_column.
-        op_col = [c for c in results.columns if c.endswith(f"_{self.hex_resampling}")]
+        results[h3_col] = results["_h3_str"].astype("uint64")
+        results = results.drop(columns=["_h3_str"])
+
+        # exactextract column naming: older versions emit "band_1_{op}",
+        # newer versions (>=0.3) emit just "{op}" for single-band rasters.
+        op_col = [
+            c for c in results.columns
+            if c == self.hex_resampling or c.endswith(f"_{self.hex_resampling}")
+        ]
         if not op_col:
             raise RuntimeError(
                 f"exactextract returned no '{self.hex_resampling}' column; "

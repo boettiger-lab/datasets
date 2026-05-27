@@ -619,9 +619,14 @@ class TestH3MassConservation:
         return str(path)
 
     @requires_gdal
+    @pytest.mark.timeout(600)
     def test_h3_aggregation_conserves_mass(self, ghs_pop_clip, temp_dir):
         """SUM(value) over the output parquet equals the source raster SUM
-        within 1%. Pre-fix this fails by ~50% for ghs-pop-2020."""
+        within 1%. Pre-fix this fails by ~50% for ghs-pop-2020.
+
+        Only iterates the h0 cells that overlap the fixture (rather than
+        all 122) so the test finishes in seconds instead of minutes.
+        """
         import rasterio
         import duckdb
         from cng_datasets.raster import RasterProcessor
@@ -631,6 +636,7 @@ class TestH3MassConservation:
             arr = src.read(1, masked=True)
             raster_sum = float(arr.sum())
             nodata = src.nodata
+            src_bounds = src.bounds  # (left, bottom, right, top)
 
         assert raster_sum > 0, "Fixture must contain populated pixels"
 
@@ -645,7 +651,26 @@ class TestH3MassConservation:
             hex_resampling="sum",
             nodata_value=nodata,
         )
-        outputs = processor.process_all_h0_regions()
+
+        # Find only the h0 indices whose bounding box overlaps the fixture
+        # extent — the global iteration of 122 cells dominates wall time
+        # otherwise.
+        overlapping_h0 = processor.con.execute(
+            f"""
+            SELECT i FROM read_parquet('{processor.h0_grid_path}')
+            WHERE ST_Intersects(
+              geom,
+              ST_MakeEnvelope({src_bounds.left}, {src_bounds.bottom},
+                              {src_bounds.right}, {src_bounds.top})
+            )
+            """
+        ).fetchdf()["i"].tolist()
+
+        outputs = []
+        for idx in overlapping_h0:
+            out = processor.process_h0_region(idx)
+            if out:
+                outputs.append(out)
         assert len(outputs) > 0, "Pipeline produced no parquet output"
 
         # Read back: sum across all h0 partitions.
