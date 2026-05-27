@@ -22,7 +22,13 @@ def _exact_extract_chunk(args):
     pixel cache), receives a primitive list of (h3_id, boundary_wkt) pairs,
     and returns a pandas DataFrame with the op output plus the cell id
     column as a string (the caller casts back to uint64).
+
+    Retries transient TIFF/HTTP read failures up to a few times — Ceph S3
+    occasionally returns truncated tile reads under heavy concurrent load,
+    and the partial read becomes a hard RuntimeError that would otherwise
+    kill the whole pool.
     """
+    import time
     import geopandas as gpd
     from shapely import wkt as shapely_wkt
     from exactextract import exact_extract
@@ -40,13 +46,31 @@ def _exact_extract_chunk(args):
         crs="EPSG:4326",
     )
 
-    return exact_extract(
-        rast=raster_path,
-        vec=gdf,
-        ops=[op_name],
-        output="pandas",
-        include_cols=["_h3_str"],
-    )
+    max_attempts = 4
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return exact_extract(
+                rast=raster_path,
+                vec=gdf,
+                ops=[op_name],
+                output="pandas",
+                include_cols=["_h3_str"],
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            transient = (
+                "TIFFReadEncodedTile" in msg
+                or "TIFFFillTile" in msg
+                or "IReadBlock" in msg
+                or "Could not connect" in msg
+                or "HTTP" in msg
+            )
+            if not transient or attempt == max_attempts - 1:
+                raise
+            last_exc = exc
+            time.sleep(2 ** attempt)  # 1, 2, 4 seconds
+    raise RuntimeError(f"Unreachable; last={last_exc}")
 
 
 def _cgroup_cpu_count() -> int:
