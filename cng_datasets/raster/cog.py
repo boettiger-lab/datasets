@@ -551,8 +551,13 @@ class RasterProcessor:
                 )
                 input_path = mosaic_path
 
-        # Use public endpoint for input reads
-        self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=True)
+        # Use /vsis3/ so reads honor AWS_S3_ENDPOINT — inside the cluster this
+        # routes to the internal Ceph endpoint (e.g. rook-ceph-rgw-nautiluss3.rook),
+        # not the external s3-west.nrp-nautilus.io load balancer. The external
+        # endpoint added latency and was the source of intermittent
+        # "Failed to connect to s3-west.nrp-nautilus.io" failures observed
+        # during the global ghs-pop-2020 build.
+        self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=False)
 
         # Warn if input is in a projected CRS — reprojection to EPSG:4326 will happen
         # internally, but a projected input can cause silent failures if PROJ is misconfigured.
