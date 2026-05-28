@@ -46,7 +46,7 @@ def _exact_extract_chunk(args):
         crs="EPSG:4326",
     )
 
-    max_attempts = 4
+    max_attempts = 6
     last_exc = None
     for attempt in range(max_attempts):
         try:
@@ -59,17 +59,21 @@ def _exact_extract_chunk(args):
             )
         except RuntimeError as exc:
             msg = str(exc)
+            msg_lower = msg.lower()
             transient = (
                 "TIFFReadEncodedTile" in msg
                 or "TIFFFillTile" in msg
                 or "IReadBlock" in msg
-                or "Could not connect" in msg
-                or "HTTP" in msg
+                or "curl" in msg_lower
+                or "connect" in msg_lower
+                or "http" in msg_lower
+                or "timed out" in msg_lower
+                or "timeout" in msg_lower
             )
             if not transient or attempt == max_attempts - 1:
                 raise
             last_exc = exc
-            time.sleep(2 ** attempt)  # 1, 2, 4 seconds
+            time.sleep(min(2 ** attempt, 30))  # 1, 2, 4, 8, 16, 30 seconds
     raise RuntimeError(f"Unreachable; last={last_exc}")
 
 
