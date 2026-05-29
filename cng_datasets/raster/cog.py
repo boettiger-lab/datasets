@@ -177,6 +177,81 @@ def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     return path
 
 
+def _localize_input(input_path: str, cache_dir: str) -> str:
+    """Copy a remote raster (s3:// or http(s)://) to local disk and return the local path.
+
+    The downstream exact_extract pipeline does many small range reads against
+    the source raster while integrating fractional pixel coverage per H3
+    cell. When the source is remote, each read pays HTTP round-trip latency,
+    and on dense h0 cells workers spend the majority of wall time blocked
+    on I/O — empirically ~12× slower than reading from a local NVMe copy.
+
+    For local input paths this is a no-op (returns input_path unchanged).
+    For remote inputs, uses rclone if available (matches the NRP/Ceph
+    production pattern, respects rclone-config), otherwise falls back to
+    GDAL's VSI layer (gdal.VSICopyFile) which uses the same credential/
+    endpoint env vars the rest of the package already honors.
+    """
+    import shutil
+    import subprocess
+
+    if not (input_path.startswith("s3://")
+            or input_path.startswith("http://")
+            or input_path.startswith("https://")):
+        return input_path  # already local
+
+    os.makedirs(cache_dir, exist_ok=True)
+    basename = os.path.basename(input_path.rstrip("/"))
+    local_path = os.path.join(cache_dir, basename)
+
+    if os.path.exists(local_path):
+        print(f"✓ Local cache hit: {local_path}")
+        return local_path
+
+    print(f"  Localizing input → {local_path}")
+
+    # Prefer rclone — it's what production NRP jobs use and handles
+    # /vsis3-style endpoints via the configured remote. rclone respects
+    # the rclone-config secret typically mounted into NRP pods.
+    if shutil.which("rclone"):
+        try:
+            # Convert s3://bucket/path → nrp:bucket/path for the standard
+            # NRP remote name. Users with a different remote can pre-stage
+            # the file or call with a local path.
+            if input_path.startswith("s3://"):
+                rclone_src = "nrp:" + input_path[len("s3://"):]
+            else:
+                rclone_src = input_path
+            cmd = ["rclone", "copy", "--s3-no-check-bucket",
+                   "--transfers", "4", rclone_src, cache_dir]
+            subprocess.run(cmd, check=True)
+            if os.path.exists(local_path):
+                print(f"  ✓ Localized via rclone: {os.path.getsize(local_path)} bytes")
+                return local_path
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"  ⚠ rclone copy failed ({e}); falling back to GDAL VSI copy")
+
+    # Fallback: stream the bytes through GDAL VSI to a local file. This
+    # respects AWS_S3_ENDPOINT / AWS_ACCESS_KEY_ID / AWS_HTTPS env vars
+    # that configure_s3_credentials sets up for the rest of the package.
+    vsi_src = _ensure_vsi_path(input_path, use_public_endpoint=False)
+    src_fh = gdal.VSIFOpenL(vsi_src, "rb")
+    if src_fh is None:
+        raise RuntimeError(f"Could not open remote source for localization: {vsi_src}")
+    try:
+        with open(local_path, "wb") as dst:
+            while True:
+                buf = gdal.VSIFReadL(1, 16 * 1024 * 1024, src_fh)  # 16 MiB
+                if not buf:
+                    break
+                dst.write(buf)
+    finally:
+        gdal.VSIFCloseL(src_fh)
+
+    print(f"  ✓ Localized via GDAL VSI: {os.path.getsize(local_path)} bytes")
+    return local_path
+
+
 def is_cog(url: str) -> bool:
     """Check if a raster is a Cloud-Optimized GeoTIFF.
 
@@ -495,6 +570,7 @@ class RasterProcessor:
         target_extent: Optional[tuple] = None,
         target_resolution: Optional[float] = None,
         band: Optional[int] = None,
+        local_cache_dir: Optional[str] = "/tmp/cng-raster-cache",
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
     ):
@@ -551,12 +627,25 @@ class RasterProcessor:
                 )
                 input_path = mosaic_path
 
+        # Default: localize remote inputs to local disk before processing.
+        # exact_extract issues many small pixel-coverage queries against the
+        # source raster; over /vsis3/ each one pays HTTP round-trip latency,
+        # and on dense h0 cells (e.g. urban Asia at h9) workers spent ~95%
+        # of wall time blocked on I/O — empirically ~12× slower than reading
+        # from a local NVMe copy. Localization is a one-time per-pod cost
+        # (~2 min for a 12 GB GHS-POP COG via rclone) that pays for itself
+        # many times over. Pass local_cache_dir=None to opt out and stream
+        # directly via /vsis3/ (useful for small rasters or non-cluster
+        # environments without local disk headroom).
+        if local_cache_dir and (isinstance(input_path, str) and
+                                 (input_path.startswith("s3://") or
+                                  input_path.startswith("http://") or
+                                  input_path.startswith("https://"))):
+            input_path = _localize_input(input_path, local_cache_dir)
+
         # Use /vsis3/ so reads honor AWS_S3_ENDPOINT — inside the cluster this
         # routes to the internal Ceph endpoint (e.g. rook-ceph-rgw-nautiluss3.rook),
-        # not the external s3-west.nrp-nautilus.io load balancer. The external
-        # endpoint added latency and was the source of intermittent
-        # "Failed to connect to s3-west.nrp-nautilus.io" failures observed
-        # during the global ghs-pop-2020 build.
+        # not the external s3-west.nrp-nautilus.io load balancer.
         self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=False)
 
         # Warn if input is in a projected CRS — reprojection to EPSG:4326 will happen
