@@ -14,9 +14,9 @@ def main():
         description="Cloud-native geospatial dataset processing toolkit",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
+
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
-    
+
     # Vector processing command
     vector_parser = subparsers.add_parser("vector", help="Process vector datasets")
     vector_parser.add_argument("--input", required=True, help="Input file URL")
@@ -28,7 +28,7 @@ def main():
     vector_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
     vector_parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
 
-    
+
     # Raster processing command
     raster_parser = subparsers.add_parser("raster", help="Process raster datasets")
     raster_parser.add_argument("--input", required=True, action="append", dest="inputs",
@@ -78,7 +78,7 @@ def main():
     repartition_parser.add_argument("--source-parquet", required=True, help="Source parquet with full attributes")
     repartition_parser.add_argument("--cleanup", action="store_true", default=True, help="Remove chunks after repartitioning")
     repartition_parser.add_argument("--memory-limit", type=str, default=None, help="DuckDB memory limit (e.g. '27GiB'). Overrides DUCKDB_MEMORY_LIMIT env var.")
-    
+
     # K8s job generation command
     k8s_parser = subparsers.add_parser("k8s", help="Generate Kubernetes job")
     k8s_parser.add_argument("--job-name", required=True, help="Job name")
@@ -86,7 +86,7 @@ def main():
     k8s_parser.add_argument("--output", default="job.yaml", help="Output YAML file")
     k8s_parser.add_argument("--chunks", type=int, help="Number of chunks for indexed job")
     k8s_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
-    
+
     # Workflow generation command
     workflow_parser = subparsers.add_parser("workflow", help="Generate complete dataset workflow")
     workflow_parser.add_argument("--dataset", required=True, help="Dataset name (e.g., redlining)")
@@ -163,27 +163,27 @@ def main():
     sync_job_parser.add_argument("--cpu", default="2", help="CPU request/limit (default: 2)")
     sync_job_parser.add_argument("--memory", default="4Gi", help="Memory request/limit (default: 4Gi)")
     sync_job_parser.add_argument("--dry-run", action="store_true", help="Dry run mode (show what would be synced)")
-    
+
     # Storage management command
     storage_parser = subparsers.add_parser("storage", help="Manage cloud storage")
     storage_subparsers = storage_parser.add_subparsers(dest="storage_command")
-    
+
     cors_parser = storage_subparsers.add_parser("cors", help="Configure bucket CORS")
     cors_parser.add_argument("--bucket", required=True, help="Bucket name")
     cors_parser.add_argument("--endpoint", help="S3 endpoint URL")
-    
+
     sync_parser = storage_subparsers.add_parser("sync", help="Sync with rclone")
     sync_parser.add_argument("--source", required=True, help="Source path")
     sync_parser.add_argument("--destination", required=True, help="Destination path")
     sync_parser.add_argument("--dry-run", action="store_true", help="Dry run mode")
-    
+
     setup_bucket_parser = storage_subparsers.add_parser("setup-bucket", help="Setup public bucket with CORS")
     setup_bucket_parser.add_argument("--bucket", required=True, help="Bucket name")
     setup_bucket_parser.add_argument("--remote", default="nrp", help="Rclone remote name (default: nrp)")
     setup_bucket_parser.add_argument("--endpoint", help="S3 endpoint URL (defaults to AWS_PUBLIC_ENDPOINT env var)")
     setup_bucket_parser.add_argument("--no-cors", action="store_true", help="Skip CORS configuration")
     setup_bucket_parser.add_argument("--verify", action="store_true", help="Verify bucket configuration after setup")
-    
+
     args = parser.parse_args()
 
     if not args.command:
@@ -212,7 +212,7 @@ def _dispatch(args):
             intermediate_chunk_size=args.intermediate_chunk_size,
             id_column=args.id_column,
         )
-    
+
     elif args.command == "raster":
         from .raster import RasterProcessor, create_mosaic_cog
 
@@ -270,7 +270,7 @@ def _dispatch(args):
                     processor.process_h0_region()
                 else:
                     processor.process_all_h0_regions()
-    
+
     elif args.command == "repartition":
         from .vector import repartition_by_h0
         repartition_by_h0(
@@ -280,7 +280,7 @@ def _dispatch(args):
             cleanup=args.cleanup,
             memory_limit=args.memory_limit,
         )
-    
+
     elif args.command == "k8s":
         from .k8s import K8sJobManager
         manager = K8sJobManager(namespace=getattr(args, 'namespace', 'biodiversity'))
@@ -296,7 +296,7 @@ def _dispatch(args):
                 command=args.container_command,
             )
         manager.save_job_yaml(job_spec, args.output)
-    
+
     elif args.command == "sync-job":
         from .k8s import generate_sync_job
         generate_sync_job(
@@ -309,7 +309,7 @@ def _dispatch(args):
             memory=args.memory,
             dry_run=args.dry_run,
         )
-    
+
     elif args.command == "workflow":
         from .k8s import generate_dataset_workflow
         # Parse parent resolutions from comma-separated string
@@ -397,7 +397,7 @@ def _dispatch(args):
             from .storage import setup_public_bucket
             from .storage.setup_bucket import verify_bucket_config
             import json
-            
+
             success = setup_public_bucket(
                 bucket_name=args.bucket,
                 remote=args.remote,
@@ -405,12 +405,12 @@ def _dispatch(args):
                 set_cors=not args.no_cors,
                 verbose=True
             )
-            
+
             if success and args.verify:
                 print("\nVerifying configuration...")
                 results = verify_bucket_config(args.bucket, args.endpoint)
                 print(json.dumps(results, indent=2))
-            
+
             sys.exit(0 if success else 1)
 
 

@@ -5,9 +5,9 @@ from .rclone import RcloneSync, create_public_bucket as create_public_bucket_rcl
 from .setup_bucket import setup_public_bucket
 
 __all__ = [
-    "S3Manager", 
-    "configure_bucket_cors", 
-    "create_public_bucket", 
+    "S3Manager",
+    "configure_bucket_cors",
+    "create_public_bucket",
     "RcloneSync",
     "create_public_bucket_rclone",
     "setup_public_bucket"

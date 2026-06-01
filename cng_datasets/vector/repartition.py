@@ -11,7 +11,6 @@ import subprocess
 import duckdb
 import ibis
 from cng_datasets.storage.s3 import configure_s3_credentials
-from cng_datasets.vector.h3_tiling import identify_id_column
 
 
 def repartition_by_h0(
@@ -47,11 +46,11 @@ def repartition_by_h0(
     con.raw_sql('SET http_timeout=1200')
     con.raw_sql('SET http_retries=30')
     con.raw_sql('SET arrow_large_buffer_size=true')
-    
+
     # Create local temporary directory
     local_dir = '/tmp/hex'
     os.makedirs(local_dir, exist_ok=True)
-    
+
     # Read chunks (sparse format: ID_column, h10, h9, h8, h0)
     try:
         chunks = con.read_parquet(f'{chunks_dir}/*.parquet')
@@ -62,30 +61,30 @@ def repartition_by_h0(
             f"Original error: {e}"
         ) from e
     chunk_cols = chunks.columns
-    
+
     # Identify ID column in chunks
     # Prioritize _cng_fid (standard from convert_to_parquet), then _fid (fallback), then other non-h3 columns
     chunk_id_col = None
     priority_ids = ['_cng_fid', '_fid']
-    
+
     # First check for priority IDs
     for priority_id in priority_ids:
         if priority_id in chunk_cols:
             chunk_id_col = priority_id
             break
-    
+
     # If no priority ID found, look for any non-h3 column
     if not chunk_id_col:
         for col in chunk_cols:
             if not col.startswith('h') or not col[1:].isdigit():
                 chunk_id_col = col
                 break
-    
+
     if not chunk_id_col:
         raise ValueError(f"Could not identify ID column in chunks. Columns: {chunk_cols}")
-    
+
     print(f"Chunks ID column: {chunk_id_col}")
-    
+
     # If source parquet provided, join back all attributes (except geometry)
     if source_parquet:
         print(f'Joining attributes from {source_parquet}...')
@@ -194,9 +193,9 @@ def repartition_by_h0(
 
     print('Cleaning up local directory...')
     shutil.rmtree(local_dir, ignore_errors=True)
-    
+
     print('✓ Repartitioning complete!')
-    
+
     # Clean up chunks directory if requested
     if cleanup and chunks_dir.startswith('s3://'):
         print('Removing chunks directory from S3...')
@@ -207,7 +206,7 @@ def repartition_by_h0(
             rclone_path = f'nrp:{bucket}/{path}'
         else:
             rclone_path = f'nrp:{parts[0]}'
-        
+
         try:
             result = subprocess.run(
                 ['rclone', 'purge', rclone_path],
@@ -221,5 +220,5 @@ def repartition_by_h0(
                 print(f'⚠ rclone cleanup warning: {result.stderr}')
         except Exception as e:
             print(f'⚠ Error during cleanup: {e}')
-    
+
     print('✓ All done!')
