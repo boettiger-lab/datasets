@@ -10,8 +10,140 @@ import os
 import math
 import tempfile
 import duckdb
-from osgeo import gdal, ogr, osr
+from osgeo import gdal, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
+
+
+def _split_antimeridian(geom):
+    """Split a cell polygon that wraps the antimeridian into a MultiPolygon.
+
+    h3_cell_to_boundary_wkt returns, for an H3 cell touching +/-180, a planar
+    polygon whose vertices on either side of the antimeridian are joined the
+    long way around — so its bounding box spans ~360 deg of longitude. Handed
+    to exact_extract unchanged, such a cell integrates the entire latitude
+    band rather than its true ~0.1 km^2 footprint, inflating SUM aggregates
+    (issue #88). H3 cells are tiny, so a longitude span > 180 deg unambiguously
+    means the cell wraps.
+
+    We unwrap (shift negative longitudes by +360 so all vertices sit just east
+    of +180), split the unwrapped polygon at x=180, and translate the eastern
+    piece back by -360 — yielding two small polygons hugging +180 and -180.
+    Non-wrapping geometries are returned unchanged.
+    """
+    minx, _, maxx, _ = geom.bounds
+    if maxx - minx <= 180:
+        return geom
+
+    from shapely.geometry import Polygon, box
+    from shapely.affinity import translate
+    from shapely.ops import unary_union
+
+    unwrapped = Polygon([(x + 360.0 if x < 0 else x, y)
+                         for x, y in geom.exterior.coords])
+    uminx, uminy, umaxx, umaxy = unwrapped.bounds
+    west = unwrapped.intersection(box(uminx, uminy, 180.0, umaxy))
+    east = unwrapped.intersection(box(180.0, uminy, umaxx, umaxy))
+
+    parts = []
+    if not west.is_empty:
+        parts.append(west)
+    if not east.is_empty:
+        parts.append(translate(east, xoff=-360.0))
+    if not parts:
+        return geom
+    return unary_union(parts)
+
+
+def _exact_extract_chunk(args):
+    """Worker for chunked-parallel exact_extract over one slice of cells.
+
+    Top-level so it pickles cleanly across processes. Each worker reopens
+    the raster itself (each process has its own /vsicurl/ handle and
+    pixel cache), receives a primitive list of (h3_id, boundary_wkt) pairs,
+    and returns a pandas DataFrame with the op output plus the cell id
+    column as a string (the caller casts back to uint64).
+
+    Retries transient TIFF/HTTP read failures up to a few times — Ceph S3
+    occasionally returns truncated tile reads under heavy concurrent load,
+    and the partial read becomes a hard RuntimeError that would otherwise
+    kill the whole pool.
+    """
+    import time
+    import geopandas as gpd
+    from shapely import wkt as shapely_wkt
+    from exactextract import exact_extract
+
+    raster_path, op_name, chunk_cells = args
+    if not chunk_cells:
+        return None
+
+    # Split cells that straddle +/-180 into a MultiPolygon so exact_extract
+    # integrates their true footprint, not a 360-deg ribbon (issue #88).
+    geometries = [_split_antimeridian(shapely_wkt.loads(wkt))
+                  for _, wkt in chunk_cells]
+    gdf = gpd.GeoDataFrame(
+        {
+            "_h3_str": [str(h) for h, _ in chunk_cells],
+            "geometry": geometries,
+        },
+        crs="EPSG:4326",
+    )
+
+    max_attempts = 6
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return exact_extract(
+                rast=raster_path,
+                vec=gdf,
+                ops=[op_name],
+                output="pandas",
+                include_cols=["_h3_str"],
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            msg_lower = msg.lower()
+            transient = (
+                "TIFFReadEncodedTile" in msg
+                or "TIFFFillTile" in msg
+                or "IReadBlock" in msg
+                or "curl" in msg_lower
+                or "connect" in msg_lower
+                or "http" in msg_lower
+                or "timed out" in msg_lower
+                or "timeout" in msg_lower
+            )
+            if not transient or attempt == max_attempts - 1:
+                raise
+            last_exc = exc
+            time.sleep(min(2 ** attempt, 30))  # 1, 2, 4, 8, 16, 30 seconds
+    raise RuntimeError(f"Unreachable; last={last_exc}")
+
+
+def _cgroup_cpu_count() -> int:
+    """Return the cgroup CPU quota (kubernetes pod limit) or os.cpu_count() fallback.
+
+    os.cpu_count() returns the node's CPU count inside a k8s pod, which
+    over-provisions workers when the pod is limited to e.g. 8 CPU on a
+    64-core node. Read cgroup v2 cpu.max if present.
+    """
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().strip().split()
+            if quota != "max":
+                return max(1, int(int(quota) / int(period)))
+    except (FileNotFoundError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+        if quota > 0:
+            return max(1, int(quota / period))
+    except (FileNotFoundError, ValueError):
+        pass
+    return os.cpu_count() or 1
 
 # Set GDAL to use exceptions for better error handling
 gdal.UseExceptions()
@@ -53,21 +185,10 @@ def _configure_proj():
 _configure_proj()
 
 
-def _h3_res_to_degrees(h3_resolution: int) -> float:
-    """Approximate pixel size in degrees for a given H3 resolution.
-
-    Uses the equatorial approximation (1° ≈ 111,320 m) which slightly
-    over-samples at higher latitudes — acceptable for mean aggregation.
-    """
-    # Average H3 edge lengths in km (from h3geo.org/docs/core-library/restable)
-    _H3_EDGE_KM = {
-        0: 1281.256011, 1: 483.0568391, 2: 182.5129565, 3: 68.97922179,
-        4: 26.07175968, 5: 9.854090990, 6: 3.724532667, 7: 1.406475763,
-        8: 0.531414010, 9: 0.200786148, 10: 0.075863783, 11: 0.028663897,
-        12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169,
-    }
-    edge_m = _H3_EDGE_KM[h3_resolution] * 1000
-    return edge_m / 111320.0
+# Area-weighted reducers supported by the H3 hex aggregator (#84).
+# Used both for runtime validation in RasterProcessor.__init__ and as
+# argparse `choices=` in the CLI.
+VALID_HEX_REDUCERS = ("sum", "mean", "mode")
 
 
 def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
@@ -97,6 +218,81 @@ def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     if path.startswith("https://") or path.startswith("http://"):
         return f"/vsicurl/{path}"
     return path
+
+
+def _localize_input(input_path: str, cache_dir: str) -> str:
+    """Copy a remote raster (s3:// or http(s)://) to local disk and return the local path.
+
+    The downstream exact_extract pipeline does many small range reads against
+    the source raster while integrating fractional pixel coverage per H3
+    cell. When the source is remote, each read pays HTTP round-trip latency,
+    and on dense h0 cells workers spend the majority of wall time blocked
+    on I/O — empirically ~12× slower than reading from a local NVMe copy.
+
+    For local input paths this is a no-op (returns input_path unchanged).
+    For remote inputs, uses rclone if available (matches the NRP/Ceph
+    production pattern, respects rclone-config), otherwise falls back to
+    GDAL's VSI layer (gdal.VSICopyFile) which uses the same credential/
+    endpoint env vars the rest of the package already honors.
+    """
+    import shutil
+    import subprocess
+
+    if not (input_path.startswith("s3://")
+            or input_path.startswith("http://")
+            or input_path.startswith("https://")):
+        return input_path  # already local
+
+    os.makedirs(cache_dir, exist_ok=True)
+    basename = os.path.basename(input_path.rstrip("/"))
+    local_path = os.path.join(cache_dir, basename)
+
+    if os.path.exists(local_path):
+        print(f"✓ Local cache hit: {local_path}")
+        return local_path
+
+    print(f"  Localizing input → {local_path}")
+
+    # Prefer rclone — it's what production NRP jobs use and handles
+    # /vsis3-style endpoints via the configured remote. rclone respects
+    # the rclone-config secret typically mounted into NRP pods.
+    if shutil.which("rclone"):
+        try:
+            # Convert s3://bucket/path → nrp:bucket/path for the standard
+            # NRP remote name. Users with a different remote can pre-stage
+            # the file or call with a local path.
+            if input_path.startswith("s3://"):
+                rclone_src = "nrp:" + input_path[len("s3://"):]
+            else:
+                rclone_src = input_path
+            cmd = ["rclone", "copy", "--s3-no-check-bucket",
+                   "--transfers", "4", rclone_src, cache_dir]
+            subprocess.run(cmd, check=True)
+            if os.path.exists(local_path):
+                print(f"  ✓ Localized via rclone: {os.path.getsize(local_path)} bytes")
+                return local_path
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"  ⚠ rclone copy failed ({e}); falling back to GDAL VSI copy")
+
+    # Fallback: stream the bytes through GDAL VSI to a local file. This
+    # respects AWS_S3_ENDPOINT / AWS_ACCESS_KEY_ID / AWS_HTTPS env vars
+    # that configure_s3_credentials sets up for the rest of the package.
+    vsi_src = _ensure_vsi_path(input_path, use_public_endpoint=False)
+    src_fh = gdal.VSIFOpenL(vsi_src, "rb")
+    if src_fh is None:
+        raise RuntimeError(f"Could not open remote source for localization: {vsi_src}")
+    try:
+        with open(local_path, "wb") as dst:
+            while True:
+                buf = gdal.VSIFReadL(1, 16 * 1024 * 1024, src_fh)  # 16 MiB
+                if not buf:
+                    break
+                dst.write(buf)
+    finally:
+        gdal.VSIFCloseL(src_fh)
+
+    print(f"  ✓ Localized via GDAL VSI: {os.path.getsize(local_path)} bytes")
+    return local_path
 
 
 def is_cog(url: str) -> bool:
@@ -411,12 +607,13 @@ class RasterProcessor:
         compression: str = "deflate",
         blocksize: int = 512,
         resampling: str = "nearest",
-        hex_resampling: str = "average",
+        hex_resampling: str = "mean",
         nodata_value: Optional[float] = None,
         target_crs: str = "EPSG:4326",
         target_extent: Optional[tuple] = None,
         target_resolution: Optional[float] = None,
         band: Optional[int] = None,
+        local_cache_dir: Optional[str] = "/tmp/cng-raster-cache",
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
     ):
@@ -437,11 +634,11 @@ class RasterProcessor:
             compression: Compression method for COG (deflate, lzw, zstd, etc.)
             blocksize: Block size for COG tiling
             resampling: Resampling method for COG creation (default: "nearest")
-            hex_resampling: Resampling method for H3 hex downsampling step
-                (default: "average"). Use "mode" for categorical rasters
-                (land cover, classifications) to preserve class codes; averaging
-                produces meaningless values like 45 from {40, 50}. Accepts any
-                GDAL resampling string: nearest, bilinear, cubic, average, mode, etc.
+            hex_resampling: Area-weighted reducer for aggregating source
+                pixels into each H3 cell. One of: "sum" (counts/stocks like
+                population), "mean" (intensities like NDVI), "mode" (categorical
+                like land cover). Default: "mean". This replaces the older
+                GDAL-Warp resampling enum (#84).
             nodata_value: NoData value to exclude from H3 conversion
             target_crs: CRS for output (default: EPSG:4326); used when mosaicking
             target_extent: Clip extent (xmin, ymin, xmax, ymax) in target_crs; used when mosaicking
@@ -473,8 +670,26 @@ class RasterProcessor:
                 )
                 input_path = mosaic_path
 
-        # Use public endpoint for input reads
-        self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=True)
+        # Default: localize remote inputs to local disk before processing.
+        # exact_extract issues many small pixel-coverage queries against the
+        # source raster; over /vsis3/ each one pays HTTP round-trip latency,
+        # and on dense h0 cells (e.g. urban Asia at h9) workers spent ~95%
+        # of wall time blocked on I/O — empirically ~12× slower than reading
+        # from a local NVMe copy. Localization is a one-time per-pod cost
+        # (~2 min for a 12 GB GHS-POP COG via rclone) that pays for itself
+        # many times over. Pass local_cache_dir=None to opt out and stream
+        # directly via /vsis3/ (useful for small rasters or non-cluster
+        # environments without local disk headroom).
+        if local_cache_dir and (isinstance(input_path, str) and
+                                 (input_path.startswith("s3://") or
+                                  input_path.startswith("http://") or
+                                  input_path.startswith("https://"))):
+            input_path = _localize_input(input_path, local_cache_dir)
+
+        # Use /vsis3/ so reads honor AWS_S3_ENDPOINT — inside the cluster this
+        # routes to the internal Ceph endpoint (e.g. rook-ceph-rgw-nautiluss3.rook),
+        # not the external s3-west.nrp-nautilus.io load balancer.
+        self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=False)
 
         # Warn if input is in a projected CRS — reprojection to EPSG:4326 will happen
         # internally, but a projected input can cause silent failures if PROJ is misconfigured.
@@ -501,6 +716,16 @@ class RasterProcessor:
         self.compression = compression
         self.blocksize = blocksize
         self.resampling = resampling
+        # Area-weighted aggregation supports only these reducers. Old GDAL-Warp
+        # values (average/near/bilinear/cubic) are rejected; #84 removed the
+        # warp step entirely.
+        if hex_resampling not in VALID_HEX_REDUCERS:
+            raise ValueError(
+                f"hex_resampling must be one of {list(VALID_HEX_REDUCERS)}, "
+                f"got {hex_resampling!r}. The previous GDAL-Warp resampling "
+                f"values (average, near, bilinear, cubic) are no longer supported "
+                f"after #84 — see docs/raster_processing.md for migration."
+            )
         self.hex_resampling = hex_resampling
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
@@ -702,13 +927,206 @@ class RasterProcessor:
         
         print(f"  ✓ COG created: {output_path}")
         return output_path
-    
+
+    def _native_cells_for_h0(self, h0_cell: int):
+        """Return the native-resolution H3 cells of one h0 partition, with each
+        cell's boundary WKT, as a DataFrame (columns: h{res}, boundary_wkt).
+
+        Cells come from h3_cell_to_children(h0, res) — the exact H3 hierarchy
+        traversal. Every native cell has exactly one res-0 parent, so the 122
+        per-h0 cell sets are disjoint and cover the globe exactly: no overlap
+        (issue #89's cross-partition boundary duplication) and no gaps. This
+        replaces a polygon polyfill (h3_polygon_wkt_to_cells on the stored h0
+        geometry), which selected strays from neighbouring h0s, missed some
+        true children, and — for the antimeridian h0s whose stored polygon
+        spans -178..+177 in planar lat/lon — collapsed to zero cells (#88).
+
+        The child count is ~7^(h3_resolution) - comfortably millions at h9 but
+        tens-of-millions at h11; the caller chunks it across worker processes.
+        """
+        h3_col = f"h{self.h3_resolution}"
+        return self.con.execute(f"""
+            WITH native_cells AS (
+                SELECT UNNEST(
+                    h3_cell_to_children({h0_cell}, {self.h3_resolution})
+                ) AS cell
+            )
+            SELECT
+                cell AS {h3_col},
+                h3_cell_to_boundary_wkt(cell) AS boundary_wkt
+            FROM native_cells
+        """).fetchdf()
+
+    def _h0_overlaps_raster(self, h0_geom_wkt: str) -> bool:
+        """Whether the source raster's extent overlaps an h0 cell's true
+        footprint.
+
+        The stored h0 polygon is in planar lat/lon, so antimeridian h0s
+        (vertices on both sides of +/-180) have a bounding box ~360 deg wide
+        that both fails to prune anywhere and wrongly excludes the +/-180 strip
+        where their data lives. We unwrap the longitudes (negatives +360); a
+        span > 180 deg means the cell straddles the antimeridian, so its
+        longitude footprint is two intervals on [-180, 180]. Latitude is never
+        wrapped, so the polygon's lat bounds are used directly.
+        """
+        from shapely import wkt as shapely_wkt
+        poly = shapely_wkt.loads(h0_geom_wkt)
+        if poly.geom_type == "MultiPolygon":
+            xs = [x for g in poly.geoms for x, _ in g.exterior.coords]
+        else:
+            xs = [x for x, _ in poly.exterior.coords]
+        minx, miny, maxx, maxy = poly.bounds
+
+        if maxx - minx > 180:  # straddles the antimeridian
+            uxs = [x + 360.0 if x < 0 else x for x in xs]
+            umin, umax = min(uxs), max(uxs)
+            lon_intervals = [(umin, 180.0)]
+            if umax > 180.0:
+                lon_intervals.append((-180.0, umax - 360.0))
+        else:
+            lon_intervals = [(minx, maxx)]
+
+        sxmin, symin, sxmax, symax = self._src_bounds_4326  # (xmin,ymin,xmax,ymax)
+        if symax < miny or symin > maxy:  # no latitude overlap
+            return False
+        return any(not (sxmax < lo or sxmin > hi) for lo, hi in lon_intervals)
+
+    def _hex_aggregate_h0(self, h0_cell: int) -> Optional[str]:
+        """Area-weighted aggregation of source raster into native H3 cells
+        inside one h0 partition.
+
+        Uses exactextract for fractional-pixel coverage so SUM/mean/mode
+        are mass-conserving regardless of source-pixel vs hex-pitch ratio.
+        Chunks the cell list and runs exact_extract in parallel across
+        worker processes; each worker reopens the raster (private
+        /vsicurl/ handle) and processes its chunk independently.
+
+        Tunables (env vars):
+          CNG_HEX_CHUNK_SIZE — cells per worker call (default 100000)
+          CNG_HEX_WORKERS    — process pool size (default = cgroup CPU quota)
+
+        Returns the output parquet path, or None if no cells produced values.
+        """
+        import rasterio
+        from concurrent.futures import ProcessPoolExecutor
+        import pandas as pd
+
+        h3_col = f"h{self.h3_resolution}"
+        cells_df = self._native_cells_for_h0(h0_cell)
+
+        if len(cells_df) == 0:
+            print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells")
+            return None
+
+        # exactextract needs the raster opened with the right nodata.
+        # Build a VRT once that overrides nodata if needed; workers reuse it.
+        with rasterio.open(self.input_path) as rast:
+            needs_vrt = self.nodata_value is not None and rast.nodata != self.nodata_value
+
+        vrt_path = None
+        try:
+            if needs_vrt:
+                vrt_path = f"/tmp/raster_{h0_cell}_nodata.vrt"
+                gdal.Translate(
+                    vrt_path,
+                    self.input_path,
+                    format="VRT",
+                    noData=self.nodata_value,
+                )
+                rast_arg = vrt_path
+            else:
+                rast_arg = self.input_path
+
+            chunk_size = int(os.environ.get("CNG_HEX_CHUNK_SIZE", "100000"))
+            n_workers = int(os.environ.get("CNG_HEX_WORKERS", str(_cgroup_cpu_count())))
+            n_workers = max(1, n_workers)
+
+            # Build chunks as plain Python lists of (h3_id, wkt) pairs.
+            # uint64 + string pickles fast and small; shapely geometries
+            # do not (deserialize is slow), so reconstruct inside workers.
+            cells = list(zip(cells_df[h3_col].tolist(),
+                              cells_df["boundary_wkt"].tolist()))
+            chunks = [cells[i:i + chunk_size] for i in range(0, len(cells), chunk_size)]
+            del cells, cells_df
+
+            args_iter = [(rast_arg, self.hex_resampling, c) for c in chunks]
+            print(
+                f"  exact_extract: {sum(len(c) for c in chunks)} cells in "
+                f"{len(chunks)} chunks (size {chunk_size}) × {n_workers} workers"
+            )
+
+            if n_workers == 1 or len(chunks) == 1:
+                chunk_results = [_exact_extract_chunk(a) for a in args_iter]
+            else:
+                with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                    chunk_results = list(ex.map(_exact_extract_chunk, args_iter))
+
+            chunk_results = [r for r in chunk_results if r is not None and len(r) > 0]
+            if not chunk_results:
+                print(f"  ℹ h0 {h0_cell}: no cells produced values (all chunks empty)")
+                return None
+            results = pd.concat(chunk_results, ignore_index=True)
+        finally:
+            if vrt_path is not None and os.path.exists(vrt_path):
+                os.remove(vrt_path)
+
+        results[h3_col] = results["_h3_str"].astype("uint64")
+        results = results.drop(columns=["_h3_str"])
+
+        # exactextract column naming: older versions emit "band_1_{op}",
+        # newer versions (>=0.3) emit just "{op}" for single-band rasters.
+        op_col = [
+            c for c in results.columns
+            if c == self.hex_resampling or c.endswith(f"_{self.hex_resampling}")
+        ]
+        if not op_col:
+            raise RuntimeError(
+                f"exactextract returned no '{self.hex_resampling}' column; "
+                f"got {list(results.columns)}"
+            )
+        results = results.rename(columns={op_col[0]: self.value_column})
+
+        # Drop cells that produced no covered pixels (all-nodata under the cell).
+        results = results[results[self.value_column].notna()]
+        if len(results) == 0:
+            print(f"  ℹ h0 {h0_cell}: no cells produced values (all nodata)")
+            return None
+
+        # Write to DuckDB to add parent columns and emit parquet.
+        self.con.register("hex_values", results)
+
+        parent_exprs = []
+        for parent_res in sorted(self.parent_resolutions):
+            if parent_res < self.h3_resolution:
+                col_name = f"h{parent_res}"
+                parent_exprs.append(
+                    f"h3_cell_to_parent({h3_col}, {parent_res}) AS {col_name}"
+                )
+        parent_sql = ", " + ", ".join(parent_exprs) if parent_exprs else ""
+
+        output_path = (
+            f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"
+        )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        self.con.execute(f"""
+            COPY (
+                SELECT {self.value_column}, {h3_col}{parent_sql}
+                FROM hex_values
+            ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
+        """)
+        self.con.unregister("hex_values")
+
+        print(f"  ✓ Wrote: {output_path} ({len(results)} cells)")
+        return output_path
+
     def process_h0_region(self, h0_index: Optional[int] = None) -> Optional[str]:
         """
         Process a single h0 region to H3-indexed parquet.
-        
-        Extracts the h0 region from the raster, converts to XYZ points,
-        and generates H3 cells with parent resolutions.
+
+        Polyfills the h0 cell to its native-resolution H3 children and
+        area-weighted-aggregates source-raster values into each cell via
+        exactextract. Parent resolutions are added as decoration columns.
         
         Args:
             h0_index: h0 cell index (0-121), uses self.h0_index if None
@@ -740,119 +1158,22 @@ class RasterProcessor:
 
         print(f"  h0 cell: {h0_cell}")
 
-        # Skip h0 cells with no overlap with the source raster to avoid writing
-        # enormous empty XYZ files (can be TBs for high-resolution rasters).
-        h0_geom = ogr.CreateGeometryFromWkt(h0_geom_wkt)
-        h0_env = h0_geom.GetEnvelope()  # (xmin, xmax, ymin, ymax)
-        src = self._src_bounds_4326   # (xmin, ymin, xmax, ymax)
-        if src[2] < h0_env[0] or src[0] > h0_env[1] or src[3] < h0_env[2] or src[1] > h0_env[3]:
+        # Skip h0 cells with no overlap with the source raster — avoids
+        # running exact_extract over millions of children of a raster that
+        # contributes nothing. The antimeridian h0s are stored as polygons
+        # spanning ~-178..+177 in planar lat/lon, so their raw envelope both
+        # covers the globe (never prunes) AND excludes the +/-180 strip where
+        # their data actually lives (would falsely skip a seam raster). Unwrap
+        # the longitudes and test the true footprint instead.
+        if not self._h0_overlaps_raster(h0_geom_wkt):
             print(f"  ℹ No overlap between source raster and h0 cell {h0_index}, skipping")
             return None
 
-        # Extract region to XYZ using GDAL
-        xyz_file = f"/tmp/raster_{h0_index}.xyz"
-
-        print(f"  Extracting region with gdal.Warp...")
-        # Allow partial reprojection so h0 cutlines that extend outside the
-        # source raster's projection domain (e.g. Albers-projected COGs) still
-        # produce valid output for the overlap region.
-        gdal.SetConfigOption('OGR_ENABLE_PARTIAL_REPROJECTION', 'TRUE')
-
-        # Clamp output to the intersection of the h0 cell bbox and the source
-        # raster bbox. Without outputBounds, cropToCutline uses the full h0
-        # cell extent (can be 50°×50° = 250 billion pixels at 0.0001° res).
-        # h0_env from GetEnvelope() is (xmin, xmax, ymin, ymax).
-        inter_xmin = max(src[0], h0_env[0])
-        inter_ymin = max(src[1], h0_env[2])
-        inter_xmax = min(src[2], h0_env[1])
-        inter_ymax = min(src[3], h0_env[3])
-
-        # Downsample to approximately one pixel per H3 cell so the XYZ
-        # intermediate file stays small (MB instead of GB for hi-res rasters).
-        pixel_size = _h3_res_to_degrees(self.h3_resolution)
-
-        # Resampling choice matters here: "average" is appropriate for continuous
-        # rasters (elevation, temperature) but corrupts categorical data (land cover)
-        # by producing non-canonical class codes. Categorical datasets should pass
-        # hex_resampling="mode" so each output pixel is the most frequent source class.
-        warp_options = gdal.WarpOptions(
-            dstSRS='EPSG:4326',
-            cutlineWKT=h0_geom_wkt,
-            cropToCutline=True,
-            outputBounds=(inter_xmin, inter_ymin, inter_xmax, inter_ymax),
-            xRes=pixel_size,
-            yRes=pixel_size,
-            resampleAlg=self.hex_resampling,
-            format='XYZ',
-        )
-
-        result = gdal.Warp(xyz_file, self.input_path, options=warp_options)
-        
-        if result is None:
-            print(f"  ⚠ No data in region {h0_index}")
-            return None
-        
-        result = None
-        
-        # Check if file exists and has data
-        if not os.path.exists(xyz_file) or os.path.getsize(xyz_file) == 0:
-            print(f"  ⚠ No data in region {h0_index}")
-            return None
-        
-        print(f"  Converting XYZ to H3 cells...")
-        
-        # Read XYZ and convert to H3
-        # Note: Raw DuckDB uses 'delimiter', Ibis uses 'delim'
-        xyz_table = self.con.read_csv(
-            xyz_file,
-            delimiter=' ',
-            columns={'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'FLOAT'}
-        )
-        
-        # Build parent resolution columns
-        h3_col = f"h{self.h3_resolution}"
-        parent_cols = []
-        parent_exprs = []
-        
-        for parent_res in sorted(self.parent_resolutions):
-            if parent_res < self.h3_resolution:
-                col_name = f"h{parent_res}"
-                parent_cols.append(col_name)
-                parent_exprs.append(f"h3_latlng_to_cell(Y, X, {parent_res}) AS {col_name}")
-        
-        parent_sql = ', ' + ', '.join(parent_exprs) if parent_exprs else ''
-        
-        # Add nodata filter to WHERE clause if specified
-        where_clause = f"WHERE Z != {self.nodata_value}" if self.nodata_value is not None else ""
-        
-        # Generate H3 cells with parent resolutions
-        output_path = f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"
-        
-        # Create output directory if it doesn't exist
-        output_dir = os.path.dirname(output_path)
-        os.makedirs(output_dir, exist_ok=True)
-        
-        query = f"""
-            COPY (
-                SELECT 
-                    Z AS {self.value_column},
-                    h3_latlng_to_cell(Y, X, {self.h3_resolution}) AS {h3_col}
-                    {parent_sql}
-                FROM xyz_table
-                {where_clause}
-            ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
-        """
-        
-        self.con.execute(query)
-        
-        # Clean up
-        try:
-            os.remove(xyz_file)
-        except Exception as e:
-            print(f"  Warning: Could not remove temp file: {e}")
-        
-        print(f"  ✓ Wrote: {output_path}")
-        return output_path
+        # Area-weighted aggregation into native H3 cells (issue #84).
+        # The previous gdal.Warp + XYZ + centroid-assignment path emitted
+        # one row per warped pixel and lost mass at hex boundaries; replaced
+        # with exact_extract over per-cell polygons.
+        return self._hex_aggregate_h0(h0_cell)
     
     def process_all_h0_regions(self) -> List[str]:
         """

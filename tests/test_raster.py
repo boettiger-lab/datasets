@@ -270,8 +270,8 @@ class TestRasterProcessor:
         assert processor.h3_resolution == 6
         assert processor.parent_resolutions == [5, 0]
         assert processor.con is not None
-        # Default hex resampling preserves existing behavior for continuous rasters
-        assert processor.hex_resampling == "average"
+        # Default hex resampling is 'mean' for continuous rasters
+        assert processor.hex_resampling == "mean"
 
     @pytest.mark.timeout(60)
     def test_raster_processor_hex_resampling_mode(self, small_raster):
@@ -299,42 +299,6 @@ class TestRasterProcessor:
         assert processor.h3_resolution is not None
         assert 4 <= processor.h3_resolution <= 6
     
-    @pytest.mark.timeout(30)
-    def test_duckdb_csv_reading(self, small_raster, temp_dir):
-        """Test that DuckDB connection uses correct CSV parameter names."""
-        from cng_datasets.raster import RasterProcessor
-        import os
-        
-        # Create a simple XYZ file
-        xyz_file = os.path.join(temp_dir, 'test.xyz')
-        with open(xyz_file, 'w') as f:
-            f.write('-122.5 37.7 100\n')
-            f.write('-122.4 37.8 200\n')
-        
-        # Create a minimal processor using small_raster fixture
-        processor = RasterProcessor(
-            input_path=small_raster,
-            h3_resolution=8,
-        )
-        
-        # Test that read_csv works with 'delimiter' (raw DuckDB parameter)
-        # This would fail if using 'delim' (Ibis parameter)
-        result = processor.con.read_csv(
-            xyz_file,
-            delimiter=' ',
-            columns={'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'FLOAT'}
-        )
-        
-        # Verify we can execute the query
-        df = result.fetchdf()
-        assert len(df) == 2
-        # Check approximate float values
-        assert abs(df['X'].iloc[0] - (-122.5)) < 0.001
-        assert abs(df['X'].iloc[1] - (-122.4)) < 0.001
-        assert abs(df['Z'].iloc[0] - 100.0) < 0.001
-        assert abs(df['Z'].iloc[1] - 200.0) < 0.001
-
-
 class TestRasterToH3Conversion:
     """Test raster to H3 parquet conversion with small data."""
     
@@ -389,12 +353,15 @@ class TestRasterToH3Conversion:
         import geopandas as gpd
         from shapely.geometry import box
         
-        # Create a mock h0 grid file locally that covers our test area
-        # San Francisco area: -122.5 to -122.45, 37.7 to 37.75
+        # Create a mock h0 grid file locally that covers our test area.
+        # Cell selection is now h3_cell_to_children(h0, res), so the h0 id must
+        # be the *real* res-0 cell containing the San Francisco test raster
+        # (577199624117288959 = h3_latlng_to_cell(37.725, -122.475, 0)); the
+        # stored polygon is only used for the overlap-skip.
         h0_geom = box(-123, 37, -122, 38)  # Wider box to ensure coverage
         h0_gdf = gpd.GeoDataFrame({
             'i': [0],
-            'h0': ['8007fffffffffff'],  # Mock h0 cell ID
+            'h0': [577199624117288959],  # real res-0 cell over San Francisco
             'geometry': [h0_geom]
         }, crs='EPSG:4326')
         
@@ -411,25 +378,25 @@ class TestRasterToH3Conversion:
         processor = RasterProcessor(
             input_path=tiny_raster,
             output_parquet_path=output_dir,
-            h3_resolution=7,  # Coarse resolution for speed
+            h3_resolution=4,  # Coarse: children of one h0 = 7^4 cells (fast)
             parent_resolutions=[0],
             h0_grid_path=h0_file,  # Use local h0 grid file
             value_column="test_value",
             nodata_value=999,
         )
-        
+
         # Test the pipeline by processing this h0 region
         result = processor.process_h0_region(0)
-        
+
         # Check the output exists
         if result:
             assert os.path.exists(result)
-            
+
             # Verify parquet structure
             con = processor.con
             df = con.read_parquet(result).fetchdf()
             assert 'test_value' in df.columns
-            assert 'h7' in df.columns
+            assert 'h4' in df.columns
             assert 'h0' in df.columns
             assert len(df) > 0
             
@@ -485,267 +452,6 @@ class TestH3EdgeLengths:
         sig = inspect.signature(detect_optimal_h3_resolution)
         assert 'raster_path' in sig.parameters
         assert sig.return_annotation == int or str(sig.return_annotation) == 'int'
-
-
-class TestH3Downsampling:
-    """Test that gdal.Warp downsamples to H3 resolution."""
-
-    @pytest.mark.timeout(5)
-    def test_h3_res_to_degrees_monotonic(self):
-        """Finer H3 resolutions should yield smaller pixel sizes."""
-        from cng_datasets.raster.cog import _h3_res_to_degrees
-
-        prev = _h3_res_to_degrees(0)
-        for res in range(1, 16):
-            cur = _h3_res_to_degrees(res)
-            assert cur < prev, f"h{res} ({cur}) should be smaller than h{res-1} ({prev})"
-            prev = cur
-
-    @pytest.mark.timeout(5)
-    def test_h3_res_to_degrees_known_values(self):
-        """Spot-check a few resolutions against expected degree values."""
-        from cng_datasets.raster.cog import _h3_res_to_degrees
-
-        # h8 edge ≈ 531 m → ~0.0048°, h10 edge ≈ 76 m → ~0.00068°
-        h8 = _h3_res_to_degrees(8)
-        assert 0.003 < h8 < 0.007, f"h8 pixel size {h8} out of expected range"
-
-        h10 = _h3_res_to_degrees(10)
-        assert 0.0004 < h10 < 0.001, f"h10 pixel size {h10} out of expected range"
-
-    @requires_gdal_array
-    @pytest.mark.timeout(60)
-    def test_warp_downsamples_high_res_raster(self):
-        """A high-res raster warped at h8 should produce far fewer rows than source pixels."""
-        from cng_datasets.raster.cog import _h3_res_to_degrees
-
-        # Create a 200x200 raster at 0.0001° (~11 m) covering a 0.02°×0.02° patch.
-        # Source pixels: 40,000.  At h8 (~0.0048°) the output grid should be
-        # roughly (0.02/0.0048)^2 ≈ 17 pixels — orders of magnitude fewer.
-        width, height = 200, 200
-        xmin, ymin = -105.0, 42.0
-        src_pixel = 0.0001
-
-        with tempfile.TemporaryDirectory() as tmp:
-            src_path = os.path.join(tmp, "hires.tif")
-            driver = gdal.GetDriverByName("GTiff")
-            ds = driver.Create(src_path, width, height, 1, gdal.GDT_Float32)
-            ds.SetGeoTransform([xmin, src_pixel, 0, ymin + height * src_pixel, 0, -src_pixel])
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(4326)
-            ds.SetProjection(srs.ExportToWkt())
-            band = ds.GetRasterBand(1)
-            data = np.arange(width * height, dtype=np.float32).reshape(height, width)
-            band.WriteArray(data)
-            band.FlushCache()
-            ds = None
-
-            # Warp WITH downsampling (h8)
-            pixel_size = _h3_res_to_degrees(8)
-            xyz_ds_path = os.path.join(tmp, "downsampled.xyz")
-            extent = (xmin, ymin, xmin + width * src_pixel, ymin + height * src_pixel)
-            opts = gdal.WarpOptions(
-                dstSRS="EPSG:4326",
-                outputBounds=extent,
-                xRes=pixel_size,
-                yRes=pixel_size,
-                resampleAlg=gdal.GRA_Average,
-                format="XYZ",
-            )
-            result = gdal.Warp(xyz_ds_path, src_path, options=opts)
-            assert result is not None
-            result = None
-
-            # Warp WITHOUT downsampling (native resolution)
-            xyz_native_path = os.path.join(tmp, "native.xyz")
-            opts_native = gdal.WarpOptions(
-                dstSRS="EPSG:4326",
-                outputBounds=extent,
-                format="XYZ",
-            )
-            result = gdal.Warp(xyz_native_path, src_path, options=opts_native)
-            assert result is not None
-            result = None
-
-            ds_size = os.path.getsize(xyz_ds_path)
-            native_size = os.path.getsize(xyz_native_path)
-
-            # The downsampled file should be at least 10× smaller
-            assert ds_size < native_size / 10, (
-                f"Downsampled XYZ ({ds_size} bytes) should be much smaller "
-                f"than native ({native_size} bytes)"
-            )
-
-    @requires_gdal_array
-    @pytest.mark.timeout(60)
-    def test_warp_average_resampling_produces_mean(self):
-        """GRA_Average should produce the mean of source pixels, not nearest."""
-        from cng_datasets.raster.cog import _h3_res_to_degrees
-
-        # 4x4 raster with known values, downsampled to ~1 output pixel.
-        width, height = 4, 4
-        xmin, ymin = -105.0, 42.0
-        src_pixel = 0.001  # each pixel ~0.001°
-
-        with tempfile.TemporaryDirectory() as tmp:
-            src_path = os.path.join(tmp, "uniform.tif")
-            driver = gdal.GetDriverByName("GTiff")
-            ds = driver.Create(src_path, width, height, 1, gdal.GDT_Float32)
-            ds.SetGeoTransform([xmin, src_pixel, 0, ymin + height * src_pixel, 0, -src_pixel])
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(4326)
-            ds.SetProjection(srs.ExportToWkt())
-            # Values: 10, 20, 30, 40 ... average = 25
-            data = np.array([
-                [10, 20, 30, 40],
-                [10, 20, 30, 40],
-                [10, 20, 30, 40],
-                [10, 20, 30, 40],
-            ], dtype=np.float32)
-            ds.GetRasterBand(1).WriteArray(data)
-            ds.GetRasterBand(1).FlushCache()
-            ds = None
-
-            extent = (xmin, ymin, xmin + width * src_pixel, ymin + height * src_pixel)
-            # Use a large pixel size so everything collapses to ~1 pixel
-            pixel_size = 0.005
-            xyz_path = os.path.join(tmp, "avg.xyz")
-            opts = gdal.WarpOptions(
-                dstSRS="EPSG:4326",
-                outputBounds=extent,
-                xRes=pixel_size,
-                yRes=pixel_size,
-                resampleAlg=gdal.GRA_Average,
-                format="XYZ",
-            )
-            result = gdal.Warp(xyz_path, src_path, options=opts)
-            assert result is not None
-            result = None
-
-            # Read the XYZ output — should be 1 (or very few) row(s).
-            # The value should be a blend of the source pixels (10, 20, 30, 40),
-            # not one of those exact values (which would indicate nearest-neighbor).
-            with open(xyz_path) as f:
-                lines = [l.strip() for l in f if l.strip()]
-            assert len(lines) >= 1
-            val = float(lines[0].split()[2])
-            assert val not in (10.0, 20.0, 30.0, 40.0), (
-                f"Got exact source value {val}; expected a blended average"
-            )
-            assert 10.0 <= val <= 40.0, f"Averaged value {val} outside source range"
-
-    @requires_gdal_array
-    @pytest.mark.timeout(60)
-    def test_warp_mode_resampling_preserves_categorical_classes(self):
-        """Regression test for issue #80: mode resampling must not blend class codes.
-
-        GRA_Average on categorical data (e.g. land cover class codes {40, 50}) yields
-        meaningless interpolated values (45) that don't map to any real class. GRA_Mode
-        picks the most frequent source class, preserving categorical semantics.
-        """
-        # Categorical raster: checkerboard of class 40 and class 50. Any output
-        # pixel covering a mixed region will average to 45 under GRA_Average but
-        # must remain in {40, 50} under GRA_Mode.
-        width, height = 8, 8
-        xmin, ymin = -105.0, 42.0
-        src_pixel = 0.001
-
-        with tempfile.TemporaryDirectory() as tmp:
-            src_path = os.path.join(tmp, "categorical.tif")
-            driver = gdal.GetDriverByName("GTiff")
-            ds = driver.Create(src_path, width, height, 1, gdal.GDT_Int16)
-            ds.SetGeoTransform([xmin, src_pixel, 0, ymin + height * src_pixel, 0, -src_pixel])
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(4326)
-            ds.SetProjection(srs.ExportToWkt())
-            # Alternating 40/50 checkerboard
-            data = np.where(
-                (np.indices((height, width)).sum(axis=0) % 2) == 0, 40, 50
-            ).astype(np.int16)
-            ds.GetRasterBand(1).WriteArray(data)
-            ds.GetRasterBand(1).FlushCache()
-            ds = None
-
-            extent = (xmin, ymin, xmin + width * src_pixel, ymin + height * src_pixel)
-            # Downsample by ~4x so each output pixel mixes source pixels
-            pixel_size = 0.004
-
-            def warp(alg, out_name):
-                out_path = os.path.join(tmp, out_name)
-                result = gdal.Warp(out_path, src_path, options=gdal.WarpOptions(
-                    dstSRS="EPSG:4326",
-                    outputBounds=extent,
-                    xRes=pixel_size,
-                    yRes=pixel_size,
-                    resampleAlg=alg,
-                    format="XYZ",
-                ))
-                assert result is not None
-                result = None
-                with open(out_path) as f:
-                    return [float(l.split()[2]) for l in f if l.strip()]
-
-            avg_vals = warp("average", "avg.xyz")
-            mode_vals = warp("mode", "mode.xyz")
-
-            # Average produces the bug: 45 appears
-            assert any(abs(v - 45.0) < 0.5 for v in avg_vals), (
-                "Expected averaging to produce invalid class code ~45 from {40,50}"
-            )
-            # Mode preserves canonical class codes only
-            for v in mode_vals:
-                assert v in (40.0, 50.0), (
-                    f"Mode resampling produced non-canonical class {v}; "
-                    f"must be one of {{40, 50}}"
-                )
-
-    @requires_gdal_array
-    @pytest.mark.timeout(60)
-    def test_no_downsample_when_source_coarser(self):
-        """When source pixels are coarser than H3 cell size, output ≈ source size."""
-        from cng_datasets.raster.cog import _h3_res_to_degrees
-
-        # 10x10 raster at 0.01° (~1 km) pixels, warp at h10 (~0.0007°).
-        # xRes < source pixel size, so GDAL upsamples — output should be
-        # larger than input (more rows), confirming no data is lost.
-        width, height = 10, 10
-        xmin, ymin = -105.0, 42.0
-        src_pixel = 0.01
-
-        with tempfile.TemporaryDirectory() as tmp:
-            src_path = os.path.join(tmp, "coarse.tif")
-            driver = gdal.GetDriverByName("GTiff")
-            ds = driver.Create(src_path, width, height, 1, gdal.GDT_Float32)
-            ds.SetGeoTransform([xmin, src_pixel, 0, ymin + height * src_pixel, 0, -src_pixel])
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(4326)
-            ds.SetProjection(srs.ExportToWkt())
-            data = np.ones((height, width), dtype=np.float32) * 42.0
-            ds.GetRasterBand(1).WriteArray(data)
-            ds.GetRasterBand(1).FlushCache()
-            ds = None
-
-            pixel_size = _h3_res_to_degrees(10)  # ~0.0007°, finer than 0.01°
-            xyz_path = os.path.join(tmp, "coarse_out.xyz")
-            extent = (xmin, ymin, xmin + width * src_pixel, ymin + height * src_pixel)
-            opts = gdal.WarpOptions(
-                dstSRS="EPSG:4326",
-                outputBounds=extent,
-                xRes=pixel_size,
-                yRes=pixel_size,
-                resampleAlg=gdal.GRA_Average,
-                format="XYZ",
-            )
-            result = gdal.Warp(xyz_path, src_path, options=opts)
-            assert result is not None
-            result = None
-
-            with open(xyz_path) as f:
-                lines = [l.strip() for l in f if l.strip()]
-            # Should produce MORE rows than source pixels (upsampled)
-            assert len(lines) > width * height, (
-                f"Expected more rows than source ({width*height}), got {len(lines)}"
-            )
 
 
 @requires_gdal_array
@@ -893,6 +599,366 @@ class TestIntegration:
             
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestH3MassConservation:
+    """Issue #84: SUM(value) across output parquet must equal the source raster
+    total, within rounding. Pre-fix, the centroid-assignment of warped pixels
+    produces a ~50% shortfall on this fixture."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        """Local temp directory — the fixture in TestRasterProcessor is class-scoped."""
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def ghs_pop_clip(self):
+        """Path to the committed clipped ghs-pop-2020 tile."""
+        path = Path(__file__).parent / "fixtures" / "ghs_pop_clip.tif"
+        if not path.exists():
+            pytest.skip(f"Fixture not found: {path}")
+        return str(path)
+
+    @requires_gdal
+    @pytest.mark.timeout(600)
+    def test_h3_aggregation_conserves_mass(self, ghs_pop_clip, temp_dir):
+        """SUM(value) over the output parquet equals the source raster SUM
+        within 1%. Pre-fix this fails by ~50% for ghs-pop-2020.
+
+        Only iterates the h0 cells that overlap the fixture (rather than
+        all 122) so the test finishes in seconds instead of minutes.
+        """
+        import rasterio
+        import duckdb
+        from cng_datasets.raster import RasterProcessor
+
+        # Source truth: sum of all valid pixels in the raster.
+        with rasterio.open(ghs_pop_clip) as src:
+            arr = src.read(1, masked=True)
+            raster_sum = float(arr.sum())
+            nodata = src.nodata
+            src_bounds = src.bounds  # (left, bottom, right, top)
+
+        assert raster_sum > 0, "Fixture must contain populated pixels"
+
+        # Run the pipeline at h7 — the regression (corner-effect mass loss)
+        # surfaces at every resolution, but at h9 the polyfill (~40M cells/h0)
+        # OOMs the 7 GiB GitHub Actions runner. h7 keeps it under ~1 M cells.
+        output_dir = os.path.join(temp_dir, "ghs_pop_hex")
+        processor = RasterProcessor(
+            input_path=ghs_pop_clip,
+            output_parquet_path=output_dir,
+            h3_resolution=7,
+            parent_resolutions=[0, 5, 6],
+            value_column="population",
+            hex_resampling="sum",
+            nodata_value=nodata,
+        )
+
+        # Find only the h0 indices whose bounding box overlaps the fixture
+        # extent — the global iteration of 122 cells dominates wall time
+        # otherwise.
+        overlapping_h0 = processor.con.execute(
+            f"""
+            SELECT i FROM read_parquet('{processor.h0_grid_path}')
+            WHERE ST_Intersects(
+              geom,
+              ST_MakeEnvelope({src_bounds.left}, {src_bounds.bottom},
+                              {src_bounds.right}, {src_bounds.top})
+            )
+            """
+        ).fetchdf()["i"].tolist()
+
+        outputs = []
+        for idx in overlapping_h0:
+            out = processor.process_h0_region(idx)
+            if out:
+                outputs.append(out)
+        assert len(outputs) > 0, "Pipeline produced no parquet output"
+
+        # Read back: sum across all h0 partitions.
+        con = duckdb.connect()
+        parquet_glob = os.path.join(output_dir, "h0=*/data_0.parquet")
+        parquet_sum = con.execute(
+            f"SELECT SUM(population) FROM read_parquet('{parquet_glob}')"
+        ).fetchone()[0]
+
+        # Schema invariant: one row per h7 cell (no duplicates).
+        duplicate_count = con.execute(f"""
+            SELECT COUNT(*) FROM (
+                SELECT h7 FROM read_parquet('{parquet_glob}')
+                GROUP BY h7 HAVING COUNT(*) > 1
+            )
+        """).fetchone()[0]
+        assert duplicate_count == 0, (
+            f"Expected one row per h7 cell, found {duplicate_count} duplicate h7 cells. "
+            "Stage 2 must aggregate, not emit per-warped-pixel rows."
+        )
+
+        # Mass conservation: total within 1% of raster truth.
+        relative_error = abs(parquet_sum - raster_sum) / raster_sum
+        assert relative_error < 0.01, (
+            f"Mass conservation violated: raster_sum={raster_sum:.2f}, "
+            f"parquet_sum={parquet_sum:.2f}, relative_error={relative_error:.4f}. "
+            f"Issue #84 regression."
+        )
+
+    @requires_gdal
+    def test_hex_resampling_rejects_gdal_values(self, ghs_pop_clip, temp_dir):
+        """Old GDAL-Warp resampling values must error with a clear message."""
+        from cng_datasets.raster import RasterProcessor
+
+        with pytest.raises(ValueError, match="hex_resampling must be one of"):
+            RasterProcessor(
+                input_path=ghs_pop_clip,
+                output_parquet_path=os.path.join(temp_dir, "should_not_run"),
+                h3_resolution=9,
+                hex_resampling="average",
+            )
+
+
+class TestChildrenCellSelection:
+    """Issue #88: each h0 partition's native cells must be the exact H3
+    children of that h0 (h3_cell_to_children), giving a globally exact,
+    gap-free, overlap-free partition. The previous polygon polyfill yields
+    strays (cells whose true res-0 parent is a different h0) and, for the
+    antimeridian h0s whose stored polygon spans -178..+177 planar, misses
+    children entirely (one h0 polyfills to zero cells)."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def tiny_raster(self, temp_dir):
+        """A 5x5 raster; only needed so RasterProcessor can initialise."""
+        from osgeo import gdal, osr
+        path = os.path.join(temp_dir, "tiny.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 5, 5, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([-122.5, 0.01, 0, 37.75, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((5, 5), dtype=np.int16))
+        ds.FlushCache(); ds = None
+        return path
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_native_cells_are_exact_children_of_h0(self, tiny_raster):
+        from cng_datasets.raster import RasterProcessor
+
+        # 577375545977733119 is an antimeridian h0 (stored polygon spans
+        # -175.6..+177.8 planar) and a non-pentagon at res 0; its polyfill
+        # returns zero cells at every resolution.
+        h0 = 577375545977733119
+        proc = RasterProcessor(input_path=tiny_raster, h3_resolution=3)
+
+        # Cell selection depends only on the h0 id (h3_cell_to_children),
+        # never on the stored polygon.
+        df = proc._native_cells_for_h0(h0)
+        cells = [int(c) for c in df["h3"].tolist()]
+        assert len(cells) > 0, "antimeridian h0 produced no cells"
+
+        n_total, n_strays = proc.con.execute(
+            "SELECT COUNT(*), "
+            "COUNT(*) FILTER (WHERE h3_cell_to_parent(c, 0) <> ?::ubigint) "
+            "FROM (SELECT UNNEST(?::ubigint[]) AS c)",
+            [h0, cells],
+        ).fetchone()
+        assert n_strays == 0, f"{n_strays} cells are not children of h0 {h0}"
+
+        expected = proc.con.execute(
+            "SELECT len(h3_cell_to_children(?::ubigint, 3))", [h0]
+        ).fetchone()[0]
+        assert n_total == expected, f"expected {expected} children, got {n_total}"
+
+
+class TestOverlapSkipAntimeridian:
+    """Issue #88 follow-up: the overlap-skip in process_h0_region must use each
+    h0's *true* footprint, not its stored planar polygon. Antimeridian h0s are
+    stored as polygons spanning ~-178..+177, whose envelope covers the globe —
+    so without unwrapping, a raster anywhere on Earth falsely "overlaps" them
+    and they are needlessly processed (millions of children, all empty)."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _raster(self, temp_dir, name, xmin, ymin, xmax, ymax):
+        from osgeo import gdal, osr
+        path = os.path.join(temp_dir, name)
+        nx = max(1, int(round(xmax - xmin)))
+        ny = max(1, int(round(ymax - ymin)))
+        ds = gdal.GetDriverByName("GTiff").Create(path, nx, ny, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([xmin, (xmax - xmin) / nx, 0, ymax, 0, -(ymax - ymin) / ny])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((ny, nx), dtype=np.float32))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _grid(self, temp_dir, wkt):
+        import geopandas as gpd
+        from shapely import wkt as shapely_wkt
+        path = os.path.join(temp_dir, "grid.parquet")
+        gpd.GeoDataFrame(
+            {"i": [0], "h0": [579768083279773695],
+             "geometry": [shapely_wkt.loads(wkt)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(path)
+        return path
+
+    # A synthetic antimeridian h0 polygon: latitude band -45..-22 (matching the
+    # real h0 579768083279773695), drawn the planar "long way" so its bbox spans
+    # 355 deg of longitude — exactly the wrap that breaks the envelope check.
+    WRAP_WKT = "POLYGON((177.5 -45, -178 -45, -178 -22, 177.5 -22, 177.5 -45))"
+
+    @requires_gdal
+    @pytest.mark.timeout(60)
+    def test_antimeridian_h0_skipped_when_raster_far_from_seam(self, temp_dir, monkeypatch):
+        from cng_datasets.raster import RasterProcessor
+        # Decoy raster at lng -1..1 (nowhere near +/-180), same latitude band.
+        raster = self._raster(temp_dir, "decoy.tif", -1.0, -50.0, 1.0, -20.0)
+        proc = RasterProcessor(
+            input_path=raster, h3_resolution=3,
+            h0_grid_path=self._grid(temp_dir, self.WRAP_WKT),
+        )
+        called = []
+        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0: called.append(h0))
+        result = proc.process_h0_region(0)
+        assert result is None
+        assert called == [], "antimeridian h0 should be skipped for a far raster"
+
+    @requires_gdal
+    @pytest.mark.timeout(60)
+    def test_antimeridian_h0_processed_when_raster_on_seam(self, temp_dir, monkeypatch):
+        from cng_datasets.raster import RasterProcessor
+        # Raster sitting on the +180 side of the seam, within the h0 lat band:
+        # the fix must NOT skip this one (no false negatives / data loss).
+        raster = self._raster(temp_dir, "seam.tif", 178.5, -40.0, 180.0, -30.0)
+        proc = RasterProcessor(
+            input_path=raster, h3_resolution=3,
+            h0_grid_path=self._grid(temp_dir, self.WRAP_WKT),
+        )
+        called = []
+        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0: called.append(h0))
+        proc.process_h0_region(0)
+        assert called, "antimeridian h0 overlapping the seam must be processed"
+
+
+class TestSeamIntegration:
+    """Issue #88(B), end-to-end: processing an antimeridian h0 over a uniform
+    raster must not produce outlier cells. Before the per-cell antimeridian
+    split is wired into the exact_extract worker, the wrapping seam children
+    integrate a 360-deg ribbon of the raster and dwarf every other cell."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def ones_raster(self, temp_dir):
+        """A global all-ones raster at 1-degree pitch."""
+        from osgeo import gdal, osr
+        path = os.path.join(temp_dir, "ones.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 360, 180, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-180.0, 1.0, 0, 90.0, 0, -1.0])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((180, 360), dtype=np.float32))
+        ds.FlushCache(); ds = None
+        return path
+
+    @requires_gdal
+    @pytest.mark.timeout(180)
+    def test_antimeridian_h0_has_no_outlier_cells(self, ones_raster, temp_dir):
+        from cng_datasets.raster import RasterProcessor
+        import geopandas as gpd
+        from shapely.geometry import box
+        import duckdb
+
+        # 579768083279773695 is an antimeridian h0; ~7% of its children at any
+        # resolution wrap +/-180. Geometry is only used for the overlap-skip.
+        grid = os.path.join(temp_dir, "grid.parquet")
+        gpd.GeoDataFrame(
+            {"i": [0], "h0": [579768083279773695], "geometry": [box(-180, -90, 180, 90)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(grid)
+
+        out_dir = os.path.join(temp_dir, "hex")
+        proc = RasterProcessor(
+            input_path=ones_raster,
+            output_parquet_path=out_dir,
+            h3_resolution=3,
+            parent_resolutions=[0],
+            h0_grid_path=grid,
+            value_column="v",
+            hex_resampling="sum",
+        )
+        result = proc.process_h0_region(0)
+        assert result, "expected output for a global raster"
+
+        con = duckdb.connect()
+        vals = con.execute(
+            f"SELECT v FROM read_parquet('{result}') ORDER BY v"
+        ).fetchdf()["v"].tolist()
+        assert len(vals) > 0
+        # All cells at one resolution have ~equal area, so over a uniform
+        # raster their summed coverage is comparable. A wrapping seam cell that
+        # integrates a 360-deg ribbon would be orders of magnitude larger.
+        median = vals[len(vals) // 2]
+        assert max(vals) < 5 * median, (
+            f"outlier cell: max={max(vals):.3f} median={median:.3f} — a seam "
+            "cell is integrating a 360-deg ribbon (issue #88 part B)."
+        )
+
+
+class TestAntimeridianSplit:
+    """Issue #88(B): h3_cell_to_boundary_wkt returns, for a cell touching
+    +/-180, a planar polygon whose vertices on each side are joined the long
+    way around, so its bounding box spans ~360 deg of longitude. Passed to
+    exact_extract unchanged, the cell integrates the entire latitude band.
+    _split_antimeridian must cut such a polygon at +/-180 into small parts."""
+
+    def test_splits_wrapping_seam_cell(self):
+        from cng_datasets.raster.cog import _split_antimeridian
+        from shapely import wkt as shapely_wkt
+
+        # Real boundary of h9 619238790872170495 (lat -6.89, lng ~ +/-180).
+        seam = ("POLYGON ((-179.999972 -6.895538, -179.999137 -6.894068, "
+                "-179.999923 -6.892804, 179.998456 -6.893010, "
+                "179.997621 -6.894481, 179.998407 -6.895745, "
+                "-179.999972 -6.895538))")
+        geom = shapely_wkt.loads(seam)
+        assert geom.bounds[2] - geom.bounds[0] > 180, "fixture should wrap"
+
+        fixed = _split_antimeridian(geom)
+
+        parts = list(fixed.geoms) if fixed.geom_type == "MultiPolygon" else [fixed]
+        for p in parts:
+            assert p.bounds[2] - p.bounds[0] < 1.0, "a part still wraps"
+            assert p.bounds[0] >= -180.0001 and p.bounds[2] <= 180.0001
+        # The true cell is ~0.1 km^2 (~1e-5 deg^2), nowhere near the ~1 deg^2
+        # area of the unsplit 360-deg ribbon.
+        assert fixed.area < 1e-3, f"split area {fixed.area} too large"
+
+    def test_leaves_normal_cell_unchanged(self):
+        from cng_datasets.raster.cog import _split_antimeridian
+        from shapely import wkt as shapely_wkt
+
+        normal = ("POLYGON ((10.0 6.0, 10.001 6.0, 10.0015 6.001, "
+                  "10.001 6.002, 10.0 6.002, 9.9995 6.001, 10.0 6.0))")
+        geom = shapely_wkt.loads(normal)
+        out = _split_antimeridian(geom)
+        assert out.equals(geom)
 
 
 if __name__ == "__main__":

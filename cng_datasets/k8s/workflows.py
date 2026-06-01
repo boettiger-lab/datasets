@@ -621,7 +621,7 @@ def generate_raster_workflow(
     parent_resolutions: Optional[List[int]] = None,
     value_column: str = "value",
     nodata_value: Optional[float] = None,
-    hex_resampling: str = "average",
+    hex_resampling: str = "mean",
     hex_memory: str = "32Gi",
     max_parallelism: int = 61,
     hex_storage: str = "20Gi",
@@ -669,8 +669,9 @@ def generate_raster_workflow(
         parent_resolutions: List of parent H3 resolutions (default: [0])
         value_column: Name for raster value column (default: "value")
         nodata_value: NoData value to exclude (optional)
-        hex_resampling: Resampling method for H3 hex downsampling (default: "average").
-            Use "mode" for categorical rasters (land cover, classifications) to
+        hex_resampling: Area-weighted reducer for H3 aggregation (default: "mean").
+            Use "sum" for counts/stocks (population, carbon), "mean" for
+            intensities (NDVI, indices), "mode" for categorical (land cover) to
             preserve class codes — averaging yields meaningless non-canonical values.
         hex_memory: Memory per hex pod (default: "32Gi")
         max_parallelism: Max parallel hex pods (default: 61)
@@ -890,7 +891,7 @@ def _generate_raster_hex_job(
     manager, dataset_name, source_url, bucket, output_path, git_repo,
     h3_resolution, parent_resolutions, value_column, nodata_value,
     hex_memory, max_parallelism, hex_storage="20Gi",
-    hex_resampling: str = "average", config: ClusterConfig = None,
+    hex_resampling: str = "mean", config: ClusterConfig = None,
 ):
     """Generate raster H3 hex tiling job."""
     if config is None:

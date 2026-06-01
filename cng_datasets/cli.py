@@ -5,6 +5,8 @@ Command-line interface for cng-datasets toolkit.
 import argparse
 import sys
 
+from cng_datasets.raster.cog import VALID_HEX_REDUCERS
+
 
 def main():
     """Main CLI entry point."""
@@ -41,15 +43,26 @@ def main():
     raster_parser.add_argument("--compression", default="deflate", help="COG compression (deflate, lzw, zstd)")
     raster_parser.add_argument("--blocksize", type=int, default=512, help="COG block size (default: 512)")
     raster_parser.add_argument("--resampling", default="nearest", help="Resampling method for COG creation (default: nearest)")
-    raster_parser.add_argument("--hex-resampling", default="average",
-                               help="Resampling method for H3 hex downsampling step (default: average). "
-                                    "Use 'mode' for categorical rasters (land cover, classifications); "
-                                    "averaging produces meaningless non-canonical class codes.")
+    raster_parser.add_argument("--hex-resampling", default="mean",
+                               choices=VALID_HEX_REDUCERS,
+                               help="Area-weighted reducer for aggregating source pixels into each "
+                                    "H3 cell. 'sum' for counts/stocks (population, carbon); 'mean' "
+                                    "for intensities (NDVI, indices); 'mode' for categorical "
+                                    "(land cover). Default: mean.")
     raster_parser.add_argument("--target-crs", default="EPSG:4326", help="Output CRS for mosaic (default: EPSG:4326)")
     raster_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in target CRS (mosaic only)")
     raster_parser.add_argument("--target-resolution", type=float, help="Output pixel size in target CRS units (mosaic only)")
     raster_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (mosaic only)")
-    
+    raster_parser.add_argument("--local-cache-dir", default="/tmp/cng-raster-cache",
+                               help="Directory to copy remote input rasters into before processing "
+                                    "(default: /tmp/cng-raster-cache). Reading a remote COG via "
+                                    "/vsis3/ pays per-pixel HTTP latency that dominates wall time "
+                                    "on dense h0 cells — local-cache gives ~12x speedup at the "
+                                    "cost of one upfront copy. Use --no-local-cache to stream.")
+    raster_parser.add_argument("--no-local-cache", dest="local_cache_dir", action="store_const",
+                               const=None, help="Stream the input via /vsis3/ instead of "
+                                                "copying to local disk first.")
+
     # Repartition command
     repartition_parser = subparsers.add_parser("repartition", help="Repartition chunks by h0")
     repartition_parser.add_argument("--chunks-dir", required=True, help="Input chunks directory URL")
@@ -108,9 +121,11 @@ def main():
     raster_workflow_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
     raster_workflow_parser.add_argument("--value-column", default="value", help="Name for raster value column")
     raster_workflow_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
-    raster_workflow_parser.add_argument("--hex-resampling", default="average",
-                                        help="Resampling method for H3 hex downsampling step (default: average). "
-                                             "Use 'mode' for categorical rasters (land cover, classifications).")
+    raster_workflow_parser.add_argument("--hex-resampling", default="mean",
+                                        choices=VALID_HEX_REDUCERS,
+                                        help="Area-weighted reducer for H3 aggregation. 'sum' for "
+                                             "counts (population, carbon); 'mean' for intensities; "
+                                             "'mode' for categorical. Default: mean.")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
     raster_workflow_parser.add_argument("--hex-storage", type=str, default="20Gi", help="Ephemeral storage request/limit per hex job pod (default: 20Gi)")
@@ -235,6 +250,7 @@ def _dispatch(args):
                 target_extent=target_extent,
                 target_resolution=getattr(args, 'target_resolution', None),
                 band=getattr(args, 'band', None),
+                local_cache_dir=getattr(args, 'local_cache_dir', '/tmp/cng-raster-cache'),
             )
 
             if args.output_cog:

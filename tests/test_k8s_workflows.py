@@ -631,7 +631,7 @@ class TestRasterWorkflowGeneration:
 
     @pytest.mark.timeout(5)
     def test_hex_resampling_default_in_hex_command(self):
-        """Hex job command should include --hex-resampling with the default 'average'."""
+        """Hex job command should include --hex-resampling with the default 'mean'."""
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_raster_workflow(
                 dataset_name="test-raster",
@@ -641,7 +641,7 @@ class TestRasterWorkflowGeneration:
             )
             hex_job = self._load_yaml(Path(tmpdir) / "test-raster-hex.yaml")
             command_str = str(hex_job["spec"]["template"]["spec"]["containers"][0]["command"])
-            assert "--hex-resampling average" in command_str
+            assert "--hex-resampling mean" in command_str
 
     @pytest.mark.timeout(5)
     def test_hex_resampling_mode_propagates_to_hex_command(self):

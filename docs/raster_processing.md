@@ -100,7 +100,8 @@ The processor provides helpful feedback when you choose a resolution different f
 - `nodata_value` (float, optional): NoData value to exclude
 - `compression` (str): COG compression method (default: "zstd")
 - `blocksize` (int): COG tile size (default: 512)
-- `resampling` (str): Resampling method (default: "nearest")
+- `resampling` (str): Resampling method for COG (default: "nearest")
+- `hex_resampling` (str): Aggregation method for H3 cells (default: "mean"). Valid values: `sum`, `mean`, `mode`
 
 ## Cloud-Optimized GeoTIFF (COG)
 
@@ -220,11 +221,13 @@ s3://bucket/dataset/
     ...
 ```
 
-Each parquet file contains:
+Each parquet file contains one row per native H3 cell:
 - `h3_cell`: H3 cell ID at specified resolution
-- `value`: Raster value (customizable column name)
+- `value`: Aggregated raster value using area-weighted aggregation (customizable column name)
 - Parent H3 cells if `parent_resolutions` specified
 - Excludes nodata values if specified
+
+Aggregation uses exact-area weighting (via `exactextract`) to account for partially-covered H3 cells, ensuring mass-conserving aggregation across the raster boundary.
 
 ## Examples
 

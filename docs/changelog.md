@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Raster → H3 pipeline now produces one row per native H3 cell with mass-conserving area-weighted aggregation, fixing ~50% mass loss observed on `ghs-pop-2020` and `irrecoverable-carbon-2024` (#84). Implementation uses `exactextract` for precise pixel-to-cell overlap accounting.
+
+### Breaking
+- `--hex-resampling` now accepts only `sum`, `mean`, or `mode` (was: any GDAL Warp resampling string). Default changed from `average` to `mean`. Migration: replace `average` with `mean` in existing scripts. Categorical rasters still use `mode`. New: `sum` for count/stock data. Rasters processed before this change have undercounted totals and should be reprocessed.
+
 ### Added
 - **Multi-cluster configuration** (`ClusterConfig`): all NRP-specific values in generated Kubernetes job specs are now overridable via CLI flags (`--s3-endpoint`, `--s3-public-endpoint`, `--s3-secret-name`, `--rclone-secret-name`, `--rclone-remote`, `--priority-class`, `--node-affinity`) and matching keyword arguments on `generate_dataset_workflow` / `generate_raster_workflow`. All defaults equal the current hardcoded NRP values — existing commands produce identical YAML without changes.
 - **YAML cluster profiles** (`--profile`): save cluster settings in a YAML file and reuse them across datasets. Profile resolution: explicit file path → `~/.config/cng-datasets/profiles/<name>.yaml` → built-in package profiles. The built-in `nrp` profile captures the NRP Nautilus defaults. Explicit CLI flags override individual profile values.

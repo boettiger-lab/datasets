@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     python3-dev \
     python3-numpy \
+    libgeos-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Build tippecanoe 2.79.0 from source
@@ -46,9 +47,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Also install pip so users can pip install instead of uv pip install.
 RUN uv pip install "numpy<2" pip
 
-# Install the package with uv for fast resolution (GDAL already available from system)
-# Include pytest and pytest-timeout so tests can run inside the container without extra installs
-RUN uv pip install -e "." pytest pytest-timeout pytest-mock
+# Install the package with uv for fast resolution (GDAL already available from system).
+# [raster] extras pulls in exactextract and rasterio for the raster→H3 pipeline (#84).
+# Include pytest and pytest-timeout so tests can run inside the container without extra installs.
+RUN uv pip install -e ".[raster]" pytest pytest-timeout pytest-mock
 
 # Point PROJ CLI tools to the highest-versioned proj.db on the system.
 # The gdal:ubuntu-full image ships GDAL 3.13 with a compatible PROJ (requires
