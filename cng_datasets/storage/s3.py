@@ -5,16 +5,15 @@ Tools for creating, configuring, and managing S3 buckets for
 public dataset distribution.
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, List
 import json
 import os
-import duckdb
 
 
 def configure_s3_credentials(con) -> None:
     """
     Configure S3 credentials for DuckDB using environment variables.
-    
+
     Args:
         con: DuckDB connection (raw or ibis) to configure
     """
@@ -28,26 +27,26 @@ def configure_s3_credentials(con) -> None:
         # Raw DuckDB connection
         con.execute("INSTALL httpfs")
         con.execute("LOAD httpfs")
-    
+
     # Enable large buffer size for complex geometries
     if hasattr(con, 'raw_sql'):
         con.raw_sql("SET arrow_large_buffer_size=true")
     else:
         con.execute("SET arrow_large_buffer_size=true")
-    
+
     key = os.getenv("AWS_ACCESS_KEY_ID", "")
     secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     endpoint = os.getenv("AWS_S3_ENDPOINT", "s3-west.nrp-nautilus.io")
     region = os.getenv("AWS_REGION", "us-east-1")
     use_ssl = os.getenv("AWS_HTTPS", "TRUE")
     url_style = os.getenv("AWS_VIRTUAL_HOSTING", "FALSE")
-    
+
     # Convert TRUE/FALSE strings to path/vhost
     if url_style.upper() == "FALSE":
         url_style = "path"
     else:
         url_style = "vhost"
-    
+
     # Always create secret, even for anonymous/public access (empty key/secret)
     # USE_SSL must be a string, not boolean!
     query = f"""
@@ -70,10 +69,10 @@ def configure_s3_credentials(con) -> None:
 class S3Manager:
     """
     Manage S3 buckets for dataset storage.
-    
+
     Handles bucket creation, CORS configuration, and public access setup.
     """
-    
+
     def __init__(
         self,
         access_key: Optional[str] = None,
@@ -83,7 +82,7 @@ class S3Manager:
     ):
         """
         Initialize S3 manager.
-        
+
         Args:
             access_key: AWS access key ID
             secret_key: AWS secret access key
@@ -95,7 +94,7 @@ class S3Manager:
         self.endpoint_url = endpoint_url
         self.region = region
         self._client = None
-    
+
     @property
     def client(self):
         """Get or create boto3 S3 client."""
@@ -109,21 +108,21 @@ class S3Manager:
                 region_name=self.region,
             )
         return self._client
-    
+
     def create_bucket(self, bucket_name: str, public: bool = False) -> str:
         """
         Create an S3 bucket.
-        
+
         Args:
             bucket_name: Name for the bucket
             public: Whether to configure for public read access
-            
+
         Returns:
             Bucket name
         """
         # Placeholder - to be implemented with boto3
         raise NotImplementedError("Bucket creation to be implemented")
-    
+
     def configure_cors(
         self,
         bucket_name: str,
@@ -132,7 +131,7 @@ class S3Manager:
     ):
         """
         Configure CORS for a bucket.
-        
+
         Args:
             bucket_name: Bucket name
             allowed_origins: List of allowed origins (default: ["*"])
@@ -142,7 +141,7 @@ class S3Manager:
             allowed_origins = ["*"]
         if allowed_methods is None:
             allowed_methods = ["GET", "HEAD"]
-        
+
         cors_configuration = {
             'CORSRules': [{
                 'AllowedOrigins': allowed_origins,
@@ -151,17 +150,17 @@ class S3Manager:
                 'MaxAgeSeconds': 3600
             }]
         }
-        
+
         self.client.put_bucket_cors(
             Bucket=bucket_name,
             CORSConfiguration=cors_configuration
         )
         print(f"CORS configured for bucket: {bucket_name}")
-    
+
     def set_public_read(self, bucket_name: str):
         """
         Configure bucket for public read access.
-        
+
         Args:
             bucket_name: Bucket name
         """
@@ -175,7 +174,7 @@ class S3Manager:
                 "Resource": f"arn:aws:s3:::{bucket_name}/*"
             }]
         }
-        
+
         self.client.put_bucket_policy(
             Bucket=bucket_name,
             Policy=json.dumps(policy)
@@ -190,7 +189,7 @@ def configure_bucket_cors(
 ):
     """
     Convenience function to configure CORS for a bucket.
-    
+
     Args:
         bucket_name: Bucket name
         endpoint_url: S3-compatible endpoint URL
@@ -207,12 +206,12 @@ def create_public_bucket(
 ) -> str:
     """
     Create a publicly accessible S3 bucket.
-    
+
     Args:
         bucket_name: Name for the bucket
         endpoint_url: S3-compatible endpoint URL
         **kwargs: Additional arguments passed to S3Manager
-        
+
     Returns:
         Bucket name
     """

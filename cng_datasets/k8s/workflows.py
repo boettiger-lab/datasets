@@ -5,7 +5,7 @@ Functions for creating complete dataset processing workflows with
 multiple coordinated Kubernetes jobs.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 import math
@@ -187,33 +187,33 @@ def _count_source_features(source_urls: Union[str, List[str]], layer: str = None
     """
     Count features in source file(s) (shapefile, geopackage, etc.) using GDAL with vsicurl.
     For .zip files, it downloads, extracts, and counts features in all shapefiles.
-    
+
     Args:
         source_urls: HTTP(S) or S3 URL(s) to source vector file(s). Can be a single string or list.
         layer: Optional layer name for multi-layer sources (GDB, GPKG)
-        
+
     Returns:
         Total number of features across all source file(s)
     """
     # Normalize to list
     if isinstance(source_urls, str):
         source_urls = [source_urls]
-    
+
     total_count = 0
     for source_url in source_urls:
         total_count += _count_single_source(source_url, layer)
-    
+
     return total_count
 
 
 def _count_single_source(source_url: str, layer: str = None) -> int:
     """
     Count features in a single source file.
-    
+
     Args:
         source_url: HTTP(S) or S3 URL to source vector file
         layer: Optional layer name for multi-layer sources (GDB, GPKG)
-        
+
     Returns:
         Number of features in the source file
     """
@@ -223,38 +223,38 @@ def _count_single_source(source_url: str, layer: str = None) -> int:
     import shutil
     import zipfile
     from urllib.request import urlretrieve
-    
+
     # Check for zip file
     if source_url.lower().endswith('.zip'):
         try:
-            print(f"  Detected zip file, downloading to temporary directory...")
+            print("  Detected zip file, downloading to temporary directory...")
             temp_dir = tempfile.mkdtemp()
             local_zip = os.path.join(temp_dir, "download.zip")
-            
+
             # Handle S3 vs HTTP
             download_url = source_url
             if source_url.startswith('s3://'):
                  if "nrp-nautilus.io" in source_url or "public-iucn" in source_url:
                      path = source_url.replace("s3://", "")
                      download_url = f"https://s3-west.nrp-nautilus.io/{path}"
-            
+
             # Strip vsicurl if present (legacy compat)
             if download_url.startswith('/vsicurl/'):
                 download_url = download_url.replace('/vsicurl/', '')
-            
+
             if download_url.startswith('http://') or download_url.startswith('https://') or download_url.startswith('ftp://'):
                 urlretrieve(download_url, local_zip)
             elif os.path.exists(download_url):
                 shutil.copy(download_url, local_zip)
             else:
-                 # Try adding file:// scheme if it looks like an absolute path but failed above checks? 
+                 # Try adding file:// scheme if it looks like an absolute path but failed above checks?
                  # Or just let urlretrieve try if it has a scheme.
                  urlretrieve(download_url, local_zip)
 
-            
+
             with zipfile.ZipFile(local_zip, 'r') as zip_ref:
                 zip_ref.extractall(temp_dir)
-                
+
             # Find all shapefiles
             total_count = 0
             shapefiles = []
@@ -262,12 +262,12 @@ def _count_single_source(source_url: str, layer: str = None) -> int:
                 for file in files:
                     if file.lower().endswith(".shp"):
                         shapefiles.append(os.path.join(root, file))
-            
+
             if not shapefiles:
                 raise ValueError("No shapefiles found in zip archive")
-                
+
             print(f"  Found {len(shapefiles)} shapefiles, counting features...")
-            
+
             for shp in shapefiles:
                 result = subprocess.run(
                     ['ogrinfo', '-so', '-al', shp],
@@ -275,13 +275,13 @@ def _count_single_source(source_url: str, layer: str = None) -> int:
                     text=True,
                     check=True
                 )
-                
+
                 for line in result.stdout.split('\n'):
                     if 'Feature Count:' in line:
                         count = int(line.split(':')[1].strip())
                         total_count += count
                         break
-            
+
             return total_count
 
         finally:
@@ -292,13 +292,13 @@ def _count_single_source(source_url: str, layer: str = None) -> int:
     if source_url.startswith('s3://'):
         path = source_url.replace('s3://', '')
         source_url = f"https://s3-west.nrp-nautilus.io/{path}"
-    
+
     # Use vsicurl prefix for remote files
     if source_url.startswith('http://') or source_url.startswith('https://'):
         gdal_path = f"/vsicurl/{source_url}"
     else:
         gdal_path = source_url
-    
+
     # Use ogrinfo to count features
     if layer:
         # Query specific layer for multi-layer sources (GDB, GPKG)
@@ -318,13 +318,13 @@ def _count_single_source(source_url: str, layer: str = None) -> int:
             check=True,
             timeout=30,
         )
-    
+
     # Parse output to find "Feature Count: XXXXX"
     for line in result.stdout.split('\n'):
         if 'Feature Count:' in line:
             count_str = line.split(':')[1].strip()
             return int(count_str)
-    
+
     raise ValueError("Could not find feature count in ogrinfo output")
 
 
@@ -382,24 +382,24 @@ _DEFAULT_H3_RESOLUTION = {
 def _calculate_chunking(total_rows: int, max_completions: int = 200, max_parallelism: int = 50) -> tuple[int, int, int]:
     """
     Calculate optimal chunk size, completions, and parallelism.
-    
+
     Args:
         total_rows: Total number of rows/features in dataset
         max_completions: Maximum number of job completions (default: 200)
         max_parallelism: Maximum parallelism (default: 50)
-        
+
     Returns:
         Tuple of (chunk_size, completions, parallelism)
     """
     # Calculate chunk size to stay under max_completions
     chunk_size = math.ceil(total_rows / max_completions)
-    
+
     # Calculate actual number of completions needed
     completions = math.ceil(total_rows / chunk_size)
-    
+
     # Set parallelism to min of max_parallelism or completions
     parallelism = min(max_parallelism, completions)
-    
+
     return chunk_size, completions, parallelism
 
 
@@ -503,7 +503,7 @@ def generate_dataset_workflow(
         h3_resolution = _DEFAULT_H3_RESOLUTION.get(geom_type, 10)
         print(f"  Detected geometry type: {geom_type} — using H3 resolution {h3_resolution}")
         if geom_type == 'line':
-            print(f"  Line geometries will be buffered before H3 polyfill for continuous cell coverage.")
+            print("  Line geometries will be buffered before H3 polyfill for continuous cell coverage.")
 
     # Set defaults for parent resolutions if not provided
     if parent_resolutions is None:
@@ -517,7 +517,7 @@ def generate_dataset_workflow(
 
     # Generate pmtiles job (uses converted parquet, not source)
     _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config)
-    
+
     # Count features in source file(s) and calculate chunking parameters
     if len(source_urls) > 1:
         print(f"Counting features in {len(source_urls)} sources...")
@@ -536,21 +536,21 @@ def generate_dataset_workflow(
         total_rows = max_completions * 1000  # Conservative: covers up to max_completions*1000 features
         chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
         print(f"  Warning: feature count unknown — defaults cover at most {total_rows:,} features (chunk_size={chunk_size}).")
-        print(f"  If your dataset is larger, set --chunk-size manually.")
+        print("  If your dataset is larger, set --chunk-size manually.")
         print(f"  Using defaults: chunk_size={chunk_size}, completions={completions}, parallelism={parallelism}")
-    
+
     print(f"  H3 resolution: {h3_resolution}")
     print(f"  Parent resolutions: {parent_resolutions}")
-    
+
     # Generate hex tiling job
     _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config)
 
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory, config=config)
-    
+
     # Generate workflow RBAC (generic for all cng-datasets workflows)
     _generate_workflow_rbac(namespace, output_path)
-    
+
     # Build generation command for documentation
     parent_res_str = ','.join(map(str, parent_resolutions))
     # Format source URLs for command recreation
@@ -558,13 +558,13 @@ def generate_dataset_workflow(
     gen_command = (f"cng-datasets workflow --dataset {dataset_name} "
                    f"{source_urls_str} --bucket {bucket} "
                    f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
-    
+
     # Generate ConfigMap YAML from job files
     _generate_configmap(k8s_name, namespace, output_path, gen_command)
-    
+
     # Generate Argo workflow with ConfigMap-based approach
     _generate_argo_workflow(k8s_name, namespace, output_path, output_dir)
-    
+
     if backend == "armada":
         armada_files = convert_workflow_to_armada(
             k8s_yaml_dir=str(output_path),
@@ -575,13 +575,13 @@ def generate_dataset_workflow(
         print(f"\nArmada files created in {output_dir}:")
         for f in armada_files:
             print(f"  - {Path(f).name}")
-        print(f"\nTo run (submit each step in order):")
+        print("\nTo run (submit each step in order):")
         steps = ["setup-bucket", "convert", "pmtiles", "hex", "repartition"]
         for step in steps:
             armada_file = output_path / f"armada-{k8s_name}-{step}.yaml"
             if armada_file.exists():
                 print(f"  armadactl submit {output_dir}/armada-{k8s_name}-{step}.yaml")
-        print(f"\nMonitor at: https://armada-lookout.nrp-nautilus.io")
+        print("\nMonitor at: https://armada-lookout.nrp-nautilus.io")
     else:
         print(f"\n✓ Generated complete workflow for {dataset_name}")
         print(f"\nFiles created in {output_dir}:")
@@ -590,21 +590,21 @@ def generate_dataset_workflow(
         print(f"  - {k8s_name}-pmtiles.yaml")
         print(f"  - {k8s_name}-hex.yaml")
         print(f"  - {k8s_name}-repartition.yaml")
-        print(f"  - workflow-rbac.yaml (generic, reusable)")
-        print(f"  - configmap.yaml (job configs)")
-        print(f"  - workflow.yaml (orchestrator)")
-        print(f"\nTo run:")
-        print(f"  # One-time RBAC setup")
+        print("  - workflow-rbac.yaml (generic, reusable)")
+        print("  - configmap.yaml (job configs)")
+        print("  - workflow.yaml (orchestrator)")
+        print("\nTo run:")
+        print("  # One-time RBAC setup")
         print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml")
-        print(f"")
-        print(f"  # Apply all workflow files (safe to re-run)")
+        print("")
+        print("  # Apply all workflow files (safe to re-run)")
         print(f"  kubectl apply -f {output_dir}/configmap.yaml")
         print(f"  kubectl apply -f {output_dir}/workflow.yaml")
-        print(f"")
-        print(f"  # Monitor progress")
+        print("")
+        print("  # Monitor progress")
         print(f"  kubectl logs -f job/{k8s_name}-workflow")
-        print(f"")
-        print(f"  # Clean up")
+        print("")
+        print("  # Clean up")
         print(f"  kubectl delete -f {output_dir}/workflow.yaml")
         print(f"  kubectl delete -f {output_dir}/configmap.yaml")
 
@@ -718,7 +718,7 @@ def generate_raster_workflow(
     if not needs_preprocess:
         from cng_datasets.raster.cog import is_cog
         if not is_cog(source_urls[0]):
-            print(f"  ⚠ Source raster is not a COG — adding preprocess-cog step to convert before hex tiling")
+            print("  ⚠ Source raster is not a COG — adding preprocess-cog step to convert before hex tiling")
             needs_preprocess = True
 
     if needs_preprocess:
@@ -776,14 +776,14 @@ def generate_raster_workflow(
         print(f"\nArmada files created in {output_dir}:")
         for f in armada_files:
             print(f"  - {Path(f).name}")
-        print(f"\nTo run (submit each step in order):")
+        print("\nTo run (submit each step in order):")
         steps = ["setup-bucket"]
         if needs_preprocess:
             steps.append("preprocess-cog")
         steps.append("hex")
         for step in steps:
             print(f"  armadactl submit {output_dir}/armada-{k8s_name}-{step}.yaml")
-        print(f"\nMonitor at: https://armada-lookout.nrp-nautilus.io")
+        print("\nMonitor at: https://armada-lookout.nrp-nautilus.io")
     else:
         print(f"\n✓ Generated raster workflow for {dataset_name}")
         print(f"\nFiles created in {output_dir}:")
@@ -791,10 +791,10 @@ def generate_raster_workflow(
         if needs_preprocess:
             print(f"  - {k8s_name}-preprocess-cog.yaml  (mosaic {len(source_urls)} tiles → {cog_key})")
         print(f"  - {k8s_name}-hex.yaml")
-        print(f"  - workflow-rbac.yaml")
-        print(f"  - configmap.yaml")
-        print(f"  - workflow.yaml")
-        print(f"\nTo run:")
+        print("  - workflow-rbac.yaml")
+        print("  - configmap.yaml")
+        print("  - workflow.yaml")
+        print("\nTo run:")
         print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml  # one-time")
         print(f"  kubectl apply -f {output_dir}/configmap.yaml -f {output_dir}/workflow.yaml")
 
@@ -913,7 +913,7 @@ if [ -n "$PROJ_DB" ]; then
 fi
 
 {cng_cmd}"""
-    
+
     pod_spec = {
         "restartPolicy": "Never",
         "containers": [{
@@ -1135,10 +1135,10 @@ def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_pat
     # Normalize to list
     if isinstance(source_urls, str):
         source_urls = [source_urls]
-    
+
     # Build source URLs string (one per line for readability)
     sources_str = " \\\n  ".join(source_urls)
-    
+
     # Build the conversion command with optional layer parameter
     layer_flag = f" \\\n  --layer {layer}" if layer else ""
     convert_cmd = f"""set -e
@@ -1147,7 +1147,7 @@ cng-convert-to-parquet \\
   s3://{bucket}/{s3_dataset}.parquet \\
   --row-group-size {row_group_size}{layer_flag}
 """
-    
+
     pod_spec = {
         "restartPolicy": "Never",
         "containers": [{
@@ -1202,7 +1202,7 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
     s3_dataset = s3_dataset or dataset_name
     # Use the converted geoparquet instead of original source
     geoparquet_url = f"https://{config.s3_public_endpoint}/{bucket}/{s3_dataset}.parquet"
-    
+
     # For rclone upload, compute the S3 directory that contains the output file
     if '/' in s3_dataset:
         s3_parent_dir = '/'.join(s3_dataset.split('/')[:-1]) + '/'
@@ -1210,7 +1210,7 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
         s3_parent_dir = ''
     # basename for temp files and tippecanoe layer name
     s3_basename = s3_dataset.split('/')[-1]
-    
+
     pod_spec = {
         "restartPolicy": "Never",
         "containers": [{
@@ -1275,7 +1275,7 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
 
 def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None):
     """Generate H3 hex tiling job.
-    
+
     Args:
         manager: K8sJobManager instance
         dataset_name: Name for k8s resources
@@ -1297,7 +1297,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     s3_dataset = s3_dataset or dataset_name
     # Format parent resolutions as comma-separated string
     parent_res_str = ','.join(map(str, parent_resolutions))
-    
+
     # Build command with optional id-column parameter
     cmd_parts = [
         "set -e",
@@ -1305,9 +1305,9 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     ]
     if id_column:
         cmd_parts[-1] += f" --id-column {id_column}"
-    
+
     command_str = "\n".join(cmd_parts)
-    
+
     pod_spec = {
         "restartPolicy": "Never",
         "containers": [{
@@ -1426,7 +1426,7 @@ cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output
 def _generate_workflow_rbac(namespace, output_path):
     """Generate generic workflow RBAC configuration for cng-datasets package."""
     import yaml
-    
+
     rbac = {
         "apiVersion": "v1",
         "kind": "ServiceAccount",
@@ -1435,7 +1435,7 @@ def _generate_workflow_rbac(namespace, output_path):
             "namespace": namespace
         }
     }
-    
+
     with open(output_path / "workflow-rbac.yaml", "w") as f:
         yaml.dump_all([
             rbac,
@@ -1460,25 +1460,25 @@ def _generate_workflow_rbac(namespace, output_path):
 
 def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     """Generate ConfigMap YAML containing all job definitions.
-    
+
     Args:
         dataset_name: Sanitized k8s-compatible dataset name
-        namespace: Kubernetes namespace  
+        namespace: Kubernetes namespace
         output_path: Path object where YAML files are written
         gen_command: Command used to generate this workflow
     """
     import yaml
-    
+
     # Read all job YAML files
     job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-convert.yaml", f"{dataset_name}-pmtiles.yaml", f"{dataset_name}-hex.yaml", f"{dataset_name}-repartition.yaml"]
     data = {}
-    
+
     for job_file in job_files:
         file_path = output_path / job_file
         if file_path.exists():
             with open(file_path, 'r') as f:
                 data[job_file] = f.read()
-    
+
     configmap = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -1488,7 +1488,7 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
         },
         "data": data
     }
-    
+
     with open(output_path / "configmap.yaml", "w") as f:
         f.write("# Auto-generated ConfigMap containing job definitions\n")
         f.write(f"# Generated from: {dataset_name}-setup-bucket.yaml, {dataset_name}-convert.yaml, {dataset_name}-pmtiles.yaml, {dataset_name}-hex.yaml, {dataset_name}-repartition.yaml\n")
@@ -1508,7 +1508,7 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
 
 def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir):
     """Generate K8s Job that orchestrates the workflow using a ConfigMap.
-    
+
     Args:
         dataset_name: Sanitized k8s-compatible dataset name (with hyphens)
         namespace: Kubernetes namespace
@@ -1516,9 +1516,9 @@ def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir):
         output_dir: String path to YAML directory for kubectl create configmap command
     """
     import yaml
-    
+
     configmap_name = f"{dataset_name}-yamls"
-    
+
     workflow_job = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1591,7 +1591,7 @@ echo "  kubectl delete configmap {configmap_name} -n {namespace}"
             "ttlSecondsAfterFinished": 10800
         }
     }
-    
+
     with open(output_path / "workflow.yaml", "w") as f:
         yaml.dump(workflow_job, f, default_flow_style=False)
 
@@ -1609,7 +1609,7 @@ def generate_sync_job(
 ) -> str:
     """
     Generate Kubernetes job for syncing between two S3 storage locations using rclone.
-    
+
     Args:
         job_name: Name for the Kubernetes job
         source: Source path in rclone remote format (e.g., 'remote1:bucket/path')
@@ -1620,10 +1620,10 @@ def generate_sync_job(
         cpu: CPU request/limit (default: 2)
         memory: Memory request/limit (default: 4Gi)
         dry_run: If True, only show what would be synced without actually syncing
-        
+
     Returns:
         Path to the generated YAML file
-        
+
     Example:
         >>> generate_sync_job(
         ...     job_name="sync-data",
@@ -1633,7 +1633,7 @@ def generate_sync_job(
         ... )
     """
     dry_run_flag = "--dry-run" if dry_run else ""
-    
+
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1704,32 +1704,32 @@ rclone size "{destination}"
             }
         }
     }
-    
+
     # Save to file with custom representer for multiline strings
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Custom representer for multi-line strings to use literal style (|)
     def str_representer(dumper, data):
         if '\n' in data:
             return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
         return dumper.represent_scalar('tag:yaml.org,2002:str', data)
-    
+
     yaml.add_representer(str, str_representer)
-    
+
     with open(output_path, "w") as f:
         yaml.dump(job_spec, f, default_flow_style=False, sort_keys=False)
-    
+
     print(f"✓ Generated sync job: {output_file}")
-    print(f"")
-    print(f"Submit with:")
+    print("")
+    print("Submit with:")
     print(f"  kubectl apply -f {output_file} -n {namespace}")
-    print(f"")
-    print(f"Monitor progress:")
+    print("")
+    print("Monitor progress:")
     print(f"  kubectl logs -f job/{job_name} -n {namespace}")
-    print(f"")
-    print(f"Clean up:")
+    print("")
+    print("Clean up:")
     print(f"  kubectl delete -f {output_file} -n {namespace}")
-    
+
     return str(output_path)
 

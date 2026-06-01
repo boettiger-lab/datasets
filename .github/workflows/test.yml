@@ -53,4 +53,3 @@ jobs:
     - name: Lint with ruff
       run: |
         ruff check cng_datasets/ --select E,F,W --ignore E501
-      continue-on-error: true

@@ -16,10 +16,8 @@ import sys
 import tempfile
 import os
 import shutil
-import glob
 import subprocess
 import zipfile
-from pathlib import Path
 from typing import Optional, Tuple, List, Union
 import duckdb
 import geopandas as gpd
@@ -133,11 +131,11 @@ def _linearize_source(source_url: str, layer: Optional[str] = None,
     """
     if not _is_gdb_source(source_url):
         if verbose:
-            print(f"  Source is not a GDB — skipping linearization")
+            print("  Source is not a GDB — skipping linearization")
         return source_url, layer, None
 
-    print(f"  GDB source detected — linearizing with ogr2ogr "
-          f"(CONVERT_TO_LINEAR + PROMOTE_TO_MULTI)...")
+    print("  GDB source detected — linearizing with ogr2ogr "
+          "(CONVERT_TO_LINEAR + PROMOTE_TO_MULTI)...")
 
     lin_dir = tempfile.mkdtemp(prefix='cng_linearize_')
     output_path = os.path.join(lin_dir, 'linearized.gpkg')
@@ -169,10 +167,10 @@ def _linearize_source(source_url: str, layer: Optional[str] = None,
 def is_parquet_file(source_url: str) -> bool:
     """
     Check if a source URL points to a parquet file.
-    
+
     Args:
         source_url: Source dataset URL
-        
+
     Returns:
         True if the file ends with .parquet, False otherwise
     """
@@ -185,7 +183,7 @@ def is_parquet_file(source_url: str) -> bool:
 def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> None:
     """
     Download a file from a URL and extract it if it is a zip file.
-    
+
     Args:
         url: Source URL
         extract_to: Directory to extract to
@@ -194,21 +192,21 @@ def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> No
     try:
         if verbose:
             print(f"  Downloading {url}...")
-            
+
         # Handle S3 URLs via https if possible, otherwise rely on system tools or direct download
         # For simplicity, if it's s3-west.nrp-nautilus.io, we can use requests/urllib
-        # If it's generic s3://, we might need boto3 or rclone? 
+        # If it's generic s3://, we might need boto3 or rclone?
         # For now, let's assume http/https or file path
-        
+
         local_zip = os.path.join(extract_to, "downloadpkg.zip")
-        
+
         if url.startswith("s3://"):
              # Simple S3 to https conversion for Nautilus
              if "nrp-nautilus.io" in url or "public-iucn" in url: # minimal heuristic
                  # This might need to be more robust, but complying with user request example
                  path = url.replace("s3://", "")
                  url = f"https://s3-west.nrp-nautilus.io/{path}"
-        
+
         if url.startswith(("http://", "https://")):
             urlretrieve(url, local_zip)
         else:
@@ -217,16 +215,16 @@ def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> No
                 shutil.copy(url, local_zip)
             else:
                 raise ValueError(f"File not found: {url}")
-                
+
         if verbose:
-            print(f"  Extracting zip file...")
-            
+            print("  Extracting zip file...")
+
         with zipfile.ZipFile(local_zip, 'r') as zip_ref:
             zip_ref.extractall(extract_to)
-            
+
         # Cleanup zip
         os.remove(local_zip)
-        
+
     except Exception as e:
         raise RuntimeError(f"Failed to download/extract zip: {e}")
 
@@ -246,7 +244,7 @@ def find_shapefiles(directory: str) -> List[str]:
 def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = False) -> Optional[str]:
     """
     Detect the CRS of a vector dataset using geopandas.
-    
+
     Args:
         source_input: Source dataset URL or path
         layer: Layer name
@@ -257,30 +255,30 @@ def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = F
         kwargs = {'rows': 1}
         if layer:
             kwargs['layer'] = layer
-            
+
         # If source_input is a URL that geopandas can't handle directly without vsicurl, ensure it's handled
         # But for shapefiles on disk (which pass into here), it works fine.
-        
+
         gdf = gpd.read_file(source_input, **kwargs)
-        
+
         if gdf.crs is None:
             if verbose:
                 print("Warning: No CRS found in dataset")
             return None
-        
+
         # Try to get EPSG code
         if gdf.crs.to_epsg():
             return f"EPSG:{gdf.crs.to_epsg()}"
-        
+
         # Fallback to authority string if available
         if gdf.crs.to_authority():
             auth, code = gdf.crs.to_authority()
             return f"{auth}:{code}"
-        
+
         if verbose:
             print(f"Warning: Could not determine EPSG code, CRS is: {gdf.crs}")
         return None
-        
+
     except Exception as e:
         if verbose:
             print(f"Warning: CRS detection failed: {e}")
@@ -354,17 +352,17 @@ def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: b
 def is_geographic_crs(crs: str) -> bool:
     """
     Check if a CRS is geographic (uses degrees) vs projected (uses meters).
-    
+
     Args:
         crs: CRS string (e.g., "EPSG:4326")
-        
+
     Returns:
         True if geographic, False if projected
     """
     # Common geographic CRS codes
     if crs in ["EPSG:4326", "EPSG:4269", "EPSG:4267"]:
         return True
-    
+
     # Extract EPSG code
     if crs.startswith("EPSG:"):
         try:
@@ -374,7 +372,7 @@ def is_geographic_crs(crs: str) -> bool:
                 return True
         except (ValueError, IndexError):
             pass
-    
+
     return False
 
 
@@ -475,13 +473,13 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
     else:
         # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
         geom_expr = f"{raw_geom} AS {geom_col}" if geom_is_blob else geom_col
-    
+
     layer_param = f", layer='{layer}'" if layer else ""
-    
+
     # helper to format a single SELECT
     def make_select(src):
         return f"""
-        SELECT 
+        SELECT
             * EXCLUDE ({geom_col}),
             {geom_expr}
         FROM ST_Read('{src}'{layer_param})
@@ -493,26 +491,26 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         query = "\nUNION ALL\n".join(selects)
     else:
         query = make_select(source_inputs)
-    
+
     if verbose:
         print(f"Read/Reproject Query (preview): {query[:500]}...")
-    
+
     return query
 
 
 def add_id_column_query(base_query: str, id_column: str = "_cng_fid") -> str:
     """
     Wrap a query to add a synthetic ID column.
-    
+
     Args:
         base_query: Base query that reads/reprojects data
         id_column: Name of ID column to create
-        
+
     Returns:
         Wrapped query with ID column
     """
     return f"""
-    SELECT 
+    SELECT
         ROW_NUMBER() OVER () AS {id_column},
         *
     FROM ({base_query})
@@ -533,11 +531,11 @@ def process_parquet_input(
 ):
     """
     Process a parquet input file to ensure it has global ID and cloud optimization.
-    
+
     When the input is already parquet, we use DuckDB to read it directly
     without using ST_Read, ensuring we have an ID column and applying
     GeoParquet optimizations.
-    
+
     Args:
         source_url: Source parquet URL (supports s3://, http://, file paths)
         destination: Output path (s3:// or local file path)
@@ -552,18 +550,18 @@ def process_parquet_input(
     """
     print(f"Processing parquet file: {source_url}")
     print(f"               Output to: {destination}")
-    
+
     if progress:
         print(f"  Compression: {compression} level {compression_level}")
         print(f"  Row group size: {row_group_size:,}")
-    
+
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
-    
+
     # Enable large buffer size for complex geometries
     con.execute("SET arrow_large_buffer_size=true")
-    
+
     try:
         # Convert s3:// URLs to GDAL format for reading
         read_url = source_url
@@ -571,19 +569,19 @@ def process_parquet_input(
             # DuckDB spatial extension can read from vsicurl
             path = source_url.replace('s3://', '')
             read_url = f"https://s3-west.nrp-nautilus.io/{path}"
-        
+
         # Check for ID column
         print("  Checking for ID column...")
         columns = con.execute(f"""
             DESCRIBE SELECT * FROM read_parquet('{read_url}') LIMIT 0
         """).fetchall()
-        
+
         column_names = [col[0].lower() for col in columns]
-        
+
         # Determine ID column
         needs_id = False
         id_col_name = None
-        
+
         if id_column:
             if id_column.lower() in column_names:
                 id_col_name = id_column
@@ -596,23 +594,23 @@ def process_parquet_input(
                 if id_name in column_names:
                     id_col_name = id_name
                     break
-            
+
             if id_col_name is None:
                 if force_id:
                     needs_id = True
                     id_col_name = "_cng_fid"
                 else:
                     raise ValueError("No ID column found and force_id=False")
-        
+
         if needs_id:
             print(f"  Adding synthetic ID column: {id_col_name}")
         else:
             print(f"  Using existing ID column: {id_col_name}")
-        
+
         # Build query to read and optionally add ID
         if needs_id:
             query = f"""
-            SELECT 
+            SELECT
                 ROW_NUMBER() OVER () AS {id_col_name},
                 *
             FROM read_parquet('{read_url}')
@@ -621,25 +619,25 @@ def process_parquet_input(
             query = f"""
             SELECT * FROM read_parquet('{read_url}')
             """
-        
+
         # Write with DuckDB
         is_s3_dest = destination.startswith('s3://')
-        
+
         if is_s3_dest:
             # Write to temp file first
             with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
                 tmp_path = tmp.name
-            
+
             try:
                 if verbose:
                     print(f"  Writing to temporary file: {tmp_path}")
-                
+
                 write_with_duckdb(query, tmp_path, compression, compression_level,
                                 row_group_size, verbose)
 
                 # Upload to S3
                 upload_to_s3(tmp_path, destination, verbose=progress)
-                
+
             finally:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
@@ -649,7 +647,7 @@ def process_parquet_input(
                             row_group_size, verbose)
 
         print("✓ Parquet processing completed successfully!")
-        
+
     except Exception as e:
         print(f"✗ Parquet processing failed: {e}", file=sys.stderr)
         if verbose:
@@ -667,7 +665,7 @@ def write_with_duckdb(query: str, output_path: str,
                       verbose: bool = False) -> None:
     """
     Write parquet file using DuckDB COPY. Simple and reliable.
-    
+
     Args:
         query: DuckDB query that produces the data to write
         output_path: Local output file path
@@ -679,26 +677,26 @@ def write_with_duckdb(query: str, output_path: str,
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
-    
+
     # Enable large buffer size for complex geometries (Total buffer > 2GB)
     con.execute("SET arrow_large_buffer_size=true")
-    
+
     try:
         if verbose:
             print(f"  Writing with DuckDB to {output_path}...")
-        
+
         # Use COPY - it works!
         con.execute(f"""
             COPY ({query})
             TO '{output_path}'
-            (FORMAT PARQUET, 
+            (FORMAT PARQUET,
              COMPRESSION {compression},
              ROW_GROUP_SIZE {row_group_size})
         """)
-        
+
         if verbose:
             print(f"  ✓ Wrote {output_path}")
-            
+
     finally:
         con.close()
 
@@ -707,7 +705,7 @@ def write_with_duckdb(query: str, output_path: str,
 def upload_to_s3(local_path: str, s3_destination: str, verbose: bool = True) -> None:
     """
     Upload a local file to S3 using rclone.
-    
+
     Args:
         local_path: Local file path
         s3_destination: S3 destination (s3://bucket/path)
@@ -716,24 +714,24 @@ def upload_to_s3(local_path: str, s3_destination: str, verbose: bool = True) -> 
     # Convert s3://bucket/path to rclone format nrp:bucket/path
     if not s3_destination.startswith('s3://'):
         raise ValueError(f"S3 destination must start with s3://: {s3_destination}")
-    
+
     # Parse s3://bucket/path -> nrp:bucket/path
     # The 'nrp' remote is configured in rclone for NRP Nautilus S3
     s3_path = s3_destination[5:]  # Remove s3://
     rclone_dest = f"nrp:{s3_path}"
-    
+
     if verbose:
         print(f"  Uploading {local_path} to {s3_destination}...")
-    
+
     result = subprocess.run(
         ['rclone', 'copyto', local_path, rclone_dest, '--progress'],
         capture_output=not verbose,
         text=True
     )
-    
+
     if result.returncode != 0:
         raise RuntimeError(f"rclone upload failed: {result.stderr if result.stderr else 'Unknown error'}")
-    
+
     if verbose:
         print(f"  ✓ Uploaded to {s3_destination}")
 
@@ -754,14 +752,14 @@ def convert_to_parquet(
 ):
     """
     Convert a vector dataset to optimized GeoParquet.
-    
+
     Workflow:
     1. Detect source CRS using GDAL
     2. Check if ID column exists or needs creation
     3. Build DuckDB query to read, add ID, and reproject
     4. Write GeoParquet with DuckDB COPY
     5. Upload to S3 via rclone if destination is S3
-    
+
     Args:
         source_url: Source dataset URL or list of URLs (supports s3://, http://, file paths). Multiple URLs will be merged with UNION ALL.
         destination: Output path (s3:// or local file path)
@@ -788,7 +786,7 @@ def convert_to_parquet(
         is_multi_source = False
         source_urls = [source_url]
         representative_source = source_url
-    
+
     # Check if all inputs are parquet (special handling)
     if all(is_parquet_file(url) for url in source_urls):
         # Use parquet-specific processing (no ST_Read)
@@ -807,7 +805,7 @@ def convert_to_parquet(
             target_crs=target_crs,
             verbose=verbose
         )
-    
+
     # Original processing for non-parquet inputs
     if is_multi_source:
         print(f"Converting {len(source_urls)} sources:")
@@ -818,47 +816,47 @@ def convert_to_parquet(
     if layer:
         print(f"     layer {layer}")
     print(f"       to {destination}")
-    
+
     if progress:
         print(f"  Compression: {compression} level {compression_level}")
         print(f"  Row group size: {row_group_size:,}")
-    
+
     # Check if any source is a .zip file
     has_zip = any(url.lower().endswith(".zip") for url in source_urls)
-    
+
     if has_zip and is_multi_source:
         raise ValueError("Cannot mix .zip files with multiple source URLs. Extract zip files or process separately.")
-    
+
     is_zip = source_urls[0].lower().endswith(".zip") if not is_multi_source else False
-    
+
     if is_zip:
         # Strip GDAL VSI prefixes if present so we can download the raw file
         if source_urls[0].startswith('/vsicurl/'):
             source_urls[0] = source_urls[0].replace('/vsicurl/', '')
-    
+
     try:
         temp_dir = None
         linearize_dir = None
         source_inputs = []
-        
+
         if is_zip:
             print(f"  Detected Zip archive: {source_urls[0]}")
             temp_dir = tempfile.mkdtemp()
             print(f"  Created temporary directory: {temp_dir}")
-            
+
             download_and_extract(source_urls[0], temp_dir, verbose=verbose)
-            
+
             shapefiles = find_shapefiles(temp_dir)
             if not shapefiles:
                 raise ValueError("No shapefiles found in zip archive")
-                
+
             print(f"  Found {len(shapefiles)} shapefiles in archive")
             source_inputs = shapefiles
-            
+
             # Use the first shapefile as representative for metadata
             representative_source = shapefiles[0]
             print(f"  Using {os.path.basename(representative_source)} for metadata detection")
-            
+
         elif is_multi_source:
             # Multiple non-zip sources
             print(f"  Processing {len(source_urls)} input files...")
@@ -882,7 +880,7 @@ def convert_to_parquet(
         # Step 1: Detect source CRS and geometry column
         print("  Detecting source CRS...")
         source_crs = detect_crs(representative_source, layer=layer, verbose=verbose)
-        
+
         print("  Detecting geometry column...")
         geom_col, geom_is_blob = get_geometry_column(representative_source, layer=layer, verbose=verbose)
 
@@ -939,26 +937,26 @@ def convert_to_parquet(
             verbose=verbose,
             geom_is_blob=geom_is_blob,
         )
-        
+
         # Step 3: Check ID column and wrap query if needed
         print("  Checking for ID column...")
-        needs_id, id_col_name = check_id_column(representative_source, layer=layer, id_column=id_column, 
+        needs_id, id_col_name = check_id_column(representative_source, layer=layer, id_column=id_column,
                                                   force_id=force_id, verbose=verbose)
-        
+
         if needs_id:
             print(f"  Adding synthetic ID column: {id_col_name}")
             query = add_id_column_query(query, id_col_name)
         else:
             print(f"  Using existing ID column: {id_col_name}")
-        
+
         # Step 4: Write with DuckDB
         is_s3_dest = destination.startswith('s3://')
-        
+
         if is_s3_dest:
             # Write to temp file first
             with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
                 tmp_path = tmp.name
-            
+
             try:
                 # Write data
                 write_with_duckdb(query, tmp_path, compression, compression_level,
@@ -966,7 +964,7 @@ def convert_to_parquet(
 
                 # Upload to S3
                 upload_to_s3(tmp_path, destination, verbose=progress)
-                
+
             finally:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
@@ -977,7 +975,7 @@ def convert_to_parquet(
 
         if verbose:
             print("✓ Conversion completed successfully!")
-            
+
     except Exception as e:
         print(f"✗ Conversion failed: {e}", file=sys.stderr)
         if verbose:
@@ -1008,21 +1006,21 @@ def main():
 Examples:
   # Convert local shapefile
   cng-convert-to-parquet input.shp output.parquet
-  
+
   # Convert from S3 to S3
   cng-convert-to-parquet s3://bucket/input.shp s3://bucket/output.parquet
-  
+
   # Convert with custom compression
   cng-convert-to-parquet input.shp output.parquet --compression GZIP --compression-level 9
-  
+
   # Convert and specify ID column
   cng-convert-to-parquet input.shp output.parquet --id-column objectid
         """
     )
-    
+
     parser.add_argument("source", nargs='+', help="Source dataset URL(s) or path(s). Multiple sources will be merged with UNION ALL.")
     parser.add_argument("destination", help="Output GeoParquet path")
-    
+
     parser.add_argument("--compression", default="ZSTD",
                        choices=["ZSTD", "GZIP", "SNAPPY", "NONE"],
                        help="Compression algorithm (default: ZSTD)")
@@ -1033,24 +1031,24 @@ Examples:
     parser.add_argument("--geometry-encoding", default="WKB",
                        choices=["WKB", "WKT"],
                        help="Geometry encoding (default: WKB)")
-    
+
     parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
     parser.add_argument("--no-force-id", action="store_true",
                        help="Don't create synthetic ID if none exists")
     parser.add_argument("--target-crs", default="EPSG:4326",
                        help="Target CRS (default: EPSG:4326)")
     parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")
-    
+
     parser.add_argument("--no-progress", action="store_true",
                        help="Disable progress output")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable detailed debug output")
-    
+
     args = parser.parse_args()
-    
+
     # Handle single vs multiple sources
     source_inputs = args.source if len(args.source) > 1 else args.source[0]
-    
+
     try:
         convert_to_parquet(
             source_url=source_inputs,

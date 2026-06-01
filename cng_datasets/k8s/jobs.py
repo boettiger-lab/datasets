@@ -7,16 +7,15 @@ dataset processing on clusters.
 
 from typing import Optional, Dict, Any, List
 import yaml
-from pathlib import Path
 
 
 class K8sJobManager:
     """
     Manage Kubernetes jobs for dataset processing.
-    
+
     Generates job YAML configurations and submits them to a Kubernetes cluster.
     """
-    
+
     def __init__(
         self,
         namespace: str = "biodiversity",
@@ -26,7 +25,7 @@ class K8sJobManager:
     ):
         """
         Initialize the K8s job manager.
-        
+
         Args:
             namespace: Kubernetes namespace for jobs
             image: Container image to use
@@ -37,7 +36,7 @@ class K8sJobManager:
         self.image = image
         self.service_account = service_account
         self.secrets = secrets or []
-    
+
     def generate_job_yaml(
         self,
         job_name: str,
@@ -52,7 +51,7 @@ class K8sJobManager:
     ) -> Dict[str, Any]:
         """
         Generate Kubernetes job specification.
-        
+
         Args:
             job_name: Name for the job
             command: Container command
@@ -63,7 +62,7 @@ class K8sJobManager:
             completions: Number of job completions needed
             parallelism: Number of parallel pods
             restart_policy: Pod restart policy
-            
+
         Returns:
             Job specification as dictionary
         """
@@ -93,20 +92,20 @@ class K8sJobManager:
                 }
             }
         }
-        
+
         # Add arguments if provided
         if args:
             job_spec["spec"]["template"]["spec"]["containers"][0]["args"] = args
-        
+
         # Add environment variables
         if env_vars:
             env_list = [{"name": k, "value": v} for k, v in env_vars.items()]
             job_spec["spec"]["template"]["spec"]["containers"][0]["env"] = env_list
-        
+
         # Add service account if specified
         if self.service_account:
             job_spec["spec"]["template"]["spec"]["serviceAccountName"] = self.service_account
-        
+
         # Add secrets if specified
         if self.secrets:
             volumes = []
@@ -123,9 +122,9 @@ class K8sJobManager:
                 })
             job_spec["spec"]["template"]["spec"]["volumes"] = volumes
             job_spec["spec"]["template"]["spec"]["containers"][0]["volumeMounts"] = volume_mounts
-        
+
         return job_spec
-    
+
     def generate_chunked_job(
         self,
         job_name: str,
@@ -136,21 +135,21 @@ class K8sJobManager:
     ) -> Dict[str, Any]:
         """
         Generate a job for processing data in chunks.
-        
+
         Args:
             job_name: Base name for the job
             script_path: Path to processing script in container
             num_chunks: Total number of chunks to process
             base_args: Base arguments for the script
             **kwargs: Additional arguments passed to generate_job_yaml
-            
+
         Returns:
             Job specification with indexed completions
         """
         # Use indexed completions for chunk processing
         args = base_args or []
         args.extend(["--i", "$(INDEX)"])
-        
+
         job_spec = self.generate_job_yaml(
             job_name=job_name,
             command=["python", script_path],
@@ -159,12 +158,12 @@ class K8sJobManager:
             parallelism=kwargs.pop("parallelism", min(num_chunks, 10)),
             **kwargs
         )
-        
+
         # Add completion index for chunk processing
         job_spec["spec"]["completionMode"] = "Indexed"
-        
+
         return job_spec
-    
+
     def save_job_yaml(self, job_spec: Dict[str, Any], output_path: str):
         """Save job specification to YAML file."""
         # Custom representer for multi-line strings to use literal style
@@ -172,20 +171,20 @@ class K8sJobManager:
             if '\n' in data:
                 return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
             return dumper.represent_scalar('tag:yaml.org,2002:str', data)
-        
+
         yaml.add_representer(str, str_representer)
-        
+
         with open(output_path, 'w') as f:
             yaml.dump(job_spec, f, default_flow_style=False, sort_keys=False)
         print(f"Job YAML saved to {output_path}")
-    
+
     def submit_job(self, job_spec: Dict[str, Any]) -> str:
         """
         Submit job to Kubernetes cluster.
-        
+
         Args:
             job_spec: Job specification dictionary
-            
+
         Returns:
             Job name
         """
@@ -201,13 +200,13 @@ def generate_job_yaml(
 ) -> Dict[str, Any]:
     """
     Convenience function to generate a job YAML specification.
-    
+
     Args:
         job_name: Name for the job
         command: Container command
         namespace: Kubernetes namespace
         **kwargs: Additional arguments passed to K8sJobManager
-        
+
     Returns:
         Job specification dictionary
     """
@@ -218,10 +217,10 @@ def generate_job_yaml(
 def submit_job(job_spec: Dict[str, Any]) -> str:
     """
     Submit a job to Kubernetes cluster.
-    
+
     Args:
         job_spec: Job specification dictionary
-        
+
     Returns:
         Job name
     """

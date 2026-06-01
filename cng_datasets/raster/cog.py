@@ -5,7 +5,7 @@ Tools for converting raster datasets to COG format and subsequently
 to H3-indexed parquet files partitioned by h0 cells.
 """
 
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, List, Union
 import os
 import math
 import tempfile
@@ -284,12 +284,12 @@ def _h3_res_to_degrees(h3_resolution: int) -> float:
 
 def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     """Convert path to appropriate GDAL VSI notation.
-    
+
     Args:
         path: Input path (s3://, https://, or local)
         use_public_endpoint: If True, convert s3:// to /vsicurl/ with public HTTPS URL
                             for single-file reads (faster for public data)
-    
+
     Returns:
         Path in GDAL VSI notation
     """
@@ -421,11 +421,11 @@ def is_cog(url: str) -> bool:
 def detect_nodata_value(raster_path: str, verbose: bool = True) -> Optional[float]:
     """
     Detect NoData value from raster metadata.
-    
+
     Args:
         raster_path: Path to raster file (can be /vsis3/ URL)
         verbose: Whether to print detection message (default: True)
-        
+
     Returns:
         NoData value if found, None otherwise
     """
@@ -434,35 +434,35 @@ def detect_nodata_value(raster_path: str, verbose: bool = True) -> Optional[floa
     ds = gdal.Open(raster_path)
     if ds is None:
         raise ValueError(f"Could not open raster: {raster_path}")
-    
+
     # Get the first band
     band = ds.GetRasterBand(1)
     nodata_value = band.GetNoDataValue()
-    
+
     ds = None
-    
+
     if nodata_value is not None and verbose:
         print(f"✓ Auto-detected NoData value: {nodata_value}")
     elif verbose:
         print("ℹ No NoData value found in raster metadata")
-    
+
     return nodata_value
 
 
 def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
     """
     Detect optimal H3 resolution based on raster resolution.
-    
+
     Uses the finest pixel dimension to recommend an H3 resolution.
     H3 average edge lengths (from https://h3geo.org/docs/core-library/restable):
     - h15: 0.58m, h14: 1.5m, h13: 4.1m, h12: 10.8m, h11: 28.7m
     - h10: 75.9m, h9: 200.8m, h8: 531.4m, h7: 1.4km, h6: 3.7km
     - h5: 9.9km, h4: 26.1km, h3: 69.0km, h2: 182.5km, h1: 483.1km, h0: 1281.3km
-    
+
     Args:
         raster_path: Path to raster file (can be /vsis3/ URL)
         verbose: Whether to print detection message (default: True)
-        
+
     Returns:
         Recommended H3 resolution (0-15)
     """
@@ -471,24 +471,24 @@ def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
     ds = gdal.Open(raster_path)
     if ds is None:
         raise ValueError(f"Could not open raster: {raster_path}")
-    
+
     # Get geotransform to compute resolution
     gt = ds.GetGeoTransform()
     pixel_width = abs(gt[1])
     pixel_height = abs(gt[5])
-    
+
     # Use finest resolution
     pixel_res_deg = min(pixel_width, pixel_height)
-    
+
     # Convert to meters (approximate at equator: 1 degree ≈ 111km)
     pixel_res_m = pixel_res_deg * 111000
-    
+
     ds = None
-    
+
     # Map to H3 resolution
     # Use ~3x pixel resolution as target H3 edge length
     target_edge_m = pixel_res_m * 3
-    
+
     # H3 average edge lengths in Km (from https://h3geo.org/docs/core-library/restable/)
     # Converting to meters for comparison
     h3_edge_lengths_km = {
@@ -498,17 +498,17 @@ def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
         12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169
     }
     h3_edge_lengths = {res: km * 1000 for res, km in h3_edge_lengths_km.items()}
-    
+
     # Find closest H3 resolution
     best_res = 8  # default
     min_diff = float('inf')
-    
+
     for res, edge_m in h3_edge_lengths.items():
         diff = abs(math.log10(edge_m) - math.log10(target_edge_m))
         if diff < min_diff:
             min_diff = diff
             best_res = res
-    
+
     if verbose:
         print(f"Raster resolution: {pixel_res_m:.1f}m → Recommended H3: {best_res}")
     return best_res
@@ -631,7 +631,7 @@ def create_mosaic_cog(
         # Writing directly to COG via auto-overview generation is unreliable for S3
         # output and for large files; the explicit BuildOverviews + COPY_SRC_OVERVIEWS
         # pattern is the recommended approach for fast GDAL downsampling (issue #25).
-        print(f"  Writing intermediate GTiff...")
+        print("  Writing intermediate GTiff...")
         tmp_tif = os.path.join(workdir, "intermediate.tif")
         tmp_opts = gdal.TranslateOptions(
             format="GTiff",
@@ -642,7 +642,7 @@ def create_mosaic_cog(
             raise RuntimeError(f"gdal.Translate (GTiff) failed: {gdal.GetLastErrorMsg()}")
         result = None
 
-        print(f"  Building overviews...")
+        print("  Building overviews...")
         tmp_ds = gdal.Open(tmp_tif, gdal.GA_Update)
         tmp_ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32, 64])
         tmp_ds = None
@@ -679,12 +679,12 @@ def create_mosaic_cog(
 class RasterProcessor:
     """
     Process raster datasets into cloud-native formats.
-    
+
     Converts raster data to COG format and H3-indexed parquet files
     partitioned by h0 cells, processing each h0 region separately
     for memory efficiency with global datasets.
     """
-    
+
     def __init__(
         self,
         input_path: Union[str, List[str]],
@@ -845,7 +845,7 @@ class RasterProcessor:
         self.hex_resampling = hex_resampling
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
-        
+
         # Auto-detect NoData value if not specified
         if nodata_value is None:
             detected_nodata = detect_nodata_value(input_path, verbose=True)
@@ -857,10 +857,10 @@ class RasterProcessor:
         else:
             self.nodata_value = nodata_value
             print(f"✓ Using user-specified NoData value: {nodata_value}")
-        
+
         # Handle H3 resolution with informative messages
         detected_resolution = detect_optimal_h3_resolution(input_path, verbose=False)
-        
+
         if h3_resolution is None:
             # Use auto-detected resolution
             self.h3_resolution = detected_resolution
@@ -868,43 +868,43 @@ class RasterProcessor:
         else:
             # User specified a resolution - compare with detection
             self.h3_resolution = h3_resolution
-            
+
             if h3_resolution != detected_resolution:
                 if h3_resolution < detected_resolution:
                     print(f"ℹ Using coarser resolution h{h3_resolution} (user specified) instead of detected h{detected_resolution}")
-                    print(f"  Note: Coarser resolution will aggregate more pixels per H3 cell")
+                    print("  Note: Coarser resolution will aggregate more pixels per H3 cell")
                 else:
                     print(f"ℹ Using finer resolution h{h3_resolution} (user specified) instead of detected h{detected_resolution}")
-                    print(f"  Note: Finer resolution will create more H3 cells and larger output files")
+                    print("  Note: Finer resolution will create more H3 cells and larger output files")
             else:
                 print(f"✓ Using h{h3_resolution} (matches auto-detected resolution)")
-        
+
         self.parent_resolutions = parent_resolutions or []
-        
+
         # Set up DuckDB connection
         self.con = self._setup_duckdb()
 
         # Pre-compute source raster bounds in EPSG:4326 for fast h0 intersection checks
         self._src_bounds_4326 = self._compute_src_bounds_4326()
-    
+
     def _setup_duckdb(self) -> duckdb.DuckDBPyConnection:
         """Set up DuckDB connection with extensions."""
         con = duckdb.connect()
-        
+
         # Install and load extensions
         con.execute("INSTALL spatial")
         con.execute("LOAD spatial")
         con.execute("INSTALL h3 FROM community")
         con.execute("LOAD h3")
-        
+
         # Configure HTTP settings
         con.execute("SET http_retries=20")
         con.execute("SET http_retry_wait_ms=5000")
         con.execute("SET temp_directory='/tmp'")
-        
+
         # Configure S3 credentials
         configure_s3_credentials(con)
-        
+
         return con
 
     def _compute_src_bounds_4326(self) -> tuple:
@@ -947,27 +947,27 @@ class RasterProcessor:
     ) -> str:
         """
         Create a Cloud-Optimized GeoTIFF from input raster.
-        
+
         Optimized for cloud rendering in services like titiler with:
         - Internal tiling
         - Overview pyramids
         - Optimized compression
         - EPSG:4326 reprojection
-        
+
         Args:
             output_path: Path for output COG (uses self.output_cog_path if None)
             overviews: Whether to create overview pyramids
             overview_resampling: Resampling method for overviews
-            
+
         Returns:
             Path to created COG file
         """
         if output_path is None:
             output_path = self.output_cog_path
-        
+
         if output_path is None:
             raise ValueError("output_path or output_cog_path must be specified")
-        
+
         print(f"Creating COG: {output_path}")
         print(f"  Input: {self.input_path}")
 
@@ -1021,7 +1021,7 @@ class RasterProcessor:
                 cog_creation_opts.append('COPY_SRC_OVERVIEWS=YES')
                 cog_creation_opts.append(f'OVERVIEW_RESAMPLING={overview_resampling.upper()}')
 
-            print(f"  Writing COG...")
+            print("  Writing COG...")
             vsi_output = _ensure_vsi_path(output_path)
             # COG driver requires random-write access; /vsis3/ needs this config option.
             if vsi_output.startswith("/vsis3/"):
@@ -1040,7 +1040,7 @@ class RasterProcessor:
             raise RuntimeError(f"Failed to create COG: {gdal.GetLastErrorMsg()}")
 
         result = None  # Close dataset
-        
+
         print(f"  ✓ COG created: {output_path}")
         return output_path
 
@@ -1243,32 +1243,32 @@ class RasterProcessor:
         Polyfills the h0 cell to its native-resolution H3 children and
         area-weighted-aggregates source-raster values into each cell via
         exactextract. Parent resolutions are added as decoration columns.
-        
+
         Args:
             h0_index: h0 cell index (0-121), uses self.h0_index if None
-            
+
         Returns:
             Path to output parquet file, or None if region has no data
         """
         if h0_index is None:
             h0_index = self.h0_index
-        
+
         if h0_index is None:
             raise ValueError("h0_index must be specified")
-        
+
         print(f"\nProcessing h0 region {h0_index}...")
-        
+
         # Load h0 polygons to get the geometry using SQL with ST_AsText for WKT
         h0_result = self.con.execute(f"""
             SELECT h0, ST_AsText(geom) as geom_wkt
             FROM read_parquet('{self.h0_grid_path}')
             WHERE i = {h0_index}
         """).fetchdf()
-        
+
         if len(h0_result) == 0:
             print(f"  ⚠ No h0 region found for index {h0_index}")
             return None
-            
+
         h0_geom_wkt = h0_result['geom_wkt'].iloc[0]
         h0_cell = h0_result['h0'].iloc[0]
 
@@ -1355,7 +1355,7 @@ class RasterProcessor:
         result = None
 
         try:
-            print(f"  warp-centroid: converting XYZ → H3...")
+            print("  warp-centroid: converting XYZ → H3...")
 
             # Bound to a local so DuckDB's replacement scan resolves the
             # `FROM xyz_table` reference in the COPY below (looks unused to
@@ -1407,12 +1407,12 @@ class RasterProcessor:
     def process_all_h0_regions(self) -> List[str]:
         """
         Process all h0 regions (0-121) to H3-indexed parquet.
-        
+
         Returns:
             List of output parquet file paths
         """
         output_files = []
-        
+
         for h0_index in range(122):
             try:
                 output_file = self.process_h0_region(h0_index)
@@ -1420,7 +1420,7 @@ class RasterProcessor:
                     output_files.append(output_file)
             except Exception as e:
                 print(f"  ✗ Error processing h0 {h0_index}: {e}")
-        
+
         print(f"\n✓ Processed {len(output_files)} h0 regions")
         return output_files
 
@@ -1436,9 +1436,9 @@ def create_cog(
 ) -> str:
     """
     Create a Cloud-Optimized GeoTIFF.
-    
+
     Convenience function that wraps RasterProcessor.create_cog().
-    
+
     Args:
         input_path: Path to input raster file
         output_path: Path for output COG file
@@ -1447,7 +1447,7 @@ def create_cog(
         overviews: Whether to create overview pyramids
         resampling: Resampling method
         **kwargs: Additional arguments passed to RasterProcessor
-        
+
     Returns:
         Path to created COG file
     """
@@ -1459,5 +1459,5 @@ def create_cog(
         resampling=resampling,
         **kwargs
     )
-    
+
     return processor.create_cog()
