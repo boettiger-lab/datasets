@@ -229,3 +229,6 @@ node_modules/
 build/
 *.egg-info/
 node_modules/
+
+# Local Claude Code session/worktree state
+.claude/
