@@ -44,11 +44,19 @@ def main():
     raster_parser.add_argument("--blocksize", type=int, default=512, help="COG block size (default: 512)")
     raster_parser.add_argument("--resampling", default="nearest", help="Resampling method for COG creation (default: nearest)")
     raster_parser.add_argument("--hex-resampling", default="mean",
-                               choices=VALID_HEX_REDUCERS,
-                               help="Area-weighted reducer for aggregating source pixels into each "
-                                    "H3 cell. 'sum' for counts/stocks (population, carbon); 'mean' "
-                                    "for intensities (NDVI, indices); 'mode' for categorical "
-                                    "(land cover). Default: mean.")
+                               help="Reducer for aggregating source pixels into each "
+                                    "H3 cell. With --method=exact-extract (default), "
+                                    "one of: sum/mean/mode. With --method=warp-centroid, "
+                                    "any GDAL resampleAlg (average, sum, mode, near, "
+                                    "bilinear, cubic, ...). Default: mean.")
+    raster_parser.add_argument("--method", default="exact-extract",
+                               choices=("exact-extract", "warp-centroid"),
+                               help="Raster→hex algorithm. 'exact-extract' (default): "
+                                    "area-weighted per-cell, one row per cell, mass-conserving. "
+                                    "'warp-centroid': older gdal.Warp→XYZ→centroid path; "
+                                    "fast and low-memory but emits one row per warped pixel "
+                                    "(consumers GROUP BY h<res>) and is mass-conserving only "
+                                    "when hex pitch is finer than source pixel pitch (see #84).")
     raster_parser.add_argument("--target-crs", default="EPSG:4326", help="Output CRS for mosaic (default: EPSG:4326)")
     raster_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in target CRS (mosaic only)")
     raster_parser.add_argument("--target-resolution", type=float, help="Output pixel size in target CRS units (mosaic only)")
@@ -246,6 +254,7 @@ def _dispatch(args):
                 blocksize=args.blocksize,
                 resampling=args.resampling,
                 hex_resampling=args.hex_resampling,
+                method=getattr(args, 'method', 'exact-extract'),
                 target_crs=getattr(args, 'target_crs', 'EPSG:4326'),
                 target_extent=target_extent,
                 target_resolution=getattr(args, 'target_resolution', None),

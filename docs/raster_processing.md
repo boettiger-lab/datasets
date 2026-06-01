@@ -101,7 +101,8 @@ The processor provides helpful feedback when you choose a resolution different f
 - `compression` (str): COG compression method (default: "zstd")
 - `blocksize` (int): COG tile size (default: 512)
 - `resampling` (str): Resampling method for COG (default: "nearest")
-- `hex_resampling` (str): Aggregation method for H3 cells (default: "mean"). Valid values: `sum`, `mean`, `mode`
+- `method` (str): Raster→H3 algorithm (default: `"exact-extract"`). One of `exact-extract` or `warp-centroid` — see [Aggregation methods](#aggregation-methods).
+- `hex_resampling` (str): Reducer for aggregating source pixels into each H3 cell (default: "mean"). Valid values depend on `method`: with `exact-extract`, one of `sum`, `mean`, `mode`; with `warp-centroid`, any GDAL `resampleAlg` (`average`, `sum`, `mode`, `near`, `bilinear`, `cubic`, ...).
 
 ## Cloud-Optimized GeoTIFF (COG)
 
@@ -228,6 +229,33 @@ Each parquet file contains one row per native H3 cell:
 - Excludes nodata values if specified
 
 Aggregation uses exact-area weighting (via `exactextract`) to account for partially-covered H3 cells, ensuring mass-conserving aggregation across the raster boundary.
+
+(aggregation-methods)=
+## Aggregation methods
+
+Two raster→H3 algorithms are available via the `method` argument (CLI: `--method`).
+
+| | `exact-extract` (default) | `warp-centroid` |
+|---|---|---|
+| How | Polyfill each h0 cell to its H3 children, then `exactextract` the area-weighted overlap of source pixels per cell. | `gdal.Warp` the source to a grid at the H3 edge pitch, then assign each warped pixel to a cell by its centroid. |
+| Schema | **One row per H3 cell.** | **One row per warped pixel** — consumers must `GROUP BY h<res>`. |
+| Mass-conserving | Always (by construction). | Only when the hex pitch is finer than the source pixel pitch (see [#84](https://github.com/boettiger-lab/datasets/issues/84)). |
+| `hex_resampling` vocabulary | `sum`, `mean`, `mode`. | Any GDAL `resampleAlg` (`average`/`mean`, `sum`, `mode`, `near`/`nearest`, `bilinear`, `cubic`, ...). |
+| Cost | Higher memory and wall time at fine resolutions (exact per-cell coverage). | Fast and low-memory. |
+| Antimeridian | Handled. | Not antimeridian-correct by design (planar cutline). |
+
+**Use `exact-extract` (the default) for stock/quantity rasters** (population, carbon) where mass conservation matters. When the two methods are both valid (hex pitch ≤ source pitch) they agree closely, and `exact-extract` is never worse — so reach for `warp-centroid` only when its speed/memory advantage is needed at scale.
+
+```python
+# Opt into the fast, low-memory path (note: emits one row per warped pixel)
+processor = RasterProcessor(
+    input_path="s3://bucket/global.tif",
+    output_parquet_path="s3://bucket/global/hex/",
+    h3_resolution=10,
+    method="warp-centroid",
+    hex_resampling="average",  # "mean" is accepted as an alias
+)
+```
 
 ## Examples
 

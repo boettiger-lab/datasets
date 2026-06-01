@@ -223,6 +223,46 @@ _configure_proj()
 # argparse `choices=` in the CLI.
 VALID_HEX_REDUCERS = ("sum", "mean", "mode")
 
+# Two implementations of the raster → H3 hex aggregation step.
+# - "exact-extract" (default): polyfill h0 → cells, exact_extract per-cell.
+#   Mass-conserving by construction; one row per cell; slow at very fine
+#   resolutions because per-cell polygon coverage is exact.
+# - "warp-centroid": gdal.Warp source raster to a grid at the H3 edge
+#   pitch, emit one parquet row per warped pixel with its centroid mapped
+#   to a hex cell. Fast and memory-light; emits N rows per hex (consumers
+#   need GROUP BY h<res>); accurate only when warp pitch is finer than
+#   source pitch (per the analysis in issue #84).
+VALID_METHODS = ("exact-extract", "warp-centroid")
+
+# GDAL resampleAlg values accepted in warp-centroid mode. exactextract has
+# a smaller vocabulary (sum / mean / mode) — warp-centroid forwards to
+# gdal.Warp so it supports the full GDAL set.
+VALID_WARP_RESAMPLERS = (
+    "sum", "average", "mean", "near", "nearest", "bilinear",
+    "cubic", "cubicspline", "lanczos", "mode", "max", "min", "med",
+)
+
+# Friendly aliases shared with the exact-extract vocabulary (and the package
+# default "mean") that GDAL's resampleAlg spells differently. Canonicalize
+# before handing the string to gdal.Warp, which otherwise raises
+# "Unknown resampling method" — notably for the default reducer "mean".
+_WARP_RESAMPLER_ALIASES = {"mean": "average", "nearest": "near"}
+
+
+def _h3_res_to_degrees(h3_resolution: int) -> float:
+    """Approximate pixel size in degrees for a given H3 resolution.
+
+    Uses the equatorial approximation (1° ≈ 111,320 m). Used only by the
+    warp-centroid path to set the warp pitch to roughly one pixel per hex.
+    """
+    _H3_EDGE_KM = {
+        0: 1281.256011, 1: 483.0568391, 2: 182.5129565, 3: 68.97922179,
+        4: 26.07175968, 5: 9.854090990, 6: 3.724532667, 7: 1.406475763,
+        8: 0.531414010, 9: 0.200786148, 10: 0.075863783, 11: 0.028663897,
+        12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169,
+    }
+    return _H3_EDGE_KM[h3_resolution] * 1000 / 111320.0
+
 
 def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     """Convert path to appropriate GDAL VSI notation.
@@ -641,6 +681,7 @@ class RasterProcessor:
         blocksize: int = 512,
         resampling: str = "nearest",
         hex_resampling: str = "mean",
+        method: str = "exact-extract",
         nodata_value: Optional[float] = None,
         target_crs: str = "EPSG:4326",
         target_extent: Optional[tuple] = None,
@@ -667,11 +708,21 @@ class RasterProcessor:
             compression: Compression method for COG (deflate, lzw, zstd, etc.)
             blocksize: Block size for COG tiling
             resampling: Resampling method for COG creation (default: "nearest")
-            hex_resampling: Area-weighted reducer for aggregating source
-                pixels into each H3 cell. One of: "sum" (counts/stocks like
-                population), "mean" (intensities like NDVI), "mode" (categorical
-                like land cover). Default: "mean". This replaces the older
-                GDAL-Warp resampling enum (#84).
+            hex_resampling: Reducer for aggregating source pixels into each
+                H3 cell. With method="exact-extract" (default), one of:
+                "sum" (counts/stocks like population), "mean" (intensities
+                like NDVI), "mode" (categorical like land cover). With
+                method="warp-centroid", any GDAL resampleAlg is accepted
+                ("average", "sum", "mode", "near", "bilinear", "cubic", ...).
+                Default: "mean".
+            method: Which raster→hex algorithm to use. "exact-extract"
+                (default) is area-weighted, mass-conserving, one row per
+                cell — recommended for stock rasters (population, carbon).
+                "warp-centroid" is the older gdal.Warp→XYZ→centroid path:
+                fast, low-memory, but emits one row per warped pixel
+                (consumers GROUP BY h<res>). Mass-conserving only when the
+                hex pitch is finer than the source pixel pitch — see issue
+                #84 for the regime analysis.
             nodata_value: NoData value to exclude from H3 conversion
             target_crs: CRS for output (default: EPSG:4326); used when mosaicking
             target_extent: Clip extent (xmin, ymin, xmax, ymax) in target_crs; used when mosaicking
@@ -749,16 +800,30 @@ class RasterProcessor:
         self.compression = compression
         self.blocksize = blocksize
         self.resampling = resampling
-        # Area-weighted aggregation supports only these reducers. Old GDAL-Warp
-        # values (average/near/bilinear/cubic) are rejected; #84 removed the
-        # warp step entirely.
-        if hex_resampling not in VALID_HEX_REDUCERS:
+        if method not in VALID_METHODS:
             raise ValueError(
-                f"hex_resampling must be one of {list(VALID_HEX_REDUCERS)}, "
-                f"got {hex_resampling!r}. The previous GDAL-Warp resampling "
-                f"values (average, near, bilinear, cubic) are no longer supported "
-                f"after #84 — see docs/raster_processing.md for migration."
+                f"method must be one of {list(VALID_METHODS)}, got {method!r}."
             )
+        self.method = method
+
+        # hex_resampling vocabulary depends on the method.
+        # exact-extract: only the area-weighted reducers (sum/mean/mode).
+        # warp-centroid: any GDAL resampleAlg is forwarded to gdal.Warp.
+        if method == "exact-extract":
+            if hex_resampling not in VALID_HEX_REDUCERS:
+                raise ValueError(
+                    f"With method='exact-extract', hex_resampling must be one of "
+                    f"{list(VALID_HEX_REDUCERS)}; got {hex_resampling!r}. "
+                    f"Use method='warp-centroid' for the older GDAL-Warp "
+                    f"resampling vocabulary (average, near, bilinear, cubic, ...)."
+                )
+        else:  # warp-centroid
+            if hex_resampling not in VALID_WARP_RESAMPLERS:
+                raise ValueError(
+                    f"With method='warp-centroid', hex_resampling must be a "
+                    f"GDAL resampleAlg value (e.g. {list(VALID_WARP_RESAMPLERS[:6])}); "
+                    f"got {hex_resampling!r}."
+                )
         self.hex_resampling = hex_resampling
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
@@ -1202,12 +1267,125 @@ class RasterProcessor:
             print(f"  ℹ No overlap between source raster and h0 cell {h0_index}, skipping")
             return None
 
-        # Area-weighted aggregation into native H3 cells (issue #84).
-        # The previous gdal.Warp + XYZ + centroid-assignment path emitted
-        # one row per warped pixel and lost mass at hex boundaries; replaced
-        # with exact_extract over per-cell polygons.
+        # Dispatch by method (issue #84). exact-extract (default) does
+        # area-weighted aggregation into native H3 cells via exact_extract;
+        # warp-centroid is the opt-in gdal.Warp -> XYZ -> centroid fallback.
+        if self.method == "warp-centroid":
+            return self._hex_warp_centroid_h0(h0_geom_wkt, h0_cell, h0_index)
         return self._hex_aggregate_h0(h0_cell)
-    
+
+    def _hex_warp_centroid_h0(
+        self, h0_geom_wkt: str, h0_cell: int, h0_index: int
+    ) -> Optional[str]:
+        """Restored gdal.Warp → XYZ → centroid pipeline (Plan B, opt-in via
+        method="warp-centroid").
+
+        Warps the source raster to a grid at the H3 edge pitch, reads pixels
+        through DuckDB, and assigns each warped pixel to its H3 cell by
+        centroid. Emits one parquet row per warped pixel, NOT per H3 cell —
+        consumers must `GROUP BY h<res>` to aggregate. Fast and low-memory,
+        but mass-conserving only when warp pitch is finer than source pixel
+        pitch (see issue #84).
+        """
+        from shapely import wkt as shapely_wkt
+        src = self._src_bounds_4326
+        # h0 bounding box (xmin, ymin, xmax, ymax) from the stored polygon.
+        # warp-centroid is an opt-in fallback and is not antimeridian-correct
+        # by design (it warps through the planar cutline); the antimeridian-safe
+        # path is the default exact-extract method.
+        h0_minx, h0_miny, h0_maxx, h0_maxy = shapely_wkt.loads(h0_geom_wkt).bounds
+
+        xyz_file = f"/tmp/raster_{h0_index}.xyz"
+
+        print(f"  warp-centroid: extracting with gdal.Warp at h{self.h3_resolution} pitch...")
+        gdal.SetConfigOption('OGR_ENABLE_PARTIAL_REPROJECTION', 'TRUE')
+
+        # Clamp output to the intersection of the h0 cell bbox and the source
+        # raster bbox so cropToCutline doesn't allocate a 250-billion-pixel
+        # output for fine resolutions.
+        inter_xmin = max(src[0], h0_minx)
+        inter_ymin = max(src[1], h0_miny)
+        inter_xmax = min(src[2], h0_maxx)
+        inter_ymax = min(src[3], h0_maxy)
+
+        pixel_size = _h3_res_to_degrees(self.h3_resolution)
+
+        # Canonicalize friendly aliases (e.g. the default "mean" -> "average")
+        # to the names GDAL's resampleAlg actually accepts.
+        resample_alg = _WARP_RESAMPLER_ALIASES.get(
+            self.hex_resampling, self.hex_resampling
+        )
+
+        warp_options = gdal.WarpOptions(
+            dstSRS='EPSG:4326',
+            cutlineWKT=h0_geom_wkt,
+            cropToCutline=True,
+            outputBounds=(inter_xmin, inter_ymin, inter_xmax, inter_ymax),
+            xRes=pixel_size,
+            yRes=pixel_size,
+            resampleAlg=resample_alg,
+            format='XYZ',
+            multithread=True,
+        )
+
+        result = gdal.Warp(xyz_file, self.input_path, options=warp_options)
+        if result is None or not os.path.exists(xyz_file) or os.path.getsize(xyz_file) == 0:
+            print(f"  ⚠ No data in region {h0_index}")
+            if os.path.exists(xyz_file):
+                os.remove(xyz_file)
+            return None
+        result = None
+
+        try:
+            print(f"  warp-centroid: converting XYZ → H3...")
+
+            # Bound to a local so DuckDB's replacement scan resolves the
+            # `FROM xyz_table` reference in the COPY below (looks unused to
+            # static linters, hence the noqa).
+            xyz_table = self.con.read_csv(  # noqa: F841
+                xyz_file,
+                delimiter=' ',
+                columns={'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'FLOAT'}
+            )
+
+            h3_col = f"h{self.h3_resolution}"
+            parent_exprs = []
+            for parent_res in sorted(self.parent_resolutions):
+                if parent_res < self.h3_resolution:
+                    parent_exprs.append(
+                        f"h3_latlng_to_cell(Y, X, {parent_res}) AS h{parent_res}"
+                    )
+            parent_sql = ', ' + ', '.join(parent_exprs) if parent_exprs else ''
+
+            where_clause = (
+                f"WHERE Z != {self.nodata_value}"
+                if self.nodata_value is not None else ""
+            )
+
+            output_path = (
+                f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"
+            )
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+            self.con.execute(f"""
+                COPY (
+                    SELECT
+                        Z AS {self.value_column},
+                        h3_latlng_to_cell(Y, X, {self.h3_resolution}) AS {h3_col}
+                        {parent_sql}
+                    FROM xyz_table
+                    {where_clause}
+                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
+            """)
+
+            print(f"  ✓ Wrote: {output_path} (warp-centroid; one row per warped pixel)")
+            return output_path
+        finally:
+            try:
+                os.remove(xyz_file)
+            except OSError:
+                pass
+
     def process_all_h0_regions(self) -> List[str]:
         """
         Process all h0 regions (0-121) to H3-indexed parquet.
