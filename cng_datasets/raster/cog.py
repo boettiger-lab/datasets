@@ -29,29 +29,47 @@ def _split_antimeridian(geom):
     of +180), split the unwrapped polygon at x=180, and translate the eastern
     piece back by -360 — yielding two small polygons hugging +180 and -180.
     Non-wrapping geometries are returned unchanged.
+
+    A cell touching both +/-180 and a pole unwraps to a self-intersecting ring
+    near lat ~90 (all meridians converge, so the boundary spans a huge longitude
+    range), which GEOS cannot intersect or union — it raises a TopologyException
+    that kills the whole worker process (issue #92). We make_valid the unwrapped
+    ring first (which resolves that self-intersection into the cell's true polar
+    footprint), and guard the whole helper so any remaining pathological cell
+    falls back to a valid copy of the original rather than crashing the worker.
     """
     minx, _, maxx, _ = geom.bounds
     if maxx - minx <= 180:
         return geom
 
+    from shapely import make_valid
     from shapely.geometry import Polygon, box
     from shapely.affinity import translate
     from shapely.ops import unary_union
+    from shapely.errors import GEOSException
 
-    unwrapped = Polygon([(x + 360.0 if x < 0 else x, y)
-                         for x, y in geom.exterior.coords])
-    uminx, uminy, umaxx, umaxy = unwrapped.bounds
-    west = unwrapped.intersection(box(uminx, uminy, 180.0, umaxy))
-    east = unwrapped.intersection(box(180.0, uminy, umaxx, umaxy))
+    try:
+        unwrapped = make_valid(Polygon([(x + 360.0 if x < 0 else x, y)
+                                        for x, y in geom.exterior.coords]))
+        uminx, uminy, umaxx, umaxy = unwrapped.bounds
+        west = unwrapped.intersection(box(uminx, uminy, 180.0, umaxy))
+        east = unwrapped.intersection(box(180.0, uminy, umaxx, umaxy))
 
-    parts = []
-    if not west.is_empty:
-        parts.append(west)
-    if not east.is_empty:
-        parts.append(translate(east, xoff=-360.0))
-    if not parts:
-        return geom
-    return unary_union(parts)
+        parts = []
+        if not west.is_empty:
+            parts.append(west)
+        if not east.is_empty:
+            parts.append(translate(east, xoff=-360.0))
+        if not parts:
+            return geom
+        return unary_union(parts)
+    except GEOSException:
+        # Last resort: hand exact_extract a valid geometry so the worker
+        # survives. A polar cell's true footprint is a tiny cap near +/-90,
+        # where raster sources almost never have data, so even an unsplit
+        # fallback contributes ~no mass.
+        valid = make_valid(geom)
+        return valid if not valid.is_empty else geom
 
 
 def _exact_extract_chunk(args):

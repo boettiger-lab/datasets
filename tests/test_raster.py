@@ -960,6 +960,31 @@ class TestAntimeridianSplit:
         out = _split_antimeridian(geom)
         assert out.equals(geom)
 
+    def test_handles_polar_seam_cell(self):
+        """Issue #92: a cell touching both +/-180 and a pole unwraps to a
+        self-intersecting ring near lat ~90 that GEOS cannot split — the
+        box intersection / unary_union raises a GEOSException that kills the
+        whole worker process, so the affected h0 partition is never written.
+        The helper must return a valid, non-empty geometry instead of raising.
+
+        Fixture is the real boundary of h9 617048546304851967
+        (h3_latlng_to_cell(89.999, 0.0, 9)), the pole cell that triggers it.
+        """
+        from cng_datasets.raster.cog import _split_antimeridian
+        from shapely import wkt as shapely_wkt
+
+        polar = ("POLYGON ((11.400728 89.998110, 86.369271 89.999144, "
+                 "-159.168809 89.998601, -110.483110 89.997514, "
+                 "-71.709687 89.997041, -32.485280 89.997285, "
+                 "11.400728 89.998110))")
+        geom = shapely_wkt.loads(polar)
+        assert geom.bounds[2] - geom.bounds[0] > 180, "fixture should wrap"
+
+        fixed = _split_antimeridian(geom)  # must not raise
+
+        assert fixed.is_valid, "split produced an invalid geometry"
+        assert not fixed.is_empty, "split dropped the cell entirely"
+
 
 class TestProjDbSelection:
     """The container (and the CI runner) carry more than one proj.db — a
