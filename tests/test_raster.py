@@ -961,5 +961,49 @@ class TestAntimeridianSplit:
         assert out.equals(geom)
 
 
+class TestProjDbSelection:
+    """The container (and the CI runner) carry more than one proj.db — a
+    GDAL-compatible one (DATABASE.LAYOUT.VERSION.MINOR >= 7) and a stale
+    Ubuntu proj-data one (MINOR == 6). _configure_proj must deterministically
+    pick the highest-version db and require MINOR >= 7, never letting `find`
+    ordering land it on the stale db (which throws 'a number >= 7 is expected'
+    and would intermittently fail raster jobs)."""
+
+    def _make_proj_db(self, path, minor):
+        import sqlite3
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE metadata (key TEXT, value TEXT)")
+        con.execute(
+            "INSERT INTO metadata VALUES ('DATABASE.LAYOUT.VERSION.MINOR', ?)",
+            (str(minor),),
+        )
+        con.commit(); con.close()
+        return path
+
+    def test_picks_highest_version_regardless_of_order(self, tmp_path):
+        from cng_datasets.raster.cog import _select_proj_db
+        good = self._make_proj_db(str(tmp_path / "gdal" / "proj.db"), 7)
+        stale = self._make_proj_db(str(tmp_path / "ubuntu" / "proj.db"), 6)
+        # `find` order is arbitrary — the stale db must never win.
+        assert _select_proj_db([stale, good]) == good
+        assert _select_proj_db([good, stale]) == good
+
+    def test_returns_none_when_best_below_minimum(self, tmp_path):
+        from cng_datasets.raster.cog import _select_proj_db
+        stale = self._make_proj_db(str(tmp_path / "ubuntu" / "proj.db"), 6)
+        # No qualifying db -> return None so the caller leaves GDAL's own
+        # configuration untouched rather than clobbering it with a stale db.
+        assert _select_proj_db([stale]) is None
+
+    def test_ignores_unreadable_candidates(self, tmp_path):
+        from cng_datasets.raster.cog import _select_proj_db
+        bad = tmp_path / "broken" / "proj.db"
+        os.makedirs(bad.parent, exist_ok=True)
+        bad.write_text("not a sqlite database")
+        good = self._make_proj_db(str(tmp_path / "gdal" / "proj.db"), 9)
+        assert _select_proj_db([str(bad), good]) == good
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -148,14 +148,56 @@ def _cgroup_cpu_count() -> int:
 # Set GDAL to use exceptions for better error handling
 gdal.UseExceptions()
 
-def _configure_proj():
-    """Find a PROJ database with the correct schema version and configure GDAL to use it.
+# Minimum proj.db schema version (DATABASE.LAYOUT.VERSION.MINOR) accepted by
+# the GDAL/PROJ stack in our image (GDAL 3.13 / PROJ 9.x requires >= 7). A db
+# below this throws "a number >= 7 is expected. It comes from another PROJ
+# installation." for every CRS operation.
+_PROJ_MIN_MINOR = 7
 
-    The container may have multiple proj.db files from different PROJ installations.
-    We use sqlite3 to check the schema minor version and pick one that is >=6,
-    which is required by PROJ 9.x.
-    """
+
+def _proj_db_minor(path: str) -> int:
+    """Return a proj.db's DATABASE.LAYOUT.VERSION.MINOR, or -1 if unreadable."""
     import sqlite3
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key='DATABASE.LAYOUT.VERSION.MINOR'"
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row else -1
+    except Exception:
+        return -1
+
+
+def _select_proj_db(candidates, min_minor: int = _PROJ_MIN_MINOR):
+    """Pick the highest-version proj.db from `candidates`.
+
+    Returns the path with the greatest schema MINOR version, but only if it
+    meets `min_minor`; otherwise None. Selecting the maximum (rather than the
+    first acceptable, as before) makes the choice deterministic regardless of
+    filesystem `find` ordering, and the min_minor gate stops us from clobbering
+    GDAL's own configuration with a stale db it cannot use (issue: flaky PROJ
+    'number >= 7 is expected' failures in CI and cluster raster jobs).
+    """
+    best, best_minor = None, -1
+    for path in candidates:
+        minor = _proj_db_minor(path)
+        if minor > best_minor:
+            best, best_minor = path, minor
+    return best if best_minor >= min_minor else None
+
+
+def _configure_proj():
+    """Find the best PROJ database on the system and point GDAL at it.
+
+    The container (and the CI runner) carry multiple proj.db files — a
+    GDAL-compatible one and a stale Ubuntu proj-data one (MINOR == 6) that can
+    take precedence. Choose the highest-version db deterministically; if none
+    meets the minimum, leave GDAL's existing configuration alone rather than
+    forcing a stale db.
+    """
     import subprocess
 
     try:
@@ -164,21 +206,12 @@ def _configure_proj():
             capture_output=True, text=True, timeout=10
         )
         candidates = [p for p in result.stdout.strip().split("\n") if p]
-        for path in candidates:
-            try:
-                conn = sqlite3.connect(path)
-                row = conn.execute(
-                    "SELECT value FROM metadata WHERE key='DATABASE.LAYOUT.VERSION.MINOR'"
-                ).fetchone()
-                conn.close()
-                if row and int(row[0]) >= 6:
-                    proj_dir = os.path.dirname(path)
-                    os.environ["PROJ_DATA"] = proj_dir
-                    os.environ["PROJ_LIB"] = proj_dir
-                    gdal.SetConfigOption("PROJ_DATA", proj_dir)
-                    return
-            except Exception:
-                continue
+        chosen = _select_proj_db(candidates)
+        if chosen is not None:
+            proj_dir = os.path.dirname(chosen)
+            os.environ["PROJ_DATA"] = proj_dir
+            os.environ["PROJ_LIB"] = proj_dir
+            gdal.SetConfigOption("PROJ_DATA", proj_dir)
     except Exception:
         pass
 
