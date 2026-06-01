@@ -14,6 +14,8 @@ You are taking source geospatial data and producing three outputs per dataset:
 
 You do **not** process data locally. You generate Kubernetes jobs that do the processing on the cluster.
 
+The `cng-datasets` CLI and all its dependencies (GDAL, PROJ, exactextract, ...) are provided by the project's Docker image — there is no local virtualenv. Run the CLI from the image, e.g. `docker run --rm -v "$PWD":/app -w /app ghcr.io/boettiger-lab/datasets:latest cng-datasets ...`. The `cng-datasets ...` commands below are what you run inside that container.
+
 ## How To Process a Dataset
 
 ### Step 1: Identify the source data

@@ -13,9 +13,14 @@ Do NOT read or modify `cng_datasets/` source code unless you are fixing a bug in
 
 ## Local Environment
 
-Activate the virtualenv: `source .venv/bin/activate`
+This project is Docker-based — there is no local virtualenv. Run the `cng-datasets` CLI from the project's version-stable image, which pins every dependency (GDAL, PROJ, exactextract, h3, ...). The image is the source of truth for what's installed; don't assume versions:
 
-The `cng-datasets` CLI is installed in the venv. Use it to generate k8s job YAML files. Do not run processing commands (vector, raster, repartition) locally — those run inside k8s pods.
+```bash
+docker run --rm -v "$PWD":/app -w /app ghcr.io/boettiger-lab/datasets:latest \
+  cng-datasets workflow --dataset <name> ...
+```
+
+Use the CLI only to generate k8s job YAML files. Do not run processing commands (vector, raster, repartition) locally — those run inside k8s pods.
 
 ## Kubernetes
 
