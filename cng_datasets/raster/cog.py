@@ -242,6 +242,12 @@ VALID_WARP_RESAMPLERS = (
     "cubic", "cubicspline", "lanczos", "mode", "max", "min", "med",
 )
 
+# Friendly aliases shared with the exact-extract vocabulary (and the package
+# default "mean") that GDAL's resampleAlg spells differently. Canonicalize
+# before handing the string to gdal.Warp, which otherwise raises
+# "Unknown resampling method" — notably for the default reducer "mean".
+_WARP_RESAMPLER_ALIASES = {"mean": "average", "nearest": "near"}
+
 
 def _h3_res_to_degrees(h3_resolution: int) -> float:
     """Approximate pixel size in degrees for a given H3 resolution.
@@ -1304,6 +1310,12 @@ class RasterProcessor:
 
         pixel_size = _h3_res_to_degrees(self.h3_resolution)
 
+        # Canonicalize friendly aliases (e.g. the default "mean" -> "average")
+        # to the names GDAL's resampleAlg actually accepts.
+        resample_alg = _WARP_RESAMPLER_ALIASES.get(
+            self.hex_resampling, self.hex_resampling
+        )
+
         warp_options = gdal.WarpOptions(
             dstSRS='EPSG:4326',
             cutlineWKT=h0_geom_wkt,
@@ -1311,7 +1323,7 @@ class RasterProcessor:
             outputBounds=(inter_xmin, inter_ymin, inter_xmax, inter_ymax),
             xRes=pixel_size,
             yRes=pixel_size,
-            resampleAlg=self.hex_resampling,
+            resampleAlg=resample_alg,
             format='XYZ',
             multithread=True,
         )

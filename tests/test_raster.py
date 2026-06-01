@@ -1085,6 +1085,28 @@ class TestWarpCentroidMethod:
         assert {"v", "h7", "h0"}.issubset(df.columns)
         assert len(df) > 0
 
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_warp_centroid_default_reducer_runs(self, sf_raster, temp_dir):
+        """The default hex_resampling ('mean') must work in warp-centroid mode.
+        GDAL's resampleAlg vocabulary spells it 'average' (and 'near', not
+        'nearest'), so the friendly aliases must be canonicalized before the
+        warp — otherwise `--method warp-centroid` with no explicit
+        --hex-resampling crashes with 'Unknown resampling method'."""
+        from cng_datasets.raster import RasterProcessor
+        out_dir = os.path.join(temp_dir, "hex")
+        proc = RasterProcessor(
+            input_path=sf_raster, output_parquet_path=out_dir,
+            h3_resolution=7, parent_resolutions=[0], h0_grid_path=self._sf_grid(temp_dir),
+            value_column="v", method="warp-centroid",  # hex_resampling defaults to "mean"
+        )
+        assert proc.hex_resampling == "mean"
+        result = proc.process_h0_region(0)
+        assert result and os.path.exists(result)
+        df = proc.con.read_parquet(result).fetchdf()
+        assert {"v", "h7", "h0"}.issubset(df.columns)
+        assert len(df) > 0
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
