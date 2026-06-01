@@ -1327,7 +1327,10 @@ class RasterProcessor:
         try:
             print(f"  warp-centroid: converting XYZ → H3...")
 
-            xyz_table = self.con.read_csv(
+            # Bound to a local so DuckDB's replacement scan resolves the
+            # `FROM xyz_table` reference in the COPY below (looks unused to
+            # static linters, hence the noqa).
+            xyz_table = self.con.read_csv(  # noqa: F841
                 xyz_file,
                 delimiter=' ',
                 columns={'X': 'FLOAT', 'Y': 'FLOAT', 'Z': 'FLOAT'}
