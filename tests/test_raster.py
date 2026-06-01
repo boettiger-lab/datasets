@@ -353,12 +353,15 @@ class TestRasterToH3Conversion:
         import geopandas as gpd
         from shapely.geometry import box
         
-        # Create a mock h0 grid file locally that covers our test area
-        # San Francisco area: -122.5 to -122.45, 37.7 to 37.75
+        # Create a mock h0 grid file locally that covers our test area.
+        # Cell selection is now h3_cell_to_children(h0, res), so the h0 id must
+        # be the *real* res-0 cell containing the San Francisco test raster
+        # (577199624117288959 = h3_latlng_to_cell(37.725, -122.475, 0)); the
+        # stored polygon is only used for the overlap-skip.
         h0_geom = box(-123, 37, -122, 38)  # Wider box to ensure coverage
         h0_gdf = gpd.GeoDataFrame({
             'i': [0],
-            'h0': ['8007fffffffffff'],  # Mock h0 cell ID
+            'h0': [577199624117288959],  # real res-0 cell over San Francisco
             'geometry': [h0_geom]
         }, crs='EPSG:4326')
         
@@ -375,25 +378,25 @@ class TestRasterToH3Conversion:
         processor = RasterProcessor(
             input_path=tiny_raster,
             output_parquet_path=output_dir,
-            h3_resolution=7,  # Coarse resolution for speed
+            h3_resolution=4,  # Coarse: children of one h0 = 7^4 cells (fast)
             parent_resolutions=[0],
             h0_grid_path=h0_file,  # Use local h0 grid file
             value_column="test_value",
             nodata_value=999,
         )
-        
+
         # Test the pipeline by processing this h0 region
         result = processor.process_h0_region(0)
-        
+
         # Check the output exists
         if result:
             assert os.path.exists(result)
-            
+
             # Verify parquet structure
             con = processor.con
             df = con.read_parquet(result).fetchdf()
             assert 'test_value' in df.columns
-            assert 'h7' in df.columns
+            assert 'h4' in df.columns
             assert 'h0' in df.columns
             assert len(df) > 0
             
@@ -714,6 +717,248 @@ class TestH3MassConservation:
                 h3_resolution=9,
                 hex_resampling="average",
             )
+
+
+class TestChildrenCellSelection:
+    """Issue #88: each h0 partition's native cells must be the exact H3
+    children of that h0 (h3_cell_to_children), giving a globally exact,
+    gap-free, overlap-free partition. The previous polygon polyfill yields
+    strays (cells whose true res-0 parent is a different h0) and, for the
+    antimeridian h0s whose stored polygon spans -178..+177 planar, misses
+    children entirely (one h0 polyfills to zero cells)."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def tiny_raster(self, temp_dir):
+        """A 5x5 raster; only needed so RasterProcessor can initialise."""
+        from osgeo import gdal, osr
+        path = os.path.join(temp_dir, "tiny.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 5, 5, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([-122.5, 0.01, 0, 37.75, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((5, 5), dtype=np.int16))
+        ds.FlushCache(); ds = None
+        return path
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_native_cells_are_exact_children_of_h0(self, tiny_raster):
+        from cng_datasets.raster import RasterProcessor
+
+        # 577375545977733119 is an antimeridian h0 (stored polygon spans
+        # -175.6..+177.8 planar) and a non-pentagon at res 0; its polyfill
+        # returns zero cells at every resolution.
+        h0 = 577375545977733119
+        proc = RasterProcessor(input_path=tiny_raster, h3_resolution=3)
+
+        # Cell selection depends only on the h0 id (h3_cell_to_children),
+        # never on the stored polygon.
+        df = proc._native_cells_for_h0(h0)
+        cells = [int(c) for c in df["h3"].tolist()]
+        assert len(cells) > 0, "antimeridian h0 produced no cells"
+
+        n_total, n_strays = proc.con.execute(
+            "SELECT COUNT(*), "
+            "COUNT(*) FILTER (WHERE h3_cell_to_parent(c, 0) <> ?::ubigint) "
+            "FROM (SELECT UNNEST(?::ubigint[]) AS c)",
+            [h0, cells],
+        ).fetchone()
+        assert n_strays == 0, f"{n_strays} cells are not children of h0 {h0}"
+
+        expected = proc.con.execute(
+            "SELECT len(h3_cell_to_children(?::ubigint, 3))", [h0]
+        ).fetchone()[0]
+        assert n_total == expected, f"expected {expected} children, got {n_total}"
+
+
+class TestOverlapSkipAntimeridian:
+    """Issue #88 follow-up: the overlap-skip in process_h0_region must use each
+    h0's *true* footprint, not its stored planar polygon. Antimeridian h0s are
+    stored as polygons spanning ~-178..+177, whose envelope covers the globe —
+    so without unwrapping, a raster anywhere on Earth falsely "overlaps" them
+    and they are needlessly processed (millions of children, all empty)."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _raster(self, temp_dir, name, xmin, ymin, xmax, ymax):
+        from osgeo import gdal, osr
+        path = os.path.join(temp_dir, name)
+        nx = max(1, int(round(xmax - xmin)))
+        ny = max(1, int(round(ymax - ymin)))
+        ds = gdal.GetDriverByName("GTiff").Create(path, nx, ny, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([xmin, (xmax - xmin) / nx, 0, ymax, 0, -(ymax - ymin) / ny])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((ny, nx), dtype=np.float32))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _grid(self, temp_dir, wkt):
+        import geopandas as gpd
+        from shapely import wkt as shapely_wkt
+        path = os.path.join(temp_dir, "grid.parquet")
+        gpd.GeoDataFrame(
+            {"i": [0], "h0": [579768083279773695],
+             "geometry": [shapely_wkt.loads(wkt)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(path)
+        return path
+
+    # A synthetic antimeridian h0 polygon: latitude band -45..-22 (matching the
+    # real h0 579768083279773695), drawn the planar "long way" so its bbox spans
+    # 355 deg of longitude — exactly the wrap that breaks the envelope check.
+    WRAP_WKT = "POLYGON((177.5 -45, -178 -45, -178 -22, 177.5 -22, 177.5 -45))"
+
+    @requires_gdal
+    @pytest.mark.timeout(60)
+    def test_antimeridian_h0_skipped_when_raster_far_from_seam(self, temp_dir, monkeypatch):
+        from cng_datasets.raster import RasterProcessor
+        # Decoy raster at lng -1..1 (nowhere near +/-180), same latitude band.
+        raster = self._raster(temp_dir, "decoy.tif", -1.0, -50.0, 1.0, -20.0)
+        proc = RasterProcessor(
+            input_path=raster, h3_resolution=3,
+            h0_grid_path=self._grid(temp_dir, self.WRAP_WKT),
+        )
+        called = []
+        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0: called.append(h0))
+        result = proc.process_h0_region(0)
+        assert result is None
+        assert called == [], "antimeridian h0 should be skipped for a far raster"
+
+    @requires_gdal
+    @pytest.mark.timeout(60)
+    def test_antimeridian_h0_processed_when_raster_on_seam(self, temp_dir, monkeypatch):
+        from cng_datasets.raster import RasterProcessor
+        # Raster sitting on the +180 side of the seam, within the h0 lat band:
+        # the fix must NOT skip this one (no false negatives / data loss).
+        raster = self._raster(temp_dir, "seam.tif", 178.5, -40.0, 180.0, -30.0)
+        proc = RasterProcessor(
+            input_path=raster, h3_resolution=3,
+            h0_grid_path=self._grid(temp_dir, self.WRAP_WKT),
+        )
+        called = []
+        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0: called.append(h0))
+        proc.process_h0_region(0)
+        assert called, "antimeridian h0 overlapping the seam must be processed"
+
+
+class TestSeamIntegration:
+    """Issue #88(B), end-to-end: processing an antimeridian h0 over a uniform
+    raster must not produce outlier cells. Before the per-cell antimeridian
+    split is wired into the exact_extract worker, the wrapping seam children
+    integrate a 360-deg ribbon of the raster and dwarf every other cell."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def ones_raster(self, temp_dir):
+        """A global all-ones raster at 1-degree pitch."""
+        from osgeo import gdal, osr
+        path = os.path.join(temp_dir, "ones.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 360, 180, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-180.0, 1.0, 0, 90.0, 0, -1.0])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((180, 360), dtype=np.float32))
+        ds.FlushCache(); ds = None
+        return path
+
+    @requires_gdal
+    @pytest.mark.timeout(180)
+    def test_antimeridian_h0_has_no_outlier_cells(self, ones_raster, temp_dir):
+        from cng_datasets.raster import RasterProcessor
+        import geopandas as gpd
+        from shapely.geometry import box
+        import duckdb
+
+        # 579768083279773695 is an antimeridian h0; ~7% of its children at any
+        # resolution wrap +/-180. Geometry is only used for the overlap-skip.
+        grid = os.path.join(temp_dir, "grid.parquet")
+        gpd.GeoDataFrame(
+            {"i": [0], "h0": [579768083279773695], "geometry": [box(-180, -90, 180, 90)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(grid)
+
+        out_dir = os.path.join(temp_dir, "hex")
+        proc = RasterProcessor(
+            input_path=ones_raster,
+            output_parquet_path=out_dir,
+            h3_resolution=3,
+            parent_resolutions=[0],
+            h0_grid_path=grid,
+            value_column="v",
+            hex_resampling="sum",
+        )
+        result = proc.process_h0_region(0)
+        assert result, "expected output for a global raster"
+
+        con = duckdb.connect()
+        vals = con.execute(
+            f"SELECT v FROM read_parquet('{result}') ORDER BY v"
+        ).fetchdf()["v"].tolist()
+        assert len(vals) > 0
+        # All cells at one resolution have ~equal area, so over a uniform
+        # raster their summed coverage is comparable. A wrapping seam cell that
+        # integrates a 360-deg ribbon would be orders of magnitude larger.
+        median = vals[len(vals) // 2]
+        assert max(vals) < 5 * median, (
+            f"outlier cell: max={max(vals):.3f} median={median:.3f} — a seam "
+            "cell is integrating a 360-deg ribbon (issue #88 part B)."
+        )
+
+
+class TestAntimeridianSplit:
+    """Issue #88(B): h3_cell_to_boundary_wkt returns, for a cell touching
+    +/-180, a planar polygon whose vertices on each side are joined the long
+    way around, so its bounding box spans ~360 deg of longitude. Passed to
+    exact_extract unchanged, the cell integrates the entire latitude band.
+    _split_antimeridian must cut such a polygon at +/-180 into small parts."""
+
+    def test_splits_wrapping_seam_cell(self):
+        from cng_datasets.raster.cog import _split_antimeridian
+        from shapely import wkt as shapely_wkt
+
+        # Real boundary of h9 619238790872170495 (lat -6.89, lng ~ +/-180).
+        seam = ("POLYGON ((-179.999972 -6.895538, -179.999137 -6.894068, "
+                "-179.999923 -6.892804, 179.998456 -6.893010, "
+                "179.997621 -6.894481, 179.998407 -6.895745, "
+                "-179.999972 -6.895538))")
+        geom = shapely_wkt.loads(seam)
+        assert geom.bounds[2] - geom.bounds[0] > 180, "fixture should wrap"
+
+        fixed = _split_antimeridian(geom)
+
+        parts = list(fixed.geoms) if fixed.geom_type == "MultiPolygon" else [fixed]
+        for p in parts:
+            assert p.bounds[2] - p.bounds[0] < 1.0, "a part still wraps"
+            assert p.bounds[0] >= -180.0001 and p.bounds[2] <= 180.0001
+        # The true cell is ~0.1 km^2 (~1e-5 deg^2), nowhere near the ~1 deg^2
+        # area of the unsplit 360-deg ribbon.
+        assert fixed.area < 1e-3, f"split area {fixed.area} too large"
+
+    def test_leaves_normal_cell_unchanged(self):
+        from cng_datasets.raster.cog import _split_antimeridian
+        from shapely import wkt as shapely_wkt
+
+        normal = ("POLYGON ((10.0 6.0, 10.001 6.0, 10.0015 6.001, "
+                  "10.001 6.002, 10.0 6.002, 9.9995 6.001, 10.0 6.0))")
+        geom = shapely_wkt.loads(normal)
+        out = _split_antimeridian(geom)
+        assert out.equals(geom)
 
 
 if __name__ == "__main__":

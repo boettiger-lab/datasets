@@ -10,8 +10,48 @@ import os
 import math
 import tempfile
 import duckdb
-from osgeo import gdal, ogr, osr
+from osgeo import gdal, osr
 from cng_datasets.storage.s3 import configure_s3_credentials
+
+
+def _split_antimeridian(geom):
+    """Split a cell polygon that wraps the antimeridian into a MultiPolygon.
+
+    h3_cell_to_boundary_wkt returns, for an H3 cell touching +/-180, a planar
+    polygon whose vertices on either side of the antimeridian are joined the
+    long way around — so its bounding box spans ~360 deg of longitude. Handed
+    to exact_extract unchanged, such a cell integrates the entire latitude
+    band rather than its true ~0.1 km^2 footprint, inflating SUM aggregates
+    (issue #88). H3 cells are tiny, so a longitude span > 180 deg unambiguously
+    means the cell wraps.
+
+    We unwrap (shift negative longitudes by +360 so all vertices sit just east
+    of +180), split the unwrapped polygon at x=180, and translate the eastern
+    piece back by -360 — yielding two small polygons hugging +180 and -180.
+    Non-wrapping geometries are returned unchanged.
+    """
+    minx, _, maxx, _ = geom.bounds
+    if maxx - minx <= 180:
+        return geom
+
+    from shapely.geometry import Polygon, box
+    from shapely.affinity import translate
+    from shapely.ops import unary_union
+
+    unwrapped = Polygon([(x + 360.0 if x < 0 else x, y)
+                         for x, y in geom.exterior.coords])
+    uminx, uminy, umaxx, umaxy = unwrapped.bounds
+    west = unwrapped.intersection(box(uminx, uminy, 180.0, umaxy))
+    east = unwrapped.intersection(box(180.0, uminy, umaxx, umaxy))
+
+    parts = []
+    if not west.is_empty:
+        parts.append(west)
+    if not east.is_empty:
+        parts.append(translate(east, xoff=-360.0))
+    if not parts:
+        return geom
+    return unary_union(parts)
 
 
 def _exact_extract_chunk(args):
@@ -37,7 +77,10 @@ def _exact_extract_chunk(args):
     if not chunk_cells:
         return None
 
-    geometries = [shapely_wkt.loads(wkt) for _, wkt in chunk_cells]
+    # Split cells that straddle +/-180 into a MultiPolygon so exact_extract
+    # integrates their true footprint, not a 360-deg ribbon (issue #88).
+    geometries = [_split_antimeridian(shapely_wkt.loads(wkt))
+                  for _, wkt in chunk_cells]
     gdf = gpd.GeoDataFrame(
         {
             "_h3_str": [str(h) for h, _ in chunk_cells],
@@ -885,7 +928,70 @@ class RasterProcessor:
         print(f"  ✓ COG created: {output_path}")
         return output_path
 
-    def _hex_aggregate_h0(self, h0_geom_wkt: str, h0_cell: int) -> Optional[str]:
+    def _native_cells_for_h0(self, h0_cell: int):
+        """Return the native-resolution H3 cells of one h0 partition, with each
+        cell's boundary WKT, as a DataFrame (columns: h{res}, boundary_wkt).
+
+        Cells come from h3_cell_to_children(h0, res) — the exact H3 hierarchy
+        traversal. Every native cell has exactly one res-0 parent, so the 122
+        per-h0 cell sets are disjoint and cover the globe exactly: no overlap
+        (issue #89's cross-partition boundary duplication) and no gaps. This
+        replaces a polygon polyfill (h3_polygon_wkt_to_cells on the stored h0
+        geometry), which selected strays from neighbouring h0s, missed some
+        true children, and — for the antimeridian h0s whose stored polygon
+        spans -178..+177 in planar lat/lon — collapsed to zero cells (#88).
+
+        The child count is ~7^(h3_resolution) - comfortably millions at h9 but
+        tens-of-millions at h11; the caller chunks it across worker processes.
+        """
+        h3_col = f"h{self.h3_resolution}"
+        return self.con.execute(f"""
+            WITH native_cells AS (
+                SELECT UNNEST(
+                    h3_cell_to_children({h0_cell}, {self.h3_resolution})
+                ) AS cell
+            )
+            SELECT
+                cell AS {h3_col},
+                h3_cell_to_boundary_wkt(cell) AS boundary_wkt
+            FROM native_cells
+        """).fetchdf()
+
+    def _h0_overlaps_raster(self, h0_geom_wkt: str) -> bool:
+        """Whether the source raster's extent overlaps an h0 cell's true
+        footprint.
+
+        The stored h0 polygon is in planar lat/lon, so antimeridian h0s
+        (vertices on both sides of +/-180) have a bounding box ~360 deg wide
+        that both fails to prune anywhere and wrongly excludes the +/-180 strip
+        where their data lives. We unwrap the longitudes (negatives +360); a
+        span > 180 deg means the cell straddles the antimeridian, so its
+        longitude footprint is two intervals on [-180, 180]. Latitude is never
+        wrapped, so the polygon's lat bounds are used directly.
+        """
+        from shapely import wkt as shapely_wkt
+        poly = shapely_wkt.loads(h0_geom_wkt)
+        if poly.geom_type == "MultiPolygon":
+            xs = [x for g in poly.geoms for x, _ in g.exterior.coords]
+        else:
+            xs = [x for x, _ in poly.exterior.coords]
+        minx, miny, maxx, maxy = poly.bounds
+
+        if maxx - minx > 180:  # straddles the antimeridian
+            uxs = [x + 360.0 if x < 0 else x for x in xs]
+            umin, umax = min(uxs), max(uxs)
+            lon_intervals = [(umin, 180.0)]
+            if umax > 180.0:
+                lon_intervals.append((-180.0, umax - 360.0))
+        else:
+            lon_intervals = [(minx, maxx)]
+
+        sxmin, symin, sxmax, symax = self._src_bounds_4326  # (xmin,ymin,xmax,ymax)
+        if symax < miny or symin > maxy:  # no latitude overlap
+            return False
+        return any(not (sxmax < lo or sxmin > hi) for lo, hi in lon_intervals)
+
+    def _hex_aggregate_h0(self, h0_cell: int) -> Optional[str]:
         """Area-weighted aggregation of source raster into native H3 cells
         inside one h0 partition.
 
@@ -906,26 +1012,10 @@ class RasterProcessor:
         import pandas as pd
 
         h3_col = f"h{self.h3_resolution}"
-        # Polyfill h0 -> native cells, then materialize each cell's boundary.
-        # The polyfill is bounded by the h0 cell, which caps the number of cells
-        # per call at ~7^(h3_resolution) - comfortably millions at h9 but
-        # tens-of-millions at h11. If memory becomes a concern at fine
-        # resolutions, this query can be chunked by an intermediate parent;
-        # not done here because current workflows top out at h9-h10.
-        cells_df = self.con.execute(f"""
-            WITH native_cells AS (
-                SELECT UNNEST(
-                    h3_polygon_wkt_to_cells('{h0_geom_wkt}', {self.h3_resolution})
-                ) AS cell
-            )
-            SELECT
-                cell AS {h3_col},
-                h3_cell_to_boundary_wkt(cell) AS boundary_wkt
-            FROM native_cells
-        """).fetchdf()
+        cells_df = self._native_cells_for_h0(h0_cell)
 
         if len(cells_df) == 0:
-            print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells in polyfill")
+            print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells")
             return None
 
         # exactextract needs the raster opened with the right nodata.
@@ -1068,12 +1158,14 @@ class RasterProcessor:
 
         print(f"  h0 cell: {h0_cell}")
 
-        # Skip h0 cells with no overlap with the source raster — avoids a
-        # full-globe polyfill over a raster that contributes nothing.
-        h0_geom = ogr.CreateGeometryFromWkt(h0_geom_wkt)
-        h0_env = h0_geom.GetEnvelope()  # (xmin, xmax, ymin, ymax)
-        src = self._src_bounds_4326   # (xmin, ymin, xmax, ymax)
-        if src[2] < h0_env[0] or src[0] > h0_env[1] or src[3] < h0_env[2] or src[1] > h0_env[3]:
+        # Skip h0 cells with no overlap with the source raster — avoids
+        # running exact_extract over millions of children of a raster that
+        # contributes nothing. The antimeridian h0s are stored as polygons
+        # spanning ~-178..+177 in planar lat/lon, so their raw envelope both
+        # covers the globe (never prunes) AND excludes the +/-180 strip where
+        # their data actually lives (would falsely skip a seam raster). Unwrap
+        # the longitudes and test the true footprint instead.
+        if not self._h0_overlaps_raster(h0_geom_wkt):
             print(f"  ℹ No overlap between source raster and h0 cell {h0_index}, skipping")
             return None
 
@@ -1081,7 +1173,7 @@ class RasterProcessor:
         # The previous gdal.Warp + XYZ + centroid-assignment path emitted
         # one row per warped pixel and lost mass at hex boundaries; replaced
         # with exact_extract over per-cell polygons.
-        return self._hex_aggregate_h0(h0_geom_wkt, h0_cell)
+        return self._hex_aggregate_h0(h0_cell)
     
     def process_all_h0_regions(self) -> List[str]:
         """
