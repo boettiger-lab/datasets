@@ -46,7 +46,8 @@ def main():
     raster_parser.add_argument("--hex-resampling", default="mean",
                                help="Reducer for aggregating source pixels into each "
                                     "H3 cell. With --method=exact-extract (default), "
-                                    "one of: sum/mean/mode. With --method=warp-centroid, "
+                                    "one of: sum/mean/mode/max/min (max/min for "
+                                    "peak/richness rasters). With --method=warp-centroid, "
                                     "any GDAL resampleAlg (average, sum, mode, near, "
                                     "bilinear, cubic, ...). Default: mean.")
     raster_parser.add_argument("--method", default="exact-extract",
@@ -131,9 +132,10 @@ def main():
     raster_workflow_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
     raster_workflow_parser.add_argument("--hex-resampling", default="mean",
                                         choices=VALID_HEX_REDUCERS,
-                                        help="Area-weighted reducer for H3 aggregation. 'sum' for "
+                                        help="Reducer for H3 aggregation. 'sum' for "
                                              "counts (population, carbon); 'mean' for intensities; "
-                                             "'mode' for categorical. Default: mean.")
+                                             "'mode' for categorical; 'max'/'min' for peak/extremum "
+                                             "(species richness). Default: mean.")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
     raster_workflow_parser.add_argument("--hex-storage", type=str, default="20Gi", help="Ephemeral storage request/limit per hex job pod (default: 20Gi)")

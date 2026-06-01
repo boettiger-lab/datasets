@@ -236,10 +236,13 @@ def _configure_proj():
 _configure_proj()
 
 
-# Area-weighted reducers supported by the H3 hex aggregator (#84).
+# Reducers supported by the exact-extract H3 hex aggregator. "sum"/"mean" are
+# coverage-weighted (#84); "mode" is the categorical majority; "max"/"min" are
+# coverage-agnostic extrema for peak/"max-over-area" rasters like species
+# richness, where sum double-counts and mean averages away the hotspot (#95).
 # Used both for runtime validation in RasterProcessor.__init__ and as
 # argparse `choices=` in the CLI.
-VALID_HEX_REDUCERS = ("sum", "mean", "mode")
+VALID_HEX_REDUCERS = ("sum", "mean", "mode", "max", "min")
 
 # Two implementations of the raster → H3 hex aggregation step.
 # - "exact-extract" (default): polyfill h0 → cells, exact_extract per-cell.
@@ -729,7 +732,9 @@ class RasterProcessor:
             hex_resampling: Reducer for aggregating source pixels into each
                 H3 cell. With method="exact-extract" (default), one of:
                 "sum" (counts/stocks like population), "mean" (intensities
-                like NDVI), "mode" (categorical like land cover). With
+                like NDVI), "mode" (categorical like land cover), "max"/"min"
+                (peak/extremum like species richness, where sum double-counts
+                and mean averages away the hotspot). With
                 method="warp-centroid", any GDAL resampleAlg is accepted
                 ("average", "sum", "mode", "near", "bilinear", "cubic", ...).
                 Default: "mean".
@@ -825,7 +830,7 @@ class RasterProcessor:
         self.method = method
 
         # hex_resampling vocabulary depends on the method.
-        # exact-extract: only the area-weighted reducers (sum/mean/mode).
+        # exact-extract: only the exact-extract reducers (sum/mean/mode/max/min).
         # warp-centroid: any GDAL resampleAlg is forwarded to gdal.Warp.
         if method == "exact-extract":
             if hex_resampling not in VALID_HEX_REDUCERS:

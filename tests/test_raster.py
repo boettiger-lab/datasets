@@ -284,7 +284,21 @@ class TestRasterProcessor:
             hex_resampling="mode",
         )
         assert processor.hex_resampling == "mode"
-    
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("reducer", ["max", "min"])
+    def test_raster_processor_hex_resampling_max_min(self, small_raster, reducer):
+        """Peak/extremum rasters (e.g. species richness) need max/min reducers
+        (issue #95). sum double-counts and mean averages away the hotspot."""
+        from cng_datasets.raster import RasterProcessor
+
+        processor = RasterProcessor(
+            input_path=small_raster,
+            h3_resolution=6,
+            hex_resampling=reducer,
+        )
+        assert processor.hex_resampling == reducer
+
     @pytest.mark.timeout(60)
     def test_raster_processor_auto_detect(self, small_raster):
         """Test RasterProcessor with auto-detected resolution."""
@@ -1131,6 +1145,98 @@ class TestWarpCentroidMethod:
         df = proc.con.read_parquet(result).fetchdf()
         assert {"v", "h7", "h0"}.issubset(df.columns)
         assert len(df) > 0
+
+
+class TestHexResamplingMaxMin:
+    """Issue #95: peak/extremum rasters (species richness, IUCN richness) must
+    aggregate to a hex cell's MAX over its footprint, not sum (double-counts
+    species) or mean (averages away the hotspot). max/min are coverage-agnostic
+    — the cell extremum is independent of fractional pixel coverage — so they
+    forward straight to exactextract's first-class `max`/`min` ops."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def striped_raster(self, temp_dir):
+        """A global 1-degree raster striped by latitude row: value 9.0 on even
+        rows, 1.0 on odd rows. A per-cell extremum (max/min) must return one of
+        the two actual pixel values; a MEAN would return intermediate values
+        (~5) and a SUM would return values far above 9 — so every output value
+        landing in {1.0, 9.0} discriminates an extremum reducer from both, and
+        the peak 9.0 being present proves max preserved the hotspot."""
+        from osgeo import gdal, osr
+        path = os.path.join(temp_dir, "striped.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 360, 180, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-180.0, 1.0, 0, 90.0, 0, -1.0])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        arr = np.ones((180, 360), dtype=np.float32)
+        arr[::2, :] = 9.0  # even rows = 9, odd rows = 1
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.FlushCache(); ds = None
+        return path
+
+    def _run(self, striped_raster, temp_dir, reducer):
+        from cng_datasets.raster import RasterProcessor
+        import geopandas as gpd
+        from shapely.geometry import box
+
+        grid = os.path.join(temp_dir, f"grid_{reducer}.parquet")
+        gpd.GeoDataFrame(
+            {"i": [0], "h0": [578536630256664575], "geometry": [box(-180, -90, 180, 90)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(grid)
+
+        out_dir = os.path.join(temp_dir, f"hex_{reducer}")
+        proc = RasterProcessor(
+            input_path=striped_raster,
+            output_parquet_path=out_dir,
+            h3_resolution=3,
+            parent_resolutions=[0],
+            h0_grid_path=grid,
+            value_column="richness",
+            hex_resampling=reducer,
+        )
+        result = proc.process_h0_region(0)
+        assert result, f"expected output for a global raster ({reducer})"
+        con = duckdb.connect()
+        return con.execute(
+            f"SELECT richness FROM read_parquet('{result}')"
+        ).fetchdf()["richness"].tolist()
+
+    @requires_gdal
+    @pytest.mark.timeout(180)
+    def test_max_reducer_returns_per_cell_maximum(self, striped_raster, temp_dir):
+        vals = self._run(striped_raster, temp_dir, "max")
+        assert len(vals) > 0
+        # Every output value must be one of the actual pixel values {1.0, 9.0}:
+        # a mean would yield intermediates (~5) and a sum values far above 9.
+        assert all(abs(v - 1.0) < 1e-4 or abs(v - 9.0) < 1e-4 for v in vals), (
+            f"max output not an extremum of pixel values: "
+            f"min={min(vals):.3f} max={max(vals):.3f} (expected values in {{1,9}})"
+        )
+        # The peak (9.0) must survive — max must not average the hotspot away.
+        assert max(vals) == pytest.approx(9.0, abs=1e-4), (
+            f"max reducer lost the peak: max={max(vals):.3f} (expected 9.0)"
+        )
+
+    @requires_gdal
+    @pytest.mark.timeout(180)
+    def test_min_reducer_returns_per_cell_minimum(self, striped_raster, temp_dir):
+        vals = self._run(striped_raster, temp_dir, "min")
+        assert len(vals) > 0
+        assert all(abs(v - 1.0) < 1e-4 or abs(v - 9.0) < 1e-4 for v in vals), (
+            f"min output not an extremum of pixel values: "
+            f"min={min(vals):.3f} max={max(vals):.3f} (expected values in {{1,9}})"
+        )
+        # The trough (1.0) must survive — min must not average it away.
+        assert min(vals) == pytest.approx(1.0, abs=1e-4), (
+            f"min reducer lost the trough: min={min(vals):.3f} (expected 1.0)"
+        )
 
 
 if __name__ == "__main__":
