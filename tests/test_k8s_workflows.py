@@ -914,6 +914,27 @@ class TestClusterConfig:
             pod_spec = hex_job["spec"]["template"]["spec"]
             assert "affinity" not in pod_spec
 
+    @pytest.mark.timeout(5)
+    def test_raster_hex_job_mounts_rclone_config(self):
+        """Hex job must mount rclone-config so _localize_input can rclone-copy the COG (issue #99)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="raster-cfg",
+                source_urls="https://example.com/tile.tif",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                rclone_secret_name="my-rclone-secret",
+            )
+            hex_job = yaml.safe_load(open(Path(tmpdir) / "raster-cfg-hex.yaml"))
+            pod_spec = hex_job["spec"]["template"]["spec"]
+            rclone_vol = next(v for v in pod_spec["volumes"] if v["name"] == "rclone-config")
+            assert rclone_vol["secret"]["secretName"] == "my-rclone-secret"
+            mount = next(
+                m for m in pod_spec["containers"][0]["volumeMounts"]
+                if m["name"] == "rclone-config"
+            )
+            assert mount["mountPath"] == "/root/.config/rclone"
+
 
 class TestProfileLoading:
     """Tests for load_profile() and cluster_config_from_args()."""
