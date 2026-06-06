@@ -925,12 +925,18 @@ fi
                 {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
                 {"name": "BUCKET", "value": bucket}
             ],
+            "volumeMounts": [
+                {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+            ],
             "command": ["bash", "-c", command_str],
             "resources": {
                 "requests": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": hex_storage},
                 "limits": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": hex_storage}
             }
-        }]
+        }],
+        "volumes": [
+            {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
+        ]
     }
     _apply_scheduling(pod_spec, config)
     job_spec = {
