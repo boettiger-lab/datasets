@@ -207,6 +207,9 @@ def _select_proj_db(candidates, min_minor: int = _PROJ_MIN_MINOR):
     return best if best_minor >= min_minor else None
 
 
+_proj_configured = False
+
+
 def _configure_proj():
     """Find the best PROJ database on the system and point GDAL at it.
 
@@ -215,7 +218,24 @@ def _configure_proj():
     take precedence. Choose the highest-version db deterministically; if none
     meets the minimum, leave GDAL's existing configuration alone rather than
     forcing a stale db.
+
+    Lazy and idempotent: the first reprojecting entrypoint (RasterProcessor,
+    create_mosaic_cog) calls this; it runs at most once per process. It used to
+    run at import time, so even YAML-generation and unit-test imports paid for
+    the full-filesystem `find` — slow on container overlay filesystems and the
+    cause of spurious test timeouts (issue #99 fallout).
+
+    This deliberately re-runs the deterministic `_select_proj_db` scan even when
+    PROJ_DATA is already exported: the generated k8s job's bash wrapper sets
+    PROJ_DATA from `find ... | head -1`, which is non-deterministic and can land
+    on the stale Ubuntu db (MINOR == 6). Python's selection is authoritative and
+    overrides it — trusting the pre-set value would reintroduce that race.
     """
+    global _proj_configured
+    if _proj_configured:
+        return
+    _proj_configured = True
+
     import subprocess
 
     try:
@@ -232,8 +252,6 @@ def _configure_proj():
             gdal.SetConfigOption("PROJ_DATA", proj_dir)
     except Exception:
         pass
-
-_configure_proj()
 
 
 # Reducers supported by the exact-extract H3 hex aggregator. "sum"/"mean" are
@@ -556,6 +574,7 @@ def create_mosaic_cog(
     if not source_urls:
         raise ValueError("source_urls must not be empty")
 
+    _configure_proj()
     print(f"Creating mosaic COG from {len(source_urls)} source tile(s)...")
 
     # Resolve VSI paths for all sources
@@ -754,6 +773,7 @@ class RasterProcessor:
             read_credentials: Dict with AWS credentials for reading
             write_credentials: Dict with AWS credentials for writing
         """
+        _configure_proj()
         # If a list of tiles is provided, mosaic them into a temp COG first
         self._mosaic_tmpdir = None
         if isinstance(input_path, list):
