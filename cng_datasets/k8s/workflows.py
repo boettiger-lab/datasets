@@ -821,14 +821,11 @@ def _generate_cog_preprocess_job(
     if nodata_value is not None:
         optional_flags += f"\n  --nodata {nodata_value} \\"
 
+    # PROJ database selection is handled deterministically inside the CLI
+    # (cog._configure_proj picks the highest-version proj.db, MINOR>=7). A bash
+    # `find ... | head -1` here would be non-deterministic and could export a
+    # stale PROJ_DATA — see issue #91.
     command_str = f"""set -e
-
-# Locate PROJ database
-PROJ_DB=$(find /usr /opt -name "proj.db" 2>/dev/null | head -1)
-if [ -n "$PROJ_DB" ]; then
-  export PROJ_DATA="$(dirname $PROJ_DB)"
-  export PROJ_LIB="$PROJ_DATA"
-fi
 
 echo "Mosaicking {len(source_urls)} tiles → {output_cog_url}"
 
@@ -903,14 +900,11 @@ def _generate_raster_hex_job(
     if nodata_value is not None:
         cng_cmd += f" --nodata {nodata_value}"
 
+    # PROJ database selection is handled deterministically inside the CLI
+    # (cog._configure_proj picks the highest-version proj.db, MINOR>=7). A bash
+    # `find ... | head -1` here would be non-deterministic and could export a
+    # stale PROJ_DATA — see issue #91.
     command_str = f"""set -e
-
-# Locate PROJ database dynamically to avoid version mismatches
-PROJ_DB=$(find /usr /opt -name "proj.db" 2>/dev/null | head -1)
-if [ -n "$PROJ_DB" ]; then
-  export PROJ_DATA="$(dirname $PROJ_DB)"
-  export PROJ_LIB="$PROJ_DATA"
-fi
 
 {cng_cmd}"""
 

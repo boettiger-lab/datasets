@@ -1043,6 +1043,40 @@ class TestProjDbSelection:
         good = self._make_proj_db(str(tmp_path / "gdal" / "proj.db"), 9)
         assert _select_proj_db([str(bad), good]) == good
 
+    def test_overrides_stale_preset_proj_data(self, tmp_path, monkeypatch):
+        """_configure_proj must run its deterministic scan even when PROJ_DATA is
+        already exported. The generated k8s job's bash wrapper sets PROJ_DATA from
+        `find ... | head -1` (non-deterministic, can land on the stale MINOR==6 db
+        — issue #91). Trusting that pre-set value would reintroduce the flaky
+        version-mismatch race, so Python's selection must override it."""
+        import subprocess
+        from cng_datasets.raster import cog
+        good_dir = tmp_path / "gdal"
+        self._make_proj_db(str(good_dir / "proj.db"), 9)
+
+        monkeypatch.setenv("PROJ_DATA", "/some/stale/dir")
+        monkeypatch.setattr(cog, "_proj_configured", False)
+
+        class _Result:
+            stdout = str(good_dir / "proj.db") + "\n"
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
+
+        cog._configure_proj()
+        assert os.environ["PROJ_DATA"] == str(good_dir), "stale pre-set value must be overridden"
+
+    def test_configure_proj_runs_once(self, monkeypatch):
+        """The scan is guarded so it runs at most once per process — repeated
+        entrypoint calls (RasterProcessor, create_mosaic_cog) don't re-`find`."""
+        import subprocess
+        from cng_datasets.raster import cog
+        monkeypatch.setattr(cog, "_proj_configured", False)
+        calls = []
+        monkeypatch.setattr(subprocess, "run",
+                            lambda *a, **k: calls.append(1) or type("R", (), {"stdout": ""})())
+        cog._configure_proj()
+        cog._configure_proj()
+        assert len(calls) == 1
+
 
 class TestWarpCentroidMethod:
     """PR #86: the opt-in warp-centroid fallback method (gdal.Warp -> XYZ ->
