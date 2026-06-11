@@ -1290,7 +1290,10 @@ ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$DATASET.geojsonl /v
 # non-power-of-2 logical CPU counts which triggers an internal assertion
 # failure "N shards not a power of 2" (felt/tippecanoe#216).
 # Round detected CPU count down to nearest power of 2 to preserve I/O parallelism.
-TIPPECANOE_MAX_THREADS=$(python3 -c "import os; n=os.cpu_count() or 1; print(1<<(n.bit_length()-1))")
+# Must be `export`ed: tippecanoe is a child process and reads this from the
+# environment, not the shell. A plain assignment is invisible to it, so it
+# falls back to the raw (non-power-of-2) CPU count and crashes (issue #77).
+export TIPPECANOE_MAX_THREADS=$(python3 -c "import os; n=os.cpu_count() or 1; print(1<<(n.bit_length()-1))")
 tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/$DATASET.geojsonl
 
 # Upload to S3 using rclone
