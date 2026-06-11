@@ -1376,9 +1376,34 @@ class TestMultiValueNodata:
         # Genuine class codes are untouched.
         assert 11 in arr and 22 in arr and 33 in arr
 
-    @pytest.mark.timeout(180)
-    def test_hex_excludes_all_fill_codes(self, categorical_raster, temp_dir):
-        """The hex step drops every fill code, not just the band's own nodata."""
+    @pytest.fixture
+    def secondary_fill_raster(self, temp_dir):
+        """A raster filled entirely with a *secondary* fill code (-1111).
+
+        The band declares 32767 as NoData, so -1111 is not the band's own
+        nodata. A single-value pipeline would treat every pixel as a valid
+        class; only multi-value exclusion (collapsing -1111 → primary) makes
+        the whole raster nodata (issue #108).
+        """
+        width, height = 6, 6
+        xmin, ymin = -122.0, 37.0
+        pixel_size = 0.01
+        raster_path = os.path.join(temp_dir, "all_secondary_fill.tif")
+
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(raster_path, width, height, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([xmin, pixel_size, 0, ymin + height * pixel_size, 0, -pixel_size])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        band.WriteArray(np.full((height, width), -1111, dtype=np.int16))
+        band.SetNoDataValue(32767)
+        band.FlushCache()
+        ds = None
+        return raster_path
+
+    def _run_hex(self, raster, temp_dir, nodata_value):
         import geopandas as gpd
         from shapely.geometry import box
         from cng_datasets.raster import RasterProcessor
@@ -1394,18 +1419,43 @@ class TestMultiValueNodata:
         os.makedirs(output_dir, exist_ok=True)
 
         proc = RasterProcessor(
-            input_path=categorical_raster,
+            input_path=raster,
             output_parquet_path=output_dir,
             h3_resolution=5,
             parent_resolutions=[0],
             h0_grid_path=h0_file,
             value_column="evt",
             hex_resampling="mode",
-            nodata_value="-9999,-1111,32767",
+            nodata_value=nodata_value,
         )
         result = proc.process_h0_region(0)
+        df = proc.con.read_parquet(result).fetchdf() if result else None
+        return result, df
+
+    @pytest.mark.timeout(180)
+    def test_hex_excludes_secondary_fill_code(self, secondary_fill_raster, temp_dir):
+        """A raster of nothing but a secondary fill code yields no hex cells."""
+        result, df = self._run_hex(secondary_fill_raster, temp_dir, "-9999,-1111,32767")
+        # Every pixel is a fill code, so once collapsed the whole raster is
+        # nodata and no cell produces a value.
+        assert result is None or len(df) == 0
+
+    @pytest.mark.timeout(180)
+    def test_hex_secondary_fill_leaks_without_multi_value(self, secondary_fill_raster, temp_dir):
+        """Control: with only the band nodata, the secondary fill leaks through.
+
+        Confirms the previous test is actually exercising multi-value exclusion
+        and not passing for an unrelated reason.
+        """
+        result, df = self._run_hex(secondary_fill_raster, temp_dir, 32767)
+        assert result is not None and len(df) > 0
+        assert (df["evt"] == -1111).all()
+
+    @pytest.mark.timeout(180)
+    def test_hex_keeps_valid_codes_drops_fills(self, categorical_raster, temp_dir):
+        """Genuine class codes survive; no fill code appears in the output."""
+        result, df = self._run_hex(categorical_raster, temp_dir, "-9999,-1111,32767")
         if result:
-            df = proc.con.read_parquet(result).fetchdf()
             for fill in (-9999, -1111, 32767):
                 assert fill not in df["evt"].values, f"fill code {fill} leaked into hex output"
 

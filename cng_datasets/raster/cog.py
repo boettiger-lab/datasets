@@ -311,15 +311,54 @@ def _parse_nodata_values(nodata) -> List[float]:
 
 
 def _fmt_gdal(value: float) -> str:
-    """Format a nodata value for a GDAL command/option string.
+    """Format a nodata value for a CLI/SQL string.
 
-    Integer-valued floats are emitted without a trailing ".0" (so a
-    space-separated srcNodata reads "-9999 -1111 32767", not
-    "-9999.0 -1111.0 32767.0"); GDAL parses either, but the clean form is
-    what lands in generated k8s job YAML and CLI help.
+    Integer-valued floats are emitted without a trailing ".0" (so a generated
+    flag reads --nodata "-9999,-1111,32767" and a SQL list reads
+    "Z NOT IN (-9999, 32767)"), keeping generated k8s YAML and queries clean.
     """
     f = float(value)
     return str(int(f)) if f.is_integer() else repr(f)
+
+
+def _collapse_fill_values(tif_path: str, fill_values: List[float], primary: float) -> None:
+    """Rewrite every fill code in `tif_path` to `primary`, in place, block-wise.
+
+    A GDAL raster band can declare only ONE nodata value, and `srcNodata`
+    with a space-separated list means *per-band* nodata, not "treat any of
+    these values as nodata in one band". Categorical products (LANDFIRE)
+    carry several fill codes in a single band, so collapsing them to one
+    requires an explicit value remap, not a nodata declaration (issue #108).
+
+    Reads and writes one block at a time so a continent-scale source never
+    has to fit in memory, then sets the band NoData to `primary` so the
+    downstream COG/hex steps exclude every former fill code via a single value.
+    """
+    import numpy as np
+
+    extras = [v for v in fill_values if v != primary]
+    ds = gdal.Open(tif_path, gdal.GA_Update)
+    if ds is None:
+        raise ValueError(f"Could not open raster to collapse fill values: {tif_path}")
+    try:
+        for b in range(1, ds.RasterCount + 1):
+            band = ds.GetRasterBand(b)
+            block_x, block_y = band.GetBlockSize()
+            xsize, ysize = band.XSize, band.YSize
+            for yoff in range(0, ysize, block_y):
+                ny = min(block_y, ysize - yoff)
+                for xoff in range(0, xsize, block_x):
+                    nx = min(block_x, xsize - xoff)
+                    arr = band.ReadAsArray(xoff, yoff, nx, ny)
+                    if extras:
+                        mask = np.isin(arr, extras)
+                        if mask.any():
+                            arr[mask] = primary
+                            band.WriteArray(arr, xoff, yoff)
+            band.SetNoDataValue(primary)
+        ds.FlushCache()
+    finally:
+        ds = None
 
 
 def _h3_res_to_degrees(h3_resolution: int) -> float:
@@ -660,11 +699,12 @@ def create_mosaic_cog(
         if target_resolution is not None:
             warp_kwargs["xRes"] = target_resolution
             warp_kwargs["yRes"] = target_resolution
-        if nodata_values:
-            # Apply every fill code as srcNodata, collapse to the first as
-            # dstNodata so the merged COG carries a single nodata (issue #108).
-            warp_kwargs["srcNodata"] = " ".join(_fmt_gdal(v) for v in nodata_values)
-            warp_kwargs["dstNodata"] = nodata_values[0]
+        primary_nodata = nodata_values[0] if nodata_values else None
+        if primary_nodata is not None:
+            # A band carries one nodata value; declare the primary here and
+            # remap any remaining fill codes to it after the merge (issue #108).
+            warp_kwargs["srcNodata"] = _fmt_gdal(primary_nodata)
+            warp_kwargs["dstNodata"] = primary_nodata
 
         for i, (crs_key, tiles) in enumerate(crs_groups.items()):
             print(f"  Building VRT for {crs_key} ({len(tiles)} tiles)...")
@@ -686,9 +726,9 @@ def create_mosaic_cog(
         print(f"  Merging {len(warped_paths)} warped group(s)...")
         merged_vrt = os.path.join(workdir, "merged.vrt")
         build_vrt_opts = {}
-        if nodata_values:
-            build_vrt_opts["srcNodata"] = nodata_values[0]
-            build_vrt_opts["VRTNodata"] = nodata_values[0]
+        if primary_nodata is not None:
+            build_vrt_opts["srcNodata"] = primary_nodata
+            build_vrt_opts["VRTNodata"] = primary_nodata
         merged_ds = gdal.BuildVRT(merged_vrt, warped_paths, **build_vrt_opts)
         if merged_ds is None:
             raise RuntimeError(f"gdal.BuildVRT failed for merge: {gdal.GetLastErrorMsg()}")
@@ -708,6 +748,12 @@ def create_mosaic_cog(
         if result is None:
             raise RuntimeError(f"gdal.Translate (GTiff) failed: {gdal.GetLastErrorMsg()}")
         result = None
+
+        # Collapse any secondary fill codes to the primary nodata before
+        # overviews so the merged COG carries a single nodata (issue #108).
+        if len(nodata_values) > 1:
+            print(f"  Collapsing fill codes {nodata_values} → {primary_nodata}...")
+            _collapse_fill_values(tmp_tif, nodata_values, primary_nodata)
 
         print("  Building overviews...")
         tmp_ds = gdal.Open(tmp_tif, gdal.GA_Update)
@@ -1073,21 +1119,20 @@ class RasterProcessor:
         needs_reprojection = not srs.IsGeographic()
         ds = None
 
-        # Collapse every declared fill code to a single nodata. Multiple values
-        # can only be remapped by a warp, so force the warp path when >1 value
-        # is given even for an already-geographic source (issue #108). Without
-        # this, create_cog applied no nodata at all and secondary fill codes
-        # (LANDFIRE -9999/-1111) survived as "valid" classes into the hex step.
+        # NoData handling (issue #108): a band carries only one nodata value, so
+        # the primary (first) value is declared on the warp/translate and the
+        # remaining fill codes are remapped to it afterwards. Previously
+        # create_cog applied no nodata at all, so secondary fill codes (LANDFIRE
+        # -9999/-1111) survived as "valid" classes into the hex step.
         nodata_values = self.nodata_values
-        use_warp = needs_reprojection or len(nodata_values) > 1
+        primary_nodata = nodata_values[0] if nodata_values else None
 
         workdir = tempfile.mkdtemp(prefix="create_cog_")
         try:
             tmp_tif = os.path.join(workdir, "intermediate.tif")
 
-            if use_warp:
-                if needs_reprojection:
-                    print("  Reprojecting to EPSG:4326...")
+            if needs_reprojection:
+                print("  Reprojecting to EPSG:4326...")
                 warp_kwargs = dict(
                     dstSRS='EPSG:4326',
                     format='GTiff',
@@ -1095,9 +1140,9 @@ class RasterProcessor:
                     resampleAlg=self.resampling,
                     multithread=True,
                 )
-                if nodata_values:
-                    warp_kwargs["srcNodata"] = " ".join(_fmt_gdal(v) for v in nodata_values)
-                    warp_kwargs["dstNodata"] = nodata_values[0]
+                if primary_nodata is not None:
+                    warp_kwargs["srcNodata"] = _fmt_gdal(primary_nodata)
+                    warp_kwargs["dstNodata"] = primary_nodata
                 result = gdal.Warp(tmp_tif, self.input_path,
                                    options=gdal.WarpOptions(**warp_kwargs))
             else:
@@ -1105,13 +1150,20 @@ class RasterProcessor:
                     format='GTiff',
                     creationOptions=['COMPRESS=NONE', 'BIGTIFF=IF_SAFER'],
                 )
-                if nodata_values:
-                    translate_kwargs["noData"] = nodata_values[0]
+                if primary_nodata is not None:
+                    translate_kwargs["noData"] = primary_nodata
                 result = gdal.Translate(tmp_tif, self.input_path, **translate_kwargs)
 
             if result is None:
                 raise RuntimeError(f"Failed to create intermediate GTiff: {gdal.GetLastErrorMsg()}")
             result = None
+
+            # Collapse any secondary fill codes to the primary nodata before
+            # building overviews, so the overviews and the COG carry a single,
+            # consistent nodata (issue #108).
+            if len(nodata_values) > 1:
+                print(f"  Collapsing fill codes {nodata_values} → {primary_nodata}...")
+                _collapse_fill_values(tmp_tif, nodata_values, primary_nodata)
 
             if overviews:
                 print("  Building overviews...")
@@ -1207,6 +1259,40 @@ class RasterProcessor:
             return False
         return any(not (sxmax < lo or sxmin > hi) for lo, hi in lon_intervals)
 
+    def _collapsed_aggregation_input(self) -> str:
+        """Local raster with every fill code collapsed to the primary nodata.
+
+        Built once and reused across all h0 regions. Needed only when more than
+        one fill code is requested (issue #108): exactextract honors a single
+        band nodata, so the extra codes must be physically remapped first. The
+        raster is staged to a local GTiff (GA_Update needs a writable file, not
+        a /vsis3/ object) and collapsed block-wise so a continent-scale source
+        never has to fit in memory.
+
+        In the standard raster-workflow the COG step already collapses the fill
+        codes, so the hex job is handed only the primary value and never reaches
+        this path; it covers running the hex step directly on a multi-fill source.
+        """
+        if getattr(self, "_collapsed_input", None) is not None:
+            return self._collapsed_input
+        primary = self.nodata_values[0]
+        collapsed = os.path.join(tempfile.gettempdir(), "cng_collapsed_input.tif")
+        print(f"  Collapsing fill codes {self.nodata_values} → {primary} for hex aggregation...")
+        result = gdal.Translate(
+            collapsed,
+            self.input_path,
+            format="GTiff",
+            creationOptions=["BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS"],
+        )
+        if result is None:
+            raise RuntimeError(
+                f"Failed to stage raster for fill-code collapse: {gdal.GetLastErrorMsg()}"
+            )
+        result = None
+        _collapse_fill_values(collapsed, self.nodata_values, primary)
+        self._collapsed_input = collapsed
+        return collapsed
+
     def _hex_aggregate_h0(self, h0_cell: int) -> Optional[str]:
         """Area-weighted aggregation of source raster into native H3 cells
         inside one h0 partition.
@@ -1234,11 +1320,11 @@ class RasterProcessor:
             print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells")
             return None
 
-        # exactextract excludes pixels equal to the raster's declared nodata.
-        # Build a VRT once that imposes the requested nodata; workers reuse it.
-        # A single value just overrides the band nodata; multiple fill codes
-        # (issue #108) are collapsed to the first via an identity warp VRT so
-        # exactextract drops every one of them, not just the band's own.
+        # exactextract excludes pixels equal to the raster's single declared
+        # nodata. A lone requested value just overrides the band nodata via a
+        # cheap VRT; multiple fill codes (issue #108) cannot be expressed as one
+        # band nodata, so they are physically remapped to the primary in a
+        # collapsed copy built once and reused across h0 regions.
         nodata_values = self.nodata_values
         with rasterio.open(self.input_path) as rast:
             src_nodata = rast.nodata
@@ -1260,15 +1346,7 @@ class RasterProcessor:
                 else:
                     rast_arg = self.input_path
             else:
-                vrt_path = f"/tmp/raster_{h0_cell}_nodata.vrt"
-                gdal.Warp(
-                    vrt_path,
-                    self.input_path,
-                    format="VRT",
-                    srcNodata=" ".join(_fmt_gdal(v) for v in nodata_values),
-                    dstNodata=nodata_values[0],
-                )
-                rast_arg = vrt_path
+                rast_arg = self._collapsed_aggregation_input()
 
             chunk_size = int(os.environ.get("CNG_HEX_CHUNK_SIZE", "100000"))
             n_workers = int(os.environ.get("CNG_HEX_WORKERS", str(_cgroup_cpu_count())))

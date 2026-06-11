@@ -649,6 +649,27 @@ class TestRasterWorkflowGeneration:
             assert '--nodata "-9999,-1111,32767"' in cmd
 
     @pytest.mark.timeout(5)
+    def test_hex_job_gets_primary_nodata_when_preprocess(self):
+        """When a COG preprocess collapses fills, the hex job needs only the primary value."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,  # multi-tile → preprocess-cog runs
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                nodata_value="-9999,-1111,32767",
+            )
+            # Preprocess collapses all fills → COG carries one nodata.
+            pre = self._load_yaml(Path(tmpdir) / "test-mosaic-preprocess-cog.yaml")
+            pre_cmd = pre["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert '--nodata "-9999,-1111,32767"' in pre_cmd
+            # Hex only excludes the primary; it must not re-remap the full list.
+            hex_job = self._load_yaml(Path(tmpdir) / "test-mosaic-hex.yaml")
+            hex_cmd = hex_job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert '--nodata "-9999"' in hex_cmd
+            assert "-1111" not in hex_cmd
+
+    @pytest.mark.timeout(5)
     def test_hex_job_reads_from_cog_when_preprocess(self):
         """When preprocess is needed, hex job should read from the intermediate COG, not source URLs."""
         with tempfile.TemporaryDirectory() as tmpdir:

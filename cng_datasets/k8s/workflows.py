@@ -47,6 +47,17 @@ def _nodata_cli_value(nodata_value) -> Optional[str]:
     return ",".join(_fmt(v) for v in items)
 
 
+def _primary_nodata_cli_value(nodata_value) -> Optional[str]:
+    """The first nodata value as a CLI string, or None.
+
+    Once the COG preprocess step has collapsed every fill code to the primary
+    value, the hex job only needs to exclude that one — passing the full list
+    would force each hex pod to redundantly re-remap the whole COG (issue #108).
+    """
+    full = _nodata_cli_value(nodata_value)
+    return full.split(",")[0] if full else None
+
+
 @dataclass
 class ClusterConfig:
     """Configuration for a target Kubernetes cluster and S3 backend.
@@ -774,10 +785,17 @@ def generate_raster_workflow(
             config=config,
         )
 
+    # The hex job excludes nodata. When a preprocess-cog step runs it has
+    # already collapsed every fill code to the primary value, so the hex job
+    # only needs that one (issue #108) — handing it the full list would make
+    # each hex pod redundantly re-remap the whole COG. Without preprocess the
+    # source is untouched, so the full list is passed through.
+    hex_nodata = _primary_nodata_cli_value(nodata_value) if needs_preprocess else nodata_value
+
     # Generate raster hex tiling job
     _generate_raster_hex_job(
         manager, k8s_name, hex_input_url, bucket, output_path, git_repo,
-        h3_resolution, parent_resolutions, value_column, nodata_value,
+        h3_resolution, parent_resolutions, value_column, hex_nodata,
         hex_memory, max_parallelism, hex_storage=hex_storage,
         hex_resampling=hex_resampling, config=config,
     )
