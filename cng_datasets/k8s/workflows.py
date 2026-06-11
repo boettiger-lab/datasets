@@ -21,6 +21,32 @@ _CONFIG_KEYS = {
 }
 
 
+def _nodata_cli_value(nodata_value) -> Optional[str]:
+    """Render a nodata spec as the value for a generated `--nodata` flag.
+
+    Accepts None, a number, a list/tuple, or a comma-separated string and
+    returns a clean comma-separated string ("-9999,-1111,32767") or None.
+    Categorical products carry several fill codes that must all be excluded
+    (issue #108). Kept dependency-free so YAML generation never imports GDAL.
+    """
+    if nodata_value is None:
+        return None
+    if isinstance(nodata_value, (list, tuple)):
+        items = list(nodata_value)
+    elif isinstance(nodata_value, str):
+        items = [p.strip() for p in nodata_value.split(",") if p.strip()]
+    else:
+        items = [nodata_value]
+    if not items:
+        return None
+
+    def _fmt(v):
+        f = float(v)
+        return str(int(f)) if f.is_integer() else repr(f)
+
+    return ",".join(_fmt(v) for v in items)
+
+
 @dataclass
 class ClusterConfig:
     """Configuration for a target Kubernetes cluster and S3 backend.
@@ -668,7 +694,10 @@ def generate_raster_workflow(
         h3_resolution: Target H3 resolution for tiling (default: 8)
         parent_resolutions: List of parent H3 resolutions (default: [0])
         value_column: Name for raster value column (default: "value")
-        nodata_value: NoData value to exclude (optional)
+        nodata_value: NoData value(s) to exclude (optional). A single value, a
+            list, or a comma-separated string ("-9999,-1111,32767") for
+            categorical products with multiple fill codes — all are collapsed to
+            the first in the COG step and excluded from hex tiling (issue #108).
         hex_resampling: Area-weighted reducer for H3 aggregation (default: "mean").
             Use "sum" for counts/stocks (population, carbon), "mean" for
             intensities (NDVI, indices), "mode" for categorical (land cover) to
@@ -740,6 +769,7 @@ def generate_raster_workflow(
             target_resolution=target_resolution,
             band=band,
             nodata_value=nodata_value,
+            hex_resampling=hex_resampling,
             cog_storage=cog_storage,
             config=config,
         )
@@ -802,24 +832,33 @@ def generate_raster_workflow(
 def _generate_cog_preprocess_job(
     manager, dataset_name, source_urls, output_cog_url, output_path,
     target_extent=None, target_resolution=None, band=None, nodata_value=None,
-    cog_storage="50Gi", config: ClusterConfig = None,
+    hex_resampling="mean", cog_storage="50Gi", config: ClusterConfig = None,
 ):
     """Generate a k8s job that mosaics multiple raster tiles into a single COG on S3."""
     if config is None:
         config = ClusterConfig()
-    # Build --input flags (one per tile)
-    input_flags = "\n  ".join(f'--input "{u}" \\' for u in source_urls)
-
-    optional_flags = ""
+    # Assemble all CLI flags as a list and join with " \\\n  " so the line
+    # continuations are always well-formed and the final flag carries no
+    # trailing backslash (a missing/extra backslash silently breaks the
+    # multi-line shell command).
+    flags = [f'--input "{u}"' for u in source_urls]
+    flags.append(f'--output-cog "{output_cog_url}"')
+    flags.append("--target-crs EPSG:4326")
+    flags.append("--resampling bilinear")
     if target_extent is not None:
         xmin, ymin, xmax, ymax = target_extent
-        optional_flags += f'\n  --target-extent "{xmin},{ymin},{xmax},{ymax}" \\'
+        flags.append(f'--target-extent "{xmin},{ymin},{xmax},{ymax}"')
     if target_resolution is not None:
-        optional_flags += f"\n  --target-resolution {target_resolution} \\"
+        flags.append(f"--target-resolution {target_resolution}")
     if band is not None:
-        optional_flags += f"\n  --band {band} \\"
-    if nodata_value is not None:
-        optional_flags += f"\n  --nodata {nodata_value} \\"
+        flags.append(f"--band {band}")
+    nodata_cli = _nodata_cli_value(nodata_value)
+    if nodata_cli is not None:
+        flags.append(f'--nodata "{nodata_cli}"')
+    # Carry the reducer into the COG step so a categorical source builds
+    # mode (not average) overviews and collapses all fill codes (issue #108).
+    flags.append(f"--hex-resampling {hex_resampling}")
+    flag_block = " \\\n  ".join(flags)
 
     # PROJ database selection is handled deterministically inside the CLI
     # (cog._configure_proj picks the highest-version proj.db, MINOR>=7). A bash
@@ -830,10 +869,7 @@ def _generate_cog_preprocess_job(
 echo "Mosaicking {len(source_urls)} tiles → {output_cog_url}"
 
 cng-datasets raster \\
-  {input_flags}
-  --output-cog "{output_cog_url}" \\
-  --target-crs EPSG:4326 \\
-  --resampling bilinear{optional_flags}
+  {flag_block}
 
 echo "✓ Preprocess COG complete: {output_cog_url}"
 """
@@ -897,8 +933,9 @@ def _generate_raster_hex_job(
 
     # Build command
     cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
-    if nodata_value is not None:
-        cng_cmd += f" --nodata {nodata_value}"
+    nodata_cli = _nodata_cli_value(nodata_value)
+    if nodata_cli is not None:
+        cng_cmd += f' --nodata "{nodata_cli}"'
 
     # PROJ database selection is handled deterministically inside the CLI
     # (cog._configure_proj picks the highest-version proj.db, MINOR>=7). A bash

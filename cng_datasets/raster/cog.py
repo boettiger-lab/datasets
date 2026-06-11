@@ -288,6 +288,40 @@ VALID_WARP_RESAMPLERS = (
 _WARP_RESAMPLER_ALIASES = {"mean": "average", "nearest": "near"}
 
 
+def _parse_nodata_values(nodata) -> List[float]:
+    """Normalize a nodata specification to a list of floats.
+
+    Accepts None, a single number, a list/tuple of numbers, or a
+    comma-separated string (e.g. "-9999,-1111,32767"). Categorical raster
+    products (LANDFIRE EVT/BpS/FRG, etc.) carry several fill codes —
+    Fill-NoData, Fill-Not-Mapped, an internal GeoTIFF nodata — that must
+    *all* be excluded; a single nodata leaves the others masquerading as
+    valid classes and inflating the hex output (issue #108). Returns [] for
+    None or an empty/whitespace string.
+    """
+    if nodata is None:
+        return []
+    if isinstance(nodata, (list, tuple)):
+        items = list(nodata)
+    elif isinstance(nodata, str):
+        items = [p.strip() for p in nodata.split(",") if p.strip()]
+    else:
+        items = [nodata]
+    return [float(x) for x in items]
+
+
+def _fmt_gdal(value: float) -> str:
+    """Format a nodata value for a GDAL command/option string.
+
+    Integer-valued floats are emitted without a trailing ".0" (so a
+    space-separated srcNodata reads "-9999 -1111 32767", not
+    "-9999.0 -1111.0 32767.0"); GDAL parses either, but the clean form is
+    what lands in generated k8s job YAML and CLI help.
+    """
+    f = float(value)
+    return str(int(f)) if f.is_integer() else repr(f)
+
+
 def _h3_res_to_degrees(h3_resolution: int) -> float:
     """Approximate pixel size in degrees for a given H3 resolution.
 
@@ -542,9 +576,10 @@ def create_mosaic_cog(
     target_extent: Optional[tuple] = None,
     target_resolution: Optional[float] = None,
     band: Optional[int] = None,
-    nodata: Optional[float] = None,
+    nodata: Optional[Union[float, str, List[float]]] = None,
     resampling: str = "bilinear",
     compression: str = "deflate",
+    overview_resampling: str = "average",
 ) -> str:
     """
     Mosaic multiple raster tiles (potentially in different CRS) into a single COG.
@@ -564,15 +599,23 @@ def create_mosaic_cog(
                            in degrees). If None, derived from the finest source tile.
         band: Extract a single band from multi-band sources (1-indexed). If None,
               all bands are preserved.
-        nodata: NoData value for output. If None, inherited from source tiles.
+        nodata: NoData value(s) for output. Accepts a single number, a list, or
+                a comma-separated string ("-9999,-1111,32767"); all are applied
+                as srcNodata and collapsed to the first as dstNodata so multi-fill
+                categorical products end up with one nodata (issue #108). If None,
+                inherited from source tiles.
         resampling: Resampling algorithm for warping (default: bilinear).
         compression: COG compression (deflate, lzw, zstd).
+        overview_resampling: Resampling for COG overviews. Use "mode"/"nearest"
+                for categorical sources — "average" corrupts class codes.
 
     Returns:
         output_path (echoed back for chaining)
     """
     if not source_urls:
         raise ValueError("source_urls must not be empty")
+
+    nodata_values = _parse_nodata_values(nodata)
 
     _configure_proj()
     print(f"Creating mosaic COG from {len(source_urls)} source tile(s)...")
@@ -617,9 +660,11 @@ def create_mosaic_cog(
         if target_resolution is not None:
             warp_kwargs["xRes"] = target_resolution
             warp_kwargs["yRes"] = target_resolution
-        if nodata is not None:
-            warp_kwargs["srcNodata"] = nodata
-            warp_kwargs["dstNodata"] = nodata
+        if nodata_values:
+            # Apply every fill code as srcNodata, collapse to the first as
+            # dstNodata so the merged COG carries a single nodata (issue #108).
+            warp_kwargs["srcNodata"] = " ".join(_fmt_gdal(v) for v in nodata_values)
+            warp_kwargs["dstNodata"] = nodata_values[0]
 
         for i, (crs_key, tiles) in enumerate(crs_groups.items()):
             print(f"  Building VRT for {crs_key} ({len(tiles)} tiles)...")
@@ -641,9 +686,9 @@ def create_mosaic_cog(
         print(f"  Merging {len(warped_paths)} warped group(s)...")
         merged_vrt = os.path.join(workdir, "merged.vrt")
         build_vrt_opts = {}
-        if nodata is not None:
-            build_vrt_opts["srcNodata"] = nodata
-            build_vrt_opts["VRTNodata"] = nodata
+        if nodata_values:
+            build_vrt_opts["srcNodata"] = nodata_values[0]
+            build_vrt_opts["VRTNodata"] = nodata_values[0]
         merged_ds = gdal.BuildVRT(merged_vrt, warped_paths, **build_vrt_opts)
         if merged_ds is None:
             raise RuntimeError(f"gdal.BuildVRT failed for merge: {gdal.GetLastErrorMsg()}")
@@ -666,7 +711,7 @@ def create_mosaic_cog(
 
         print("  Building overviews...")
         tmp_ds = gdal.Open(tmp_tif, gdal.GA_Update)
-        tmp_ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32, 64])
+        tmp_ds.BuildOverviews(overview_resampling.upper(), [2, 4, 8, 16, 32, 64])
         tmp_ds = None
 
         print(f"  Writing COG → {output_path}...")
@@ -680,7 +725,7 @@ def create_mosaic_cog(
                 f"COMPRESS={compression.upper()}",
                 "PREDICTOR=YES",
                 "COPY_SRC_OVERVIEWS=YES",
-                "OVERVIEW_RESAMPLING=AVERAGE",
+                f"OVERVIEW_RESAMPLING={overview_resampling.upper()}",
                 "BIGTIFF=IF_SAFER",
                 "NUM_THREADS=ALL_CPUS",
             ],
@@ -722,7 +767,7 @@ class RasterProcessor:
         resampling: str = "nearest",
         hex_resampling: str = "mean",
         method: str = "exact-extract",
-        nodata_value: Optional[float] = None,
+        nodata_value: Optional[Union[float, str, List[float]]] = None,
         target_crs: str = "EPSG:4326",
         target_extent: Optional[tuple] = None,
         target_resolution: Optional[float] = None,
@@ -765,7 +810,10 @@ class RasterProcessor:
                 (consumers GROUP BY h<res>). Mass-conserving only when the
                 hex pitch is finer than the source pixel pitch — see issue
                 #84 for the regime analysis.
-            nodata_value: NoData value to exclude from H3 conversion
+            nodata_value: NoData value(s) to exclude from H3 conversion and to
+                collapse in the COG warp. Accepts a single number, a list, or a
+                comma-separated string ("-9999,-1111,32767") for categorical
+                products with multiple fill codes (issue #108).
             target_crs: CRS for output (default: EPSG:4326); used when mosaicking
             target_extent: Clip extent (xmin, ymin, xmax, ymax) in target_crs; used when mosaicking
             target_resolution: Output pixel size in target_crs units; used when mosaicking
@@ -871,17 +919,22 @@ class RasterProcessor:
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
 
-        # Auto-detect NoData value if not specified
-        if nodata_value is None:
+        # Auto-detect NoData value if not specified. Categorical products carry
+        # several fill codes, so nodata is tracked as a list (issue #108); the
+        # single-value paths (VRT build, detection) use self.nodata_value, the
+        # first entry, for backwards compatibility.
+        parsed_nodata = _parse_nodata_values(nodata_value)
+        if not parsed_nodata:
             detected_nodata = detect_nodata_value(input_path, verbose=True)
             if detected_nodata is not None:
-                self.nodata_value = detected_nodata
+                self.nodata_values = [detected_nodata]
             else:
-                self.nodata_value = None
+                self.nodata_values = []
                 print("ℹ No NoData value specified or detected - all values will be included")
         else:
-            self.nodata_value = nodata_value
-            print(f"✓ Using user-specified NoData value: {nodata_value}")
+            self.nodata_values = parsed_nodata
+            print(f"✓ Using user-specified NoData value(s): {parsed_nodata}")
+        self.nodata_value = self.nodata_values[0] if self.nodata_values else None
 
         # Handle H3 resolution with informative messages
         detected_resolution = detect_optimal_h3_resolution(input_path, verbose=False)
@@ -968,7 +1021,7 @@ class RasterProcessor:
         self,
         output_path: Optional[str] = None,
         overviews: bool = True,
-        overview_resampling: str = "average",
+        overview_resampling: Optional[str] = None,
     ) -> str:
         """
         Create a Cloud-Optimized GeoTIFF from input raster.
@@ -982,7 +1035,10 @@ class RasterProcessor:
         Args:
             output_path: Path for output COG (uses self.output_cog_path if None)
             overviews: Whether to create overview pyramids
-            overview_resampling: Resampling method for overviews
+            overview_resampling: Resampling method for overviews. Defaults to
+                "mode" when hex_resampling is "mode" (categorical — averaging
+                class codes corrupts the zoomed-out COG, issue #108) and
+                "average" otherwise.
 
         Returns:
             Path to created COG file
@@ -992,6 +1048,11 @@ class RasterProcessor:
 
         if output_path is None:
             raise ValueError("output_path or output_cog_path must be specified")
+
+        if overview_resampling is None:
+            # Categorical rasters (hex_resampling="mode") must not average their
+            # class codes in overviews — use mode (issue #108).
+            overview_resampling = "mode" if self.hex_resampling == "mode" else "average"
 
         print(f"Creating COG: {output_path}")
         print(f"  Input: {self.input_path}")
@@ -1012,27 +1073,41 @@ class RasterProcessor:
         needs_reprojection = not srs.IsGeographic()
         ds = None
 
+        # Collapse every declared fill code to a single nodata. Multiple values
+        # can only be remapped by a warp, so force the warp path when >1 value
+        # is given even for an already-geographic source (issue #108). Without
+        # this, create_cog applied no nodata at all and secondary fill codes
+        # (LANDFIRE -9999/-1111) survived as "valid" classes into the hex step.
+        nodata_values = self.nodata_values
+        use_warp = needs_reprojection or len(nodata_values) > 1
+
         workdir = tempfile.mkdtemp(prefix="create_cog_")
         try:
             tmp_tif = os.path.join(workdir, "intermediate.tif")
 
-            if needs_reprojection:
-                print("  Reprojecting to EPSG:4326...")
-                warp_options = gdal.WarpOptions(
+            if use_warp:
+                if needs_reprojection:
+                    print("  Reprojecting to EPSG:4326...")
+                warp_kwargs = dict(
                     dstSRS='EPSG:4326',
                     format='GTiff',
                     creationOptions=['COMPRESS=NONE', 'BIGTIFF=IF_SAFER'],
                     resampleAlg=self.resampling,
                     multithread=True,
                 )
-                result = gdal.Warp(tmp_tif, self.input_path, options=warp_options)
+                if nodata_values:
+                    warp_kwargs["srcNodata"] = " ".join(_fmt_gdal(v) for v in nodata_values)
+                    warp_kwargs["dstNodata"] = nodata_values[0]
+                result = gdal.Warp(tmp_tif, self.input_path,
+                                   options=gdal.WarpOptions(**warp_kwargs))
             else:
-                result = gdal.Translate(
-                    tmp_tif,
-                    self.input_path,
+                translate_kwargs = dict(
                     format='GTiff',
                     creationOptions=['COMPRESS=NONE', 'BIGTIFF=IF_SAFER'],
                 )
+                if nodata_values:
+                    translate_kwargs["noData"] = nodata_values[0]
+                result = gdal.Translate(tmp_tif, self.input_path, **translate_kwargs)
 
             if result is None:
                 raise RuntimeError(f"Failed to create intermediate GTiff: {gdal.GetLastErrorMsg()}")
@@ -1159,24 +1234,41 @@ class RasterProcessor:
             print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells")
             return None
 
-        # exactextract needs the raster opened with the right nodata.
-        # Build a VRT once that overrides nodata if needed; workers reuse it.
+        # exactextract excludes pixels equal to the raster's declared nodata.
+        # Build a VRT once that imposes the requested nodata; workers reuse it.
+        # A single value just overrides the band nodata; multiple fill codes
+        # (issue #108) are collapsed to the first via an identity warp VRT so
+        # exactextract drops every one of them, not just the band's own.
+        nodata_values = self.nodata_values
         with rasterio.open(self.input_path) as rast:
-            needs_vrt = self.nodata_value is not None and rast.nodata != self.nodata_value
+            src_nodata = rast.nodata
 
         vrt_path = None
         try:
-            if needs_vrt:
+            if not nodata_values:
+                rast_arg = self.input_path
+            elif len(nodata_values) == 1:
+                if src_nodata != nodata_values[0]:
+                    vrt_path = f"/tmp/raster_{h0_cell}_nodata.vrt"
+                    gdal.Translate(
+                        vrt_path,
+                        self.input_path,
+                        format="VRT",
+                        noData=nodata_values[0],
+                    )
+                    rast_arg = vrt_path
+                else:
+                    rast_arg = self.input_path
+            else:
                 vrt_path = f"/tmp/raster_{h0_cell}_nodata.vrt"
-                gdal.Translate(
+                gdal.Warp(
                     vrt_path,
                     self.input_path,
                     format="VRT",
-                    noData=self.nodata_value,
+                    srcNodata=" ".join(_fmt_gdal(v) for v in nodata_values),
+                    dstNodata=nodata_values[0],
                 )
                 rast_arg = vrt_path
-            else:
-                rast_arg = self.input_path
 
             chunk_size = int(os.environ.get("CNG_HEX_CHUNK_SIZE", "100000"))
             n_workers = int(os.environ.get("CNG_HEX_WORKERS", str(_cgroup_cpu_count())))
@@ -1400,10 +1492,11 @@ class RasterProcessor:
                     )
             parent_sql = ', ' + ', '.join(parent_exprs) if parent_exprs else ''
 
-            where_clause = (
-                f"WHERE Z != {self.nodata_value}"
-                if self.nodata_value is not None else ""
-            )
+            if self.nodata_values:
+                vals = ", ".join(_fmt_gdal(v) for v in self.nodata_values)
+                where_clause = f"WHERE Z NOT IN ({vals})"
+            else:
+                where_clause = ""
 
             output_path = (
                 f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"

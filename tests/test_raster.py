@@ -1273,5 +1273,142 @@ class TestHexResamplingMaxMin:
         )
 
 
+class TestParseNodataValues:
+    """Multi-value nodata parsing/formatting helpers (issue #108)."""
+
+    @pytest.mark.timeout(5)
+    def test_parse_accepts_none_number_list_and_string(self):
+        from cng_datasets.raster.cog import _parse_nodata_values
+        assert _parse_nodata_values(None) == []
+        assert _parse_nodata_values("") == []
+        assert _parse_nodata_values(32767) == [32767.0]
+        assert _parse_nodata_values([-9999, -1111]) == [-9999.0, -1111.0]
+        assert _parse_nodata_values("-9999,-1111,32767") == [-9999.0, -1111.0, 32767.0]
+        # whitespace and stray separators are tolerated
+        assert _parse_nodata_values("  -9999 , 32767 ") == [-9999.0, 32767.0]
+
+    @pytest.mark.timeout(5)
+    def test_fmt_gdal_drops_trailing_zero_for_integers(self):
+        from cng_datasets.raster.cog import _fmt_gdal
+        assert _fmt_gdal(-9999.0) == "-9999"
+        assert _fmt_gdal(32767) == "32767"
+        assert _fmt_gdal(1.5) == "1.5"
+
+
+@requires_gdal
+class TestMultiValueNodata:
+    """Categorical sources with multiple fill codes (issue #108)."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def categorical_raster(self, temp_dir):
+        """A small Int16 raster carrying three distinct fill codes.
+
+        Mimics LANDFIRE: -9999 (Fill-NoData), -1111 (Fill-Not-Mapped) and an
+        internal nodata 32767, alongside genuine class codes (11, 22, 33).
+        Only the internal 32767 is declared as the band NoData — the others
+        leak through unless multi-value nodata is honored.
+        """
+        width, height = 6, 6
+        xmin, ymin = -122.0, 37.0
+        pixel_size = 0.01
+        raster_path = os.path.join(temp_dir, "categorical.tif")
+
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(raster_path, width, height, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([xmin, pixel_size, 0, ymin + height * pixel_size, 0, -pixel_size])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+
+        data = np.full((height, width), 11, dtype=np.int16)
+        data[:, 1] = 22
+        data[:, 2] = 33
+        data[0, 0] = -9999   # Fill-NoData
+        data[0, 1] = -1111   # Fill-Not-Mapped
+        data[0, 2] = 32767   # internal nodata
+        band = ds.GetRasterBand(1)
+        band.WriteArray(data)
+        band.SetNoDataValue(32767)
+        band.FlushCache()
+        ds = None
+        return raster_path
+
+    @pytest.mark.timeout(30)
+    def test_processor_stores_nodata_value_list(self, categorical_raster):
+        from cng_datasets.raster import RasterProcessor
+        proc = RasterProcessor(
+            input_path=categorical_raster,
+            h3_resolution=6,
+            nodata_value="-9999,-1111,32767",
+        )
+        assert proc.nodata_values == [-9999.0, -1111.0, 32767.0]
+        # the single-value paths still see the primary fill code
+        assert proc.nodata_value == -9999.0
+
+    @pytest.mark.timeout(60)
+    def test_create_cog_collapses_all_fill_codes(self, categorical_raster, temp_dir):
+        """All declared fill codes collapse to one nodata in the COG (issue #108)."""
+        from cng_datasets.raster import RasterProcessor
+        out = os.path.join(temp_dir, "categorical-cog.tif")
+        proc = RasterProcessor(
+            input_path=categorical_raster,
+            output_cog_path=out,
+            h3_resolution=6,
+            hex_resampling="mode",
+            nodata_value="-9999,-1111,32767",
+        )
+        proc.create_cog()
+
+        ds = gdal.Open(out)
+        band = ds.GetRasterBand(1)
+        assert band.GetNoDataValue() == -9999.0
+        arr = band.ReadAsArray()
+        ds = None
+        # Every former fill code is now the single nodata; none survive as data.
+        assert -1111 not in arr
+        assert 32767 not in arr
+        # Genuine class codes are untouched.
+        assert 11 in arr and 22 in arr and 33 in arr
+
+    @pytest.mark.timeout(180)
+    def test_hex_excludes_all_fill_codes(self, categorical_raster, temp_dir):
+        """The hex step drops every fill code, not just the band's own nodata."""
+        import geopandas as gpd
+        from shapely.geometry import box
+        from cng_datasets.raster import RasterProcessor
+
+        h0_gdf = gpd.GeoDataFrame(
+            {"i": [0], "h0": [577199624117288959], "geometry": [box(-123, 36, -121, 39)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom")
+        h0_file = os.path.join(temp_dir, "h0-test.parquet")
+        h0_gdf.to_parquet(h0_file)
+
+        output_dir = os.path.join(temp_dir, "hex_output")
+        os.makedirs(output_dir, exist_ok=True)
+
+        proc = RasterProcessor(
+            input_path=categorical_raster,
+            output_parquet_path=output_dir,
+            h3_resolution=5,
+            parent_resolutions=[0],
+            h0_grid_path=h0_file,
+            value_column="evt",
+            hex_resampling="mode",
+            nodata_value="-9999,-1111,32767",
+        )
+        result = proc.process_h0_region(0)
+        if result:
+            df = proc.con.read_parquet(result).fetchdf()
+            for fill in (-9999, -1111, 32767):
+                assert fill not in df["evt"].values, f"fill code {fill} leaked into hex output"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

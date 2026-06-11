@@ -39,7 +39,11 @@ def main():
     raster_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
     raster_parser.add_argument("--h0-index", type=int, help="Process specific h0 region (0-121), or omit to process all")
     raster_parser.add_argument("--value-column", default="value", help="Name for raster value column (default: 'value')")
-    raster_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
+    raster_parser.add_argument("--nodata", type=str,
+                               help="NoData value(s) to exclude. Accepts a single value or a "
+                                    "comma-separated list for categorical products with multiple "
+                                    "fill codes, e.g. '-9999,-1111,32767' (all collapsed to the "
+                                    "first in the COG and excluded from hex tiling).")
     raster_parser.add_argument("--compression", default="deflate", help="COG compression (deflate, lzw, zstd)")
     raster_parser.add_argument("--blocksize", type=int, default=512, help="COG block size (default: 512)")
     raster_parser.add_argument("--resampling", default="nearest", help="Resampling method for COG creation (default: nearest)")
@@ -129,7 +133,10 @@ def main():
     raster_workflow_parser.add_argument("--h3-resolution", type=int, default=8, help="Target H3 resolution (default: 8)")
     raster_workflow_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
     raster_workflow_parser.add_argument("--value-column", default="value", help="Name for raster value column")
-    raster_workflow_parser.add_argument("--nodata", type=float, help="NoData value to exclude")
+    raster_workflow_parser.add_argument("--nodata", type=str,
+                                        help="NoData value(s) to exclude. Accepts a single value or "
+                                             "a comma-separated list for categorical products with "
+                                             "multiple fill codes, e.g. '-9999,-1111,32767'.")
     raster_workflow_parser.add_argument("--hex-resampling", default="mean",
                                         choices=VALID_HEX_REDUCERS,
                                         help="Reducer for H3 aggregation. 'sum' for "
@@ -231,6 +238,9 @@ def _dispatch(args):
 
         # If multiple inputs and only --output-cog requested, use create_mosaic_cog directly
         if isinstance(input_path, list) and args.output_cog and not args.output_parquet:
+            # Categorical sources (--hex-resampling mode) must not average class
+            # codes in the COG overviews (issue #108).
+            overview_resampling = "mode" if args.hex_resampling == "mode" else "average"
             create_mosaic_cog(
                 source_urls=input_path,
                 output_path=args.output_cog,
@@ -241,6 +251,7 @@ def _dispatch(args):
                 nodata=args.nodata,
                 resampling=args.resampling,
                 compression=args.compression,
+                overview_resampling=overview_resampling,
             )
         else:
             processor = RasterProcessor(
