@@ -10,6 +10,22 @@ import json
 import os
 
 
+# Response headers a browser must be allowed to read cross-origin for
+# HTTP Range-based rendering — PMTiles tile fetches and COG byte-range reads.
+# Accept-Ranges and Content-Range are NOT CORS-safelisted, so without explicit
+# exposure a JS client cannot see them and range reads fail silently even
+# though `curl` works (issues #35, #79, #87). Defined once and shared by both
+# CORS code paths (S3Manager.configure_cors and setup_public_bucket) so the two
+# can never drift apart again.
+CORS_EXPOSE_HEADERS = [
+    "ETag",
+    "Content-Length",
+    "Content-Type",
+    "Accept-Ranges",
+    "Content-Range",
+]
+
+
 def configure_s3_credentials(con) -> None:
     """
     Configure S3 credentials for DuckDB using environment variables.
@@ -147,6 +163,7 @@ class S3Manager:
                 'AllowedOrigins': allowed_origins,
                 'AllowedMethods': allowed_methods,
                 'AllowedHeaders': ['*'],
+                'ExposeHeaders': CORS_EXPOSE_HEADERS,
                 'MaxAgeSeconds': 3600
             }]
         }
