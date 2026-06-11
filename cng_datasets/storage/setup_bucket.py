@@ -11,6 +11,8 @@ import json
 import os
 from typing import Optional
 
+from .s3 import CORS_EXPOSE_HEADERS
+
 
 def setup_public_bucket(
     bucket_name: str,
@@ -137,7 +139,9 @@ def setup_public_bucket(
                     "AllowedOrigins": ["*"],
                     "AllowedMethods": ["GET", "HEAD"],
                     "AllowedHeaders": ["*"],
-                    "ExposeHeaders": ["ETag", "Content-Type", "Content-Disposition"],
+                    # Range-read headers for PMTiles/COG browser rendering
+                    # (issues #35, #79, #87); shared with S3Manager.configure_cors.
+                    "ExposeHeaders": CORS_EXPOSE_HEADERS,
                     "MaxAgeSeconds": 3600
                 }]
             }
