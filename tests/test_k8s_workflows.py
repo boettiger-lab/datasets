@@ -225,6 +225,24 @@ class TestWorkflowGeneration:
             assert "-wrapdateline" in command_str
             assert "-datelineoffset 15" in command_str
 
+    def test_pmtiles_job_exports_tippecanoe_max_threads(self):
+        """TIPPECANOE_MAX_THREADS must be exported so the child tippecanoe sees it (#77)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+
+            pmtiles_file = Path(tmpdir) / "test-ds-pmtiles.yaml"
+            with open(pmtiles_file) as f:
+                job = yaml.safe_load(f)
+
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            # A plain (un-exported) assignment is invisible to the child process.
+            assert "export TIPPECANOE_MAX_THREADS=" in command
+
     @pytest.mark.timeout(5)
     def test_workflow_rbac(self):
         """Test RBAC configuration is generated."""
