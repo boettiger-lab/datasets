@@ -281,9 +281,55 @@ class TestH3Functions:
         assert 'id' in result.columns
         assert 'name' in result.columns
         assert result['name'].iloc[0] == 'test'
-        
+
         con.close()
-    
+
+    @pytest.mark.timeout(10)
+    def test_subcell_polygon_gets_representative_cell(self):
+        """A polygon smaller than one H3 cell falls back to one representative cell (#104)."""
+        con = setup_duckdb_connection()
+        # ~50 m x 50 m polygon, far smaller than a res-8 cell (~0.74 km²).
+        con.execute("""
+            CREATE TABLE tiny AS
+            SELECT 1::BIGINT AS _cng_fid,
+                   ST_GeomFromText('POLYGON((10.00010 10.00010,10.00060 10.00010,10.00060 10.00060,10.00010 10.00060,10.00010 10.00010))') AS geom
+        """)
+        sql = geom_to_h3_cells(con, "tiny", zoom=8)
+        n = con.execute(f"SELECT len(h3id) FROM ({sql})").fetchone()[0]
+        con.close()
+        assert n == 1, f"sub-cell polygon should yield one fallback cell, got {n}"
+
+    @pytest.mark.timeout(10)
+    def test_subcell_multipolygon_part_preserved(self):
+        """A sub-cell MULTIPOLYGON part is preserved via the fallback, not dropped (#104)."""
+        con = setup_duckdb_connection()
+        con.execute("""
+            CREATE TABLE tinymp AS
+            SELECT 1::BIGINT AS _cng_fid,
+                   ST_GeomFromText('MULTIPOLYGON(((10.0001 10.0001,10.0006 10.0001,10.0006 10.0006,10.0001 10.0006,10.0001 10.0001)))') AS geom
+        """)
+        sql = geom_to_h3_cells(con, "tinymp", zoom=8)
+        n = con.execute(f"SELECT len(h3id) FROM ({sql})").fetchone()[0]
+        con.close()
+        assert n >= 1
+
+    @pytest.mark.timeout(10)
+    def test_swapped_coordinate_polygon_stays_empty(self):
+        """The fallback is gated on valid latitude: swapped (lat,lon) input stays
+        empty so the downstream swapped-coordinate check still raises (#104)."""
+        con = setup_duckdb_connection()
+        # Y values (~122) are outside H3's valid latitude range, so the fallback
+        # must NOT fire (it would feed an invalid latitude into h3_latlng_to_cell).
+        con.execute("""
+            CREATE TABLE swapped AS
+            SELECT 1::BIGINT AS _cng_fid,
+                   ST_GeomFromText('POLYGON((10 122.0001,10.0005 122.0001,10.0005 122.0006,10 122.0006,10 122.0001))') AS geom
+        """)
+        sql = geom_to_h3_cells(con, "swapped", zoom=8)
+        n = con.execute(f"SELECT len(h3id) FROM ({sql})").fetchone()[0]
+        con.close()
+        assert n == 0, "swapped-coordinate polygon must stay empty for the QC to catch it"
+
     @pytest.mark.timeout(5)
     def test_h3_parent_resolution(self):
         """Test H3 parent cell calculation."""
@@ -771,17 +817,19 @@ class TestSwappedCoordinateDetection:
             processor.con.close()
 
     @pytest.mark.timeout(60)
-    def test_small_polygon_warns_not_raises(self):
+    def test_small_polygon_preserved_via_representative_point(self):
         """
-        Polygons smaller than one H3 cell at the target resolution should produce 0
-        cells but NOT raise a RuntimeError (issue #51).  The chunk should still
-        succeed and the processor should print a warning.
+        Polygons smaller than one H3 cell must NOT be dropped (issue #104,
+        superseding the earlier #51 skip-with-warning behavior). The H3 polyfill
+        returns no cells for a sub-cell polygon, so each feature falls back to
+        the single cell containing its ST_PointOnSurface — every feature yields
+        >= 1 row, and an all-sub-cell chunk still writes output (no Pass 2 crash).
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             con = setup_duckdb_connection()
             test_parquet = f"{tmpdir}/test.parquet"
-            # A tiny polygon (~0.0001 km²) in correct (lon, lat) order.
-            # At H3 resolution 8 (cell area ~0.74 km²) this produces 0 cells.
+            # Three tiny polygons (~0.0001 km²) in correct (lon, lat) order.
+            # At H3 resolution 8 (cell area ~0.74 km²) the polyfill is empty.
             con.execute(f"""
                 CREATE TABLE test_data AS
                 SELECT
@@ -801,12 +849,16 @@ class TestSwappedCoordinateDetection:
                 h3_resolution=8,
                 chunk_size=10,
             )
-            # Must not raise — small polygons should be skipped with a warning
+            # Must not raise, and the all-sub-cell chunk must still produce output.
             output_file = processor.process_chunk(0)
-            processor.con.close()
-            # Output file is created (may be empty if all features are skipped,
-            # but the process must complete without error)
             assert output_file is not None
+            # Every sub-cell feature is preserved with exactly one fallback cell.
+            n_rows, n_features = processor.con.execute(
+                f"SELECT COUNT(*), COUNT(DISTINCT id) FROM read_parquet('{output_file}')"
+            ).fetchone()
+            processor.con.close()
+            assert n_features == 3, "all three sub-cell features must survive"
+            assert n_rows == 3, "each sub-cell feature maps to exactly one cell"
 
 
 class TestRepartitionWithAttributeJoin:

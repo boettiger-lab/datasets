@@ -173,6 +173,17 @@ def geom_to_h3_cells(
     # Convert to multi-polygons and unnest, then generate H3 cells
     # The geometry is already GEOMETRY type in DuckDB spatial extension
     # Line geometries are buffered into polygons before polyfill.
+    #
+    # Any polygon smaller than one H3 cell at this resolution contains no cell
+    # centre, so h3_polygon_wkt_to_cells returns an empty array and the feature
+    # would vanish from the output entirely; a chunk in which every feature is
+    # sub-cell produces no rows at all (issue #104). When the polyfill is empty
+    # we fall back to the single cell containing the feature's ST_PointOnSurface
+    # — a guaranteed-interior representative point — so every feature yields
+    # >= 1 cell regardless of its size. The fallback is gated on a valid latitude
+    # range: a polygon with empty polyfill AND out-of-range Y is left empty on
+    # purpose so the downstream swapped-(lat,lon) check still raises a clear
+    # error rather than feeding an invalid latitude into h3_latlng_to_cell.
     sql = f'''
         WITH t0 AS (
             SELECT {col_list},
@@ -189,14 +200,28 @@ def geom_to_h3_cells(
             SELECT {col_list},
                    UNNEST(ST_Dump(geom)).geom AS geom
             FROM t0
+        ),
+        t2 AS (
+            SELECT {col_list},
+                   geom,
+                   CASE
+                       WHEN ST_GeometryType(geom) = 'POINT'
+                       THEN [h3_latlng_to_cell(ST_Y(geom), ST_X(geom), {zoom})]
+                       ELSE h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), {zoom})
+                   END AS h3id
+            FROM t1
         )
         SELECT {col_list},
                CASE
-                   WHEN ST_GeometryType(geom) = 'POINT'
-                   THEN [h3_latlng_to_cell(ST_Y(geom), ST_X(geom), {zoom})]
-                   ELSE h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), {zoom})
+                   WHEN h3id IS NOT NULL AND len(h3id) > 0 THEN h3id
+                   WHEN ST_YMin(geom) >= -90 AND ST_YMax(geom) <= 90
+                   THEN [h3_latlng_to_cell(
+                            ST_Y(ST_PointOnSurface(geom)),
+                            ST_X(ST_PointOnSurface(geom)),
+                            {zoom})]
+                   ELSE h3id
                END AS h3id
-        FROM t1
+        FROM t2
     '''
 
     return sql
@@ -409,12 +434,15 @@ class H3VectorProcessor:
         """)
 
         # Check for features that produced 0 H3 cells despite having polygon area.
-        # Two distinct causes:
-        #   1. Swapped (lat, lon) coordinates → Y values outside valid lat range [-90, 90]
-        #      → raise RuntimeError (bad input data)
-        #   2. Polygon smaller than a single H3 cell at the target resolution
-        #      → valid input, just warn and continue
-        # Join intermediate file (has id + h3id) back to chunk_table (has id + geom).
+        # With the ST_PointOnSurface fallback (issue #104) a valid sub-cell
+        # polygon now always yields >= 1 cell, so the only remaining cause of an
+        # empty array on an area>0, valid-latitude polygon is removed. What stays
+        # detectable here is swapped (lat, lon) input: those have Y outside the
+        # valid latitude range, the fallback is deliberately NOT applied (it
+        # would feed an invalid latitude into h3_latlng_to_cell), the array stays
+        # empty, and we raise a clear RuntimeError. Any other residual empty
+        # array (degenerate geometry the fallback could not represent) is just
+        # warned about. Join intermediate (id + h3id) back to chunk_table (id + geom).
         swapped, small = self.con.execute(f"""
             SELECT
                 COUNT(*) FILTER (
@@ -440,8 +468,8 @@ class H3VectorProcessor:
         if small > 0:
             print(
                 f"  Warning: {small} polygon feature(s) in chunk {chunk_id} produced 0 H3 cells "
-                f"at resolution {self.h3_resolution} — polygons are smaller than one H3 cell "
-                f"and will be skipped."
+                f"at resolution {self.h3_resolution} even after the representative-point "
+                f"fallback — likely degenerate geometry. These features are dropped."
             )
 
         print(f"  ✓ Pass 1 complete: {intermediate_file}")
