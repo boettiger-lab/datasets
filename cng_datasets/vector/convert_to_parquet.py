@@ -542,8 +542,10 @@ def process_parquet_input(
         compression: Compression algorithm (ZSTD, GZIP, SNAPPY, NONE)
         compression_level: Compression level (1-22 for ZSTD)
         row_group_size: Number of rows per group
-        id_column: Specific ID column to use (auto-detected if not specified)
-        force_id: Create _cng_fid if no suitable ID column exists
+        id_column: Specific source column to use as the row id instead of
+            synthesizing _cng_fid (must exist in source)
+        force_id: Unused; kept for backwards compatibility (_cng_fid is always
+            created unless id_column is given or the source already has it)
         progress: Show progress during conversion
         target_crs: Target CRS for output (default: EPSG:4326)
         verbose: Print detailed debug information
@@ -578,7 +580,16 @@ def process_parquet_input(
 
         column_names = [col[0].lower() for col in columns]
 
-        # Determine ID column
+        # Determine ID handling. Always create a synthetic _cng_fid row
+        # identifier (issue #43) unless the user named an explicit id_column or
+        # the source already carries _cng_fid. Source columns such as 'fid',
+        # 'objectid', etc. are NOT trusted as row keys — they may be
+        # feature/geometry identifiers with multiple rows per value (e.g. the
+        # TPL Conservation Almanac's 'fid', one row per funding program per
+        # site), which makes the repartition join many-to-many. They are
+        # preserved unchanged alongside _cng_fid (matching check_id_column for
+        # the ST_Read path). force_id is accepted for backwards compatibility
+        # but always treated as True.
         needs_id = False
         id_col_name = None
 
@@ -587,20 +598,12 @@ def process_parquet_input(
                 id_col_name = id_column
             else:
                 raise ValueError(f"Specified ID column '{id_column}' not found in source data")
+        elif '_cng_fid' in column_names:
+            # Re-processing an already-converted dataset; don't duplicate it.
+            id_col_name = "_cng_fid"
         else:
-            # Look for common ID column names
-            common_ids = ['id', 'fid', 'objectid', 'gid', 'uid', '_cng_fid']
-            for id_name in common_ids:
-                if id_name in column_names:
-                    id_col_name = id_name
-                    break
-
-            if id_col_name is None:
-                if force_id:
-                    needs_id = True
-                    id_col_name = "_cng_fid"
-                else:
-                    raise ValueError("No ID column found and force_id=False")
+            needs_id = True
+            id_col_name = "_cng_fid"
 
         if needs_id:
             print(f"  Adding synthetic ID column: {id_col_name}")
