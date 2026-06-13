@@ -139,6 +139,104 @@ class TestConvertToParquet:
             if os.path.exists(output_path):
                 os.remove(output_path)
     
+    def test_parquet_input_with_nonunique_fid_gets_cng_fid(self):
+        """Parquet input whose 'fid' is a feature key (not row-unique) still gets
+        a row-unique _cng_fid (issue #43).
+
+        Mirrors the TPL Conservation Almanac case: multiple rows share one fid
+        (one row per funding program per site). The old parquet path picked 'fid'
+        as the id and never synthesized _cng_fid, making the repartition join
+        many-to-many. _cng_fid must be 1..N and additive (fid preserved).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "source.parquet")
+            output_path = os.path.join(tmpdir, "out.parquet")
+
+            con = duckdb.connect()
+            con.install_extension("spatial")
+            con.load_extension("spatial")
+            # 3 sites, fid repeated (2 + 2 + 1 = 5 rows): fid is NOT row-unique.
+            con.execute(f"""
+                COPY (
+                    SELECT * FROM (VALUES
+                        (42453, 'grant',   ST_Point(-122.4, 37.8)),
+                        (42453, 'bond',    ST_Point(-122.4, 37.8)),
+                        (42454, 'grant',   ST_Point(-122.5, 37.9)),
+                        (42454, 'private', ST_Point(-122.5, 37.9)),
+                        (42455, 'grant',   ST_Point(-122.6, 38.0))
+                    ) t(fid, program, geom)
+                ) TO '{source}' (FORMAT PARQUET)
+            """)
+            con.close()
+
+            convert_to_parquet(
+                source_url=source,
+                destination=output_path,
+                force_id=True,
+                progress=False,
+            )
+
+            con = duckdb.connect()
+            cols = con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{output_path}')"
+            ).fetchdf()['column_name'].tolist()
+            assert 'fid' in cols, "Source fid must be preserved"
+            assert '_cng_fid' in cols, "_cng_fid must be synthesized even when fid exists"
+
+            count = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{output_path}')"
+            ).fetchone()[0]
+            distinct = con.execute(
+                f"SELECT COUNT(DISTINCT _cng_fid) FROM read_parquet('{output_path}')"
+            ).fetchone()[0]
+            assert count == 5 and distinct == 5, (
+                f"_cng_fid must be row-unique: {distinct} distinct / {count} rows"
+            )
+            # fid stays non-unique (proves it was the wrong row key).
+            fid_distinct = con.execute(
+                f"SELECT COUNT(DISTINCT fid) FROM read_parquet('{output_path}')"
+            ).fetchone()[0]
+            assert fid_distinct == 3, "fid should remain a (non-unique) feature key"
+            con.close()
+
+    def test_parquet_input_preserves_existing_cng_fid(self):
+        """A parquet source that already carries _cng_fid is not re-numbered."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "source.parquet")
+            output_path = os.path.join(tmpdir, "out.parquet")
+
+            con = duckdb.connect()
+            con.install_extension("spatial")
+            con.load_extension("spatial")
+            con.execute(f"""
+                COPY (
+                    SELECT * FROM (VALUES
+                        (100, ST_Point(-122.4, 37.8)),
+                        (200, ST_Point(-122.5, 37.9))
+                    ) t(_cng_fid, geom)
+                ) TO '{source}' (FORMAT PARQUET)
+            """)
+            con.close()
+
+            convert_to_parquet(
+                source_url=source,
+                destination=output_path,
+                force_id=True,
+                progress=False,
+            )
+
+            con = duckdb.connect()
+            ids = con.execute(
+                f"SELECT _cng_fid FROM read_parquet('{output_path}') ORDER BY _cng_fid"
+            ).fetchdf()['_cng_fid'].tolist()
+            cols = con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{output_path}')"
+            ).fetchdf()['column_name'].tolist()
+            con.close()
+
+            assert ids == [100, 200], f"existing _cng_fid must be preserved, got {ids}"
+            assert cols.count('_cng_fid') == 1, "must not duplicate _cng_fid"
+
     def test_geoparquet_metadata_is_valid(self, sample_geojson):
         """Test that output has valid GeoParquet metadata."""
         with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
