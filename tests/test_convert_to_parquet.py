@@ -1066,3 +1066,65 @@ class TestMultipointGeometry:
         finally:
             if os.path.exists(output_path):
                 os.remove(output_path)
+
+    def test_parquet_input_blob_geometry_cast_to_geometry(self):
+        """A parquet input whose geom is a BLOB-typed WKB column must come out as
+        GEOMETRY with GeoParquet metadata (issue #61).
+
+        The ST_Read path was fixed in #75, but the parquet-input path
+        (process_parquet_input) passed BLOB geometry through unchanged, so a
+        MULTIPOINT-derived parquet stayed BLOB and broke PMTiles. No ogr2ogr
+        needed — the BLOB-geom source is built directly with DuckDB.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "blob_geom.parquet")
+            output_path = os.path.join(tmpdir, "out.parquet")
+
+            con = duckdb.connect()
+            con.install_extension("spatial")
+            con.load_extension("spatial")
+            # ST_AsWKB yields a BLOB column — the exact shape ST_Read emits for
+            # MULTIPOINT sources before the cast.
+            con.execute(f"""
+                COPY (
+                    SELECT 'A' AS name,
+                           ST_AsWKB(ST_GeomFromText('MULTIPOINT((-122.4 37.8),(-122.5 37.9))')) AS geom
+                    UNION ALL
+                    SELECT 'B' AS name,
+                           ST_AsWKB(ST_GeomFromText('MULTIPOINT((-122.6 38.0),(-122.7 38.1))')) AS geom
+                ) TO '{source}' (FORMAT PARQUET)
+            """)
+            assert con.execute(
+                f"SELECT typeof(geom) FROM read_parquet('{source}') LIMIT 1"
+            ).fetchone()[0] == "BLOB", "fixture precondition: input geom must be BLOB"
+            con.close()
+
+            convert_to_parquet(
+                source_url=source,
+                destination=output_path,
+                force_id=True,
+                progress=False,
+            )
+
+            con = duckdb.connect()
+            con.install_extension("spatial")
+            con.load_extension("spatial")
+            schema = con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{output_path}')"
+            ).fetchall()
+            geom_col_type = next((row[1] for row in schema if row[0] == "geom"), None)
+            assert geom_col_type is not None and geom_col_type.startswith("GEOMETRY"), (
+                f"Expected GEOMETRY column, got {geom_col_type!r}"
+            )
+            geom_types = {
+                row[0] for row in con.execute(
+                    f"SELECT DISTINCT ST_GeometryType(geom) FROM read_parquet('{output_path}')"
+                ).fetchall()
+            }
+            assert geom_types == {"MULTIPOINT"}, f"Unexpected geometry types: {geom_types}"
+            con.close()
+
+            # GeoParquet metadata (the 'geo' key) must be present.
+            import pyarrow.parquet as pq
+            metadata = pq.read_table(output_path).schema.metadata or {}
+            assert b"geo" in metadata, "Output must carry GeoParquet 'geo' metadata"
