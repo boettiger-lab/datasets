@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import duckdb
 import ibis
+from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
 
 
@@ -164,8 +165,15 @@ def repartition_by_h0(
         os.makedirs(local_partition, exist_ok=True)
         local_file = os.path.join(local_partition, 'data_0.parquet')
 
+        # ORDER BY the row id within each h0 partition (issue #103) so parquet
+        # row-group zonemaps can prune by feature identity: a plain
+        # `WHERE _cng_fid IN (...)` then skips the partitions/row-groups whose
+        # [min,max] excludes the targets instead of scanning every row. Wrap in
+        # a subquery so ORDER BY references the unambiguous output column (the
+        # join exposes the id on both sides). PARTITION BY h0 is unchanged.
         con.raw_sql(
-            f"COPY ({join_sql.format(h0=h0)}) TO '{local_file}'"
+            f"COPY (SELECT * FROM ({join_sql.format(h0=h0)})"
+            f" ORDER BY \"{chunk_id_col}\") TO '{local_file}'"
             f" (FORMAT PARQUET, COMPRESSION ZSTD)"
         )
 
@@ -190,6 +198,13 @@ def repartition_by_h0(
             f"No partitions written — all chunks appear to be empty. "
             f"Check that the hex job in '{chunks_dir}' produced non-empty output."
         )
+
+    # Assert H3 index columns are UBIGINT through the consumer (hive glob) path,
+    # before cleaning up the chunks. Raises on a non-UBIGINT h{N>=1} column
+    # (issue #102), leaving chunks intact for debugging if it fails.
+    hex_glob = f"{output_dir.rstrip('/')}/h0=*/data_0.parquet"
+    print(f'Asserting H3 columns are UBIGINT via {hex_glob}...')
+    assert_h3_columns_unsigned(lambda sql: con.raw_sql(sql).fetchall(), hex_glob)
 
     print('Cleaning up local directory...')
     shutil.rmtree(local_dir, ignore_errors=True)
