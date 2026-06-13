@@ -610,17 +610,37 @@ def process_parquet_input(
         else:
             print(f"  Using existing ID column: {id_col_name}")
 
-        # Build query to read and optionally add ID
+        # Detect a BLOB-typed WKB geometry column (e.g. MULTIPOINT) so we can
+        # cast it to GEOMETRY. Otherwise DuckDB writes it back as BLOB with no
+        # GeoParquet metadata and the downstream PMTiles step (ogr2ogr) sees raw
+        # binary and produces null geometries (issue #61). Mirrors the ST_Read
+        # path's get_geometry_column / ST_GeomFromWKB handling.
+        geom_blob_col = None
+        for col_name, col_type, *_ in columns:
+            if col_type.upper() == 'BLOB' and col_name.lower() in _GEOM_COLUMN_NAMES:
+                geom_blob_col = col_name
+                break
+
+        if geom_blob_col:
+            print(f"  Casting BLOB geometry column to GEOMETRY: {geom_blob_col}")
+            cols_expr = (
+                f'* EXCLUDE ("{geom_blob_col}"), '
+                f'ST_GeomFromWKB("{geom_blob_col}") AS "{geom_blob_col}"'
+            )
+        else:
+            cols_expr = "*"
+
+        # Build query to read, cast geometry, and optionally add ID
         if needs_id:
             query = f"""
             SELECT
                 ROW_NUMBER() OVER () AS {id_col_name},
-                *
+                {cols_expr}
             FROM read_parquet('{read_url}')
             """
         else:
             query = f"""
-            SELECT * FROM read_parquet('{read_url}')
+            SELECT {cols_expr} FROM read_parquet('{read_url}')
             """
 
         # Write with DuckDB
