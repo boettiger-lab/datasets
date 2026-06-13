@@ -11,6 +11,7 @@ import math
 import tempfile
 import duckdb
 from osgeo import gdal, osr
+from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
 
 
@@ -1427,6 +1428,14 @@ class RasterProcessor:
             ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
         """)
         self.con.unregister("hex_values")
+
+        # Fail fast if the h3 extension emitted signed BIGINT parents (issue #102):
+        # the native cell column is UBIGINT, but h3_cell_to_parent's return type
+        # depends on the (unpinned) extension version. Assert per-partition since
+        # each h0 region is written by an independent job.
+        assert_h3_columns_unsigned(
+            lambda sql: self.con.execute(sql).fetchall(), output_path
+        )
 
         print(f"  ✓ Wrote: {output_path} ({len(results)} cells)")
         return output_path

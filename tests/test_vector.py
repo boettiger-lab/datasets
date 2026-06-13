@@ -924,9 +924,9 @@ class TestRepartitionWithAttributeJoin:
                 CREATE TABLE chunk_data AS 
                 SELECT 
                     1 as MyID,
-                    613196575302221823 as h10,
-                    613196575302221823 as h9,
-                    613196575302221823 as h8,
+                    613196575302221823::UBIGINT as h10,
+                    613196575302221823::UBIGINT as h9,
+                    613196575302221823::UBIGINT as h8,
                     577199624117288959 as h0
             """)
             con.execute(f"COPY chunk_data TO '{chunks_dir}/chunk_000000.parquet' (FORMAT PARQUET)")
@@ -1023,9 +1023,9 @@ class TestRepartitionWithAttributeJoin:
                 CREATE TABLE chunk_data AS 
                 SELECT 
                     i as fid,
-                    613196575302221823 + i as h10,
-                    613196575302221823 as h9,
-                    613196575302221823 as h8,
+                    (613196575302221823 + i)::UBIGINT as h10,
+                    613196575302221823::UBIGINT as h9,
+                    613196575302221823::UBIGINT as h8,
                     577199624117288959 as h0
                 FROM range(10) t(i)
             """)
@@ -1053,7 +1053,54 @@ class TestRepartitionWithAttributeJoin:
             assert len(output_df) == 10
             
             con.close()
-    
+
+    @pytest.mark.timeout(15)
+    def test_repartition_orders_by_cng_fid_within_partition(self):
+        """Rows within each h0 partition are sorted by _cng_fid (issue #103).
+
+        The intra-partition ORDER BY tightens row-group [min,max] zonemaps so a
+        `WHERE _cng_fid IN (...)` can prune. We assert the physical row order is
+        non-decreasing in _cng_fid even when the chunk input is shuffled.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            chunks_dir = f"{tmpdir}/chunks"
+            os.makedirs(chunks_dir, exist_ok=True)
+
+            # Single h0 partition; _cng_fid deliberately out of order, multiple
+            # rows per fid (the hex explosion) so ordering is observable.
+            con.execute(f"""
+                CREATE TABLE chunk_data AS
+                SELECT
+                    _cng_fid,
+                    (613196575302221823 + row_number() OVER ())::UBIGINT as h10,
+                    613196575302221823::UBIGINT as h8,
+                    577199624117288959 as h0
+                FROM (VALUES (5),(1),(3),(1),(5),(2),(3)) t(_cng_fid)
+            """)
+            con.execute(f"COPY chunk_data TO '{chunks_dir}/chunk_000000.parquet' (FORMAT PARQUET)")
+            con.close()
+
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+
+            repartition_by_h0(
+                chunks_dir=chunks_dir,
+                output_dir=f"{tmpdir}/output",
+                source_parquet=None,
+                cleanup=False,
+            )
+
+            con = setup_duckdb_connection()
+            part = f"{tmpdir}/output/h0=577199624117288959/data_0.parquet"
+            # Read in physical (file) order — no ORDER BY in the query.
+            fids = [r[0] for r in con.execute(
+                f"SELECT _cng_fid FROM read_parquet('{part}')"
+            ).fetchall()]
+            con.close()
+
+            assert fids == sorted(fids), f"rows not ordered by _cng_fid: {fids}"
+
     @pytest.mark.timeout(15)
     def test_repartition_with_mixed_case_columns(self):
         """Test that mixed case ID columns are handled correctly."""
