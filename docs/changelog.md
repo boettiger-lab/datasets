@@ -5,10 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-06-13
 
 ### Fixed
 - Raster → H3 pipeline now produces one row per native H3 cell with mass-conserving area-weighted aggregation, fixing ~50% mass loss observed on `ghs-pop-2020` and `irrecoverable-carbon-2024` (#84). Implementation uses `exactextract` for precise pixel-to-cell overlap accounting.
+- **Geometry typing on both convert paths** — `cng-convert-to-parquet` now emits a properly-typed `GEOMETRY` column (with GeoParquet metadata) for BLOB-typed WKB sources such as MULTIPOINT, on both the `ST_Read` path (#75) and the parquet-input path (#117). Previously a `BLOB` `geom` produced null geometries in the downstream PMTiles step (#61).
+- **Row-unique `_cng_fid` on both convert paths** — a synthetic, monotonic `_cng_fid` is now always created (source `fid`/`objectid` preserved, additive), on both the `ST_Read` path and the parquet-input path (#116). A source `fid` may be a feature/geometry key with multiple rows per value, which made the repartition join many-to-many (#43).
+- **H3 hex-write hardening** — after the hex build, every physical `h{N≥1}` column is asserted to be `UBIGINT` (`h0` exempt as the signed hive key), catching a signed-`BIGINT` `h3_cell_to_parent` from an unpinned h3 extension; and each `h0` partition file is now ordered by `_cng_fid` so parquet row-group zonemaps can prune by feature id (#102, #103).
+- Sub-H3-cell polygons are retained via a representative-point fallback instead of being dropped when smaller than a cell (#104).
+- Antimeridian/polar H3 boundary cells are split correctly (#92).
+- PROJ configuration is deterministic and lazy, requiring `proj.db` MINOR ≥ 7, and points PROJ CLI tools at pyproj's bundled `proj.db` (#72, #91, #101).
+- Measured/3D (M/Z) geometry is flattened to 2D before DuckDB reads it, and the failing bbox-column step for M-geometry types was removed (#50, #51, #59).
+- Non-COG raster sources are auto-detected and the `/vsis3/` COG write path was fixed (#66, #68); a warning is emitted when an input raster is in a projected CRS (#73).
+- Generated raster hex job mounts the rclone config (#99); the PMTiles job exports `TIPPECANOE_MAX_THREADS` (#77).
+- Bucket CORS now exposes range-read headers for HTTP range requests (#35, #79, #87).
+- Lower ephemeral-storage defaults with matching limits (#65); conservative `chunk_size` fallback when feature count can't be determined (#63).
+- Workflow-generation tests no longer hit the network (#112).
 
 ### Breaking
 - The default raster→H3 reducer changed from `average` to `mean`, and the default algorithm is now the mass-conserving `exact-extract` path (`--method exact-extract`), where `--hex-resampling` accepts only `sum`, `mean`, or `mode`. Migration: replace `average` with `mean` in existing scripts. Categorical rasters still use `mode`; use `sum` for count/stock data. Rasters processed before this change have undercounted totals and should be reprocessed. The previous GDAL-Warp resampling vocabulary is still available via `--method warp-centroid` (see Added).
@@ -22,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Configurable priority class**: `--priority-class ""` omits `priorityClassName` for clusters without NRP/Armada priority classes.
 - `load_profile()` and `cluster_config_from_args()` exported from `cng_datasets.k8s` for programmatic use.
 - Eliminated duplicated S3 env-var blocks across all six job generators via shared `_s3_env_vars()` and `_apply_scheduling()` helpers.
+- **`max`/`min` `--hex-resampling`** reducers for peak/richness rasters (#96), and `mode` for categorical rasters (#80, #81).
+- **Multi-value `--nodata`** support with categorical-safe COG overviews (#108).
+- **LineString geometry** support in H3 hex tiling via buffering (#69); a warning is emitted when point geometries are hexed (#62).
+
+### Changed
+- Removed the `geoparquet-io` dependency — DuckDB 1.5 writes GeoParquet natively (#56).
+- CI lint (`ruff`) is now blocking, and the existing lint backlog was cleared (#90, #94).
+- Agent/developer instructions are now Docker-based; the local-venv flow was dropped (#97).
 
 ## [0.1.1] - 2026-01-01
 
@@ -64,5 +84,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Chunk-based processing for large datasets
 - h0 partitioning for efficient queries
 
+[0.2.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.2.0
 [0.1.1]: https://github.com/boettiger-lab/datasets/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.1.0
