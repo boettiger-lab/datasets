@@ -1128,3 +1128,49 @@ class TestMultipointGeometry:
             import pyarrow.parquet as pq
             metadata = pq.read_table(output_path).schema.metadata or {}
             assert b"geo" in metadata, "Output must carry GeoParquet 'geo' metadata"
+
+    def test_geoarrow_native_input_raises_clear_error(self):
+        """A geoarrow-native-encoded parquet (geometry as STRUCT, not WKB) must
+        raise a clear, actionable error rather than silently passing the
+        non-GEOMETRY column through with no GeoParquet metadata (issue #119).
+        """
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "geoarrow_native.parquet")
+            output_path = os.path.join(tmpdir, "out.parquet")
+
+            gdf = gpd.GeoDataFrame(
+                {"name": ["a", "b"]},
+                geometry=[
+                    Polygon([(-122.5, 37.7), (-122.4, 37.7), (-122.4, 37.8), (-122.5, 37.8)]),
+                    Polygon([(-121.5, 38.7), (-121.4, 38.7), (-121.4, 38.8), (-121.5, 38.8)]),
+                ],
+                crs="EPSG:4326",
+            )
+            gdf.to_parquet(source, geometry_encoding="geoarrow")
+
+            # Precondition: DuckDB sees the geometry as a STRUCT, not GEOMETRY/BLOB.
+            con = duckdb.connect()
+            con.install_extension("spatial")
+            con.load_extension("spatial")
+            geom_type = next(
+                row[1] for row in con.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{source}')"
+                ).fetchall() if row[0] == "geometry"
+            )
+            con.close()
+            assert geom_type.upper().startswith("STRUCT"), (
+                f"fixture precondition: expected STRUCT geom, got {geom_type}"
+            )
+
+            with pytest.raises(ValueError, match="DuckDB cannot ingest directly"):
+                convert_to_parquet(
+                    source_url=source,
+                    destination=output_path,
+                    force_id=True,
+                    progress=False,
+                )
+            # Nothing should have been written.
+            assert not os.path.exists(output_path)
