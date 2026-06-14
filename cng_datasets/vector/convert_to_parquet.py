@@ -610,16 +610,43 @@ def process_parquet_input(
         else:
             print(f"  Using existing ID column: {id_col_name}")
 
-        # Detect a BLOB-typed WKB geometry column (e.g. MULTIPOINT) so we can
-        # cast it to GEOMETRY. Otherwise DuckDB writes it back as BLOB with no
-        # GeoParquet metadata and the downstream PMTiles step (ogr2ogr) sees raw
-        # binary and produces null geometries (issue #61). Mirrors the ST_Read
-        # path's get_geometry_column / ST_GeomFromWKB handling.
+        # Classify the geometry column. DuckDB ingests a native GEOMETRY column
+        # directly, and a BLOB-typed WKB column via ST_GeomFromWKB (e.g.
+        # MULTIPOINT — issue #61); without that cast DuckDB writes BLOB back with
+        # no GeoParquet metadata and the PMTiles step produces null geometries.
+        # Any OTHER encoding read_parquet exposes — notably geoarrow-native (a
+        # STRUCT column) or WKT (VARCHAR) — cannot be operated on by DuckDB and
+        # would otherwise pass through verbatim as a non-GEOMETRY column with no
+        # GeoParquet metadata, silently breaking every downstream consumer
+        # (issue #119). Detect that and fail with an actionable message.
+        has_geometry = any(ct.upper().startswith('GEOMETRY') for _, ct, *_ in columns)
         geom_blob_col = None
+        geom_unsupported = None  # (name, type) of a geom-named column we can't ingest
         for col_name, col_type, *_ in columns:
-            if col_type.upper() == 'BLOB' and col_name.lower() in _GEOM_COLUMN_NAMES:
+            if col_name.lower() not in _GEOM_COLUMN_NAMES:
+                continue
+            ct = col_type.upper()
+            if ct == 'BLOB':
                 geom_blob_col = col_name
-                break
+            elif not ct.startswith('GEOMETRY'):
+                geom_unsupported = (col_name, col_type)
+
+        # Only error when there is no usable geometry at all (no native GEOMETRY,
+        # no castable BLOB) but a geom-named column exists in an encoding we can't
+        # handle. This avoids false positives when a real GEOMETRY column
+        # coexists with, say, a numeric column named "shape".
+        if not has_geometry and geom_blob_col is None and geom_unsupported is not None:
+            bad_name, bad_type = geom_unsupported
+            raise ValueError(
+                f"Geometry column '{bad_name}' has type {bad_type}, which DuckDB "
+                f"cannot ingest directly (typically geoarrow-native or WKT "
+                f"encoding). DuckDB is the supported engine; re-encode the source "
+                f"as WKB GeoParquet first and re-run, e.g.:\n"
+                f"    ogr2ogr -f Parquet fixed.parquet '{source_url}'\n"
+                f"  or in Python:\n"
+                f"    geopandas.read_parquet('{source_url}')"
+                f".to_parquet('fixed.parquet', geometry_encoding='WKB')"
+            )
 
         if geom_blob_col:
             print(f"  Casting BLOB geometry column to GEOMETRY: {geom_blob_col}")
