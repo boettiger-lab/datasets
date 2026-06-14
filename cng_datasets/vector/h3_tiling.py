@@ -20,6 +20,16 @@ _H3_EDGE_KM = {
     12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169,
 }
 
+# Pass 1 writes each feature's H3 cells as a single list value. DuckDB/Arrow
+# cannot hold one list value larger than 2^31-1 bytes — i.e. ~268M UBIGINT
+# cells — and the parquet page-size assertion (PrimitiveColumnWriter::NextPage)
+# can fire below that. We refuse a feature whose estimated cell count exceeds a
+# conservative fraction of that ceiling, raising a clear error instead of a C++
+# assertion (issue #107). The estimate (spheroid area / average hex area)
+# undercounts the true polyfill by ~1.3x, so the default leaves wide margin.
+# Override via the CNG_MAX_CELLS_PER_FEATURE environment variable.
+_DEFAULT_MAX_CELLS_PER_FEATURE = 134_000_000
+
 
 def _h3_edge_length_degrees(resolution: int) -> float:
     """Return the H3 edge length in degrees for a given resolution.
@@ -313,6 +323,9 @@ class H3VectorProcessor:
         self.id_column = id_column
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
+        self.max_cells_per_feature = int(
+            os.environ.get("CNG_MAX_CELLS_PER_FEATURE", _DEFAULT_MAX_CELLS_PER_FEATURE)
+        )
 
         self.con = setup_duckdb_connection()
         self._configure_credentials()
@@ -329,6 +342,47 @@ class H3VectorProcessor:
             if col.upper() in ['SHAPE', 'GEOMETRY', 'GEOM']:
                 return col
         raise ValueError(f"No geometry column found. Available columns: {columns}")
+
+    def _assert_no_oversized_feature(self, id_col: str, chunk_id: int) -> None:
+        """Fail fast if any feature in `chunk_table` would produce an H3 cell
+        array exceeding the single-array size limit (issue #107).
+
+        Estimates per-feature cell count as spheroid area / average hex area at
+        the target resolution and raises a clear RuntimeError naming the worst
+        offender (id, area, estimated cells) if it exceeds
+        ``self.max_cells_per_feature``. This converts an otherwise-fatal C++
+        page-size assertion in the Pass-1 COPY into an actionable error.
+        """
+        avg_hex_m2 = self.con.execute(
+            f"SELECT h3_get_hexagon_area_avg({self.h3_resolution}, 'm^2')"
+        ).fetchone()[0]
+
+        worst = self.con.execute(f"""
+            SELECT
+                "{id_col}" AS fid,
+                ST_Area_Spheroid(geom) AS area_m2,
+                ST_Area_Spheroid(geom) / {avg_hex_m2} AS est_cells
+            FROM chunk_table
+            WHERE ST_GeometryType(geom) NOT IN ('POINT', 'MULTIPOINT')
+            ORDER BY est_cells DESC
+            LIMIT 1
+        """).fetchone()
+
+        if worst is None or worst[2] is None:
+            return
+        fid, area_m2, est_cells = worst
+        if est_cells > self.max_cells_per_feature:
+            raise RuntimeError(
+                f"Chunk {chunk_id}: feature {id_col}={fid} is too large to hex at "
+                f"resolution {self.h3_resolution} — estimated {int(est_cells):,} H3 "
+                f"cells ({area_m2 / 1e6:,.0f} km²) would exceed the per-feature "
+                f"cell-array limit ({self.max_cells_per_feature:,}). A single "
+                f"feature's cells are written as one array value, which cannot "
+                f"exceed the ~268M-element (2GB) Arrow/parquet-page ceiling. "
+                f"Hex this feature at a coarser resolution (see #98 for adaptive "
+                f"variable-resolution polyfill), or raise CNG_MAX_CELLS_PER_FEATURE "
+                f"if your build tolerates a larger array."
+            )
 
     def process_chunk(
         self,
@@ -415,6 +469,14 @@ class H3VectorProcessor:
             SELECT "{id_col}", {geom_col} AS geom
             FROM {chunk_view_name}
         """)
+
+        # Guard against a single feature whose H3 cell array would exceed the
+        # 2GB / parquet-page limit (issue #107). Estimate per-feature cell count
+        # up front (spheroid area / average hex area) and fail with a clear,
+        # actionable error naming the feature, rather than letting the COPY below
+        # die on a C++ assertion. ST_Area_Spheroid needs no reprojection, so it
+        # is robust on the pathological/antimeridian polygons that trigger this.
+        self._assert_no_oversized_feature(id_col, chunk_id)
 
         # Generate H3 arrays WITHOUT unnesting
         h3_sql = geom_to_h3_cells(

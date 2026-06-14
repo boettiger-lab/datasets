@@ -751,6 +751,64 @@ class TestVectorProcessing:
             processor.con.close()
 
 
+class TestOversizedFeatureGuard:
+    """Issue #107: a feature whose H3 cell array would exceed the 2GB/page limit
+    must fail with a clear, actionable error instead of a C++ assertion."""
+
+    def _make_source(self, tmpdir):
+        src = f"{tmpdir}/polys.parquet"
+        con = setup_duckdb_connection()
+        # Feature 1: ~2deg box (~67k cells at res 8); Feature 2: tiny box.
+        con.execute(f"""
+            COPY (
+                SELECT 1 AS _cng_fid, ST_GeomFromText('POLYGON((0 0,2 0,2 2,0 2,0 0))') AS geom
+                UNION ALL
+                SELECT 2 AS _cng_fid, ST_GeomFromText('POLYGON((10 10,10.01 10,10.01 10.01,10 10.01,10 10))') AS geom
+            ) TO '{src}' (FORMAT PARQUET)
+        """)
+        con.close()
+        return src
+
+    @pytest.mark.timeout(30)
+    def test_oversized_feature_raises_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._make_source(tmpdir)
+            processor = H3VectorProcessor(
+                input_url=src, output_url=f"{tmpdir}/out",
+                h3_resolution=8, parent_resolutions=[0], chunk_size=500,
+            )
+            processor.max_cells_per_feature = 50_000  # below feature 1's ~67k estimate
+            with pytest.raises(RuntimeError, match=r"_cng_fid=1 is too large"):
+                processor._process_pass1(0)
+            processor.con.close()
+
+    @pytest.mark.timeout(30)
+    def test_normal_features_pass_under_default_threshold(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._make_source(tmpdir)
+            processor = H3VectorProcessor(
+                input_url=src, output_url=f"{tmpdir}/out",
+                h3_resolution=8, parent_resolutions=[0], chunk_size=500,
+            )
+            # Default threshold (~134M) is far above these features.
+            out = processor._process_pass1(0)
+            n = processor.con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{out}')"
+            ).fetchone()[0]
+            assert n == 2
+            processor.con.close()
+
+    def test_threshold_from_env(self, monkeypatch):
+        monkeypatch.setenv("CNG_MAX_CELLS_PER_FEATURE", "12345")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._make_source(tmpdir)
+            processor = H3VectorProcessor(
+                input_url=src, output_url=f"{tmpdir}/out", h3_resolution=8,
+            )
+            assert processor.max_cells_per_feature == 12345
+            processor.con.close()
+
+
 class TestSwappedCoordinateDetection:
     """Test that swapped lat/lon coordinates are detected and raise an error."""
 
