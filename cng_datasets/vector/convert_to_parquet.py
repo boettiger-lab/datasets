@@ -349,33 +349,6 @@ def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: b
         con.close()
 
 
-def is_geographic_crs(crs: str) -> bool:
-    """
-    Check if a CRS is geographic (uses degrees) vs projected (uses meters).
-
-    Args:
-        crs: CRS string (e.g., "EPSG:4326")
-
-    Returns:
-        True if geographic, False if projected
-    """
-    # Common geographic CRS codes
-    if crs in ["EPSG:4326", "EPSG:4269", "EPSG:4267"]:
-        return True
-
-    # Extract EPSG code
-    if crs.startswith("EPSG:"):
-        try:
-            code = int(crs.split(":")[1])
-            # EPSG codes 4000-4999 are typically geographic
-            if 4000 <= code < 5000:
-                return True
-        except (ValueError, IndexError):
-            pass
-
-    return False
-
-
 def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Optional[str] = None,
                     force_id: bool = True, verbose: bool = False) -> Tuple[bool, str]:
     """
@@ -461,15 +434,19 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
 
     # Determine geometry transformation
     if source_crs and source_crs != target_crs:
-        # Need to reproject
-        if is_geographic_crs(target_crs) and not is_geographic_crs(source_crs):
-            # Projected → geographic: DuckDB's ST_Transform outputs (lat, lon) authority
-            # axis order, but GeoParquet requires (lon, lat). Apply ST_FlipCoordinates.
-            # Geographic → geographic (e.g. EPSG:4269 → EPSG:4326): ST_Transform preserves
-            # traditional (lon, lat) order, so no flip is needed.
-            geom_expr = f"ST_FlipCoordinates(ST_Transform({raw_geom}, '{source_crs}', '{target_crs}')) AS {geom_col}"
-        else:
-            geom_expr = f"ST_Transform({raw_geom}, '{source_crs}', '{target_crs}') AS {geom_col}"
+        # Need to reproject. DuckDB's ST_Transform honours each CRS's *authority* axis
+        # order by default (e.g. EPSG:4326 is latitude-first), but GeoParquet — and
+        # DuckDB's own ST_Read — always store coordinates as (longitude, latitude).
+        # Passing always_xy := true forces ST_Transform to read AND write (lon, lat)
+        # regardless of either CRS's declared axis order, so the output is always
+        # (lon, lat) and no ST_FlipCoordinates correction is needed.
+        #
+        # This replaces an earlier is_geographic_crs() heuristic that decided whether
+        # to flip based on a numeric EPSG-code range. That heuristic mis-handled
+        # axis-order edge cases — geographic CRSs that are longitude-first (OGC:CRS84)
+        # and geographic compound/3D CRSs with codes >= 5000 (EPSG:5498
+        # "NAD83 + NAVD88 height", EPSG:4979) — swapping lat/lon for them (see #128).
+        geom_expr = f"ST_Transform({raw_geom}, '{source_crs}', '{target_crs}', always_xy := true) AS {geom_col}"
     else:
         # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
         geom_expr = f"{raw_geom} AS {geom_col}" if geom_is_blob else geom_col
