@@ -67,6 +67,32 @@ class TestReprojectQueryAxisOrder:
         finally:
             con.close()
 
+    def test_compound_crs_to_crs84_target_is_valid_and_finite(self):
+        """EPSG:5498 -> OGC:CRS84 must yield valid, finite geometry.
+
+        #128 noted that --target-crs OGC:CRS84 produced corrupt geometry (xmax=inf,
+        most features invalid). That is the same axis-order root cause: without
+        always_xy, ST_Transform read the stored (lon, lat) as 5498's authority
+        (lat, lon), feeding an out-of-range "latitude" into PROJ and blowing up to
+        infinity. always_xy := true fixes the EPSG:4326 and OGC:CRS84 targets alike.
+        """
+        con = duckdb.connect()
+        con.install_extension("spatial")
+        con.load_extension("spatial")
+        try:
+            wkt = "POLYGON((-118.3 33.8,-118.1 33.8,-118.1 34.0,-118.3 34.0,-118.3 33.8))"
+            valid, xmax, ymax = con.execute(f"""
+                SELECT ST_IsValid(g), ST_XMax(g), ST_YMax(g) FROM (
+                    SELECT ST_Transform(ST_GeomFromText('{wkt}'),
+                                        'EPSG:5498', 'OGC:CRS84', always_xy := true) AS g
+                )
+            """).fetchone()
+            assert valid, "transform to OGC:CRS84 produced invalid geometry"
+            assert xmax < 0 and xmax > -119, f"xmax {xmax} not a finite CA longitude"
+            assert 33 < ymax < 35, f"ymax {ymax} not a finite CA latitude"
+        finally:
+            con.close()
+
 
 class TestConvertToParquet:
     """Test convert_to_parquet functionality."""
