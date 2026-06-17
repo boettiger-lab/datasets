@@ -73,7 +73,8 @@ This prevents OOM errors when processing large polygons at high H3 resolutions. 
 
 - `input_url` (str): Path to input GeoParquet file
 - `output_url` (str): Path to output directory
-- `h3_resolution` (int): Primary H3 resolution (default: 10)
+- `h3_resolution` (int): Primary H3 resolution (default: 10). Ignored when `resolution_by_area` is set.
+- `resolution_by_area` (list[tuple], optional): Variable resolution per feature, parsed from a `--resolution-by-area` spec (see [Variable Resolution by Area](#variable-resolution-by-area)). Mutually exclusive with `h3_resolution`.
 - `parent_resolutions` (list[int]): Parent resolutions for aggregation (default: [9, 8, 0])
 - `chunk_size` (int): Number of rows to process at once in Pass 1 (default: 500)
 - `intermediate_chunk_size` (int): Number of array rows to unnest at once in Pass 2 (default: 10)
@@ -118,6 +119,51 @@ processor = H3VectorProcessor(
     intermediate_chunk_size=5  # Reduced from default 10
 )
 ```
+
+## Variable Resolution by Area
+
+**When to use this.** Reach for `--resolution-by-area` when a single dataset mixes
+small and very large polygons and a uniform fine resolution either OOMs in Pass 2
+or trips the 2 GB parquet-page limit on the biggest features — but dropping the
+*whole* dataset to a coarse resolution would throw away edge precision on the many
+small features. The canonical case is a species-range or protected-areas layer
+where a handful of continental/global polygons dominate cost while most features
+are small. If all your features are a similar size, keep using `--resolution`.
+
+Each feature is hexed at the native H3 resolution its **planar `ST_Area`** (deg²;
+≈12,000 km² per deg² at the equator) maps to — coarser bins for bigger features:
+
+```bash
+cng-datasets vector \
+    --input s3://bucket/ranges.parquet \
+    --output s3://bucket/ranges/chunks \
+    --resolution-by-area "12:8,600:6,5" \
+    --parent-resolutions "7,6,5,4,0"
+# area ≤ 12 deg²  -> res 8
+# area ≤ 600 deg² -> res 6
+# otherwise       -> res 5   (the trailing bare integer is the required catch-all)
+```
+
+**Output schema.** The result is a single uniform *union schema* — one `h{r}`
+column for every resolution in `{native resolutions} ∪ {parent_resolutions}`
+(capped at the finest native resolution) — plus a `native_res` column giving each
+row's true resolution. Finer columns are `NULL` in coarser tiers; the coarsest
+native resolution is non-null in every row, so flat equality joins still work
+across the mixed-resolution union (no compaction / ancestor-walks needed).
+
+**Requirements & notes.**
+- Include `0` in `--parent-resolutions` — it is the `h0` hive partition key (the
+  tool errors clearly if you omit it).
+- Mutually exclusive with `--resolution` / `--h3-resolution`.
+- The [oversized-feature guardrail](#memory-optimization) estimates cells at each
+  feature's *own* native resolution, so a polygon that would exceed the per-feature
+  cell-array limit at a fine resolution passes once a coarse bin is assigned.
+- **Chunk-size caveat:** because larger features are hexed coarser, cells-per-feature
+  still *rises* with the tier, so coarser/larger-feature tiers want a *smaller*
+  `--chunk-size` (aim for a roughly constant few-million cells per chunk, not a
+  constant row count). Automatic cells-per-chunk scaling is tracked in issue #124.
+- For a *single* feature too large even for the coarsest bin, see issue #125
+  (recursive classify-and-descend) — not yet implemented.
 
 ## Output Format
 
