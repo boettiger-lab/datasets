@@ -6,7 +6,38 @@ import tempfile
 import os
 from pathlib import Path
 import duckdb
-from cng_datasets.vector.convert_to_parquet import convert_to_parquet
+from cng_datasets.vector.convert_to_parquet import convert_to_parquet, is_geographic_crs
+
+
+class TestIsGeographicCRS:
+    """Unit tests for is_geographic_crs CRS classification."""
+
+    @pytest.mark.parametrize("crs", [
+        "EPSG:4326",   # WGS84
+        "EPSG:4269",   # NAD83 (Census TIGER)
+        "EPSG:4267",   # NAD27
+        "EPSG:4979",   # WGS84 geographic 3D
+        "EPSG:5498",   # NAD83 + NAVD88 height — compound geographic (#128)
+        "OGC:CRS84",   # WGS84 (lon, lat)
+    ])
+    def test_geographic_crs_classified_true(self, crs):
+        assert is_geographic_crs(crs) is True
+
+    @pytest.mark.parametrize("crs", [
+        "EPSG:3857",   # Web Mercator
+        "EPSG:32610",  # UTM zone 10N
+        "EPSG:5070",   # CONUS Albers — code >= 5000, projected
+    ])
+    def test_projected_crs_classified_false(self, crs):
+        assert is_geographic_crs(crs) is False
+
+    def test_compound_geographic_crs_not_flipped(self):
+        """Regression for #128: EPSG:5498 (>= 5000) is geographic, not projected.
+
+        Misclassifying it as projected made the projected->geographic branch apply
+        ST_FlipCoordinates to a geographic->geographic transform, swapping lat/lon.
+        """
+        assert is_geographic_crs("EPSG:5498") is True
 
 
 class TestConvertToParquet:

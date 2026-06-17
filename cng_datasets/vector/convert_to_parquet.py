@@ -359,6 +359,17 @@ def is_geographic_crs(crs: str) -> bool:
     Returns:
         True if geographic, False if projected
     """
+    # Prefer pyproj, which correctly classifies compound and geographic-3D CRSs
+    # (e.g. EPSG:5498 "NAD83 + NAVD88 height", EPSG:4979). A numeric range check
+    # cannot: 5498 >= 5000 looks projected but is geographic, and flipping its
+    # axes on a geographic->geographic transform corrupts coordinates (see #128).
+    try:
+        from pyproj import CRS
+        return bool(CRS.from_user_input(crs).is_geographic)
+    except Exception:
+        pass
+
+    # Fallback heuristic if pyproj is unavailable or the CRS string is unparseable.
     # Common geographic CRS codes
     if crs in ["EPSG:4326", "EPSG:4269", "EPSG:4267"]:
         return True
