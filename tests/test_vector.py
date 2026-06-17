@@ -7,8 +7,9 @@ from pathlib import Path
 import os
 from unittest.mock import patch
 
-from cng_datasets.vector.h3_tiling import geom_to_h3_cells, setup_duckdb_connection, H3VectorProcessor, identify_id_column
+from cng_datasets.vector.h3_tiling import geom_to_h3_cells, setup_duckdb_connection, H3VectorProcessor, identify_id_column, parse_resolution_by_area
 from cng_datasets.vector.repartition import repartition_by_h0
+from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
 
 
@@ -1261,5 +1262,220 @@ class TestRepartitionWithAttributeJoin:
                     output_dir=output_dir,
                     cleanup=False,
                 )
+
+
+class TestParseResolutionByArea:
+    """Issue #98: parsing the --resolution-by-area spec into sorted bins."""
+
+    def test_valid_spec_sorts_and_appends_catchall(self):
+        # Intentionally out of order to confirm threshold sorting.
+        bins = parse_resolution_by_area("600:6,12:8,5")
+        assert bins == [(12.0, 8), (600.0, 6), (None, 5)]
+
+    def test_single_catchall_only(self):
+        assert parse_resolution_by_area("7") == [(None, 7)]
+
+    def test_missing_catchall_raises(self):
+        with pytest.raises(ValueError, match="catch-all"):
+            parse_resolution_by_area("12:8,600:6")
+
+    def test_multiple_catchalls_raise(self):
+        with pytest.raises(ValueError, match="more than one catch-all"):
+            parse_resolution_by_area("12:8,5,3")
+
+    def test_empty_spec_raises(self):
+        with pytest.raises(ValueError, match="Empty"):
+            parse_resolution_by_area("")
+
+    def test_non_numeric_bin_raises(self):
+        with pytest.raises(ValueError, match="Invalid"):
+            parse_resolution_by_area("12:8,9:bad,5")
+
+    def test_resolution_out_of_range_raises(self):
+        with pytest.raises(ValueError, match="out of range"):
+            parse_resolution_by_area("12:99,5")
+
+    def test_duplicate_threshold_raises(self):
+        with pytest.raises(ValueError, match="duplicate threshold"):
+            parse_resolution_by_area("12:8,12:6,5")
+
+
+class TestResolutionByArea:
+    """Issue #98: variable-resolution (size-stratified) H3 polyfill.
+
+    Each feature is hexed at the native resolution its planar ST_Area maps to;
+    output carries a union schema (finer columns NULL in coarser tiers) plus a
+    native_res column, with the coarsest native resolution acting as a common
+    floor present in every row.
+    """
+
+    # area 0.0001 deg² -> res 8; area 100 -> res 6; area 2250 -> res 5
+    _SPEC = "1:8,600:6,5"
+    _PARENTS = [7, 6, 5, 4, 0]
+
+    def _make_source(self, tmpdir):
+        src = f"{tmpdir}/polys.parquet"
+        con = setup_duckdb_connection()
+        con.execute(f"""
+            COPY (SELECT * FROM (VALUES
+                (1, 'small',  ST_GeomFromText('POLYGON((0 0,0 0.01,0.01 0.01,0.01 0,0 0))')),
+                (2, 'medium', ST_GeomFromText('POLYGON((10 10,10 20,20 20,20 10,10 10))')),
+                (3, 'large',  ST_GeomFromText('POLYGON((40 0,40 45,90 45,90 0,40 0))'))
+            ) AS v(_cng_fid, name, geometry))
+            TO '{src}' (FORMAT PARQUET)
+        """)
+        con.close()
+        return src
+
+    @pytest.mark.timeout(15)
+    def test_geom_to_h3_cells_assigns_native_res(self):
+        """A tiny polygon is hexed fine (res 8); a huge one coarse (res 5)."""
+        con = setup_duckdb_connection()
+        con.execute("""
+            CREATE TABLE polys AS
+            SELECT * FROM (VALUES
+                (1, ST_GeomFromText('POLYGON((0 0,0 0.01,0.01 0.01,0.01 0,0 0))')),
+                (3, ST_GeomFromText('POLYGON((40 0,40 45,90 45,90 0,40 0))'))
+            ) AS v(_cng_fid, geom)
+        """)
+        bins = parse_resolution_by_area(self._SPEC)
+        sql = geom_to_h3_cells(con, "polys", keep_cols=['_cng_fid'], resolution_by_area=bins)
+        rows = con.execute(f"""
+            SELECT _cng_fid, native_res,
+                   h3_get_resolution(h3id[1]) AS cell_res
+            FROM ({sql}) ORDER BY _cng_fid
+        """).fetchall()
+        con.close()
+        by_fid = {r[0]: (r[1], r[2]) for r in rows}
+        assert by_fid[1] == (8, 8), "tiny polygon should be native res 8"
+        assert by_fid[3] == (5, 5), "huge polygon should be native res 5"
+
+    @pytest.mark.timeout(60)
+    def test_processor_emits_union_schema_and_native_res(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._make_source(tmpdir)
+            out = f"{tmpdir}/chunks"
+            os.makedirs(out)
+            processor = H3VectorProcessor(
+                input_url=src, output_url=out,
+                parent_resolutions=self._PARENTS, chunk_size=10,
+                intermediate_chunk_size=5,
+                resolution_by_area=parse_resolution_by_area(self._SPEC),
+            )
+            # finest bin resolution stands in for h3_resolution
+            assert processor.h3_resolution == 8
+            chunk_file = processor.process_chunk(0)
+            con = processor.con
+
+            cols = [d[0] for d in con.execute(
+                f"SELECT * FROM read_parquet('{chunk_file}') LIMIT 0").description]
+            assert cols == ['_cng_fid', 'native_res', 'h8', 'h7', 'h6', 'h5', 'h4', 'h0']
+
+            # native_res per feature
+            native = dict(con.execute(
+                f"SELECT DISTINCT _cng_fid, native_res FROM read_parquet('{chunk_file}')"
+            ).fetchall())
+            assert native == {1: 8, 2: 6, 3: 5}
+
+            # coarse-tier rows have NULL finer columns; common floor never NULL
+            nulls = con.execute(f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE native_res = 5 AND h8 IS NOT NULL),
+                    COUNT(*) FILTER (WHERE native_res = 5 AND h6 IS NOT NULL),
+                    COUNT(*) FILTER (WHERE native_res = 6 AND h7 IS NOT NULL),
+                    COUNT(*) FILTER (WHERE h5 IS NULL),
+                    COUNT(*) FILTER (WHERE h0 IS NULL)
+                FROM read_parquet('{chunk_file}')
+            """).fetchone()
+            assert nulls == (0, 0, 0, 0, 0), (
+                "coarse tiers must NULL their finer columns; the common floor (h5) "
+                "and partition column (h0) must be non-null in every row"
+            )
+
+            # the native cell column equals native_res's resolution for every row
+            bad = con.execute(f"""
+                SELECT COUNT(*) FROM read_parquet('{chunk_file}')
+                WHERE h3_get_resolution(
+                    CASE native_res WHEN 8 THEN h8 WHEN 6 THEN h6 WHEN 5 THEN h5 END
+                ) <> native_res
+            """).fetchone()[0]
+            assert bad == 0
+
+            # all physical h{N>=1} columns are UBIGINT (issue #102)
+            assert_h3_columns_unsigned(
+                lambda q: con.execute(q).fetchall(), chunk_file)
+            processor.con.close()
+
+    def test_missing_h0_partition_column_raises(self):
+        """By-area output must carry h0 (the hive partition key); omitting 0 from
+        --parent-resolutions fails fast with a clear error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="h0 partition column"):
+                H3VectorProcessor(
+                    input_url=f"{tmpdir}/x.parquet", output_url=tmpdir,
+                    parent_resolutions=[7, 6, 5],  # no 0
+                    resolution_by_area=parse_resolution_by_area(self._SPEC),
+                )
+
+    @pytest.mark.timeout(60)
+    def test_parent_finer_than_finest_native_is_dropped(self):
+        """A parent resolution finer than the finest native bin would be an
+        all-NULL column, so it is not emitted (matches the fixed-res path)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._make_source(tmpdir)
+            out = f"{tmpdir}/chunks"
+            os.makedirs(out)
+            processor = H3VectorProcessor(
+                input_url=src, output_url=out,
+                parent_resolutions=[9, 8, 0],  # 9 > finest native (8)
+                chunk_size=10, intermediate_chunk_size=5,
+                resolution_by_area=parse_resolution_by_area(self._SPEC),
+            )
+            chunk_file = processor.process_chunk(0)
+            cols = [d[0] for d in processor.con.execute(
+                f"SELECT * FROM read_parquet('{chunk_file}') LIMIT 0").description]
+            assert 'h9' not in cols, "all-null h9 (finer than finest native) must be dropped"
+            # attributes (name) are rejoined later in repartition, not in the chunk
+            assert cols == ['_cng_fid', 'native_res', 'h8', 'h6', 'h5', 'h0']
+            processor.con.close()
+
+    @pytest.mark.timeout(60)
+    def test_oversized_feature_backs_off_to_native_res(self):
+        """A feature that would exceed the #107 limit at the finest resolution
+        passes when its area assigns it a coarse native resolution."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            src = f"{tmpdir}/big.parquet"
+            con.execute(f"""
+                COPY (SELECT 3 AS _cng_fid,
+                             ST_GeomFromText('POLYGON((40 0,40 45,90 45,90 0,40 0))') AS geom)
+                TO '{src}' (FORMAT PARQUET)
+            """)
+            con.close()
+
+            # Fixed res 8: estimate far exceeds the (lowered) limit -> raises.
+            fixed = H3VectorProcessor(
+                input_url=src, output_url=f"{tmpdir}/o1",
+                h3_resolution=8, parent_resolutions=[0], chunk_size=10,
+            )
+            fixed.max_cells_per_feature = 1_000_000
+            with pytest.raises(RuntimeError, match=r"_cng_fid=3 is too large.*resolution 8"):
+                fixed._process_pass1(0)
+            fixed.con.close()
+
+            # By-area assigns res 5: estimate is well under the same limit -> passes.
+            os.makedirs(f"{tmpdir}/o2")
+            byarea = H3VectorProcessor(
+                input_url=src, output_url=f"{tmpdir}/o2",
+                parent_resolutions=[5, 4, 0], chunk_size=10, intermediate_chunk_size=5,
+                resolution_by_area=parse_resolution_by_area(self._SPEC),
+            )
+            byarea.max_cells_per_feature = 1_000_000
+            chunk_file = byarea.process_chunk(0)
+            assert chunk_file is not None
+            n = byarea.con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{chunk_file}')").fetchone()[0]
+            assert n > 0
+            byarea.con.close()
 
 

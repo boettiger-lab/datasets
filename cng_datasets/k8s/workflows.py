@@ -449,6 +449,7 @@ def generate_dataset_workflow(
     image: str = "ghcr.io/boettiger-lab/datasets:latest",
     git_repo: str = "https://github.com/boettiger-lab/datasets.git",
     h3_resolution: Optional[int] = None,
+    resolution_by_area: Optional[str] = None,
     parent_resolutions: Optional[List[int]] = None,
     id_column: Optional[str] = None,
     layer: Optional[str] = None,
@@ -534,8 +535,17 @@ def generate_dataset_workflow(
     if isinstance(source_urls, str):
         source_urls = [source_urls]
 
+    # Variable-resolution mode (issue #98): the hex job receives the
+    # --resolution-by-area spec instead of a single --h3-resolution. Derive the
+    # finest bin resolution from the spec for messaging / column naming, and skip
+    # geometry-type auto-detection (which only picks a single target resolution).
+    if resolution_by_area is not None:
+        from ..vector.h3_tiling import parse_resolution_by_area
+        bins = parse_resolution_by_area(resolution_by_area)
+        h3_resolution = max(res for _, res in bins)
+        print(f"  Variable resolution by area: {resolution_by_area} (finest res {h3_resolution})")
     # Auto-detect geometry type and set H3 resolution default if not specified
-    if h3_resolution is None:
+    elif h3_resolution is None:
         geom_type = _detect_geometry_type(source_urls, layer=layer)
         h3_resolution = _DEFAULT_H3_RESOLUTION.get(geom_type, 10)
         print(f"  Detected geometry type: {geom_type} — using H3 resolution {h3_resolution}")
@@ -580,7 +590,7 @@ def generate_dataset_workflow(
     print(f"  Parent resolutions: {parent_resolutions}")
 
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config, resolution_by_area=resolution_by_area)
 
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory, config=config)
@@ -592,9 +602,12 @@ def generate_dataset_workflow(
     parent_res_str = ','.join(map(str, parent_resolutions))
     # Format source URLs for command recreation
     source_urls_str = ' '.join([f'--source-url {url}' for url in source_urls])
+    res_flag = (f"--resolution-by-area \"{resolution_by_area}\""
+                if resolution_by_area is not None
+                else f"--h3-resolution {h3_resolution}")
     gen_command = (f"cng-datasets workflow --dataset {dataset_name} "
                    f"{source_urls_str} --bucket {bucket} "
-                   f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
+                   f"{res_flag} --parent-resolutions \"{parent_res_str}\"")
 
     # Generate ConfigMap YAML from job files
     _generate_configmap(k8s_name, namespace, output_path, gen_command)
@@ -1331,7 +1344,7 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-pmtiles.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None, resolution_by_area=None):
     """Generate H3 hex tiling job.
 
     Args:
@@ -1356,10 +1369,16 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     # Format parent resolutions as comma-separated string
     parent_res_str = ','.join(map(str, parent_resolutions))
 
+    # Variable-resolution mode (issue #98) passes the per-area spec; otherwise a
+    # single target resolution. The spec needs quoting (it contains commas/colons).
+    res_flag = (f'--resolution-by-area "{resolution_by_area}"'
+                if resolution_by_area is not None
+                else f"--resolution {h3_resolution}")
+
     # Build command with optional id-column parameter
     cmd_parts = [
         "set -e",
-        f"cng-datasets vector --input s3://{bucket}/{s3_dataset}.parquet --output s3://{bucket}/{s3_dataset}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --intermediate-chunk-size {intermediate_chunk_size} --resolution {h3_resolution} --parent-resolutions {parent_res_str}"
+        f"cng-datasets vector --input s3://{bucket}/{s3_dataset}.parquet --output s3://{bucket}/{s3_dataset}/chunks --chunk-id ${{JOB_COMPLETION_INDEX}} --chunk-size {chunk_size} --intermediate-chunk-size {intermediate_chunk_size} {res_flag} --parent-resolutions {parent_res_str}"
     ]
     if id_column:
         cmd_parts[-1] += f" --id-column {id_column}"
