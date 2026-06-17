@@ -6,38 +6,66 @@ import tempfile
 import os
 from pathlib import Path
 import duckdb
-from cng_datasets.vector.convert_to_parquet import convert_to_parquet, is_geographic_crs
+from cng_datasets.vector.convert_to_parquet import (
+    convert_to_parquet,
+    build_read_reproject_query,
+)
 
 
-class TestIsGeographicCRS:
-    """Unit tests for is_geographic_crs CRS classification."""
+class TestReprojectQueryAxisOrder:
+    """Axis-order handling in the read/reproject query (regression for #128).
 
-    @pytest.mark.parametrize("crs", [
-        "EPSG:4326",   # WGS84
-        "EPSG:4269",   # NAD83 (Census TIGER)
-        "EPSG:4267",   # NAD27
+    DuckDB's ST_Transform honours each CRS's authority axis order by default
+    (EPSG:4326 is latitude-first), while GeoParquet always stores (lon, lat).
+    The query passes always_xy := true so ST_Transform reads and writes (lon, lat)
+    for every CRS, which removes the need for ST_FlipCoordinates and fixes the
+    lat/lon swap that the old numeric is_geographic_crs() heuristic produced for
+    geographic compound CRSs such as EPSG:5498 ("NAD83 + NAVD88 height").
+    """
+
+    @pytest.mark.parametrize("source_crs", [
+        "EPSG:5498",   # NAD83 + NAVD88 height — compound geographic, code >= 5000 (#128)
+        "EPSG:4269",   # NAD83 (Census TIGER), latitude-first geographic
+        "OGC:CRS84",   # WGS84 longitude-first geographic
         "EPSG:4979",   # WGS84 geographic 3D
-        "EPSG:5498",   # NAD83 + NAVD88 height — compound geographic (#128)
-        "OGC:CRS84",   # WGS84 (lon, lat)
+        "EPSG:3310",   # CA Albers, projected
     ])
-    def test_geographic_crs_classified_true(self, crs):
-        assert is_geographic_crs(crs) is True
+    def test_reproject_uses_always_xy_and_never_flips(self, source_crs):
+        sql = build_read_reproject_query(
+            "dummy.gdb", source_crs=source_crs, target_crs="EPSG:4326", geom_col="geom"
+        )
+        assert "always_xy := true" in sql, "ST_Transform must force (lon, lat) axis order"
+        assert "ST_FlipCoordinates" not in sql, (
+            "No coordinate flip should be emitted; always_xy already yields (lon, lat)"
+        )
 
-    @pytest.mark.parametrize("crs", [
-        "EPSG:3857",   # Web Mercator
-        "EPSG:32610",  # UTM zone 10N
-        "EPSG:5070",   # CONUS Albers — code >= 5000, projected
-    ])
-    def test_projected_crs_classified_false(self, crs):
-        assert is_geographic_crs(crs) is False
+    def test_no_reprojection_when_source_equals_target(self):
+        sql = build_read_reproject_query(
+            "dummy.gpkg", source_crs="EPSG:4326", target_crs="EPSG:4326", geom_col="geom"
+        )
+        assert "ST_Transform" not in sql
 
-    def test_compound_geographic_crs_not_flipped(self):
-        """Regression for #128: EPSG:5498 (>= 5000) is geographic, not projected.
+    def test_compound_crs_transform_preserves_lon_lat(self):
+        """End-to-end ST_Transform check (no ogr2ogr needed): a point stored as
+        (lon, lat) in EPSG:5498 must remain (lon, lat) after transform to EPSG:4326.
 
-        Misclassifying it as projected made the projected->geographic branch apply
-        ST_FlipCoordinates to a geographic->geographic transform, swapping lat/lon.
+        This is the exact #128 scenario isolated to the transform DuckDB runs.
         """
-        assert is_geographic_crs("EPSG:5498") is True
+        con = duckdb.connect()
+        con.install_extension("spatial")
+        con.load_extension("spatial")
+        try:
+            # Compton Creek-ish point: lon=-118.2, lat=33.9 (stored x=lon, y=lat)
+            x, y = con.execute("""
+                SELECT ST_X(g), ST_Y(g) FROM (
+                    SELECT ST_Transform(ST_Point(-118.2, 33.9),
+                                        'EPSG:5498', 'EPSG:4326', always_xy := true) AS g
+                )
+            """).fetchone()
+            assert -119 < x < -117, f"X must be longitude ~-118, got {x:.3f} (lat/lon swapped)"
+            assert 33 < y < 35, f"Y must be latitude ~34, got {y:.3f} (lat/lon swapped)"
+        finally:
+            con.close()
 
 
 class TestConvertToParquet:
@@ -627,10 +655,9 @@ class TestReprojection:
         """
         Create a shapefile in EPSG:4269 (NAD83) — the CRS used by all Census TIGER files.
 
-        This is the real bug scenario: source is geographic (EPSG:4269), target is
-        EPSG:4326. reprojection is triggered because they differ, and the previous code
-        incorrectly applied ST_FlipCoordinates for all geographic targets — including
-        geographic→geographic transforms where ST_Transform does NOT swap axes.
+        Source is geographic (EPSG:4269), target is EPSG:4326; reprojection is
+        triggered because they differ. Exercises the always_xy := true transform
+        path, which must keep coordinates in (lon, lat) order.
         """
         import subprocess
         import json
@@ -679,9 +706,9 @@ class TestReprojection:
         """
         EPSG:4269 (NAD83) shapefile → EPSG:4326 must produce (lon, lat) = (X, Y).
 
-        This is the regression test for Census TIGER data. The bug: the old code applied
-        ST_FlipCoordinates for any geographic target CRS, but geographic→geographic
-        ST_Transform does NOT swap axes. The flip incorrectly put latitude values in X.
+        Regression test for Census TIGER data. ST_Transform is now invoked with
+        always_xy := true so it reads and writes (lon, lat) regardless of authority
+        axis order; the output must therefore keep longitude in X.
         """
         with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
             output_path = f.name
@@ -714,8 +741,8 @@ class TestReprojection:
             # X must be longitude (negative for US west coast), not latitude (~37)
             assert min_x < -100, (
                 f"X min is {min_x:.2f} — looks like latitude, not longitude. "
-                "Axis swap bug: ST_FlipCoordinates is being applied to a "
-                "geographic→geographic transform that doesn't need it."
+                "Axis swap bug: ST_Transform output is not (lon, lat) — check that "
+                "always_xy := true is set."
             )
             assert -123 <= min_x <= -122, f"X min {min_x:.2f} not in expected SF Bay Area lon range"
             assert -123 <= max_x <= -122, f"X max {max_x:.2f} not in expected SF Bay Area lon range"
