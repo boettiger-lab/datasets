@@ -31,6 +31,108 @@ _H3_EDGE_KM = {
 _DEFAULT_MAX_CELLS_PER_FEATURE = 134_000_000
 
 
+def parse_resolution_by_area(spec: str) -> List[Tuple[Optional[float], int]]:
+    """Parse a ``--resolution-by-area`` spec into sorted (threshold, resolution) bins.
+
+    The spec stratifies polygons by their planar ``ST_Area`` (deg²; ~12,000 km²
+    per deg² at the equator) so very large features are hexed at a coarser native
+    resolution — avoiding the Pass-2 OOM / 2 GB parquet-page limit that uniform
+    fine resolution hits (issue #98). This is the proven "Plan A" used to build the
+    published ``iucn-ranges-2025/hex`` product.
+
+    Format: comma-separated ``threshold:resolution`` pairs plus a single trailing
+    bare ``resolution`` that is the catch-all for features larger than every
+    threshold. Example ``"12:8,600:6,5"`` means::
+
+        area <= 12   -> res 8
+        area <= 600  -> res 6
+        otherwise    -> res 5   (the catch-all)
+
+    Args:
+        spec: The raw ``--resolution-by-area`` string.
+
+    Returns:
+        Bins as ``(threshold, resolution)`` tuples sorted ascending by threshold,
+        terminated by exactly one catch-all ``(None, resolution)``.
+
+    Raises:
+        ValueError: malformed token, resolution out of [0, 15], no catch-all, or
+            more than one catch-all.
+    """
+    tokens = [t.strip() for t in spec.split(',') if t.strip()]
+    if not tokens:
+        raise ValueError(
+            "Empty --resolution-by-area spec. Expected e.g. '12:8,600:6,5' "
+            "(threshold:resolution pairs plus a trailing catch-all resolution)."
+        )
+
+    bins: List[Tuple[float, int]] = []
+    catchall: Optional[int] = None
+    for tok in tokens:
+        if ':' in tok:
+            thresh_str, res_str = tok.split(':', 1)
+            try:
+                threshold = float(thresh_str)
+                res = int(res_str)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid --resolution-by-area bin '{tok}'. Expected "
+                    f"'threshold:resolution' with numeric values."
+                )
+            bins.append((threshold, res))
+        else:
+            if catchall is not None:
+                raise ValueError(
+                    f"--resolution-by-area has more than one catch-all resolution "
+                    f"(bare integer without a threshold). Found '{tok}' after a "
+                    f"catch-all was already set; only the final entry may be bare."
+                )
+            try:
+                catchall = int(tok)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid --resolution-by-area catch-all '{tok}'. Expected a "
+                    f"bare integer resolution (the final entry)."
+                )
+
+    if catchall is None:
+        raise ValueError(
+            "--resolution-by-area requires a trailing catch-all resolution (a bare "
+            "integer with no threshold) for features larger than every threshold, "
+            "e.g. the '5' in '12:8,600:6,5'."
+        )
+
+    for _, res in bins:
+        if not 0 <= res <= 15:
+            raise ValueError(f"H3 resolution {res} out of range [0, 15] in --resolution-by-area.")
+    if not 0 <= catchall <= 15:
+        raise ValueError(f"H3 catch-all resolution {catchall} out of range [0, 15].")
+
+    bins.sort(key=lambda b: b[0])
+    for (t_prev, _), (t_cur, _) in zip(bins, bins[1:]):
+        if t_cur == t_prev:
+            raise ValueError(
+                f"--resolution-by-area has a duplicate threshold {t_cur}; the later "
+                f"bin would be unreachable. Use distinct, increasing thresholds."
+            )
+    return [(t, r) for t, r in bins] + [(None, catchall)]
+
+
+def _native_res_case_sql(bins: List[Tuple[Optional[float], int]], geom_expr: str) -> str:
+    """Build a SQL CASE expression mapping a geometry's planar area to its native
+    H3 resolution, given parsed ``--resolution-by-area`` bins.
+
+    The catch-all (``threshold is None``) becomes the ELSE branch.
+    """
+    whens = [
+        f"WHEN ST_Area({geom_expr}) <= {threshold} THEN {res}"
+        for threshold, res in bins
+        if threshold is not None
+    ]
+    catchall = next(res for threshold, res in bins if threshold is None)
+    return "CASE " + " ".join(whens) + f" ELSE {catchall} END"
+
+
 def _h3_edge_length_degrees(resolution: int) -> float:
     """Return the H3 edge length in degrees for a given resolution.
 
@@ -39,6 +141,20 @@ def _h3_edge_length_degrees(resolution: int) -> float:
     for a spatial index.
     """
     return _H3_EDGE_KM[resolution] / 111.32
+
+
+def _buffer_case_sql(native_res_col: str) -> str:
+    """Build a SQL CASE mapping a per-row native H3 resolution column to the line
+    buffer width in degrees (H3 edge length at that resolution).
+
+    Used only on the variable-resolution path (issue #98), where the buffer for a
+    line feature must track that feature's native_res rather than a fixed zoom.
+    """
+    whens = " ".join(
+        f"WHEN {res} THEN {_h3_edge_length_degrees(res)}" for res in sorted(_H3_EDGE_KM)
+    )
+    # Fall back to the finest resolution's edge length if native_res is unexpected.
+    return f"CASE {native_res_col} {whens} ELSE {_h3_edge_length_degrees(max(_H3_EDGE_KM))} END"
 
 
 def identify_id_column(
@@ -125,6 +241,7 @@ def geom_to_h3_cells(
     zoom: int = 10,
     keep_cols: Optional[List[str]] = None,
     geom_col: str = "geom",
+    resolution_by_area: Optional[List[Tuple[Optional[float], int]]] = None,
 ) -> str:
     """
     Convert geometries to H3 cells at specified resolution.
@@ -132,9 +249,14 @@ def geom_to_h3_cells(
     Args:
         con: DuckDB connection
         table_name: Name of the table or view with geometry column
-        zoom: H3 resolution level (0-15)
+        zoom: H3 resolution level (0-15). Used when resolution_by_area is None.
         keep_cols: List of columns to keep from input. If None, keeps all except geom.
         geom_col: Name of the geometry column
+        resolution_by_area: Optional parsed bins from parse_resolution_by_area. When
+            provided, each feature is hexed at the native resolution its planar
+            ST_Area maps to (issue #98), and a per-feature ``native_res`` column is
+            emitted alongside ``h3id``. Points/lines have ~0 planar area and so fall
+            in the finest (first) bin. When None, every feature is hexed at ``zoom``.
 
     Returns:
         SQL query string that generates H3 cells
@@ -179,6 +301,61 @@ def geom_to_h3_cells(
             f"Buffering by {buffer_deg:.6f} deg (~H3 edge length at res {zoom}) "
             f"before H3 polyfill to ensure continuous cell coverage."
         )
+
+    # Variable-resolution (issue #98): when resolution_by_area is provided, each
+    # feature is hexed at the native resolution its planar ST_Area maps to, a
+    # per-feature `native_res` column is emitted, and the H3 functions take that
+    # column (not a literal zoom) as the resolution argument — DuckDB's H3
+    # bindings accept a per-row resolution expression. The buffer width for line
+    # geometries likewise tracks each feature's native_res. Otherwise the
+    # original single-`zoom` path below is used unchanged.
+    if resolution_by_area is not None:
+        native_res_case = _native_res_case_sql(resolution_by_area, geom_col)
+        buffer_case = _buffer_case_sql("native_res")
+        return f'''
+        WITH tbase AS (
+            SELECT {col_list},
+                   {geom_col} AS _geom_orig,
+                   {native_res_case} AS native_res
+            FROM {table_name}
+        ),
+        t0 AS (
+            SELECT {col_list}, native_res,
+                   CASE
+                       WHEN ST_GeometryType(_geom_orig) IN ('LINESTRING', 'MULTILINESTRING')
+                       THEN ST_Multi(ST_Buffer(ST_Force2D(_geom_orig), {buffer_case}))
+                       WHEN ST_GeometryType(_geom_orig) = 'POLYGON'
+                       THEN ST_Multi(_geom_orig)
+                       ELSE _geom_orig
+                   END AS geom
+            FROM tbase
+        ),
+        t1 AS (
+            SELECT {col_list}, native_res,
+                   UNNEST(ST_Dump(geom)).geom AS geom
+            FROM t0
+        ),
+        t2 AS (
+            SELECT {col_list}, native_res, geom,
+                   CASE
+                       WHEN ST_GeometryType(geom) = 'POINT'
+                       THEN [h3_latlng_to_cell(ST_Y(geom), ST_X(geom), native_res)]
+                       ELSE h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), native_res)
+                   END AS h3id
+            FROM t1
+        )
+        SELECT {col_list}, native_res,
+               CASE
+                   WHEN h3id IS NOT NULL AND len(h3id) > 0 THEN h3id
+                   WHEN ST_YMin(geom) >= -90 AND ST_YMax(geom) <= 90
+                   THEN [h3_latlng_to_cell(
+                            ST_Y(ST_PointOnSurface(geom)),
+                            ST_X(ST_PointOnSurface(geom)),
+                            native_res)]
+                   ELSE h3id
+               END AS h3id
+        FROM t2
+        '''
 
     # Convert to multi-polygons and unnest, then generate H3 cells
     # The geometry is already GEOMETRY type in DuckDB spatial extension
@@ -297,6 +474,7 @@ class H3VectorProcessor:
         chunk_size: int = 500,
         intermediate_chunk_size: int = 10,
         id_column: Optional[str] = None,
+        resolution_by_area: Optional[List[Tuple[Optional[float], int]]] = None,
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
     ):
@@ -306,18 +484,41 @@ class H3VectorProcessor:
         Args:
             input_url: S3 URL or local path to input parquet/geoparquet file
             output_url: S3 URL or local path to output directory
-            h3_resolution: Target H3 resolution for tiling
+            h3_resolution: Target H3 resolution for tiling. Ignored when
+                resolution_by_area is set (the finest bin resolution is used).
             parent_resolutions: List of parent resolutions to include (e.g., [9, 8, 0])
             chunk_size: Number of rows to process in pass 1 (geometry to H3 arrays)
             intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays)
             id_column: Name of ID column to use (auto-detected if not specified)
+            resolution_by_area: Optional parsed bins from parse_resolution_by_area
+                (issue #98). When set, each feature is hexed at the native resolution
+                its planar ST_Area maps to, and the output carries a union schema
+                (one column per resolution in the bins + parent_resolutions, finer
+                columns NULL in coarser tiers) plus a native_res column.
             read_credentials: Dict with AWS credentials for reading (key, secret, region, endpoint)
             write_credentials: Dict with AWS credentials for writing (key, secret, region, endpoint)
         """
         self.input_url = input_url
         self.output_url = output_url
-        self.h3_resolution = h3_resolution
+        self.resolution_by_area = resolution_by_area
+        # In variable-resolution mode the finest bin resolution stands in for
+        # h3_resolution wherever a single "target" resolution is needed (output
+        # column naming for the native cell, empty-polyfill latitude checks).
+        if resolution_by_area is not None:
+            self.h3_resolution = max(res for _, res in resolution_by_area)
+        else:
+            self.h3_resolution = h3_resolution
         self.parent_resolutions = parent_resolutions or [9, 8, 0]
+        if resolution_by_area is not None:
+            # The output must carry an h0 column: it is the hive partition key for
+            # the repartition step. Fail fast and clearly rather than letting
+            # repartition_by_h0 die on a missing-column binder error downstream.
+            res_set = {res for _, res in resolution_by_area} | set(self.parent_resolutions)
+            if 0 not in res_set:
+                raise ValueError(
+                    "--resolution-by-area output needs an h0 partition column; "
+                    "include 0 in --parent-resolutions (e.g. '7,6,5,4,0')."
+                )
         self.chunk_size = chunk_size
         self.intermediate_chunk_size = intermediate_chunk_size
         self.id_column = id_column
@@ -352,16 +553,32 @@ class H3VectorProcessor:
         offender (id, area, estimated cells) if it exceeds
         ``self.max_cells_per_feature``. This converts an otherwise-fatal C++
         page-size assertion in the Pass-1 COPY into an actionable error.
+
+        In variable-resolution mode (issue #98) the estimate uses each feature's
+        own native resolution — large features map to a coarser resolution and far
+        fewer cells, the per-feature back-off that complements this guardrail — and
+        the reported resolution is the worst offender's native res.
         """
-        avg_hex_m2 = self.con.execute(
-            f"SELECT h3_get_hexagon_area_avg({self.h3_resolution}, 'm^2')"
-        ).fetchone()[0]
+        if self.resolution_by_area is not None:
+            native_res_case = _native_res_case_sql(self.resolution_by_area, "geom")
+            est_cells_expr = (
+                f"ST_Area_Spheroid(geom) / "
+                f"h3_get_hexagon_area_avg({native_res_case}, 'm^2')"
+            )
+            res_select = f"{native_res_case} AS native_res"
+        else:
+            avg_hex_m2 = self.con.execute(
+                f"SELECT h3_get_hexagon_area_avg({self.h3_resolution}, 'm^2')"
+            ).fetchone()[0]
+            est_cells_expr = f"ST_Area_Spheroid(geom) / {avg_hex_m2}"
+            res_select = f"{self.h3_resolution} AS native_res"
 
         worst = self.con.execute(f"""
             SELECT
                 "{id_col}" AS fid,
                 ST_Area_Spheroid(geom) AS area_m2,
-                ST_Area_Spheroid(geom) / {avg_hex_m2} AS est_cells
+                {est_cells_expr} AS est_cells,
+                {res_select}
             FROM chunk_table
             WHERE ST_GeometryType(geom) NOT IN ('POINT', 'MULTIPOINT')
             ORDER BY est_cells DESC
@@ -370,11 +587,11 @@ class H3VectorProcessor:
 
         if worst is None or worst[2] is None:
             return
-        fid, area_m2, est_cells = worst
+        fid, area_m2, est_cells, native_res = worst
         if est_cells > self.max_cells_per_feature:
             raise RuntimeError(
                 f"Chunk {chunk_id}: feature {id_col}={fid} is too large to hex at "
-                f"resolution {self.h3_resolution} — estimated {int(est_cells):,} H3 "
+                f"resolution {native_res} — estimated {int(est_cells):,} H3 "
                 f"cells ({area_m2 / 1e6:,.0f} km²) would exceed the per-feature "
                 f"cell-array limit ({self.max_cells_per_feature:,}). A single "
                 f"feature's cells are written as one array value, which cannot "
@@ -483,7 +700,8 @@ class H3VectorProcessor:
             self.con,
             'chunk_table',
             zoom=self.h3_resolution,
-            keep_cols=[id_col]
+            keep_cols=[id_col],
+            resolution_by_area=self.resolution_by_area,
         )
 
         # Write arrays to intermediate file (NO UNNEST!)
@@ -528,9 +746,14 @@ class H3VectorProcessor:
                 f"Check input geometry coordinate order."
             )
         if small > 0:
+            res_desc = (
+                "their per-feature native resolution"
+                if self.resolution_by_area is not None
+                else f"resolution {self.h3_resolution}"
+            )
             print(
                 f"  Warning: {small} polygon feature(s) in chunk {chunk_id} produced 0 H3 cells "
-                f"at resolution {self.h3_resolution} even after the representative-point "
+                f"at {res_desc} even after the representative-point "
                 f"fallback — likely degenerate geometry. These features are dropped."
             )
 
@@ -559,15 +782,45 @@ class H3VectorProcessor:
         result = self.con.execute(f"SELECT * FROM read_parquet('{intermediate_file}') LIMIT 0").description
         id_col = result[0][0]  # First column is the ID
 
-        # Build parent resolution columns
-        h3_col = f"h{self.h3_resolution}"
-        parent_cols = []
-        for parent_res in sorted(self.parent_resolutions):
-            if parent_res < self.h3_resolution:
-                col_name = f"h{parent_res}"
-                parent_cols.append(f"h3_cell_to_parent({h3_col}, {parent_res}) AS {col_name}")
+        # Build the per-batch SELECT that unnests each feature's H3 cell array.
+        #
+        # Variable-resolution mode (issue #98): every chunk emits the same union
+        # schema — one h{r} column per resolution in {native resolutions} ∪
+        # {parent_resolutions} — so the schema is uniform across chunks and the
+        # repartition step is unaffected. For a row whose feature was hexed at
+        # native_res, each column h{r} is the cell's ancestor at r when r <=
+        # native_res (r == native_res returns the cell itself) and NULL otherwise.
+        # A per-row native_res column lets consumers filter to a tier. The common
+        # floor (coarsest native resolution) is non-null in every row, preserving
+        # flat equality joins.
+        if self.resolution_by_area is not None:
+            native_resolutions = {res for _, res in self.resolution_by_area}
+            finest_native = max(native_resolutions)
+            # Union of native + parent resolutions, but never finer than the
+            # finest native resolution: a parent res > finest_native could never
+            # be a rollup of any cell, so it would be an all-NULL column for every
+            # row (the fixed-resolution path likewise only emits parents < target).
+            col_resolutions = sorted(
+                {r for r in native_resolutions | set(self.parent_resolutions)
+                 if r <= finest_native},
+                reverse=True,
+            )
+            union_cols = [
+                f"CASE WHEN {r} <= native_res THEN h3_cell_to_parent(cell, {r}) "
+                f"ELSE CAST(NULL AS UBIGINT) END AS h{r}"
+                for r in col_resolutions
+            ]
+            union_cols_str = ', '.join(union_cols)
+        else:
+            # Build parent resolution columns
+            h3_col = f"h{self.h3_resolution}"
+            parent_cols = []
+            for parent_res in sorted(self.parent_resolutions):
+                if parent_res < self.h3_resolution:
+                    col_name = f"h{parent_res}"
+                    parent_cols.append(f"h3_cell_to_parent({h3_col}, {parent_res}) AS {col_name}")
 
-        parent_cols_str = ', ' + ', '.join(parent_cols) if parent_cols else ''
+            parent_cols_str = ', ' + ', '.join(parent_cols) if parent_cols else ''
 
         # Use local /tmp for fast batch processing, then copy to final destination
         local_output = f"/tmp/h3_output_{chunk_id:06d}.parquet"
@@ -579,14 +832,28 @@ class H3VectorProcessor:
             # Read small batch and unnest
             # IMPORTANT: Use subquery to apply LIMIT/OFFSET to input rows BEFORE unnest
             # Otherwise DuckDB applies LIMIT/OFFSET to the unnested output!
-            unnest_sql = f"""
-                SELECT "{id_col}",
-                       UNNEST(h3id) AS {h3_col}{parent_cols_str}
-                FROM (
-                    SELECT * FROM read_parquet('{intermediate_file}')
-                    LIMIT {self.intermediate_chunk_size} OFFSET {batch_offset}
-                )
-            """
+            if self.resolution_by_area is not None:
+                # Unnest to one cell per row first, then derive the union columns
+                # (which reference the per-row native_res alongside each cell).
+                unnest_sql = f"""
+                    SELECT "{id_col}", native_res, {union_cols_str}
+                    FROM (
+                        SELECT "{id_col}", native_res, UNNEST(h3id) AS cell
+                        FROM (
+                            SELECT * FROM read_parquet('{intermediate_file}')
+                            LIMIT {self.intermediate_chunk_size} OFFSET {batch_offset}
+                        )
+                    )
+                """
+            else:
+                unnest_sql = f"""
+                    SELECT "{id_col}",
+                           UNNEST(h3id) AS {h3_col}{parent_cols_str}
+                    FROM (
+                        SELECT * FROM read_parquet('{intermediate_file}')
+                        LIMIT {self.intermediate_chunk_size} OFFSET {batch_offset}
+                    )
+                """
 
             # Build up local file with fast local disk I/O
             if batch_id == 0:

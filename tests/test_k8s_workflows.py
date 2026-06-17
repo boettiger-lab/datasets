@@ -159,6 +159,39 @@ class TestWorkflowGeneration:
             assert job["spec"]["completionMode"] == "Indexed"
     
     @pytest.mark.timeout(30)
+    def test_hex_job_resolution_by_area(self):
+        """Issue #98: --resolution-by-area is emitted into the hex job command in
+        place of --resolution, and geometry-type auto-detection is skipped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="byarea-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                resolution_by_area="12:8,600:6,5",
+                parent_resolutions=[7, 6, 5, 4, 0],
+            )
+            hex_file = Path(tmpdir) / "byarea-ds-hex.yaml"
+            with open(hex_file) as f:
+                job = yaml.safe_load(f)
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert '--resolution-by-area "12:8,600:6,5"' in command_str
+            assert "--resolution " not in command_str
+            assert "--parent-resolutions 7,6,5,4,0" in command_str
+
+    def test_resolution_by_area_rejects_bad_spec(self):
+        """A malformed spec fails fast during workflow generation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError):
+                generate_dataset_workflow(
+                    dataset_name="bad-ds",
+                    source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                    bucket="test-bucket",
+                    output_dir=tmpdir,
+                    resolution_by_area="12:8,600:6",  # no catch-all
+                )
+
+    @pytest.mark.timeout(30)
     @pytest.mark.integration
     def test_hex_job_real_bucket(self):
         """Test hex job with real public bucket calculates proper chunking."""

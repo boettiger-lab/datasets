@@ -21,7 +21,15 @@ def main():
     vector_parser = subparsers.add_parser("vector", help="Process vector datasets")
     vector_parser.add_argument("--input", required=True, help="Input file URL")
     vector_parser.add_argument("--output", required=True, help="Output directory URL")
-    vector_parser.add_argument("--resolution", type=int, default=10, help="H3 resolution")
+    vector_res_group = vector_parser.add_mutually_exclusive_group()
+    vector_res_group.add_argument("--resolution", type=int, default=10, help="H3 resolution")
+    vector_res_group.add_argument(
+        "--resolution-by-area", type=str, default=None,
+        help="Variable resolution by polygon area (issue #98). Comma-separated "
+             "'threshold:resolution' bins (planar deg2) plus a trailing catch-all "
+             "resolution, e.g. '12:8,600:6,5' (area<=12 -> res 8, <=600 -> res 6, "
+             "else res 5). Output carries a union schema + native_res column. "
+             "Include 0 in --parent-resolutions so the h0 partition column exists.")
     vector_parser.add_argument("--chunk-size", type=int, default=500, help="Number of rows to process in pass 1 (geometry to H3 arrays)")
     vector_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     vector_parser.add_argument("--chunk-id", type=int, help="Process specific chunk")
@@ -100,6 +108,11 @@ def main():
     workflow_parser.add_argument("--output-dir", default="k8s", help="Output directory for YAML files")
     workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
     workflow_parser.add_argument("--h3-resolution", type=int, default=None, help="Target H3 resolution (default: auto — 10 for polygons/points, 8 for lines)")
+    workflow_parser.add_argument(
+        "--resolution-by-area", type=str, default=None,
+        help="Variable resolution by polygon area (issue #98), e.g. '12:8,600:6,5'. "
+             "Mutually exclusive with --h3-resolution; emits the same flag into the "
+             "hex job. Include 0 in --parent-resolutions for the h0 partition column.")
     workflow_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
     workflow_parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
     workflow_parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")
@@ -209,8 +222,13 @@ def main():
 def _dispatch(args):
     if args.command == "vector":
         from .vector import process_vector_chunks
+        from .vector.h3_tiling import parse_resolution_by_area
         # Parse parent resolutions from comma-separated string
         parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
+        resolution_by_area = (
+            parse_resolution_by_area(args.resolution_by_area)
+            if args.resolution_by_area else None
+        )
         process_vector_chunks(
             input_url=args.input,
             output_url=args.output,
@@ -220,6 +238,7 @@ def _dispatch(args):
             chunk_size=args.chunk_size,
             intermediate_chunk_size=args.intermediate_chunk_size,
             id_column=args.id_column,
+            resolution_by_area=resolution_by_area,
         )
 
     elif args.command == "raster":
@@ -325,8 +344,14 @@ def _dispatch(args):
 
     elif args.command == "workflow":
         from .k8s import generate_dataset_workflow
+        from .vector.h3_tiling import parse_resolution_by_area
         # Parse parent resolutions from comma-separated string
         parent_res = [int(x.strip()) for x in args.parent_resolutions.split(',') if x.strip()]
+        if args.resolution_by_area and args.h3_resolution is not None:
+            raise ValueError("--resolution-by-area and --h3-resolution are mutually exclusive")
+        # Validate the spec early so workflow generation fails fast on a bad bin.
+        if args.resolution_by_area:
+            parse_resolution_by_area(args.resolution_by_area)
         generate_dataset_workflow(
             dataset_name=args.dataset,
             source_urls=args.source_urls,
@@ -334,6 +359,7 @@ def _dispatch(args):
             output_dir=args.output_dir,
             namespace=args.namespace,
             h3_resolution=args.h3_resolution,
+            resolution_by_area=args.resolution_by_area,
             parent_resolutions=parent_res,
             id_column=args.id_column,
             layer=args.layer,
