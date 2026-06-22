@@ -9,6 +9,8 @@ import duckdb
 from cng_datasets.vector.convert_to_parquet import (
     convert_to_parquet,
     build_read_reproject_query,
+    write_with_duckdb,
+    DEFAULT_ROW_GROUP_BYTES,
 )
 
 
@@ -1258,3 +1260,76 @@ class TestMultipointGeometry:
                 )
             # Nothing should have been written.
             assert not os.path.exists(output_path)
+
+
+class TestRowGroupByteCap:
+    """The geometry column must be split into multiple row groups by a byte
+    budget, not just a row count (regression for #106).
+
+    DuckDB's httpfs reader aborts with "Error: stoi" on a single Parquet column
+    chunk larger than ~2.85 GB, so a full-precision geometry column packed into
+    one 100k-row group is unreadable over S3/the duckdb-mcp server. write_with_duckdb
+    passes ROW_GROUP_SIZE_BYTES so an oversized geometry column is chunked even
+    when the row count stays under ROW_GROUP_SIZE.
+    """
+
+    # A query producing non-trivial polygon geometry (each ~hundreds of vertices).
+    _GEOM_QUERY = (
+        "SELECT i AS _cng_fid, "
+        "ST_Buffer(ST_Point(i * 1.0, i * 1.0), 1.0, 60) AS geom "
+        "FROM range(8000) t(i)"
+    )
+
+    def _geom_row_groups(self, path):
+        con = duckdb.connect()
+        try:
+            return con.execute(
+                f"SELECT COUNT(*) FROM parquet_metadata('{path}') "
+                f"WHERE path_in_schema = 'geom'"
+            ).fetchone()[0]
+        finally:
+            con.close()
+
+    def test_byte_budget_splits_geometry_column(self):
+        """A small byte budget splits the geom column into more row groups than the
+        default, even with the row-count cap left effectively unlimited."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            capped = os.path.join(tmpdir, "capped.parquet")
+            default = os.path.join(tmpdir, "default.parquet")
+
+            # row_group_size huge so the BYTE budget is what governs the split.
+            write_with_duckdb(self._GEOM_QUERY, capped,
+                              row_group_size=10_000_000, row_group_bytes="256kB")
+            write_with_duckdb(self._GEOM_QUERY, default,
+                              row_group_size=10_000_000)  # default 1GB budget
+
+            capped_groups = self._geom_row_groups(capped)
+            default_groups = self._geom_row_groups(default)
+
+            assert default_groups == 1, (
+                f"small data should fit one row group at the default {DEFAULT_ROW_GROUP_BYTES} "
+                f"budget, got {default_groups}"
+            )
+            assert capped_groups > default_groups, (
+                f"byte budget must split the geom column: capped={capped_groups} "
+                f"default={default_groups}"
+            )
+
+    def test_byte_cap_preserves_all_rows_and_unique_ids(self):
+        """Splitting (and the preserve_insertion_order=false it requires) must not
+        drop, duplicate, or corrupt rows; _cng_fid stays row-unique."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "capped.parquet")
+            write_with_duckdb(self._GEOM_QUERY, out,
+                              row_group_size=10_000_000, row_group_bytes="256kB")
+
+            con = duckdb.connect()
+            try:
+                total, distinct = con.execute(
+                    f"SELECT COUNT(*), COUNT(DISTINCT _cng_fid) FROM read_parquet('{out}')"
+                ).fetchone()
+            finally:
+                con.close()
+
+            assert total == 8000, f"expected all 8000 rows, got {total}"
+            assert distinct == 8000, f"_cng_fid must stay row-unique, got {distinct} distinct"

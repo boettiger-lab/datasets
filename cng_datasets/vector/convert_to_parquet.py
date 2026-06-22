@@ -37,6 +37,21 @@ _CURVED_GEOMETRY_TYPES = frozenset({
 # Flattening to 2D with ogr2ogr before ST_Read avoids the BLOB issue entirely.
 _NON_2D_GEOMETRY_PATTERNS = ('3d ', 'measured', ' z', ' m', 'z,', 'm,')
 
+# Upper bound on the (uncompressed) size of a single Parquet row group, passed to
+# DuckDB's COPY as ROW_GROUP_SIZE_BYTES. This caps the per-column chunk size so
+# the geometry column never produces one giant chunk.
+#
+# Why this exists (issue #106): DuckDB's httpfs reader aborts with a bare
+# "Error: stoi" when it has to read a single Parquet column chunk larger than
+# ~2.85 GB — even though a local read of the exact same file decodes fine. The
+# row-count limit (ROW_GROUP_SIZE) can't prevent this because bytes-per-feature
+# varies enormously (full-precision FEMA/IUCN multipolygons run tens of KB each),
+# so the default 100k rows packs into one ~2.9 GB chunk that is unreadable over
+# S3/httpfs by the duckdb-mcp server. A 1 GB byte budget keeps chunks an order of
+# magnitude under the cliff regardless of geometry size. Verified against the
+# issue's MRE: the byte-capped file full-scans cleanly on the MCP.
+DEFAULT_ROW_GROUP_BYTES = "1GB"
+
 
 def _is_gdb_source(source_url: str) -> bool:
     """Check if source is a GDAL FileGDB or OpenFileGDB source."""
@@ -689,7 +704,8 @@ def write_with_duckdb(query: str, output_path: str,
                       compression: str = "ZSTD",
                       compression_level: int = 15,
                       row_group_size: int = 100000,
-                      verbose: bool = False) -> None:
+                      verbose: bool = False,
+                      row_group_bytes: str = DEFAULT_ROW_GROUP_BYTES) -> None:
     """
     Write parquet file using DuckDB COPY. Simple and reliable.
 
@@ -698,7 +714,13 @@ def write_with_duckdb(query: str, output_path: str,
         output_path: Local output file path
         compression: Compression algorithm
         compression_level: Compression level
-        row_group_size: Rows per group
+        row_group_size: Rows per group (upper bound on row count)
+        row_group_bytes: Upper bound on the uncompressed size of a row group
+            (DuckDB ROW_GROUP_SIZE_BYTES). A row group is flushed when EITHER
+            this byte budget or row_group_size is reached, so small datasets are
+            unaffected while a single huge-geometry column is split into several
+            chunks. This is what keeps the geometry column chunk small enough to
+            be read over httpfs (issue #106 — see DEFAULT_ROW_GROUP_BYTES).
         verbose: Print debug information
     """
     con = duckdb.connect(':memory:')
@@ -708,9 +730,16 @@ def write_with_duckdb(query: str, output_path: str,
     # Enable large buffer size for complex geometries (Total buffer > 2GB)
     con.execute("SET arrow_large_buffer_size=true")
 
+    # ROW_GROUP_SIZE_BYTES requires insertion order not to be preserved. Output
+    # row order carries no meaning here — every row has an explicit _cng_fid (or
+    # source id) that travels with it and is what downstream joins key on — so
+    # this is safe and lets DuckDB flush row groups on the byte budget.
+    con.execute("SET preserve_insertion_order=false")
+
     try:
         if verbose:
             print(f"  Writing with DuckDB to {output_path}...")
+            print(f"    row group cap: {row_group_size:,} rows / {row_group_bytes} bytes")
 
         # Use COPY - it works!
         con.execute(f"""
@@ -718,7 +747,8 @@ def write_with_duckdb(query: str, output_path: str,
             TO '{output_path}'
             (FORMAT PARQUET,
              COMPRESSION {compression},
-             ROW_GROUP_SIZE {row_group_size})
+             ROW_GROUP_SIZE {row_group_size},
+             ROW_GROUP_SIZE_BYTES '{row_group_bytes}')
         """)
 
         if verbose:
