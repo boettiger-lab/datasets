@@ -5,12 +5,15 @@ import pytest
 import tempfile
 import os
 from pathlib import Path
+from unittest.mock import patch
 import duckdb
 from cng_datasets.vector.convert_to_parquet import (
     convert_to_parquet,
     build_read_reproject_query,
     write_with_duckdb,
     DEFAULT_ROW_GROUP_BYTES,
+    find_vector_sources,
+    download_and_extract,
 )
 
 
@@ -1333,3 +1336,82 @@ class TestRowGroupByteCap:
 
             assert total == 8000, f"expected all 8000 rows, got {total}"
             assert distinct == 8000, f"_cng_fid must stay row-unique, got {distinct} distinct"
+
+
+class TestFindVectorSources:
+    """find_vector_sources discovers .shp, .gdb dirs, and .gpkg/.fgb files (#130)."""
+
+    def test_finds_shapefiles(self):
+        with tempfile.TemporaryDirectory() as d:
+            shp = os.path.join(d, "data.shp")
+            open(shp, "w").close()
+            assert find_vector_sources(d) == [shp]
+
+    def test_finds_gdb_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            gdb = os.path.join(d, "data.gdb")
+            os.makedirs(gdb)
+            # place a file inside to confirm we don't recurse into .gdb
+            open(os.path.join(gdb, "inner.shp"), "w").close()
+            result = find_vector_sources(d)
+            assert result == [gdb], "should return .gdb dir, not files inside it"
+
+    def test_finds_gpkg_when_no_shp_or_gdb(self):
+        with tempfile.TemporaryDirectory() as d:
+            gpkg = os.path.join(d, "data.gpkg")
+            open(gpkg, "w").close()
+            assert find_vector_sources(d) == [gpkg]
+
+    def test_shp_takes_priority_over_gdb(self):
+        with tempfile.TemporaryDirectory() as d:
+            shp = os.path.join(d, "data.shp")
+            gdb = os.path.join(d, "data.gdb")
+            open(shp, "w").close()
+            os.makedirs(gdb)
+            result = find_vector_sources(d)
+            assert result == [shp]
+
+    def test_empty_directory_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            assert find_vector_sources(d) == []
+
+
+class TestDownloadAndExtractS3Rewrite:
+    """Any s3:// URL is rewritten to the public https endpoint (#130)."""
+
+    def test_arbitrary_bucket_is_rewritten(self):
+        """s3://public-ca30x30/raw/ds2788.zip must reach urlretrieve as https."""
+        with tempfile.TemporaryDirectory() as d:
+            # Provide a real zip so extraction doesn't fail
+            import zipfile, io
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("placeholder.txt", "x")
+            zip_bytes = buf.getvalue()
+
+            def fake_retrieve(url, dest):
+                assert url == "https://s3-west.nrp-nautilus.io/public-ca30x30/raw/ds2788.zip", (
+                    f"unexpected URL: {url}"
+                )
+                with open(dest, "wb") as f:
+                    f.write(zip_bytes)
+
+            with patch("cng_datasets.vector.convert_to_parquet.urlretrieve", fake_retrieve):
+                download_and_extract("s3://public-ca30x30/raw/ds2788.zip", d)
+
+    def test_nrp_bucket_still_works(self):
+        """s3://nrp-nautilus.io/... (original case) also rewrites correctly."""
+        with tempfile.TemporaryDirectory() as d:
+            import zipfile, io
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("placeholder.txt", "x")
+            zip_bytes = buf.getvalue()
+
+            def fake_retrieve(url, dest):
+                assert url.startswith("https://s3-west.nrp-nautilus.io/"), f"unexpected URL: {url}"
+                with open(dest, "wb") as f:
+                    f.write(zip_bytes)
+
+            with patch("cng_datasets.vector.convert_to_parquet.urlretrieve", fake_retrieve):
+                download_and_extract("s3://nrp-nautilus.io/some/path.zip", d)
