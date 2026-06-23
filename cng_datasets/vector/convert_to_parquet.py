@@ -468,10 +468,10 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         # axis-order edge cases — geographic CRSs that are longitude-first (OGC:CRS84)
         # and geographic compound/3D CRSs with codes >= 5000 (EPSG:5498
         # "NAD83 + NAVD88 height", EPSG:4979) — swapping lat/lon for them (see #128).
-        geom_expr = f"ST_Transform({raw_geom}, '{source_crs}', '{target_crs}', always_xy := true) AS {geom_col}"
+        geom_expr = f"ST_MakeValid(ST_Transform({raw_geom}, '{source_crs}', '{target_crs}', always_xy := true)) AS {geom_col}"
     else:
         # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
-        geom_expr = f"{raw_geom} AS {geom_col}" if geom_is_blob else geom_col
+        geom_expr = f"ST_MakeValid({raw_geom}) AS {geom_col}"
 
     layer_param = f", layer='{layer}'" if layer else ""
 
