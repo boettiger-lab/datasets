@@ -216,11 +216,8 @@ def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> No
         local_zip = os.path.join(extract_to, "downloadpkg.zip")
 
         if url.startswith("s3://"):
-             # Simple S3 to https conversion for Nautilus
-             if "nrp-nautilus.io" in url or "public-iucn" in url: # minimal heuristic
-                 # This might need to be more robust, but complying with user request example
-                 path = url.replace("s3://", "")
-                 url = f"https://s3-west.nrp-nautilus.io/{path}"
+            path = url.replace("s3://", "")
+            url = f"https://s3-west.nrp-nautilus.io/{path}"
 
         if url.startswith(("http://", "https://")):
             urlretrieve(url, local_zip)
@@ -244,16 +241,26 @@ def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> No
         raise RuntimeError(f"Failed to download/extract zip: {e}")
 
 
-def find_shapefiles(directory: str) -> List[str]:
+def find_vector_sources(directory: str) -> List[str]:
     """
-    Recursively find all .shp files in a directory.
+    Recursively find vector sources in a directory.
+    Returns .shp files if found; otherwise .gdb directories; otherwise .gpkg/.fgb files.
     """
     shapefiles = []
+    gdbs = []
+    others = []
     for root, dirs, files in os.walk(directory):
+        for d in list(dirs):
+            if d.lower().endswith(".gdb"):
+                gdbs.append(os.path.join(root, d))
+                dirs.remove(d)  # don't recurse into .gdb
         for file in files:
-            if file.lower().endswith(".shp"):
+            low = file.lower()
+            if low.endswith(".shp"):
                 shapefiles.append(os.path.join(root, file))
-    return sorted(shapefiles)
+            elif low.endswith((".gpkg", ".fgb")):
+                others.append(os.path.join(root, file))
+    return sorted(shapefiles) or sorted(gdbs) or sorted(others)
 
 
 def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = False) -> Optional[str]:
@@ -903,15 +910,14 @@ def convert_to_parquet(
 
             download_and_extract(source_urls[0], temp_dir, verbose=verbose)
 
-            shapefiles = find_shapefiles(temp_dir)
-            if not shapefiles:
-                raise ValueError("No shapefiles found in zip archive")
+            source_inputs = find_vector_sources(temp_dir)
+            if not source_inputs:
+                raise ValueError("No vector sources (.shp, .gdb, .gpkg, .fgb) found in zip archive")
 
-            print(f"  Found {len(shapefiles)} shapefiles in archive")
-            source_inputs = shapefiles
+            print(f"  Found {len(source_inputs)} vector source(s) in archive")
 
-            # Use the first shapefile as representative for metadata
-            representative_source = shapefiles[0]
+            # Use the first source as representative for metadata
+            representative_source = source_inputs[0]
             print(f"  Using {os.path.basename(representative_source)} for metadata detection")
 
         elif is_multi_source:

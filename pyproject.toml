@@ -13,11 +13,7 @@ authors = [
     {name = "Boettiger Lab", email = "cboettig@berkeley.edu"}
 ]
 dependencies = [
-    # Cap below 1.5.4: the `h3` community extension (installed fresh in the
-    # Dockerfile) is not yet published for 1.5.4, so `INSTALL h3 FROM community`
-    # 404s and breaks the image build. 1.5.3 is the tested standard. Raise the
-    # ceiling once the h3 community build catches up to the newer release.
-    "duckdb>=0.10.0,<1.5.4",
+    "duckdb==1.5.4",
     "ibis-framework[duckdb]>=9.0.0",
     "polars>=0.20.0",
     "pyarrow>=15.0.0",

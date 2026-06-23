@@ -671,7 +671,10 @@ def create_mosaic_cog(
             print(f"  ⚠ Could not open {vsi_url}, skipping")
             continue
         srs = osr.SpatialReference(wkt=ds.GetProjection())
-        srs.AutoIdentifyEPSG()
+        try:
+            srs.AutoIdentifyEPSG()
+        except RuntimeError:
+            pass  # no EPSG authority code (e.g. ESRI:102003); proceed with WKT/PROJ definition
         epsg = srs.GetAuthorityCode(None)
         crs_key = f"EPSG:{epsg}" if epsg else srs.ExportToProj4()
         ds = None
@@ -920,7 +923,10 @@ class RasterProcessor:
             _srs = osr.SpatialReference(wkt=_ds.GetProjection())
             _ds = None
             if not _srs.IsGeographic():
-                _srs.AutoIdentifyEPSG()
+                try:
+                    _srs.AutoIdentifyEPSG()
+                except RuntimeError:
+                    pass  # no EPSG authority code (e.g. ESRI:102003); proceed with WKT/PROJ definition
                 _epsg = _srs.GetAuthorityCode(None)
                 _crs_name = f"EPSG:{_epsg}" if _epsg else _srs.GetName() or "unknown projected CRS"
                 print(
