@@ -157,6 +157,34 @@ class TestRasterProcessor:
         ds = None
         return raster_path
 
+    @pytest.fixture
+    def esri102003_raster(self, temp_dir):
+        """Raster with ESRI:102003 (USA Contiguous Albers) — no EPSG authority code (#131)."""
+        from osgeo import gdal, osr
+        width, height = 10, 10
+        raster_path = os.path.join(temp_dir, "esri102003.tif")
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(raster_path, width, height, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-2000000, 10000, 0, 1000000, 0, -10000])
+        srs = osr.SpatialReference()
+        srs.ImportFromProj4(
+            "+proj=aea +lat_0=37.5 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 "
+            "+x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs"
+        )
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((height, width), dtype=np.float32))
+        ds.GetRasterBand(1).FlushCache()
+        ds = None
+        return raster_path
+
+    @pytest.mark.timeout(30)
+    def test_raster_processor_init_no_epsg_srs(self, esri102003_raster):
+        """RasterProcessor.__init__ must not crash on a raster with no EPSG authority code (#131)."""
+        from cng_datasets.raster.cog import RasterProcessor
+        # Should not raise RuntimeError from AutoIdentifyEPSG
+        proc = RasterProcessor(esri102003_raster, local_cache_dir=None)
+        assert proc.input_path is not None
+
     @pytest.mark.timeout(30)
     def test_detect_nodata_value(self, small_raster):
         """Test NoData value detection from raster metadata."""
