@@ -458,6 +458,7 @@ def generate_dataset_workflow(
     max_completions: int = 200,
     intermediate_chunk_size: int = 10,
     row_group_size: int = 100000,
+    pmtiles_max_zoom: Optional[int] = None,
     backend: str = "k8s",
     hex_storage: str = "10Gi",
     repartition_storage: str = "50Gi",
@@ -563,7 +564,7 @@ def generate_dataset_workflow(
     _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config)
 
     # Generate pmtiles job (uses converted parquet, not source)
-    _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config)
+    _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config, h3_resolution=h3_resolution, max_zoom=pmtiles_max_zoom)
 
     # Count features in source file(s) and calculate chunking parameters
     if len(source_urls) > 1:
@@ -1260,7 +1261,16 @@ cng-convert-to-parquet \\
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-convert.yaml"))
 
 
-def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo, memory="8Gi", s3_dataset=None, config: ClusterConfig = None):
+def _pmtiles_max_zoom(h3_resolution: Optional[int], max_zoom: Optional[int]) -> int:
+    """Derive PMTiles max zoom. Explicit max_zoom wins; otherwise res+3 (res-10→z13)."""
+    if max_zoom is not None:
+        return max_zoom
+    if h3_resolution is not None:
+        return h3_resolution + 3
+    return 13  # default matches res-10
+
+
+def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo, memory="8Gi", s3_dataset=None, config: ClusterConfig = None, h3_resolution: Optional[int] = None, max_zoom: Optional[int] = None):
     """Generate PMTiles job.
 
     Uses the optimized GeoParquet from convert job as input (includes ID column).
@@ -1307,7 +1317,7 @@ ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$DATASET.geojsonl /v
 # environment, not the shell. A plain assignment is invisible to it, so it
 # falls back to the raw (non-power-of-2) CPU count and crashes (issue #77).
 export TIPPECANOE_MAX_THREADS=$(python3 -c "import os; n=os.cpu_count() or 1; print(1<<(n.bit_length()-1))")
-tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --drop-densest-as-needed --extend-zooms-if-still-dropping --force /tmp/$DATASET.geojsonl
+tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --coalesce-densest-as-needed --drop-densest-as-needed -z {_pmtiles_max_zoom(h3_resolution, max_zoom)} --force /tmp/$DATASET.geojsonl
 
 # Upload to S3 using rclone
 rclone copy /tmp/$DATASET.pmtiles {config.rclone_remote}:{bucket}/{s3_parent_dir}
