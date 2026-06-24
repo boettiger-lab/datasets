@@ -73,6 +73,39 @@ def _split_antimeridian(geom):
         return valid if not valid.is_empty else geom
 
 
+def _explode_fractions(df):
+    """Explode exactextract's per-cell unique/frac arrays into long rows.
+
+    `ops=["unique", "frac"]` returns one row per cell with two parallel
+    object-arrays: the distinct values present and each one's coverage-weighted
+    share of the cell. The H3 partitioned-join model wants one row per
+    (cell, class), so expand to a flat (_h3_str, value, frac) frame. Uses
+    np.repeat/concatenate rather than DataFrame.explode — a chunk can be 100k
+    cells x several classes, and the vectorized path is markedly cheaper.
+    Cells with no covered pixels (entirely outside the raster footprint) carry
+    empty arrays and contribute no rows.
+    """
+    import numpy as np
+    import pandas as pd
+
+    uniq = df["unique"].to_list()
+    frac = df["frac"].to_list()
+    h3 = df["_h3_str"].to_numpy()
+    counts = np.fromiter(
+        (0 if u is None else len(u) for u in uniq), dtype="int64", count=len(uniq)
+    )
+    if int(counts.sum()) == 0:
+        return pd.DataFrame(
+            {"_h3_str": h3[:0], "value": np.array([], dtype="float64"),
+             "frac": np.array([], dtype="float64")}
+        )
+    vals = np.concatenate([u for u in uniq if u is not None and len(u)])
+    frs = np.concatenate([f for f in frac if f is not None and len(f)])
+    return pd.DataFrame(
+        {"_h3_str": np.repeat(h3, counts), "value": vals, "frac": frs}
+    )
+
+
 def _exact_extract_chunk(args):
     """Worker for chunked-parallel exact_extract over one slice of cells.
 
@@ -81,6 +114,11 @@ def _exact_extract_chunk(args):
     pixel cache), receives a primitive list of (h3_id, boundary_wkt) pairs,
     and returns a pandas DataFrame with the op output plus the cell id
     column as a string (the caller casts back to uint64).
+
+    For the "fractions" reducer (#142) the worker requests exactextract's
+    ["unique", "frac"] ops and returns the LONG (_h3_str, value, frac) shape;
+    every other reducer maps to a single exactextract op and returns one row
+    per cell.
 
     Retries transient TIFF/HTTP read failures up to a few times — Ceph S3
     occasionally returns truncated tile reads under heavy concurrent load,
@@ -95,6 +133,9 @@ def _exact_extract_chunk(args):
     raster_path, op_name, chunk_cells = args
     if not chunk_cells:
         return None
+
+    is_fractions = op_name == "fractions"
+    ops = ["unique", "frac"] if is_fractions else [op_name]
 
     # Split cells that straddle +/-180 into a MultiPolygon so exact_extract
     # integrates their true footprint, not a 360-deg ribbon (issue #88).
@@ -112,13 +153,21 @@ def _exact_extract_chunk(args):
     last_exc = None
     for attempt in range(max_attempts):
         try:
-            return exact_extract(
+            result = exact_extract(
                 rast=raster_path,
                 vec=gdf,
-                ops=[op_name],
+                ops=ops,
                 output="pandas",
                 include_cols=["_h3_str"],
             )
+            if not is_fractions:
+                return result
+            # exactextract column naming: bare "unique"/"frac" for single-band
+            # rasters, "band_1_unique"/… on older versions or multi-band.
+            ucol = [c for c in result.columns if c == "unique" or c.endswith("_unique")][0]
+            fcol = [c for c in result.columns if c == "frac" or c.endswith("_frac")][0]
+            result = result.rename(columns={ucol: "unique", fcol: "frac"})
+            return _explode_fractions(result)
         except RuntimeError as exc:
             msg = str(exc)
             msg_lower = msg.lower()
@@ -259,9 +308,17 @@ def _configure_proj():
 # coverage-weighted (#84); "mode" is the categorical majority; "max"/"min" are
 # coverage-agnostic extrema for peak/"max-over-area" rasters like species
 # richness, where sum double-counts and mean averages away the hotspot (#95).
+# "fractions" is the area-accounting reducer for categorical sources (#142):
+# instead of one dominant class per cell (lossy — minority classes inside a
+# mixed cell are absorbed by the mode), it emits one LONG row per present
+# class, (value, frac, h<res>), where frac is the class's coverage-weighted
+# share of the cell. Area of class X is then the cheap hex join
+# SUM(frac * cell_area). nodata is kept as an explicit class so frac sums to
+# <= 1 per cell and the nodata/unclassified share is recoverable rather than
+# silently inflating the real classes.
 # Used both for runtime validation in RasterProcessor.__init__ and as
 # argparse `choices=` in the CLI.
-VALID_HEX_REDUCERS = ("sum", "mean", "mode", "max", "min")
+VALID_HEX_REDUCERS = ("sum", "mean", "mode", "max", "min", "fractions")
 
 # Two implementations of the raster → H3 hex aggregation step.
 # - "exact-extract" (default): polyfill h0 → cells, exact_extract per-cell.
@@ -846,9 +903,13 @@ class RasterProcessor:
             hex_resampling: Reducer for aggregating source pixels into each
                 H3 cell. With method="exact-extract" (default), one of:
                 "sum" (counts/stocks like population), "mean" (intensities
-                like NDVI), "mode" (categorical like land cover), "max"/"min"
-                (peak/extremum like species richness, where sum double-counts
-                and mean averages away the hotspot). With
+                like NDVI), "mode" (categorical like land cover — single
+                dominant class per cell), "fractions" (categorical area
+                accounting — one LONG (value, frac) row per class present in
+                each cell, with nodata kept as an explicit class so frac sums
+                to <= 1 and area is SUM(frac * cell_area), issue #142),
+                "max"/"min" (peak/extremum like species richness, where sum
+                double-counts and mean averages away the hotspot). With
                 method="warp-centroid", any GDAL resampleAlg is accepted
                 ("average", "sum", "mode", "near", "bilinear", "cubic", ...).
                 Default: "mean".
@@ -1089,9 +1150,9 @@ class RasterProcessor:
             output_path: Path for output COG (uses self.output_cog_path if None)
             overviews: Whether to create overview pyramids
             overview_resampling: Resampling method for overviews. Defaults to
-                "mode" when hex_resampling is "mode" (categorical — averaging
-                class codes corrupts the zoomed-out COG, issue #108) and
-                "average" otherwise.
+                "mode" when hex_resampling is categorical ("mode"/"fractions" —
+                averaging class codes corrupts the zoomed-out COG, issue #108)
+                and "average" otherwise.
 
         Returns:
             Path to created COG file
@@ -1103,9 +1164,10 @@ class RasterProcessor:
             raise ValueError("output_path or output_cog_path must be specified")
 
         if overview_resampling is None:
-            # Categorical rasters (hex_resampling="mode") must not average their
-            # class codes in overviews — use mode (issue #108).
-            overview_resampling = "mode" if self.hex_resampling == "mode" else "average"
+            # Categorical rasters (hex_resampling "mode"/"fractions") must not
+            # average their class codes in overviews — use mode (issue #108).
+            categorical = self.hex_resampling in ("mode", "fractions")
+            overview_resampling = "mode" if categorical else "average"
 
         print(f"Creating COG: {output_path}")
         print(f"  Input: {self.input_path}")
@@ -1333,6 +1395,14 @@ class RasterProcessor:
         # band nodata, so they are physically remapped to the primary in a
         # collapsed copy built once and reused across h0 regions.
         nodata_values = self.nodata_values
+        is_fractions = self.hex_resampling == "fractions"
+        # For "fractions" the nodata code is KEPT as an explicit class (#142) so
+        # frac is the class's share of the cell *including* nodata, sums to <= 1,
+        # and the nodata/unclassified share is recoverable (rather than silently
+        # re-inflating the real classes the way valid-coverage normalization
+        # would). Cells with at least one nodata code that we still want labelled
+        # explicitly are filtered below; the codes that mark "nodata" downstream:
+        nodata_codes = [nodata_values[0]] if (is_fractions and nodata_values) else []
         with rasterio.open(self.input_path) as rast:
             src_nodata = rast.nodata
 
@@ -1340,6 +1410,18 @@ class RasterProcessor:
         try:
             if not nodata_values:
                 rast_arg = self.input_path
+            elif is_fractions:
+                # Collapse multi-fill to the primary first (#108), then CLEAR the
+                # band nodata so exactextract returns it as a normal class. The
+                # collapse step sets band nodata = primary, so a no-nodata VRT is
+                # built over whichever base we use.
+                base = (
+                    self._collapsed_aggregation_input()
+                    if len(nodata_values) > 1 else self.input_path
+                )
+                vrt_path = f"/tmp/raster_{h0_cell}_keepnodata.vrt"
+                gdal.Translate(vrt_path, base, format="VRT", noData="none")
+                rast_arg = vrt_path
             elif len(nodata_values) == 1:
                 if src_nodata != nodata_values[0]:
                     vrt_path = f"/tmp/raster_{h0_cell}_nodata.vrt"
@@ -1391,21 +1473,27 @@ class RasterProcessor:
         results[h3_col] = results["_h3_str"].astype("uint64")
         results = results.drop(columns=["_h3_str"])
 
-        # exactextract column naming: older versions emit "band_1_{op}",
-        # newer versions (>=0.3) emit just "{op}" for single-band rasters.
-        op_col = [
-            c for c in results.columns
-            if c == self.hex_resampling or c.endswith(f"_{self.hex_resampling}")
-        ]
-        if not op_col:
-            raise RuntimeError(
-                f"exactextract returned no '{self.hex_resampling}' column; "
-                f"got {list(results.columns)}"
-            )
-        results = results.rename(columns={op_col[0]: self.value_column})
+        if is_fractions:
+            # Worker already returned long (value, frac) rows; just rename the
+            # class column and drop any rows that carry no coverage fraction.
+            results = results.rename(columns={"value": self.value_column})
+            results = results[results["frac"].notna()]
+        else:
+            # exactextract column naming: older versions emit "band_1_{op}",
+            # newer versions (>=0.3) emit just "{op}" for single-band rasters.
+            op_col = [
+                c for c in results.columns
+                if c == self.hex_resampling or c.endswith(f"_{self.hex_resampling}")
+            ]
+            if not op_col:
+                raise RuntimeError(
+                    f"exactextract returned no '{self.hex_resampling}' column; "
+                    f"got {list(results.columns)}"
+                )
+            results = results.rename(columns={op_col[0]: self.value_column})
+            # Drop cells that produced no covered pixels (all-nodata under cell).
+            results = results[results[self.value_column].notna()]
 
-        # Drop cells that produced no covered pixels (all-nodata under the cell).
-        results = results[results[self.value_column].notna()]
         if len(results) == 0:
             print(f"  ℹ h0 {h0_cell}: no cells produced values (all nodata)")
             return None
@@ -1427,12 +1515,36 @@ class RasterProcessor:
         )
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        self.con.execute(f"""
-            COPY (
-                SELECT {self.value_column}, {h3_col}{parent_sql}
-                FROM hex_values
-            ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
-        """)
+        if is_fractions:
+            # Keep nodata rows only for cells that also hold a real class, so the
+            # nodata fraction stays explicit on mixed/edge cells (#142) while
+            # cells that are *entirely* nodata (e.g. open ocean under a land
+            # raster) are dropped rather than emitting a nodata-only row per
+            # cell — which would balloon the partition over empty areas.
+            select_cols = f"{self.value_column}, frac, {h3_col}{parent_sql}"
+            where_sql = ""
+            if nodata_codes:
+                codes = ", ".join(_fmt_gdal(c) for c in nodata_codes)
+                where_sql = (
+                    f"WHERE {h3_col} IN ("
+                    f"SELECT {h3_col} FROM hex_values "
+                    f"WHERE {self.value_column} NOT IN ({codes}))"
+                )
+            copy_sql = f"""
+                COPY (
+                    SELECT {select_cols}
+                    FROM hex_values
+                    {where_sql}
+                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
+            """
+        else:
+            copy_sql = f"""
+                COPY (
+                    SELECT {self.value_column}, {h3_col}{parent_sql}
+                    FROM hex_values
+                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
+            """
+        self.con.execute(copy_sql)
         self.con.unregister("hex_values")
 
         # Fail fast if the h3 extension emitted signed BIGINT parents (issue #102):
@@ -1443,7 +1555,8 @@ class RasterProcessor:
             lambda sql: self.con.execute(sql).fetchall(), output_path
         )
 
-        print(f"  ✓ Wrote: {output_path} ({len(results)} cells)")
+        unit = "class rows" if is_fractions else "cells"
+        print(f"  ✓ Wrote: {output_path} ({len(results)} {unit})")
         return output_path
 
     def process_h0_region(self, h0_index: Optional[int] = None) -> Optional[str]:

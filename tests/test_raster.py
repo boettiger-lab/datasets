@@ -1431,7 +1431,7 @@ class TestMultiValueNodata:
         ds = None
         return raster_path
 
-    def _run_hex(self, raster, temp_dir, nodata_value):
+    def _run_hex(self, raster, temp_dir, nodata_value, hex_resampling="mode"):
         import geopandas as gpd
         from shapely.geometry import box
         from cng_datasets.raster import RasterProcessor
@@ -1453,12 +1453,60 @@ class TestMultiValueNodata:
             parent_resolutions=[0],
             h0_grid_path=h0_file,
             value_column="evt",
-            hex_resampling="mode",
+            hex_resampling=hex_resampling,
             nodata_value=nodata_value,
         )
         result = proc.process_h0_region(0)
         df = proc.con.read_parquet(result).fetchdf() if result else None
         return result, df
+
+    @pytest.mark.timeout(180)
+    def test_hex_fractions_emits_per_class_long_rows(self, categorical_raster, temp_dir):
+        """fractions reducer emits long (evt, frac) rows per class per cell (#142).
+
+        Every genuine class survives (no mode-style absorption of minority
+        classes), each carries a coverage fraction in (0, 1], and the fractions
+        within a cell sum to <= 1 (the cell extends past the tiny test raster,
+        so the remainder is unclassified/outside-raster).
+        """
+        result, df = self._run_hex(
+            categorical_raster, temp_dir, "-9999,-1111,32767",
+            hex_resampling="fractions",
+        )
+        assert result is not None
+        # Long schema: a class column, a coverage fraction, and the native cell.
+        assert "evt" in df.columns and "frac" in df.columns and "h5" in df.columns
+        # No mode collapse — all three genuine classes are present as rows.
+        for cls in (11, 22, 33):
+            assert cls in df["evt"].values, f"class {cls} missing from fractions output"
+        assert (df["frac"] > 0).all() and (df["frac"] <= 1.0 + 1e-9).all()
+        # Per-cell fractions never exceed the whole cell.
+        per_cell = df.groupby("h5")["frac"].sum()
+        assert (per_cell <= 1.0 + 1e-9).all()
+
+    @pytest.mark.timeout(180)
+    def test_hex_fractions_keeps_nodata_as_explicit_class(self, categorical_raster, temp_dir):
+        """nodata is carried as an explicit class so its share is recoverable
+        rather than silently inflating the real classes (#142).
+
+        The fill codes are collapsed to the primary (-9999) and kept; cells that
+        hold at least one real class therefore also carry a -9999 row.
+        """
+        result, df = self._run_hex(
+            categorical_raster, temp_dir, "-9999,-1111,32767",
+            hex_resampling="fractions",
+        )
+        assert result is not None
+        # The collapsed nodata code appears explicitly (the raster has fill px).
+        assert -9999 in df["evt"].values
+        # The other fill codes were collapsed away, not leaked as classes.
+        for leaked in (-1111, 32767):
+            assert leaked not in df["evt"].values
+        # Every cell that carries the nodata code also carries a real class
+        # (pure-nodata cells are dropped, not emitted as nodata-only rows).
+        nodata_cells = set(df.loc[df["evt"] == -9999, "h5"])
+        real_cells = set(df.loc[df["evt"].isin([11, 22, 33]), "h5"])
+        assert nodata_cells <= real_cells
 
     @pytest.mark.timeout(180)
     def test_hex_excludes_secondary_fill_code(self, secondary_fill_raster, temp_dir):
@@ -1486,6 +1534,92 @@ class TestMultiValueNodata:
         if result:
             for fill in (-9999, -1111, 32767):
                 assert fill not in df["evt"].values, f"fill code {fill} leaked into hex output"
+
+
+@requires_gdal
+class TestFractionsWorker:
+    """Fractions-reducer worker internals (#142).
+
+    Exercises the explode helper and the exact_extract chunk worker directly,
+    isolating the long-explode logic from the gdal.Translate nodata-clearing
+    path in _hex_aggregate_h0. The aggregation logic itself needs only
+    numpy/pandas/rasterio/exactextract, but cng_datasets.raster.cog imports
+    osgeo at module load, so these are gated on GDAL like the rest.
+    """
+
+    def test_explode_fractions_flattens_parallel_arrays(self):
+        import pandas as pd
+        from cng_datasets.raster.cog import _explode_fractions
+
+        df = pd.DataFrame({
+            "_h3_str": ["a", "b", "c"],
+            "unique": [np.array([11, 22]), np.array([33]), np.array([], dtype="int32")],
+            "frac": [np.array([0.6, 0.4]), np.array([1.0]), np.array([])],
+        })
+        out = _explode_fractions(df)
+        # One row per (cell, class); the empty (no-coverage) cell drops out.
+        assert list(out.columns) == ["_h3_str", "value", "frac"]
+        assert len(out) == 3
+        assert list(out.loc[out["_h3_str"] == "a", "value"]) == [11, 22]
+        assert out.loc[out["_h3_str"] == "a", "frac"].sum() == pytest.approx(1.0)
+        assert "c" not in out["_h3_str"].values
+
+    def test_explode_fractions_all_empty(self):
+        import pandas as pd
+        from cng_datasets.raster.cog import _explode_fractions
+
+        df = pd.DataFrame({
+            "_h3_str": ["a"],
+            "unique": [np.array([], dtype="int32")],
+            "frac": [np.array([])],
+        })
+        out = _explode_fractions(df)
+        assert len(out) == 0
+        assert list(out.columns) == ["_h3_str", "value", "frac"]
+
+    def _categorical_raster(self, tmp_path, nodata=None):
+        import rasterio
+        from rasterio.transform import from_origin
+        arr = np.array([
+            [11, 11, 22, 22],
+            [11, 33, 22, 22],
+            [33, 33, 33, 22],
+            [11, 11, 22, 33],
+        ], dtype="int16")
+        p = os.path.join(tmp_path, "cat.tif")
+        transform = from_origin(-122.0, 38.0, 0.01, 0.01)
+        kwargs = dict(driver="GTiff", height=4, width=4, count=1,
+                      dtype="int16", crs="EPSG:4326", transform=transform)
+        if nodata is not None:
+            kwargs["nodata"] = nodata
+        with rasterio.open(p, "w", **kwargs) as ds:
+            ds.write(arr, 1)
+        return p
+
+    def test_chunk_worker_fractions_returns_long_rows(self, tmp_path):
+        from shapely.geometry import box
+        from cng_datasets.raster.cog import _exact_extract_chunk
+
+        raster = self._categorical_raster(str(tmp_path))
+        # A "cell" fully inside the raster footprint: fractions sum to 1.0.
+        cell_wkt = box(-122.0, 37.96, -121.96, 38.0).wkt
+        out = _exact_extract_chunk((raster, "fractions", [(123, cell_wkt)]))
+        assert list(out.columns) == ["_h3_str", "value", "frac"]
+        assert set(out["value"]) == {11, 22, 33}
+        assert out["frac"].sum() == pytest.approx(1.0)
+
+    def test_chunk_worker_fractions_excludes_band_nodata(self, tmp_path):
+        from shapely.geometry import box
+        from cng_datasets.raster.cog import _exact_extract_chunk
+
+        # Band nodata declared: the worker (no nodata-clearing VRT) leaves it to
+        # exactextract, which excludes it — nodata-keeping is _hex_aggregate_h0's
+        # job via a no-nodata VRT, not the worker's.
+        raster = self._categorical_raster(str(tmp_path), nodata=33)
+        cell_wkt = box(-122.0, 37.96, -121.96, 38.0).wkt
+        out = _exact_extract_chunk((raster, "fractions", [(123, cell_wkt)]))
+        assert 33 not in out["value"].values
+        assert out["frac"].sum() == pytest.approx(1.0)
 
 
 if __name__ == "__main__":
