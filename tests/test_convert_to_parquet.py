@@ -50,6 +50,20 @@ class TestReprojectQueryAxisOrder:
         )
         assert "ST_Transform" not in sql
 
+    def test_make_valid_always_present(self):
+        """ST_MakeValid must wrap the geometry expression in every code path (#122)."""
+        for source_crs, target_crs in [
+            ("EPSG:3310", "EPSG:4326"),   # reprojection path
+            ("EPSG:4326", "EPSG:4326"),   # no-reprojection path
+            (None, "EPSG:4326"),          # no source CRS
+        ]:
+            sql = build_read_reproject_query(
+                "dummy.gpkg", source_crs=source_crs, target_crs=target_crs, geom_col="geom"
+            )
+            assert "ST_MakeValid" in sql, (
+                f"ST_MakeValid missing from query for source_crs={source_crs!r}"
+            )
+
     def test_compound_crs_transform_preserves_lon_lat(self):
         """End-to-end ST_Transform check (no ogr2ogr needed): a point stored as
         (lon, lat) in EPSG:5498 must remain (lon, lat) after transform to EPSG:4326.
