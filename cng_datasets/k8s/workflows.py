@@ -727,6 +727,8 @@ def generate_raster_workflow(
             Use "sum" for counts/stocks (population, carbon), "mean" for
             intensities (NDVI, indices), "mode" for categorical (land cover) to
             preserve class codes — averaging yields meaningless non-canonical values.
+            Use "fractions" for categorical area accounting: per-class coverage
+            rows (value, frac) per cell so areas are exact, not mode-biased (#142).
         hex_memory: Memory per hex pod (default: "32Gi")
         max_parallelism: Max parallel hex pods (default: 61)
         target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step

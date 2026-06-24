@@ -58,10 +58,12 @@ def main():
     raster_parser.add_argument("--hex-resampling", default="mean",
                                help="Reducer for aggregating source pixels into each "
                                     "H3 cell. With --method=exact-extract (default), "
-                                    "one of: sum/mean/mode/max/min (max/min for "
-                                    "peak/richness rasters). With --method=warp-centroid, "
-                                    "any GDAL resampleAlg (average, sum, mode, near, "
-                                    "bilinear, cubic, ...). Default: mean.")
+                                    "one of: sum/mean/mode/fractions/max/min (max/min for "
+                                    "peak/richness rasters; 'fractions' emits per-class "
+                                    "coverage rows for categorical area accounting, #142). "
+                                    "With --method=warp-centroid, any GDAL resampleAlg "
+                                    "(average, sum, mode, near, bilinear, cubic, ...). "
+                                    "Default: mean.")
     raster_parser.add_argument("--method", default="exact-extract",
                                choices=("exact-extract", "warp-centroid"),
                                help="Raster→hex algorithm. 'exact-extract' (default): "
@@ -154,8 +156,10 @@ def main():
                                         choices=VALID_HEX_REDUCERS,
                                         help="Reducer for H3 aggregation. 'sum' for "
                                              "counts (population, carbon); 'mean' for intensities; "
-                                             "'mode' for categorical; 'max'/'min' for peak/extremum "
-                                             "(species richness). Default: mean.")
+                                             "'mode' for categorical (single dominant class); "
+                                             "'fractions' for categorical area accounting (one "
+                                             "(value, frac) row per class per cell); 'max'/'min' "
+                                             "for peak/extremum (species richness). Default: mean.")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
     raster_workflow_parser.add_argument("--hex-storage", type=str, default="20Gi", help="Ephemeral storage request/limit per hex job pod (default: 20Gi)")
@@ -257,9 +261,11 @@ def _dispatch(args):
 
         # If multiple inputs and only --output-cog requested, use create_mosaic_cog directly
         if isinstance(input_path, list) and args.output_cog and not args.output_parquet:
-            # Categorical sources (--hex-resampling mode) must not average class
-            # codes in the COG overviews (issue #108).
-            overview_resampling = "mode" if args.hex_resampling == "mode" else "average"
+            # Categorical sources (--hex-resampling mode/fractions) must not
+            # average class codes in the COG overviews (issue #108).
+            overview_resampling = (
+                "mode" if args.hex_resampling in ("mode", "fractions") else "average"
+            )
             create_mosaic_cog(
                 source_urls=input_path,
                 output_path=args.output_cog,
