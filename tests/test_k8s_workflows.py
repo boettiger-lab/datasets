@@ -277,6 +277,53 @@ class TestWorkflowGeneration:
             assert "export TIPPECANOE_MAX_THREADS=" in command
 
     @pytest.mark.timeout(5)
+    def test_pmtiles_max_zoom_derived_from_h3_resolution(self):
+        """PMTiles max zoom defaults to h3_resolution+3; --extend-zooms removed (#133)."""
+        from cng_datasets.k8s.workflows import _pmtiles_max_zoom
+        assert _pmtiles_max_zoom(10, None) == 13
+        assert _pmtiles_max_zoom(9, None) == 12
+        assert _pmtiles_max_zoom(8, None) == 11
+        assert _pmtiles_max_zoom(None, None) == 13   # fallback default
+        assert _pmtiles_max_zoom(10, 16) == 16       # explicit override wins
+
+    @pytest.mark.timeout(5)
+    def test_pmtiles_job_no_extend_zooms(self):
+        """tippecanoe command must not contain --extend-zooms-if-still-dropping (#133)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=10,
+            )
+            pmtiles_file = Path(tmpdir) / "test-ds-pmtiles.yaml"
+            with open(pmtiles_file) as f:
+                job = yaml.safe_load(f)
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "--extend-zooms-if-still-dropping" not in command
+            assert "-z 13" in command
+            assert "--coalesce-densest-as-needed" in command
+
+    @pytest.mark.timeout(5)
+    def test_pmtiles_max_zoom_override(self):
+        """pmtiles_max_zoom kwarg overrides the H3-derived default (#133)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=10,
+                pmtiles_max_zoom=16,
+            )
+            pmtiles_file = Path(tmpdir) / "test-ds-pmtiles.yaml"
+            with open(pmtiles_file) as f:
+                job = yaml.safe_load(f)
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "-z 16" in command
+
+    @pytest.mark.timeout(5)
     def test_workflow_rbac(self):
         """Test RBAC configuration is generated."""
         with tempfile.TemporaryDirectory() as tmpdir:
