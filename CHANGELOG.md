@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `workflow` now `shlex.quote`s each `--source-url` when interpolating it into the generated convert command, so URLs carrying `&` query strings (common for ArcGIS Hub / REST download endpoints) no longer break the `bash -c` step apart into background jobs (#147)
+
 ### Added
 - `--resolution-by-area` for variable-resolution (size-stratified) H3 hex tiling: each feature is hexed at the native resolution its planar `ST_Area` maps to, so very large polygons use a coarse resolution while small ones keep fine edges — avoiding the Pass-2 OOM / 2 GB parquet-page limit without dropping the whole dataset to a coarse resolution. Output carries a uniform union schema (one column per resolution, finer columns null in coarser tiers) plus a `native_res` column, preserving flat equality joins. The #107 oversized-feature guardrail now estimates each feature's cells at its own native resolution, so large features back off automatically (#98)
 
