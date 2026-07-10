@@ -356,8 +356,61 @@ class TestH3Functions:
         
         # Parent cells should be different from child
         assert result['h10'].iloc[0] != result['h9'].iloc[0]
-        
+
         con.close()
+
+    @pytest.mark.timeout(20)
+    def test_circumpolar_polygon_is_split_before_polyfill(self):
+        """A polygon spanning the full 360 deg of longitude must fill its band,
+        not collapse to ~1 cell. H3 polygon_to_cells reads a >180-deg ring as the
+        minimal-area side, so the pipeline splits it into <180-deg bands (#145)."""
+        con = setup_duckdb_connection()
+        # Full -180..180 x -78..-50 band (CCAMLR-shaped) plus a normal box.
+        con.execute("""
+            CREATE TABLE feats AS
+            SELECT 'ccamlr' AS id,
+                   ST_GeomFromText('POLYGON((-180 -78,180 -78,180 -50,-180 -50,-180 -78))') AS geom
+            UNION ALL
+            SELECT 'normal' AS id,
+                   ST_GeomFromText('POLYGON((-100 -70,-50 -70,-50 -50,-100 -50,-100 -70))') AS geom
+        """)
+        sql = geom_to_h3_cells(con, "feats", zoom=3, keep_cols=['id'])
+        con.execute(f"CREATE TABLE arrs AS SELECT * FROM ({sql})")
+
+        # Circumpolar feature now fills thousands of cells (was ~0 before the split).
+        n_ccamlr = con.execute(
+            "SELECT sum(len(h3id)) FROM arrs WHERE id = 'ccamlr'"
+        ).fetchone()[0]
+        assert n_ccamlr > 1000, f"circumpolar band should fill its band, got {n_ccamlr}"
+
+        # Band boundaries must not double-count cells (each cell centre lands in one band).
+        distinct, total = con.execute("""
+            SELECT count(DISTINCT cell), count(*)
+            FROM (SELECT UNNEST(h3id) AS cell FROM arrs WHERE id = 'ccamlr')
+        """).fetchone()
+        assert distinct == total, f"band split duplicated {total - distinct} boundary cells"
+
+        # The normal polygon is untouched: single row via the fast path.
+        n_rows_normal = con.execute(
+            "SELECT count(*) FROM arrs WHERE id = 'normal'"
+        ).fetchone()[0]
+        assert n_rows_normal == 1, "sub-180-deg polygon should not be band-split"
+        con.close()
+
+    @pytest.mark.timeout(20)
+    def test_circumpolar_polygon_split_variable_resolution(self):
+        """The transmeridian split also applies on the variable-resolution path (#145)."""
+        con = setup_duckdb_connection()
+        con.execute("""
+            CREATE TABLE feats AS
+            SELECT 'ccamlr' AS id,
+                   ST_GeomFromText('POLYGON((-180 -78,180 -78,180 -50,-180 -50,-180 -78))') AS geom
+        """)
+        rba = parse_resolution_by_area("12:5,3")  # large features hex at res 3
+        sql = geom_to_h3_cells(con, "feats", zoom=8, keep_cols=['id'], resolution_by_area=rba)
+        n = con.execute(f"SELECT sum(len(h3id)) FROM ({sql})").fetchone()[0]
+        con.close()
+        assert n > 1000, f"circumpolar band should fill its band on the var-res path, got {n}"
 
 
 class TestLineGeometryH3:

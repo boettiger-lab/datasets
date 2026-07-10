@@ -133,6 +133,49 @@ def _native_res_case_sql(bins: List[Tuple[Optional[float], int]], geom_expr: str
     return "CASE " + " ".join(whens) + f" ELSE {catchall} END"
 
 
+# H3 polygon_to_cells interprets a ring whose exterior spans more than 180 deg of
+# longitude as the minimal-area (complement) side, so a circumpolar / transmeridian
+# polygon fills ~nothing — e.g. a full -180..180 band yields ~1 cell instead of the
+# millions its area implies (issue #145). Before polyfill we split any polygon whose
+# longitude-bbox span exceeds 180 deg into sub-180-deg longitude bands, intersect
+# the polygon with each, and polyfill the pieces. Each band must be strictly < 180
+# deg wide (a 180-deg band is itself ambiguous and also fills ~nothing); four 90-deg
+# strips tile the whole -180..180 range with margin to spare.
+_TRANSMERIDIAN_MAX_SPAN_DEG = 180
+_TRANSMERIDIAN_BANDS = [(-180, -90), (-90, 0), (0, 90), (90, 180)]
+
+
+def _transmeridian_split_sql(carry_cols: str, source: str) -> str:
+    """SQL for a CTE body that splits >180-deg-longitude-span polygons into bands.
+
+    Rows from ``source`` whose longitude bbox span is <= 180 deg pass through
+    unchanged (the common fast path); wider rows are cross-joined with the
+    longitude bands and intersected, so downstream ST_Dump + H3 polyfill only ever
+    see sub-180-deg pieces. The intersection may yield a MULTIPOLYGON or
+    GEOMETRYCOLLECTION, which the existing ST_Dump step already splits into single
+    geometries before polyfill.
+
+    Args:
+        carry_cols: comma-separated non-geometry columns to propagate (e.g. the id
+            column, plus ``native_res`` in variable-resolution mode).
+        source: name of the upstream CTE exposing those columns and a ``geom`` column.
+    """
+    bands = ', '.join(
+        f"(ST_GeomFromText('POLYGON(({lo} -90, {hi} -90, {hi} 90, {lo} 90, {lo} -90))'))"
+        for lo, hi in _TRANSMERIDIAN_BANDS
+    )
+    return f'''
+            SELECT {carry_cols}, geom
+            FROM {source}
+            WHERE ST_XMax(geom) - ST_XMin(geom) <= {_TRANSMERIDIAN_MAX_SPAN_DEG}
+            UNION ALL
+            SELECT {carry_cols}, ST_Intersection(s.geom, _bands.band) AS geom
+            FROM {source} AS s, (VALUES {bands}) AS _bands(band)
+            WHERE ST_XMax(s.geom) - ST_XMin(s.geom) > {_TRANSMERIDIAN_MAX_SPAN_DEG}
+              AND ST_Intersects(s.geom, _bands.band)
+    '''
+
+
 def _h3_edge_length_degrees(resolution: int) -> float:
     """Return the H3 edge length in degrees for a given resolution.
 
@@ -330,10 +373,11 @@ def geom_to_h3_cells(
                    END AS geom
             FROM tbase
         ),
+        tsplit AS ({_transmeridian_split_sql(f'{col_list}, native_res', 't0')}),
         t1 AS (
             SELECT {col_list}, native_res,
                    UNNEST(ST_Dump(geom)).geom AS geom
-            FROM t0
+            FROM tsplit
         ),
         t2 AS (
             SELECT {col_list}, native_res, geom,
@@ -383,10 +427,11 @@ def geom_to_h3_cells(
                    END AS geom
             FROM {table_name}
         ),
+        tsplit AS ({_transmeridian_split_sql(col_list, 't0')}),
         t1 AS (
             SELECT {col_list},
                    UNNEST(ST_Dump(geom)).geom AS geom
-            FROM t0
+            FROM tsplit
         ),
         t2 AS (
             SELECT {col_list},
