@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 import math
 import re
+import shlex
 import yaml
 from .jobs import K8sJobManager
 from .armada import convert_workflow_to_armada
@@ -602,7 +603,7 @@ def generate_dataset_workflow(
     # Build generation command for documentation
     parent_res_str = ','.join(map(str, parent_resolutions))
     # Format source URLs for command recreation
-    source_urls_str = ' '.join([f'--source-url {url}' for url in source_urls])
+    source_urls_str = ' '.join([f'--source-url {shlex.quote(url)}' for url in source_urls])
     res_flag = (f"--resolution-by-area \"{resolution_by_area}\""
                 if resolution_by_area is not None
                 else f"--h3-resolution {h3_resolution}")
@@ -1207,8 +1208,11 @@ def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_pat
     if isinstance(source_urls, str):
         source_urls = [source_urls]
 
-    # Build source URLs string (one per line for readability)
-    sources_str = " \\\n  ".join(source_urls)
+    # Build source URLs string (one per line for readability).
+    # Quote each URL: source URLs from ArcGIS Hub / REST endpoints carry query
+    # strings with '&', which bash (this runs under `bash -c`) would otherwise
+    # interpret as job control and split the command apart. See issue #147.
+    sources_str = " \\\n  ".join(shlex.quote(url) for url in source_urls)
 
     # Build the conversion command with optional layer parameter
     layer_flag = f" \\\n  --layer {layer}" if layer else ""

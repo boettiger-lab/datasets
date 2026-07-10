@@ -138,6 +138,27 @@ class TestWorkflowGeneration:
             assert "test-bucket" in all_text
     
     @pytest.mark.timeout(5)
+    def test_convert_command_quotes_source_url(self):
+        """Source URLs with '&' query strings must be quoted so bash -c does
+        not split the command on job-control operators. Regression for #147."""
+        from cng_datasets.k8s.workflows import _generate_convert_job
+
+        url = "https://example.com/data?format=shp&a=1&b=2"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = K8sJobManager(namespace="biodiversity")
+            _generate_convert_job(
+                manager, "mre-test", url, "public-test",
+                Path(tmpdir), "https://github.com/x/y",
+            )
+            job = yaml.safe_load((Path(tmpdir) / "mre-test-convert.yaml").read_text())
+
+        convert_cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+        # The URL is passed as a single quoted argument (shlex.quote uses '...').
+        assert f"'{url}'" in convert_cmd
+        # And never appears bare, where bash would background on the first '&'.
+        assert f"\n  {url}" not in convert_cmd
+
+    @pytest.mark.timeout(5)
     def test_hex_job_chunked(self):
         """Test hex job uses automatic chunking (defaults when bucket doesn't exist)."""
         with tempfile.TemporaryDirectory() as tmpdir:
