@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Vector H3 hex now splits circumpolar / transmeridian polygons (longitude-bbox span > 180°) into sub-180° longitude bands before polyfill, so they fill their full band instead of collapsing to ~1 cell. H3 `polygon_to_cells` reads a >180° ring as the minimal-area (complement) side; a full −180..180 band (e.g. CCAMLR's Southern-Ocean RFB) previously produced ~1 cell instead of millions. Narrow (<180°-span) polygons keep the original fast path unchanged (#145)
 - `workflow` now `shlex.quote`s each `--source-url` when interpolating it into the generated convert command, so URLs carrying `&` query strings (common for ArcGIS Hub / REST download endpoints) no longer break the `bash -c` step apart into background jobs (#147)
 
 ### Added
