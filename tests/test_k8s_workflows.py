@@ -297,6 +297,25 @@ class TestWorkflowGeneration:
             # A plain (un-exported) assignment is invisible to the child process.
             assert "export TIPPECANOE_MAX_THREADS=" in command
 
+    def test_pmtiles_job_raises_open_file_limit(self):
+        """Soft fd limit must be raised before tippecanoe on high-core nodes (#154)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+
+            pmtiles_file = Path(tmpdir) / "test-ds-pmtiles.yaml"
+            with open(pmtiles_file) as f:
+                job = yaml.safe_load(f)
+
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            # ulimit must precede tippecanoe, and tolerate an unraisable limit.
+            assert "ulimit -n" in command
+            assert command.index("ulimit -n") < command.index("tippecanoe -o")
+
     @pytest.mark.timeout(5)
     def test_pmtiles_max_zoom_derived_from_h3_resolution(self):
         """PMTiles max zoom defaults to h3_resolution+3; --extend-zooms removed (#133)."""
