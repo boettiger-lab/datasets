@@ -14,7 +14,32 @@ from cng_datasets.vector.convert_to_parquet import (
     DEFAULT_ROW_GROUP_BYTES,
     find_vector_sources,
     download_and_extract,
+    to_gdal_readable,
 )
+
+
+class TestToGdalReadable:
+    """s3:// and http(s):// sources must be rewritten so ST_Read (GDAL) can open
+    them; GDAL cannot open a bare s3:// path without /vsis3 config (#153)."""
+
+    def test_s3_rewritten_to_vsicurl_public_endpoint(self):
+        assert to_gdal_readable(
+            "s3://public-cdfw/raw/fish-passage-pad.geojson"
+        ) == "/vsicurl/https://s3-west.nrp-nautilus.io/public-cdfw/raw/fish-passage-pad.geojson"
+
+    def test_http_wrapped_in_vsicurl(self):
+        assert to_gdal_readable(
+            "https://example.org/data.gpkg"
+        ) == "/vsicurl/https://example.org/data.gpkg"
+
+    def test_vsi_paths_pass_through(self):
+        vsi = "/vsicurl/https://example.org/data.gpkg"
+        assert to_gdal_readable(vsi) == vsi
+        assert to_gdal_readable("/vsis3/bucket/key.shp") == "/vsis3/bucket/key.shp"
+
+    def test_local_paths_pass_through(self):
+        assert to_gdal_readable("/tmp/local.geojson") == "/tmp/local.geojson"
+        assert to_gdal_readable("data.shp") == "data.shp"
 
 
 class TestReprojectQueryAxisOrder:
