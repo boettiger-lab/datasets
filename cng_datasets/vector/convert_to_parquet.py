@@ -195,6 +195,31 @@ def is_parquet_file(source_url: str) -> bool:
     return path.lower().endswith('.parquet')
 
 
+def to_gdal_readable(url: str) -> str:
+    """
+    Rewrite a remote source URL into a GDAL /vsicurl path so ST_Read can open it.
+
+    GDAL cannot open a bare ``s3://`` path without /vsis3 credentials configured,
+    and this tool does not set them (issue #153). The NRP object store is reachable
+    over plain HTTPS, so ``s3://bucket/key`` is rewritten to its public HTTPS
+    endpoint and then streamed via /vsicurl. Plain ``http(s)://`` URLs are wrapped
+    in /vsicurl too. Already-VSI (``/vsi*``) and local paths pass through unchanged.
+
+    Args:
+        url: Source dataset URL or path
+
+    Returns:
+        A GDAL-openable path for ST_Read.
+    """
+    if url.startswith('/vsi'):
+        return url
+    if url.startswith('s3://'):
+        url = f"https://s3-west.nrp-nautilus.io/{url[len('s3://'):]}"
+    if url.lower().startswith(('http://', 'https://')):
+        return f"/vsicurl/{url}"
+    return url
+
+
 def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> None:
     """
     Download a file from a URL and extract it if it is a zip file.
@@ -925,18 +950,16 @@ def convert_to_parquet(
             print(f"  Processing {len(source_urls)} input files...")
             processed_sources = []
             for url in source_urls:
-                # Handle HTTP(S) for GDAL/DuckDB ST_Read
-                if url.lower().startswith(('http://', 'https://')) and not url.startswith('/vsi'):
-                    processed_sources.append(f"/vsicurl/{url}")
-                else:
-                    processed_sources.append(url)
+                # Rewrite s3:// and HTTP(S) sources into GDAL /vsicurl paths so
+                # ST_Read can open them (issue #153).
+                processed_sources.append(to_gdal_readable(url))
             source_inputs = processed_sources
             representative_source = processed_sources[0]
         else:
             # Single non-zip source
-            # Handle HTTP(S) for GDAL/DuckDB ST_Read
-            if source_urls[0].lower().startswith(('http://', 'https://')) and not source_urls[0].startswith('/vsi'):
-                 source_urls[0] = f"/vsicurl/{source_urls[0]}"
+            # Rewrite s3:// and HTTP(S) sources into GDAL /vsicurl paths so
+            # ST_Read can open them (issue #153).
+            source_urls[0] = to_gdal_readable(source_urls[0])
             source_inputs = source_urls[0]
             representative_source = source_urls[0]
 
