@@ -722,6 +722,74 @@ class TestVectorProcessing:
             result_con.close()
             processor.con.close()
     
+    @pytest.mark.timeout(15)
+    def test_multipolygon_no_duplicate_feature_cell_rows(self):
+        """A MultiPolygon whose parts share cells must not emit duplicate
+        (feature, cell) rows (issue #150).
+
+        Two overlapping parts polyfill to overlapping cell sets. Before the fix,
+        Pass 2 unnested each part independently and wrote a row per part per cell,
+        byte-identically duplicating every shared cell and inflating downstream
+        SUM/area aggregates. intermediate_chunk_size=1 forces the two parts into
+        separate Pass-2 batches, so this also proves the dedup happens on the
+        fully assembled per-chunk file, not merely within a batch.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            # fid=1: MultiPolygon with two overlapping parts (guaranteed shared
+            #        cells). fid=2: a single-part Polygon control (never dup'd).
+            con.execute(f"""
+                CREATE TABLE test_data AS
+                SELECT * FROM (VALUES
+                    (1, ST_GeomFromText('MULTIPOLYGON(((-122.5 37.7,-122.4 37.7,-122.4 37.8,-122.5 37.8,-122.5 37.7)),((-122.45 37.72,-122.35 37.72,-122.35 37.82,-122.45 37.82,-122.45 37.72)))')),
+                    (2, ST_GeomFromText('POLYGON((-121.5 36.7,-121.4 36.7,-121.4 36.8,-121.5 36.8,-121.5 36.7))'))
+                ) t(id, geom)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                parent_resolutions=[0],
+                chunk_size=10,
+                intermediate_chunk_size=1,  # force parts into separate pass-2 batches
+            )
+            output_file = processor.process_chunk(0)
+            processor.con.close()
+
+            rc = setup_duckdb_connection()
+            try:
+                total, distinct = rc.execute(f"""
+                    SELECT COUNT(*), COUNT(DISTINCT (id, h8))
+                    FROM read_parquet('{output_file}')
+                """).fetchone()
+                assert total == distinct, (
+                    f"duplicate (feature, cell) rows: {total} rows vs {distinct} distinct"
+                )
+
+                # The multipart feature must still cover cells (fix removes dupes,
+                # not the feature) and no single (id, cell) may repeat.
+                worst = rc.execute(f"""
+                    SELECT MAX(n) FROM (
+                        SELECT COUNT(*) n FROM read_parquet('{output_file}')
+                        GROUP BY id, h8
+                    )
+                """).fetchone()[0]
+                assert worst == 1, f"a (feature, cell) pair repeats {worst} times"
+
+                ids = {r[0] for r in rc.execute(
+                    f"SELECT DISTINCT id FROM read_parquet('{output_file}')"
+                ).fetchall()}
+                assert ids == {1, 2}, f"expected both features present, got {ids}"
+            finally:
+                rc.close()
+
     @pytest.mark.timeout(5)
     def test_h3_vector_processor_process_chunk(self):
         """Test processing a single chunk of vector data."""

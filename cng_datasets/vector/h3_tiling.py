@@ -935,10 +935,23 @@ class H3VectorProcessor:
             if (batch_id + 1) % 10 == 0 or batch_id == num_batches - 1:
                 print(f"  Progress: {batch_id + 1}/{num_batches} batches")
 
-        # Final step: copy completed file to S3 (single write operation)
+        # Final step: copy completed file to S3 (single write operation).
+        #
+        # De-duplicate (feature, cell) rows here (issue #150). Pass 1 dumps each
+        # feature into one row PER PART (UNNEST(ST_Dump)), and Pass 2 unnests every
+        # part's cell array independently, so a cell touched by >= 2 parts of the
+        # same MultiPolygon (shared part boundaries; complex coastlines / island
+        # fringes) is emitted once per part — byte-identical duplicate rows that
+        # silently inflate every downstream SUM/area aggregate. Every column is a
+        # deterministic function of (id, cell), so DISTINCT * removes exactly the
+        # excess and keeps legitimately distinct rows (different features covering
+        # the same cell keep their distinct id). This must run on the fully
+        # assembled per-chunk file rather than per Pass-2 batch: one feature's
+        # parts can span multiple batches, and each feature lives entirely within
+        # one chunk, so a per-chunk DISTINCT is both complete and sufficient.
         print(f"  Writing final output to {final_output}...")
         self.con.execute(f"""
-            COPY (SELECT * FROM read_parquet('{local_output}'))
+            COPY (SELECT DISTINCT * FROM read_parquet('{local_output}'))
             TO '{final_output}'
             (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
         """)
