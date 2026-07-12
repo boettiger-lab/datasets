@@ -1112,24 +1112,54 @@ class RasterProcessor:
         src_srs = osr.SpatialReference()
         src_srs.ImportFromWkt(ds.GetProjection())
         src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        ds = None
 
         if src_srs.IsGeographic():
+            ds = None
             return (min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
 
+        # Projected source: compute the EPSG:4326 extent the way gdalwarp does,
+        # via AutoCreateWarpedVRT. Transforming only the four rectangular-extent
+        # corners point-by-point is unsafe for a global equal-area projection
+        # such as World Mollweide (ESRI:54009): the rectangle's corners fall in
+        # the projection's undefined oval corners, so the transform raises
+        # "Point outside of projection domain" and crashes __init__ before any
+        # work is done (issue #151). Densifying the rectangle edges doesn't help
+        # either — every edge point of the bounding rectangle is still in the
+        # undefined region, which collapses the longitude span. AutoCreateWarpedVRT
+        # samples the raster the way the warp machinery itself does (this is the
+        # file gdalwarp -t_srs EPSG:4326 handles fine) and yields a correct,
+        # domain-safe extent.
         tgt_srs = osr.SpatialReference()
         tgt_srs.ImportFromEPSG(4326)
         tgt_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        transform = osr.CoordinateTransformation(src_srs, tgt_srs)
-        corners = [
-            transform.TransformPoint(xmin, ymin),
-            transform.TransformPoint(xmin, ymax),
-            transform.TransformPoint(xmax, ymin),
-            transform.TransformPoint(xmax, ymax),
-        ]
-        lons = [c[0] for c in corners]
-        lats = [c[1] for c in corners]
-        return (min(lons), min(lats), max(lons), max(lats))
+
+        bounds = None
+        try:
+            vrt = gdal.AutoCreateWarpedVRT(ds, ds.GetProjection(), tgt_srs.ExportToWkt())
+            if vrt is not None:
+                vgt = vrt.GetGeoTransform()
+                vxmin = vgt[0]
+                vxmax = vgt[0] + vgt[1] * vrt.RasterXSize
+                vymax = vgt[3]
+                vymin = vgt[3] + vgt[5] * vrt.RasterYSize
+                vrt = None
+                if all(math.isfinite(v) for v in (vxmin, vymin, vxmax, vymax)):
+                    bounds = (min(vxmin, vxmax), min(vymin, vymax),
+                              max(vxmin, vxmax), max(vymin, vymax))
+        except RuntimeError:
+            bounds = None
+        finally:
+            ds = None
+
+        if bounds is None:
+            # Last-resort safe over-approximation: the whole globe. These bounds
+            # are only used to clip/skip h0 regions during hex aggregation, so an
+            # over-approximation is safe (it just skips fewer regions) while an
+            # under-approximation would silently drop real data. Better than the
+            # historic crash.
+            print("  ⚠ Could not compute reprojected bounds; assuming global extent.")
+            bounds = (-180.0, -90.0, 180.0, 90.0)
+        return bounds
 
     def create_cog(
         self,

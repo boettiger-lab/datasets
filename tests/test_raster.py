@@ -6,6 +6,7 @@ Tests COG creation, H3 tiling, and resolution detection using small test dataset
 
 import pytest
 import os
+import math
 import tempfile
 import shutil
 from pathlib import Path
@@ -177,6 +178,25 @@ class TestRasterProcessor:
         ds = None
         return raster_path
 
+    @pytest.fixture
+    def global_mollweide_raster(self, temp_dir):
+        """Global World Mollweide (ESRI:54009) raster whose rectangular extent
+        exceeds the projection's valid oval domain (#151)."""
+        from osgeo import gdal, osr
+        width, height = 361, 181
+        raster_path = os.path.join(temp_dir, "global_mollweide.tif")
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(raster_path, width, height, 1, gdal.GDT_Float32)
+        # Full Mollweide globe: x half-width ~1.804e7 m, y half-height ~9.02e6 m.
+        ds.SetGeoTransform([-18040000, 100000, 0, 9020000, 0, -100000])
+        srs = osr.SpatialReference()
+        srs.SetFromUserInput("ESRI:54009")
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((height, width), dtype=np.float32))
+        ds.GetRasterBand(1).FlushCache()
+        ds = None
+        return raster_path
+
     @pytest.mark.timeout(30)
     def test_raster_processor_init_no_epsg_srs(self, esri102003_raster):
         """RasterProcessor.__init__ must not crash on a raster with no EPSG authority code (#131)."""
@@ -184,6 +204,25 @@ class TestRasterProcessor:
         # Should not raise RuntimeError from AutoIdentifyEPSG
         proc = RasterProcessor(esri102003_raster, local_cache_dir=None)
         assert proc.input_path is not None
+
+    @pytest.mark.timeout(30)
+    def test_raster_processor_init_global_mollweide(self, global_mollweide_raster):
+        """__init__ must not crash computing 4326 bounds for a global Mollweide
+        raster whose bbox corners fall in the undefined projection domain (#151).
+
+        Previously _compute_src_bounds_4326 transformed the rectangular corners
+        point-by-point and raised "Point outside of projection domain". The bounds
+        are used only to clip/skip h0 regions, so they must be a safe superset of
+        the true extent: near-full longitude and latitude within [-90, 90].
+        """
+        from cng_datasets.raster.cog import RasterProcessor
+        proc = RasterProcessor(global_mollweide_raster, local_cache_dir=None)
+        xmin, ymin, xmax, ymax = proc._src_bounds_4326
+        assert all(math.isfinite(v) for v in (xmin, ymin, xmax, ymax))
+        # A global raster must span essentially the whole longitude range; a
+        # collapsed/undersized box here would silently drop data downstream.
+        assert xmin <= -179.0 and xmax >= 179.0, f"longitude not global: {(xmin, xmax)}"
+        assert -90.0 <= ymin < ymax <= 90.0, f"latitude out of range: {(ymin, ymax)}"
 
     @pytest.mark.timeout(30)
     def test_detect_nodata_value(self, small_raster):
