@@ -220,6 +220,64 @@ def to_gdal_readable(url: str) -> str:
     return url
 
 
+def _localize_gdb(source_url: str, verbose: bool = False) -> Tuple[str, Optional[str]]:
+    """
+    Copy a remote File Geodatabase (.gdb) to local disk and return its local path.
+
+    A .gdb is a multi-file *directory*, not a single file, so GDAL/OGR ST_Read
+    cannot open it over s3:// (and /vsis3 on a directory FileGDB is flaky across
+    nodes). We mirror the raster path's rclone-based localization (issue #152):
+    rclone copies the directory's objects to a temp dir and the rest of the
+    pipeline reads the local .gdb.
+
+    Only remote (s3://, http(s)://) .gdb sources are localized; local .gdb paths
+    and non-.gdb sources pass through unchanged.
+
+    Args:
+        source_url: Source dataset URL or path
+        verbose: Print debug information (also enables rclone progress)
+
+    Returns:
+        (local_or_original_path, temp_dir_to_cleanup). temp_dir_to_cleanup is
+        None when no localization happened.
+    """
+    is_remote = source_url.startswith(('s3://', 'http://', 'https://'))
+    if not (is_remote and _is_gdb_source(source_url)):
+        return source_url, None
+
+    if not shutil.which('rclone'):
+        raise RuntimeError(
+            f"Cannot localize remote File Geodatabase {source_url!r}: rclone not found. "
+            "Install rclone or pre-stage the .gdb to a local path."
+        )
+
+    tmp_root = tempfile.mkdtemp(prefix='cng_gdb_')
+    basename = os.path.basename(source_url.rstrip('/'))
+    # rclone copies the *contents* of the source into the dest dir, so target the
+    # .gdb subdir directly to reconstruct <tmp_root>/<name>.gdb/<objects>.
+    local_path = os.path.join(tmp_root, basename)
+
+    # Convert s3://bucket/path -> nrp:bucket/path for the standard NRP remote
+    # name (matches _localize_input in the raster path).
+    if source_url.startswith('s3://'):
+        rclone_src = 'nrp:' + source_url[len('s3://'):]
+    else:
+        rclone_src = source_url
+
+    print(f"  Remote File Geodatabase detected — localizing via rclone → {local_path}")
+    cmd = ['rclone', 'copy', '--s3-no-check-bucket', '--transfers', '4',
+           rclone_src, local_path]
+    if verbose:
+        cmd.append('-P')
+    try:
+        subprocess.run(cmd, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        raise RuntimeError(f"rclone failed to localize {source_url!r}: {e}")
+
+    return local_path, tmp_root
+
+
 def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> None:
     """
     Download a file from a URL and extract it if it is a zip file.
@@ -926,6 +984,7 @@ def convert_to_parquet(
     try:
         temp_dir = None
         linearize_dir = None
+        localize_dirs = []
         source_inputs = []
 
         if is_zip:
@@ -950,16 +1009,28 @@ def convert_to_parquet(
             print(f"  Processing {len(source_urls)} input files...")
             processed_sources = []
             for url in source_urls:
-                # Rewrite s3:// and HTTP(S) sources into GDAL /vsicurl paths so
-                # ST_Read can open them (issue #153).
-                processed_sources.append(to_gdal_readable(url))
+                # A remote .gdb is a directory GDAL cannot open over s3://;
+                # localize it to disk first (issue #152). Other remote sources
+                # are rewritten to GDAL /vsicurl paths (issue #153).
+                localized, gdb_dir = _localize_gdb(url, verbose=verbose)
+                if gdb_dir:
+                    localize_dirs.append(gdb_dir)
+                    processed_sources.append(localized)
+                else:
+                    processed_sources.append(to_gdal_readable(url))
             source_inputs = processed_sources
             representative_source = processed_sources[0]
         else:
             # Single non-zip source
-            # Rewrite s3:// and HTTP(S) sources into GDAL /vsicurl paths so
-            # ST_Read can open them (issue #153).
-            source_urls[0] = to_gdal_readable(source_urls[0])
+            # A remote .gdb is a directory GDAL cannot open over s3://; localize
+            # it to disk first (issue #152). Other remote sources are rewritten
+            # to GDAL /vsicurl paths so ST_Read can open them (issue #153).
+            localized, gdb_dir = _localize_gdb(source_urls[0], verbose=verbose)
+            if gdb_dir:
+                localize_dirs.append(gdb_dir)
+                source_urls[0] = localized
+            else:
+                source_urls[0] = to_gdal_readable(source_urls[0])
             source_inputs = source_urls[0]
             representative_source = source_urls[0]
 
@@ -1081,6 +1152,12 @@ def convert_to_parquet(
              if verbose:
                  print(f"  Cleaning up temporary directory: {temp_dir}")
              shutil.rmtree(temp_dir)
+        if 'localize_dirs' in locals():
+             for d in localize_dirs:
+                 if d and os.path.exists(d):
+                     if verbose:
+                         print(f"  Cleaning up localized GDB temp dir: {d}")
+                     shutil.rmtree(d, ignore_errors=True)
 
 
 def main():
