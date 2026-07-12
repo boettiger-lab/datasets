@@ -15,6 +15,7 @@ from cng_datasets.vector.convert_to_parquet import (
     find_vector_sources,
     download_and_extract,
     to_gdal_readable,
+    _localize_gdb,
 )
 
 
@@ -40,6 +41,53 @@ class TestToGdalReadable:
     def test_local_paths_pass_through(self):
         assert to_gdal_readable("/tmp/local.geojson") == "/tmp/local.geojson"
         assert to_gdal_readable("data.shp") == "data.shp"
+
+
+class TestLocalizeGdb:
+    """A remote File Geodatabase (.gdb) is a directory GDAL cannot open over
+    s3://, so it must be localized via rclone before ST_Read (#152)."""
+
+    def test_non_gdb_passes_through(self):
+        assert _localize_gdb("s3://bucket/x.geojson") == ("s3://bucket/x.geojson", None)
+        assert _localize_gdb("https://ex.org/x.gpkg") == ("https://ex.org/x.gpkg", None)
+
+    def test_local_gdb_passes_through(self):
+        assert _localize_gdb("/data/x.gdb") == ("/data/x.gdb", None)
+
+    def test_remote_gdb_localized_via_rclone_nrp_remote(self):
+        """s3:// .gdb is rclone-copied into <tmp>/<name>.gdb using the nrp: remote."""
+        captured = {}
+
+        def fake_run(cmd, check=False, **kw):
+            captured["cmd"] = cmd
+            os.makedirs(cmd[-1], exist_ok=True)  # simulate rclone creating the dir
+
+        with patch("cng_datasets.vector.convert_to_parquet.shutil.which",
+                   return_value="/usr/bin/rclone"), \
+             patch("cng_datasets.vector.convert_to_parquet.subprocess.run",
+                   side_effect=fake_run):
+            local, tmp_dir = _localize_gdb(
+                "s3://public-wui/raw/US_WUI_block_1990_2020_change_v4.gdb"
+            )
+
+        try:
+            assert tmp_dir is not None
+            # rclone copies contents INTO the dest, so dest must be the .gdb subdir.
+            assert local == os.path.join(tmp_dir, "US_WUI_block_1990_2020_change_v4.gdb")
+            cmd = captured["cmd"]
+            assert cmd[0] == "rclone" and cmd[1] == "copy"
+            assert "nrp:public-wui/raw/US_WUI_block_1990_2020_change_v4.gdb" in cmd
+            assert cmd[-1] == local
+        finally:
+            if tmp_dir and os.path.exists(tmp_dir):
+                import shutil as _sh
+                _sh.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_remote_gdb_without_rclone_raises(self):
+        with patch("cng_datasets.vector.convert_to_parquet.shutil.which",
+                   return_value=None):
+            with pytest.raises(RuntimeError, match="rclone not found"):
+                _localize_gdb("s3://bucket/x.gdb")
 
 
 class TestReprojectQueryAxisOrder:
