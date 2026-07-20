@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Cloud-native geospatial dataset processing toolkit"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 authors = [
     {name = "Boettiger Lab", email = "cboettig@berkeley.edu"}
 ]

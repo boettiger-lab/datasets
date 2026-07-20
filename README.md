@@ -1,5 +1,7 @@
 # cng-datasets
 
+[![DOI](https://zenodo.org/badge/921944685.svg)](https://zenodo.org/badge/latestdoi/921944685)
+
 A CLI toolkit for processing large geospatial datasets into cloud-native formats on Kubernetes.
 
 **What it does:** Takes source geospatial data (Shapefiles, GeoPackages, FileGDB, GeoTIFFs) and produces:
@@ -170,3 +172,18 @@ pytest tests/
 ## License
 
 Apache 2.0
+
+## Citation
+
+If you use cng-datasets in your work, please cite it via its Zenodo archive.
+The DOI badge at the top of this README resolves to the latest release; each
+release also has its own version-specific DOI. Citation metadata (authors,
+title, funding) lives in [`.zenodo.json`](.zenodo.json) and is minted
+automatically by Zenodo on each GitHub release.
+
+> Boettiger, C., & Buhler, C. K. cng-datasets: A cloud-native toolkit for
+> processing large geospatial datasets on Kubernetes. Zenodo.
+> https://zenodo.org/badge/latestdoi/921944685
+
+Once the first release is archived on Zenodo, replace the redirect above with
+the concrete versioned DOI it mints.

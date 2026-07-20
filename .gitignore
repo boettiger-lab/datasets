@@ -181,6 +181,7 @@ cython_debug/
 *.wal
 *.duckdb
 *.json
+!.zenodo.json
 *.shp
 *.xml
 *.sbn
