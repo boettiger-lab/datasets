@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+title: "cng-datasets"
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - family-names: Boettiger
+    given-names: Carl
+    orcid: "https://orcid.org/0000-0002-1642-628X"
+    affiliation: University of California, Berkeley
+  - family-names: Buhler
+    given-names: Cassidy Kim
+    orcid: "https://orcid.org/0000-0003-4157-4273"
+    affiliation: University of Colorado Boulder
+repository-code: "https://github.com/boettiger-lab/datasets"
+url: "https://boettiger-lab.github.io/datasets/"
+abstract: >-
+  A cloud-native geospatial dataset processing toolkit. Its CLI turns source
+  geospatial data (Shapefiles, GeoPackages, FileGDB, GeoTIFFs) into
+  cloud-native formats — GeoParquet, PMTiles vector tiles, H3 hexagonal-grid
+  parquet, and Cloud-Optimized GeoTIFFs — by generating Kubernetes Job
+  manifests that orchestrate the entire pipeline on a cluster, so large
+  datasets are never processed on the local machine. One of three open-source
+  components that make the cloud-native data stack reachable by the AI tools
+  researchers already use.
+keywords:
+  - cloud-native
+  - AI-ready data
+  - STAC
+  - Kubernetes
+  - geospatial
+  - GeoParquet
+  - data engineering
+license: Apache-2.0
