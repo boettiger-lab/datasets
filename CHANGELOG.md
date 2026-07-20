@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-20
+
+First release published to PyPI (`pip install cng-datasets`) via trusted publishing.
+
 ### Fixed
 - Vector H3 hex now splits circumpolar / transmeridian polygons (longitude-bbox span > 180°) into sub-180° longitude bands before polyfill, so they fill their full band instead of collapsing to ~1 cell. H3 `polygon_to_cells` reads a >180° ring as the minimal-area (complement) side; a full −180..180 band (e.g. CCAMLR's Southern-Ocean RFB) previously produced ~1 cell instead of millions. Narrow (<180°-span) polygons keep the original fast path unchanged (#145)
 - `workflow` now `shlex.quote`s each `--source-url` when interpolating it into the generated convert command, so URLs carrying `&` query strings (common for ArcGIS Hub / REST download endpoints) no longer break the `bash -c` step apart into background jobs (#147)
@@ -112,4 +116,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.3.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.3.0
 [0.1.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.1.0
