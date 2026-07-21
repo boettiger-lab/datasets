@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath('..'))
 project = 'CNG Datasets'
 copyright = '2026, Boettiger Lab'
 author = 'Boettiger Lab'
-release = '0.3.0'
+release = '0.3.1'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
