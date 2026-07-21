@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-21
+
+### Fixed
+- `.zenodo.json` dropped an unresolvable NSF grant identifier that caused Zenodo DOI minting to fail on the 0.3.0 release; the archive/DOI can now be minted (#165)
+
 ## [0.3.0] - 2026-07-20
 
 First release published to PyPI (`pip install cng-datasets`) via trusted publishing.
