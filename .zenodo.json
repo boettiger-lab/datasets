@@ -15,10 +15,5 @@
    "description":"A CLI toolkit that turns source geospatial data (Shapefiles, GeoPackages, FileGDB, GeoTIFFs) into cloud-native formats: GeoParquet for analytical queries, PMTiles vector tiles for web maps, H3 hexagonal-grid parquet (hive-partitioned for fast spatial joins), and Cloud-Optimized GeoTIFFs. A single local CLI command generates Kubernetes Job manifests that orchestrate the entire conversion pipeline on a cluster, so large datasets are never processed on the local machine.",
    "access_right":"open",
    "license":"apache-2.0",
-   "upload_type":"software",
-   "grants":[
-      {
-         "id":"10.13039/100000001::2153040"
-      }
-   ]
+   "upload_type":"software"
 }
