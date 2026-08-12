@@ -134,6 +134,49 @@ def repartition_by_h0(
             f" INNER JOIN _source_attrs s ON c.\"{chunk_id_col}\" = s.\"{chunk_id_col}\""
             f" WHERE c.h0 = {{h0}}"
         )
+
+        # Completeness guard (issue #170): the k8s hex Job is an indexed Job of
+        # `max-completions` chunks of `chunk-size` rows, so it only ever covers
+        # the first `max-completions × chunk-size` features. When the generator
+        # could not count the source up front it falls back to a default cap
+        # (e.g. 200k), and every downstream presence check still passes even
+        # though features past the cap were silently never hexed — only a
+        # post-build COUNT(DISTINCT id) catches it. Assert here, at the pipeline's
+        # natural endpoint (we hold both the hex output and the source), that
+        # every source feature with a non-null geometry made it into the hex. A
+        # shortfall is fatal: it turns silent data loss into a failed run.
+        #
+        # Null-geometry features are excluded because they legitimately produce
+        # no H3 cell (issue #169). Set CNG_SKIP_COMPLETENESS_CHECK=1 to bypass
+        # (e.g. a build with known-degenerate geometries that drop to 0 cells).
+        if os.environ.get('CNG_SKIP_COMPLETENESS_CHECK') not in ('1', 'true', 'True'):
+            geom_filter = f' WHERE "{geom_col}" IS NOT NULL' if geom_col else ''
+            source_features = con.raw_sql(
+                f"SELECT COUNT(*) FROM read_parquet('{source_parquet}'){geom_filter}"
+            ).fetchone()[0]
+            hexed_features = con.raw_sql(
+                f'SELECT COUNT(DISTINCT "{chunk_id_col}")'
+                f" FROM read_parquet('{chunks_dir}/*.parquet')"
+            ).fetchone()[0]
+            geom_note = ' with non-null geometry' if geom_col else ''
+            print(
+                f'  Completeness check: {hexed_features:,} of {source_features:,} '
+                f'source features{geom_note} present in hex output'
+            )
+            if hexed_features < source_features:
+                missing = source_features - hexed_features
+                raise RuntimeError(
+                    f"Hex output is incomplete: {hexed_features:,} of "
+                    f"{source_features:,} source features{geom_note} were hexed "
+                    f"({missing:,} missing). The k8s hex Job covers only "
+                    f"`max-completions × chunk-size` features, so a source larger "
+                    f"than that cap is silently truncated (issue #170). Re-run the "
+                    f"hex step with a larger --max-completions (or --chunk-size) so "
+                    f"that max-completions × chunk-size >= {source_features:,}. If "
+                    f"the shortfall is instead genuinely-degenerate geometry that "
+                    f"produces 0 H3 cells, set CNG_SKIP_COMPLETENESS_CHECK=1 to "
+                    f"proceed. Chunks left in place at '{chunks_dir}' for inspection."
+                )
     else:
         print('No source parquet provided, proceeding without attribute join')
         join_sql = (

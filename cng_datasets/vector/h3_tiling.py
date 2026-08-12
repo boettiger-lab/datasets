@@ -581,9 +581,35 @@ class H3VectorProcessor:
         configure_s3_credentials(self.con)
 
     def _find_geometry_column(self, table_name: str) -> str:
-        """Find the geometry column in the table."""
-        result = self.con.execute(f"SELECT * FROM {table_name} LIMIT 0").description
-        columns = [col[0] for col in result]
+        """Find the geometry column in the table.
+
+        Resolves the geometry column by DuckDB *type* first: a column whose type
+        is GEOMETRY is the geometry, regardless of its name. This keeps an
+        unrelated attribute column that merely happens to be named
+        ``GEOMETRY``/``SHAPE``/``GEOM`` (e.g. a DOUBLE carried over from a source
+        DBF, issue #171) from shadowing the real geometry column and aborting the
+        hex job with an ``ST_GeometryType(DOUBLE)`` binder error. Name matching is
+        used only as a fallback when no GEOMETRY-typed column exists (e.g. WKB
+        stored as BLOB).
+        """
+        schema = self.con.execute(f"DESCRIBE {table_name}").fetchall()
+        # DESCRIBE rows are (column_name, column_type, ...). Geometry columns are
+        # reported as GEOMETRY (optionally with a CRS annotation, e.g.
+        # "GEOMETRY('OGC:CRS84')"), so match on the type prefix.
+        geom_typed = [
+            row[0] for row in schema if str(row[1]).upper().startswith('GEOMETRY')
+        ]
+        if geom_typed:
+            # If several geometry-typed columns exist, prefer conventional names;
+            # otherwise take the first geometry-typed column.
+            by_upper = {col.upper(): col for col in geom_typed}
+            for name in ['GEOM', 'GEOMETRY', 'SHAPE']:
+                if name in by_upper:
+                    return by_upper[name]
+            return geom_typed[0]
+
+        # Fallback: no GEOMETRY-typed column (e.g. WKB blobs) — match by name.
+        columns = [row[0] for row in schema]
         for col in columns:
             if col.upper() in ['SHAPE', 'GEOMETRY', 'GEOM']:
                 return col
@@ -870,6 +896,38 @@ class H3VectorProcessor:
         # Use local /tmp for fast batch processing, then copy to final destination
         local_output = f"/tmp/h3_output_{chunk_id:06d}.parquet"
         final_output = f"{self.output_url.rstrip('/')}/chunk_{chunk_id:06d}.parquet"
+
+        # A chunk whose features all produced zero H3 cells — most commonly a
+        # contiguous block of null-geometry features (issue #169) — yields a
+        # zero-row intermediate. The per-batch loop below would then never create
+        # `local_output`, and the final COPY would abort with "No files found".
+        # Instead, write an empty partition with the correct output schema so the
+        # chunk completes cleanly (there is genuinely no data to hex). Selecting
+        # the unnest expression over the empty intermediate reproduces exactly the
+        # non-empty output schema with zero rows.
+        if total_rows == 0:
+            if self.resolution_by_area is not None:
+                empty_sql = f"""
+                    SELECT "{id_col}", native_res, {union_cols_str}
+                    FROM (
+                        SELECT "{id_col}", native_res, UNNEST(h3id) AS cell
+                        FROM read_parquet('{intermediate_file}')
+                    )
+                """
+            else:
+                empty_sql = f"""
+                    SELECT "{id_col}",
+                           UNNEST(h3id) AS {h3_col}{parent_cols_str}
+                    FROM read_parquet('{intermediate_file}')
+                """
+            print(f"  Writing empty output (0 hexable rows) to {final_output}...")
+            self.con.execute(f"""
+                COPY ({empty_sql})
+                TO '{final_output}'
+                (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
+            """)
+            print(f"  ✓ Pass 2 complete (empty): {final_output}")
+            return final_output
 
         for batch_id in range(num_batches):
             batch_offset = batch_id * self.intermediate_chunk_size
