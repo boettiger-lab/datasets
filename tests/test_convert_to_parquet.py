@@ -16,6 +16,8 @@ from cng_datasets.vector.convert_to_parquet import (
     download_and_extract,
     to_gdal_readable,
     _localize_gdb,
+    is_csv_file,
+    _resolve_latlon_columns,
 )
 
 
@@ -251,6 +253,102 @@ class TestSimplifyTolerance:
             n_out = con.execute(f"SELECT ST_NPoints(geom) FROM read_parquet('{out}')").fetchone()[0]
             con.close()
             assert n_out == n_in
+
+
+class TestCsvPointInput:
+    """Issue #78: CSV with lat/lon columns -> point GeoParquet."""
+
+    def test_is_csv_file(self):
+        assert is_csv_file("a/b/vents.csv")
+        assert is_csv_file("s3://bucket/points.tsv")
+        assert is_csv_file("https://x/y.CSV")
+        assert not is_csv_file("data.parquet")
+        assert not is_csv_file("data.shp")
+
+    def test_resolve_latlon_autodetect(self):
+        assert _resolve_latlon_columns(["Latitude", "Longitude", "name"]) == ("Latitude", "Longitude")
+        assert _resolve_latlon_columns(["LAT", "LON", "v"]) == ("LAT", "LON")
+        assert _resolve_latlon_columns(["x", "y", "v"]) == ("y", "x")
+        assert _resolve_latlon_columns(["decimalLatitude", "decimalLongitude"]) == (
+            "decimalLatitude", "decimalLongitude")
+
+    def test_resolve_latlon_explicit(self):
+        cols = ["POINT_Y", "POINT_X", "site"]
+        assert _resolve_latlon_columns(cols, lat_column="point_y", lon_column="point_x") == (
+            "POINT_Y", "POINT_X")
+
+    def test_resolve_latlon_missing_raises(self):
+        with pytest.raises(ValueError, match="latitude"):
+            _resolve_latlon_columns(["a", "b", "c"])
+        with pytest.raises(ValueError, match="not found"):
+            _resolve_latlon_columns(["Latitude", "Longitude"], lon_column="nope")
+
+    def _write_csv(self, tmpdir, header, rows):
+        path = os.path.join(tmpdir, "points.csv")
+        with open(path, "w") as f:
+            f.write(header + "\n")
+            for r in rows:
+                f.write(",".join(str(v) for v in r) + "\n")
+        return path
+
+    def test_csv_converts_to_point_geoparquet(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv = self._write_csv(
+                tmpdir, "name,Latitude,Longitude,depth",
+                [("VentA", 37.8, -122.4, 2500), ("VentB", -33.9, 18.4, 1200)],
+            )
+            out = os.path.join(tmpdir, "out.parquet")
+            convert_to_parquet(source_url=csv, destination=out, progress=False)
+
+            con = duckdb.connect(); con.install_extension("spatial"); con.load_extension("spatial")
+            rows = con.execute(f"""
+                SELECT _cng_fid, name, depth, ST_X(geom), ST_Y(geom), ST_GeometryType(geom)
+                FROM read_parquet('{out}') ORDER BY name
+            """).fetchall()
+            cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{out}')").fetchall()]
+            con.close()
+
+            # (lon, lat) order preserved, POINT geometry, id + attributes carried.
+            assert rows[0][3:6] == (-122.4, 37.8, "POINT")
+            assert rows[1][3:6] == (18.4, -33.9, "POINT")
+            assert "_cng_fid" in cols and "geom" in cols
+            assert "name" in cols and "depth" in cols and "Latitude" in cols
+
+    def test_csv_explicit_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Non-standard column names require explicit flags.
+            csv = self._write_csv(
+                tmpdir, "site,YY,XX", [("s1", 10.0, 20.0)],
+            )
+            out = os.path.join(tmpdir, "out.parquet")
+            convert_to_parquet(source_url=csv, destination=out, progress=False,
+                               lat_column="YY", lon_column="XX")
+            con = duckdb.connect(); con.install_extension("spatial"); con.load_extension("spatial")
+            x, y = con.execute(f"SELECT ST_X(geom), ST_Y(geom) FROM read_parquet('{out}')").fetchone()
+            con.close()
+            assert (x, y) == (20.0, 10.0)
+
+    def test_csv_unresolvable_columns_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv = self._write_csv(tmpdir, "a,b,c", [(1, 2, 3)])
+            out = os.path.join(tmpdir, "out.parquet")
+            with pytest.raises(ValueError, match="auto-detect a latitude"):
+                convert_to_parquet(source_url=csv, destination=out, progress=False)
+
+    def test_csv_null_coordinates_yield_null_geometry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv = self._write_csv(
+                tmpdir, "name,Latitude,Longitude",
+                [("ok", 10.0, 20.0), ("missing", "", "")],
+            )
+            out = os.path.join(tmpdir, "out.parquet")
+            convert_to_parquet(source_url=csv, destination=out, progress=False)  # must not crash
+            con = duckdb.connect(); con.install_extension("spatial"); con.load_extension("spatial")
+            n_total, n_geom = con.execute(
+                f"SELECT COUNT(*), COUNT(geom) FROM read_parquet('{out}')"
+            ).fetchone()
+            con.close()
+            assert n_total == 2 and n_geom == 1  # null-coordinate row kept, geom NULL
 
 
 class TestConvertToParquet:
