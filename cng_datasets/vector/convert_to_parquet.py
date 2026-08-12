@@ -515,7 +515,8 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
 
 def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str],
                                target_crs: str, geom_col: str = "geom", layer: Optional[str] = None,
-                               verbose: bool = False, geom_is_blob: bool = False) -> str:
+                               verbose: bool = False, geom_is_blob: bool = False,
+                               simplify_tolerance: Optional[float] = None) -> str:
     """
     Build DuckDB query to read and reproject data. Can handle multiple input files.
 
@@ -528,6 +529,9 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         verbose: Print debug information
         geom_is_blob: When True the geometry column is typed BLOB (e.g. MULTIPOINT sources)
             and must be cast to GEOMETRY via ST_GeomFromWKB() before any spatial operation.
+        simplify_tolerance: When set, simplify each geometry to this tolerance (in
+            target-CRS units) via ST_SimplifyPreserveTopology, applied AFTER
+            reprojection so the tolerance is in the output CRS (issue #132).
 
     Returns:
         DuckDB SQL query string
@@ -551,10 +555,17 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         # axis-order edge cases — geographic CRSs that are longitude-first (OGC:CRS84)
         # and geographic compound/3D CRSs with codes >= 5000 (EPSG:5498
         # "NAD83 + NAVD88 height", EPSG:4979) — swapping lat/lon for them (see #128).
-        geom_expr = f"ST_MakeValid(ST_Transform({raw_geom}, '{source_crs}', '{target_crs}', always_xy := true)) AS {geom_col}"
+        geom_inner = f"ST_Transform({raw_geom}, '{source_crs}', '{target_crs}', always_xy := true)"
     else:
         # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
-        geom_expr = f"ST_MakeValid({raw_geom}) AS {geom_col}"
+        geom_inner = raw_geom
+
+    # Simplify after reprojection (tolerance is in target-CRS units, issue #132).
+    # PreserveTopology avoids collapsing polygons into invalid/empty geometry.
+    if simplify_tolerance is not None:
+        geom_inner = f"ST_SimplifyPreserveTopology({geom_inner}, {simplify_tolerance})"
+
+    geom_expr = f"ST_MakeValid({geom_inner}) AS {geom_col}"
 
     layer_param = f", layer='{layer}'" if layer else ""
 
@@ -609,7 +620,8 @@ def process_parquet_input(
     force_id: bool = True,
     progress: bool = True,
     target_crs: str = "EPSG:4326",
-    verbose: bool = False
+    verbose: bool = False,
+    simplify_tolerance: Optional[float] = None
 ):
     """
     Process a parquet input file to ensure it has global ID and cloud optimization.
@@ -703,6 +715,7 @@ def process_parquet_input(
         # (issue #119). Detect that and fail with an actionable message.
         has_geometry = any(ct.upper().startswith('GEOMETRY') for _, ct, *_ in columns)
         geom_blob_col = None
+        geom_native_col = None  # name of a native GEOMETRY-typed column
         geom_unsupported = None  # (name, type) of a geom-named column we can't ingest
         for col_name, col_type, *_ in columns:
             if col_name.lower() not in _GEOM_COLUMN_NAMES:
@@ -710,7 +723,9 @@ def process_parquet_input(
             ct = col_type.upper()
             if ct == 'BLOB':
                 geom_blob_col = col_name
-            elif not ct.startswith('GEOMETRY'):
+            elif ct.startswith('GEOMETRY'):
+                geom_native_col = col_name
+            else:
                 geom_unsupported = (col_name, col_type)
 
         # Only error when there is no usable geometry at all (no native GEOMETRY,
@@ -730,12 +745,18 @@ def process_parquet_input(
                 f".to_parquet('fixed.parquet', geometry_encoding='WKB')"
             )
 
-        if geom_blob_col:
-            print(f"  Casting BLOB geometry column to GEOMETRY: {geom_blob_col}")
-            cols_expr = (
-                f'* EXCLUDE ("{geom_blob_col}"), '
-                f'ST_GeomFromWKB("{geom_blob_col}") AS "{geom_blob_col}"'
-            )
+        # Build the geometry projection: cast a BLOB WKB column to GEOMETRY, and/or
+        # apply simplification (issue #132). Tolerance is in the parquet's own CRS
+        # units (assumed target_crs — this path does not reproject).
+        geom_name = geom_blob_col or geom_native_col
+        if geom_name and (geom_blob_col or simplify_tolerance is not None):
+            base_geom = f'ST_GeomFromWKB("{geom_name}")' if geom_blob_col else f'"{geom_name}"'
+            if geom_blob_col:
+                print(f"  Casting BLOB geometry column to GEOMETRY: {geom_name}")
+            if simplify_tolerance is not None:
+                print(f"  Simplifying geometry with tolerance {simplify_tolerance} (target-CRS units)")
+                base_geom = f'ST_SimplifyPreserveTopology({base_geom}, {simplify_tolerance})'
+            cols_expr = f'* EXCLUDE ("{geom_name}"), {base_geom} AS "{geom_name}"'
         else:
             cols_expr = "*"
 
@@ -895,7 +916,8 @@ def convert_to_parquet(
     progress: bool = True,
     target_crs: str = "EPSG:4326",
     layer: Optional[str] = None,
-    verbose: bool = False
+    verbose: bool = False,
+    simplify_tolerance: Optional[float] = None
 ):
     """
     Convert a vector dataset to optimized GeoParquet.
@@ -920,6 +942,9 @@ def convert_to_parquet(
         target_crs: Target CRS for output (default: EPSG:4326)
         layer: Layer name for multi-layer datasets (e.g., GDB)
         verbose: Print detailed debug information
+        simplify_tolerance: Optional geometry simplification tolerance in
+            target-CRS units (e.g. degrees for EPSG:4326), applied after
+            reprojection via ST_SimplifyPreserveTopology (issue #132)
     """
     # Check if input is already parquet
     # Handle list of sources vs single source
@@ -950,7 +975,8 @@ def convert_to_parquet(
             force_id=force_id,
             progress=progress,
             target_crs=target_crs,
-            verbose=verbose
+            verbose=verbose,
+            simplify_tolerance=simplify_tolerance
         )
 
     # Original processing for non-parquet inputs
@@ -1093,6 +1119,7 @@ def convert_to_parquet(
             layer=layer,
             verbose=verbose,
             geom_is_blob=geom_is_blob,
+            simplify_tolerance=simplify_tolerance,
         )
 
         # Step 3: Check ID column and wrap query if needed
@@ -1200,6 +1227,11 @@ Examples:
                        help="Don't create synthetic ID if none exists")
     parser.add_argument("--target-crs", default="EPSG:4326",
                        help="Target CRS (default: EPSG:4326)")
+    parser.add_argument("--simplify-tolerance", type=float, default=None,
+                       help="Simplify geometry to this tolerance in TARGET-CRS units "
+                            "(degrees for EPSG:4326; e.g. 0.0001 ~ 10 m at the equator) "
+                            "via ST_SimplifyPreserveTopology, applied after reprojection. "
+                            "Right-sizes high-vertex sources for tiling/hex.")
     parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")
 
     parser.add_argument("--no-progress", action="store_true",
@@ -1225,7 +1257,8 @@ Examples:
             progress=not args.no_progress,
             target_crs=args.target_crs,
             layer=args.layer,
-            verbose=args.verbose
+            verbose=args.verbose,
+            simplify_tolerance=args.simplify_tolerance
         )
         sys.exit(0)
     except Exception as e:

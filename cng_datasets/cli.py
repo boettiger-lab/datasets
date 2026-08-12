@@ -123,6 +123,7 @@ def main():
     workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
+    workflow_parser.add_argument("--simplify-tolerance", type=float, default=None, help="Simplify geometry to this tolerance in target-CRS units (degrees for EPSG:4326; e.g. 0.0001 ~ 10m) during the convert step. Right-sizes high-vertex sources for tiling/hex (issue #132).")
     workflow_parser.add_argument("--hex-storage", type=str, default="10Gi", help="Ephemeral storage request/limit per hex job pod (default: 10Gi)")
     workflow_parser.add_argument("--repartition-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for repartition job pod (default: 50Gi)")
     workflow_parser.add_argument("--repartition-memory", type=str, default="32Gi", help="Memory request/limit for repartition job pod (default: 32Gi)")
@@ -374,6 +375,7 @@ def _dispatch(args):
             max_completions=args.max_completions,
             intermediate_chunk_size=args.intermediate_chunk_size,
             row_group_size=args.row_group_size,
+            simplify_tolerance=args.simplify_tolerance,
             backend=args.backend,
             hex_storage=args.hex_storage,
             repartition_storage=args.repartition_storage,
