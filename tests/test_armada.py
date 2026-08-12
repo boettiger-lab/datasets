@@ -268,13 +268,19 @@ class TestConvertWorkflowToArmada:
                 assert len(spec["jobs"]) >= 1
 
     @pytest.mark.timeout(30)
-    def test_hex_job_expanded_to_multiple_armada_jobs(self):
+    def test_hex_job_expanded_to_multiple_armada_jobs(self, monkeypatch):
+        # Pin the feature count so this exercises multi-completion expansion
+        # independently of the fixture's actual size and of the chunk-sizing
+        # policy (issue #144): 5000 features / 1000-per-chunk target -> 5 chunks.
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="test-ds",
                 source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
                 bucket="test-bucket",
                 output_dir=tmpdir,
+                h3_resolution=10,  # skip network geometry-type detection
             )
 
             convert_workflow_to_armada(
@@ -289,7 +295,7 @@ class TestConvertWorkflowToArmada:
             with open(hex_armada) as f:
                 spec = yaml.safe_load(f)
 
-            # 5-feature fixture -> 5 completions -> 5 Armada jobs
+            # 5000 features -> 5 completions -> 5 Armada jobs
             assert len(spec["jobs"]) == 5
 
             # No JOB_COMPLETION_INDEX references should remain
