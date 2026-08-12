@@ -174,9 +174,10 @@ class TestWorkflowGeneration:
                 job = yaml.safe_load(f)
                 
             assert job["metadata"]["name"] == "test-ds-hex"
-            # 5-feature fixture -> chunk_size=1, completions=5, parallelism=5
-            assert job["spec"]["completions"] == 5
-            assert job["spec"]["parallelism"] == 5
+            # 5-feature fixture -> chunk_size floored at 1000 -> 1 chunk (#144),
+            # not 5 tiny one-feature pods.
+            assert job["spec"]["completions"] == 1
+            assert job["spec"]["parallelism"] == 1
             assert job["spec"]["completionMode"] == "Indexed"
     
     @pytest.mark.timeout(30)
@@ -229,15 +230,15 @@ class TestWorkflowGeneration:
                 job = yaml.safe_load(f)
                 
             assert job["metadata"]["name"] == "mappinginequality-hex"
-            # 5-feature fixture -> chunk_size=1, completions=5, parallelism=5
-            assert job["spec"]["completions"] == 5
-            assert job["spec"]["parallelism"] == 5
+            # 5-feature fixture -> chunk_size floored at 1000 -> 1 chunk (#144).
+            assert job["spec"]["completions"] == 1
+            assert job["spec"]["parallelism"] == 1
             assert job["spec"]["completionMode"] == "Indexed"
 
             # Check chunk-size is set correctly
             command = job["spec"]["template"]["spec"]["containers"][0]["command"]
             command_str = str(command)
-            assert "--chunk-size 1" in command_str
+            assert "--chunk-size 1000" in command_str
 
     @pytest.mark.timeout(5)
     def test_pmtiles_job_memory(self):
@@ -446,6 +447,54 @@ class TestWorkflowGeneration:
             # DuckDB limit should be 85% = 54GiB
             command = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
             assert "--memory-limit 54GiB" in command
+
+
+class TestCalculateChunking:
+    """Issue #144: right-size hex `completions` to the chunks that hold data
+    instead of shredding small datasets into ~max_completions tiny pods."""
+
+    def test_small_dataset_uses_few_chunks(self):
+        """5,697 features -> 6 chunks of 1000, not ~200 tiny pods (the #144 repro)."""
+        from cng_datasets.k8s.workflows import _calculate_chunking
+        chunk_size, completions, parallelism = _calculate_chunking(5697, max_completions=200)
+        assert chunk_size == 1000
+        assert completions == 6
+        assert parallelism == 6
+
+    def test_tiny_dataset_is_single_chunk(self):
+        """A handful of features -> one pod, not one pod per feature."""
+        from cng_datasets.k8s.workflows import _calculate_chunking
+        assert _calculate_chunking(5, max_completions=200) == (1000, 1, 1)
+
+    def test_large_dataset_caps_at_max_completions(self):
+        """Beyond max_completions*target, chunk_size grows to cap completions."""
+        from cng_datasets.k8s.workflows import _calculate_chunking
+        # 711,583 features: target-1000 would need 712 > 200 chunks, so chunk_size
+        # grows to ceil(711583/200)=3558, completions caps at 200.
+        chunk_size, completions, parallelism = _calculate_chunking(711583, max_completions=200)
+        assert chunk_size == 3558
+        assert completions == 200
+        assert parallelism == 50
+        # Crucially, completions*chunk_size still covers every feature (no #170 truncation).
+        assert completions * chunk_size >= 711583
+
+    def test_boundary_at_target_times_max_completions(self):
+        """Exactly max_completions*target features stays at the target chunk size."""
+        from cng_datasets.k8s.workflows import _calculate_chunking
+        assert _calculate_chunking(200000, max_completions=200) == (1000, 200, 50)
+        # One more feature tips chunk_size up so completions stays <= max.
+        chunk_size, completions, _ = _calculate_chunking(200001, max_completions=200)
+        assert completions <= 200
+        assert chunk_size * completions >= 200001
+
+    def test_covers_all_features_across_scales(self):
+        """completions*chunk_size must always cover the dataset (no silent drop)."""
+        from cng_datasets.k8s.workflows import _calculate_chunking
+        for n in (1, 5, 999, 1000, 1001, 5697, 199999, 200000, 200001, 1_000_000):
+            chunk_size, completions, parallelism = _calculate_chunking(n, max_completions=200)
+            assert completions >= 1
+            assert completions <= 200
+            assert chunk_size * completions >= n, f"n={n} not fully covered"
 
 
 class TestEdgeCases:
