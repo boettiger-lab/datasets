@@ -20,7 +20,20 @@ For Parquet files, use DuckDB to inspect the schema and understand the columns/f
 duckdb -c "INSTALL httpfs; LOAD httpfs; DESCRIBE SELECT * FROM 'https://s3-west.nrp-nautilus.io/public-<dataset>/<file>.parquet' LIMIT 1;"
 ```
 
-For PMTiles, you can inspect the metadata using `pmtiles` CLI or by creating a temporary inspection script.
+For PMTiles, get the **tile-accurate** field list — tippecanoe writes only a
+subset of the source columns into the tiles, so the PMTiles schema differs from
+the Parquet schema. Read it straight from the archive footer (works on a local
+path, `http(s)://`, or `s3://` — only the header + metadata blob are fetched):
+
+```bash
+# Ready-to-paste STAC table:columns (name + type) for what's actually in the tiles
+cng-datasets pmtiles-columns https://s3-west.nrp-nautilus.io/public-<dataset>/<file>.pmtiles
+# Full PMTiles metadata (vector_layers, zoom range, ...)
+cng-datasets pmtiles-columns <file>.pmtiles --full-metadata
+```
+
+Use this field list for the PMTiles asset's `table:columns` in step 4B so it
+reflects the tiles, not the (superset) Parquet schema (issue #140).
 
 ## 3. Research Metadata & Citations
 
