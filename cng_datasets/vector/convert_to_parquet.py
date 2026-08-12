@@ -195,6 +195,73 @@ def is_parquet_file(source_url: str) -> bool:
     return path.lower().endswith('.parquet')
 
 
+def is_csv_file(source_url: str) -> bool:
+    """
+    Check if a source URL points to a CSV/TSV file.
+
+    CSV point datasets (lat/lon columns) are a common distribution format for
+    point observations (species occurrences, sensor stations, vent locations)
+    and are handled by a dedicated read_csv + ST_Point path (issue #78).
+
+    Args:
+        source_url: Source dataset URL
+
+    Returns:
+        True if the file ends with .csv/.tsv, False otherwise
+    """
+    parsed = urlparse(source_url)
+    path = parsed.path if parsed.path else source_url
+    return path.lower().endswith(('.csv', '.tsv'))
+
+
+# Case-insensitive candidate names for latitude/longitude columns in a CSV,
+# in priority order. Used when --lat-column/--lon-column are not given (#78).
+_LAT_COLUMN_CANDIDATES = ('latitude', 'lat', 'y', 'ycoord', 'y_coord', 'decimallatitude')
+_LON_COLUMN_CANDIDATES = ('longitude', 'lon', 'lng', 'long', 'x', 'xcoord', 'x_coord', 'decimallongitude')
+
+
+def _resolve_latlon_columns(
+    column_names: List[str],
+    lat_column: Optional[str] = None,
+    lon_column: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Resolve the latitude and longitude column names for a CSV point source.
+
+    Uses the explicit ``lat_column``/``lon_column`` when given (case-insensitive
+    match), otherwise auto-detects from common names (issue #78). Returns the
+    actual column names as they appear in the source (preserving case).
+
+    Raises:
+        ValueError: a specified column is absent, or auto-detection finds no
+            latitude/longitude column.
+    """
+    lower_map = {c.lower(): c for c in column_names}
+
+    def _resolve(specified, candidates, axis):
+        if specified:
+            actual = lower_map.get(specified.lower())
+            if actual is None:
+                raise ValueError(
+                    f"Specified {axis} column '{specified}' not found in CSV. "
+                    f"Available columns: {', '.join(column_names)}"
+                )
+            return actual
+        for cand in candidates:
+            if cand in lower_map:
+                return lower_map[cand]
+        raise ValueError(
+            f"Could not auto-detect a {axis} column in the CSV "
+            f"(looked for {', '.join(candidates)}). "
+            f"Specify it explicitly with --{axis[:3]}-column. "
+            f"Available columns: {', '.join(column_names)}"
+        )
+
+    return (
+        _resolve(lat_column, _LAT_COLUMN_CANDIDATES, 'latitude'),
+        _resolve(lon_column, _LON_COLUMN_CANDIDATES, 'longitude'),
+    )
+
+
 def to_gdal_readable(url: str) -> str:
     """
     Rewrite a remote source URL into a GDAL /vsicurl path so ST_Read can open it.
@@ -811,6 +878,139 @@ def process_parquet_input(
         con.close()
 
 
+def process_csv_input(
+    source_url: str,
+    destination: str,
+    lat_column: Optional[str] = None,
+    lon_column: Optional[str] = None,
+    compression: str = "ZSTD",
+    compression_level: int = 15,
+    row_group_size: int = 100000,
+    id_column: Optional[str] = None,
+    force_id: bool = True,
+    progress: bool = True,
+    target_crs: str = "EPSG:4326",
+    verbose: bool = False,
+    simplify_tolerance: Optional[float] = None,
+):
+    """
+    Convert a CSV with latitude/longitude columns into point GeoParquet (issue #78).
+
+    The lat/lon columns are read as WGS84 (EPSG:4326) coordinates and turned into
+    a Point ``geom`` column via ST_Point(lon, lat) (GeoParquet (lon, lat) order).
+    All source columns — including the lat/lon columns — are carried through as
+    attributes, and a synthetic ``_cng_fid`` is added as usual.
+
+    Args:
+        source_url: Source CSV/TSV URL (s3://, http(s)://, or local path)
+        destination: Output GeoParquet path (s3:// or local)
+        lat_column: Latitude column name (auto-detected if not given)
+        lon_column: Longitude column name (auto-detected if not given)
+        compression, compression_level, row_group_size: Parquet write options
+        id_column: Source column to use as row id instead of synthesizing _cng_fid
+        force_id: Kept for backwards compatibility (_cng_fid always created)
+        progress: Show progress messages
+        target_crs: Output CRS. Points are built in EPSG:4326 and reprojected if
+            this differs.
+        verbose: Print detailed debug information
+        simplify_tolerance: Unused for points (kept for a uniform call signature)
+    """
+    print(f"Processing CSV point file: {source_url}")
+    print(f"                Output to: {destination}")
+
+    con = duckdb.connect(':memory:')
+    con.install_extension("spatial")
+    con.load_extension("spatial")
+    con.execute("SET arrow_large_buffer_size=true")
+
+    try:
+        read_url = source_url
+        if source_url.startswith('s3://'):
+            read_url = f"https://s3-west.nrp-nautilus.io/{source_url[len('s3://'):]}"
+
+        # Detect columns
+        columns = con.execute(
+            f"DESCRIBE SELECT * FROM read_csv_auto('{read_url}') LIMIT 0"
+        ).fetchall()
+        column_names = [col[0] for col in columns]
+        column_names_lower = [c.lower() for c in column_names]
+
+        lat_col, lon_col = _resolve_latlon_columns(column_names, lat_column, lon_column)
+        print(f"  Latitude column:  {lat_col}")
+        print(f"  Longitude column: {lon_col}")
+
+        # ID handling mirrors process_parquet_input: always synthesize _cng_fid
+        # unless the user named an explicit id_column or the source already has it.
+        needs_id = False
+        if id_column:
+            if id_column.lower() not in column_names_lower:
+                raise ValueError(f"Specified ID column '{id_column}' not found in CSV")
+            id_col_name = id_column
+        elif '_cng_fid' in column_names_lower:
+            id_col_name = "_cng_fid"
+        else:
+            needs_id = True
+            id_col_name = "_cng_fid"
+        print(f"  {'Adding synthetic' if needs_id else 'Using existing'} ID column: {id_col_name}")
+
+        # Warn on out-of-range coordinates (commonly swapped lat/lon columns).
+        bad = con.execute(f"""
+            SELECT
+                COUNT(*) FILTER (WHERE abs(CAST("{lat_col}" AS DOUBLE)) > 90) AS bad_lat,
+                COUNT(*) FILTER (WHERE abs(CAST("{lon_col}" AS DOUBLE)) > 180) AS bad_lon
+            FROM read_csv_auto('{read_url}')
+            WHERE "{lat_col}" IS NOT NULL AND "{lon_col}" IS NOT NULL
+        """).fetchone()
+        if bad and (bad[0] or bad[1]):
+            print(
+                f"  Warning: {bad[0]} rows have |latitude| > 90 and {bad[1]} have "
+                f"|longitude| > 180. Check that --lat-column/--lon-column are not swapped."
+            )
+
+        # Build the point geometry in EPSG:4326, reprojecting only if the target
+        # differs. NULL coordinates yield NULL geometry (kept, hexes to nothing).
+        point_expr = (
+            f'CASE WHEN "{lon_col}" IS NOT NULL AND "{lat_col}" IS NOT NULL '
+            f'THEN ST_Point(CAST("{lon_col}" AS DOUBLE), CAST("{lat_col}" AS DOUBLE)) '
+            f'ELSE NULL END'
+        )
+        if target_crs and target_crs != "EPSG:4326":
+            point_expr = f"ST_Transform({point_expr}, 'EPSG:4326', '{target_crs}', always_xy := true)"
+        geom_expr = f"ST_MakeValid({point_expr}) AS geom"
+
+        id_prefix = f"ROW_NUMBER() OVER () AS {id_col_name}, " if needs_id else ""
+        query = f"""
+            SELECT {id_prefix}*, {geom_expr}
+            FROM read_csv_auto('{read_url}')
+        """
+
+        is_s3_dest = destination.startswith('s3://')
+        if is_s3_dest:
+            with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                write_with_duckdb(query, tmp_path, compression, compression_level,
+                                  row_group_size, verbose)
+                upload_to_s3(tmp_path, destination, verbose=progress)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        else:
+            write_with_duckdb(query, destination, compression, compression_level,
+                              row_group_size, verbose)
+
+        print("✓ CSV point processing completed successfully!")
+
+    except Exception as e:
+        print(f"✗ CSV point processing failed: {e}", file=sys.stderr)
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        raise
+    finally:
+        con.close()
+
+
 def write_with_duckdb(query: str, output_path: str,
                       compression: str = "ZSTD",
                       compression_level: int = 15,
@@ -917,7 +1117,9 @@ def convert_to_parquet(
     target_crs: str = "EPSG:4326",
     layer: Optional[str] = None,
     verbose: bool = False,
-    simplify_tolerance: Optional[float] = None
+    simplify_tolerance: Optional[float] = None,
+    lat_column: Optional[str] = None,
+    lon_column: Optional[str] = None
 ):
     """
     Convert a vector dataset to optimized GeoParquet.
@@ -945,7 +1147,29 @@ def convert_to_parquet(
         simplify_tolerance: Optional geometry simplification tolerance in
             target-CRS units (e.g. degrees for EPSG:4326), applied after
             reprojection via ST_SimplifyPreserveTopology (issue #132)
+        lat_column: Latitude column name for CSV point input (auto-detected if
+            not given, issue #78)
+        lon_column: Longitude column name for CSV point input (auto-detected if
+            not given, issue #78)
     """
+    # CSV with lat/lon columns -> point geometry (issue #78). Handled before the
+    # ST_Read path since CSV is not a spatial format GDAL/ST_Read opens directly.
+    if not isinstance(source_url, list) and is_csv_file(source_url):
+        return process_csv_input(
+            source_url=source_url,
+            destination=destination,
+            lat_column=lat_column,
+            lon_column=lon_column,
+            compression=compression,
+            compression_level=compression_level,
+            row_group_size=row_group_size,
+            id_column=id_column,
+            force_id=force_id,
+            progress=progress,
+            target_crs=target_crs,
+            verbose=verbose,
+        )
+
     # Check if input is already parquet
     # Handle list of sources vs single source
     if isinstance(source_url, list):
@@ -1233,6 +1457,12 @@ Examples:
                             "via ST_SimplifyPreserveTopology, applied after reprojection. "
                             "Right-sizes high-vertex sources for tiling/hex.")
     parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")
+    parser.add_argument("--lat-column", default=None,
+                       help="Latitude column for CSV point input (auto-detected from "
+                            "e.g. Latitude/lat/y if not given). Issue #78.")
+    parser.add_argument("--lon-column", default=None,
+                       help="Longitude column for CSV point input (auto-detected from "
+                            "e.g. Longitude/lon/x if not given). Issue #78.")
 
     parser.add_argument("--no-progress", action="store_true",
                        help="Disable progress output")
@@ -1258,7 +1488,9 @@ Examples:
             target_crs=args.target_crs,
             layer=args.layer,
             verbose=args.verbose,
-            simplify_tolerance=args.simplify_tolerance
+            simplify_tolerance=args.simplify_tolerance,
+            lat_column=args.lat_column,
+            lon_column=args.lon_column
         )
         sys.exit(0)
     except Exception as e:
