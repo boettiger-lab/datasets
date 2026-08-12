@@ -931,6 +931,122 @@ class TestOversizedFeatureGuard:
             processor.con.close()
 
 
+class TestGeometryColumnResolution:
+    """Issue #171: an unrelated attribute column named GEOMETRY/SHAPE/GEOM (e.g.
+    a DOUBLE carried over from a source DBF) must not shadow the real geometry
+    column and abort the hex job with an ST_GeometryType(DOUBLE) binder error."""
+
+    @pytest.mark.timeout(30)
+    def test_junk_geometry_named_attribute_does_not_shadow_real_geom(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/test.parquet"
+            # A DOUBLE attribute literally named GEOMETRY sits *before* the real
+            # geometry column `geom`, exactly as reported in issue #171.
+            con.execute(f"""
+                CREATE TABLE test_data AS
+                SELECT
+                    i AS _cng_fid,
+                    3.14 AS "GEOMETRY",
+                    ST_GeomFromText('POLYGON((-122.5 37.7, -122.4 37.7, -122.4 37.8, -122.5 37.8, -122.5 37.7))') AS geom
+                FROM range(5) t(i)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=8,
+                parent_resolutions=[0],
+                chunk_size=5,
+            )
+
+            # The geometry column must resolve to the real GEOMETRY-typed column.
+            processor.con.execute(f"""
+                CREATE OR REPLACE VIEW source_table AS
+                SELECT * FROM read_parquet('{test_parquet}')
+            """)
+            assert processor._find_geometry_column('source_table') == 'geom'
+
+            # And the full chunk must hex successfully rather than crash.
+            output_file = processor.process_chunk(0)
+            assert output_file is not None
+            assert Path(output_file).exists()
+            n = processor.con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{output_file}')"
+            ).fetchone()[0]
+            assert n > 0
+            processor.con.close()
+
+
+class TestAllNullGeometryChunk:
+    """Issue #169: a chunk whose features are all null-geometry produces a
+    zero-row intermediate and must be written as an empty partition instead of
+    crashing the Pass-2 final COPY with 'No files found'."""
+
+    @pytest.mark.timeout(30)
+    def test_all_null_geometry_chunk_writes_empty_partition(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = setup_duckdb_connection()
+            test_parquet = f"{tmpdir}/mixed_null.parquet"
+            # A real geoparquet: features 0-4 have geometry, features 5-9 are
+            # null-geometry. The geom column keeps its GEOMETRY type (some rows are
+            # non-null), and with chunk_size=5 the second chunk (offset 5) is an
+            # all-null window — exactly the contiguous null block from issue #169.
+            con.execute(f"""
+                CREATE TABLE test_data AS
+                SELECT
+                    i AS _cng_fid,
+                    CASE WHEN i < 5
+                         THEN ST_GeomFromText('POLYGON((-122.5 37.7, -122.4 37.7, -122.4 37.8, -122.5 37.8, -122.5 37.7))')
+                         ELSE CAST(NULL AS GEOMETRY)
+                    END AS geom
+                FROM range(10) t(i)
+            """)
+            con.execute(f"COPY test_data TO '{test_parquet}' (FORMAT PARQUET)")
+            con.close()
+
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+
+            processor = H3VectorProcessor(
+                input_url=test_parquet,
+                output_url=tmpdir,
+                h3_resolution=10,
+                parent_resolutions=[9, 8, 0],
+                chunk_size=5,
+                intermediate_chunk_size=10,
+            )
+
+            # Chunk 1 is all null-geometry: must complete (not raise) and write an
+            # empty, correctly-typed partition.
+            output_file = processor.process_chunk(1)
+            assert output_file is not None
+            assert Path(output_file).exists()
+
+            result = processor.con.execute(
+                f"SELECT * FROM read_parquet('{output_file}')"
+            ).fetchdf()
+            assert len(result) == 0
+            # Output schema is intact so repartition can still read the partition,
+            # and matches the non-empty chunk-0 output.
+            assert 'h10' in result.columns
+            assert 'h0' in result.columns
+
+            # The empty partition's schema must match a populated chunk's, so a
+            # later repartition read_parquet('chunks/*') unions them cleanly.
+            chunk0 = processor.process_chunk(0)
+            cols0 = processor.con.execute(
+                f"SELECT * FROM read_parquet('{chunk0}') LIMIT 0"
+            ).fetchdf().columns.tolist()
+            assert list(result.columns) == cols0
+            processor.con.close()
+
+
 class TestSwappedCoordinateDetection:
     """Test that swapped lat/lon coordinates are detected and raise an error."""
 
@@ -1383,6 +1499,127 @@ class TestRepartitionWithAttributeJoin:
                     output_dir=output_dir,
                     cleanup=False,
                 )
+
+
+class TestRepartitionCompletenessGuard:
+    """Issue #170: repartition must hard-fail when the hex output is missing
+    source features (silent truncation from an under-sized k8s indexed Job),
+    while tolerating null-geometry features that legitimately produce no cells."""
+
+    def _make_source(self, tmpdir, n=10, null_from=None):
+        """Source parquet of n features; features with fid >= null_from (if set)
+        get a NULL geometry."""
+        con = setup_duckdb_connection()
+        src = f"{tmpdir}/source.parquet"
+        null_pred = f"i >= {null_from}" if null_from is not None else "false"
+        con.execute(f"""
+            CREATE TABLE test_data AS
+            SELECT
+                i AS _cng_fid,
+                CASE WHEN {null_pred}
+                     THEN CAST(NULL AS GEOMETRY)
+                     ELSE ST_GeomFromText('POLYGON((-122.5 37.7, -122.4 37.7, -122.4 37.8, -122.5 37.8, -122.5 37.7))')
+                END AS geom
+            FROM range({n}) t(i)
+        """)
+        con.execute(f"COPY test_data TO '{src}' (FORMAT PARQUET)")
+        con.close()
+        return src
+
+    def _hex_chunks(self, src, chunks_dir, chunk_ids, chunk_size=5):
+        os.makedirs(chunks_dir, exist_ok=True)
+        processor = H3VectorProcessor(
+            input_url=src, output_url=chunks_dir,
+            h3_resolution=8, parent_resolutions=[0], chunk_size=chunk_size,
+        )
+        for cid in chunk_ids:
+            processor.process_chunk(cid)
+        processor.con.close()
+
+    @pytest.mark.timeout(30)
+    def test_truncated_hex_output_raises(self):
+        """Only the first chunk was hexed (5 of 10 features) → hard-fail."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            src = self._make_source(tmpdir, n=10)
+            chunks_dir = f"{tmpdir}/chunks"
+            self._hex_chunks(src, chunks_dir, chunk_ids=[0], chunk_size=5)
+
+            with pytest.raises(RuntimeError, match=r"incomplete: 5 of 10"):
+                repartition_by_h0(
+                    chunks_dir=chunks_dir,
+                    output_dir=f"{tmpdir}/output",
+                    source_parquet=src,
+                    cleanup=False,
+                )
+
+    @pytest.mark.timeout(30)
+    def test_complete_hex_output_passes(self):
+        """All chunks hexed (10 of 10 features) → repartition succeeds."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            src = self._make_source(tmpdir, n=10)
+            chunks_dir = f"{tmpdir}/chunks"
+            self._hex_chunks(src, chunks_dir, chunk_ids=[0, 1], chunk_size=5)
+
+            repartition_by_h0(
+                chunks_dir=chunks_dir,
+                output_dir=f"{tmpdir}/output",
+                source_parquet=src,
+                cleanup=False,
+            )
+            con = setup_duckdb_connection()
+            n = con.execute(
+                f"SELECT COUNT(DISTINCT _cng_fid) FROM read_parquet('{tmpdir}/output/**/*.parquet')"
+            ).fetchone()[0]
+            con.close()
+            assert n == 10
+
+    @pytest.mark.timeout(30)
+    def test_null_geometry_features_excluded_from_count(self):
+        """Features 5-9 are null-geometry (never hexable). Hexing only chunk 0
+        still covers all 5 non-null features → passes, not a false truncation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            src = self._make_source(tmpdir, n=10, null_from=5)
+            chunks_dir = f"{tmpdir}/chunks"
+            # Hex both chunks; chunk 1 is all-null and writes an empty partition.
+            self._hex_chunks(src, chunks_dir, chunk_ids=[0, 1], chunk_size=5)
+
+            repartition_by_h0(
+                chunks_dir=chunks_dir,
+                output_dir=f"{tmpdir}/output",
+                source_parquet=src,
+                cleanup=False,
+            )
+            con = setup_duckdb_connection()
+            n = con.execute(
+                f"SELECT COUNT(DISTINCT _cng_fid) FROM read_parquet('{tmpdir}/output/**/*.parquet')"
+            ).fetchone()[0]
+            con.close()
+            assert n == 5  # only the non-null-geometry features
+
+    @pytest.mark.timeout(30)
+    def test_skip_env_var_bypasses_guard(self, monkeypatch):
+        """CNG_SKIP_COMPLETENESS_CHECK=1 lets a truncated build through."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ['AWS_ACCESS_KEY_ID'] = ''
+            os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+            monkeypatch.setenv('CNG_SKIP_COMPLETENESS_CHECK', '1')
+            src = self._make_source(tmpdir, n=10)
+            chunks_dir = f"{tmpdir}/chunks"
+            self._hex_chunks(src, chunks_dir, chunk_ids=[0], chunk_size=5)
+
+            repartition_by_h0(
+                chunks_dir=chunks_dir,
+                output_dir=f"{tmpdir}/output",
+                source_parquet=src,
+                cleanup=False,
+            )  # must not raise
+            assert Path(f"{tmpdir}/output").exists()
 
 
 class TestParseResolutionByArea:
