@@ -186,6 +186,73 @@ class TestReprojectQueryAxisOrder:
             con.close()
 
 
+class TestSimplifyTolerance:
+    """Issue #132: --simplify-tolerance simplifies geometry during convert."""
+
+    def test_simplify_wraps_reprojected_geometry(self):
+        """When set, ST_SimplifyPreserveTopology is applied AFTER reprojection
+        (tolerance in target-CRS units), and inside ST_MakeValid."""
+        sql = build_read_reproject_query(
+            "dummy.gpkg", source_crs="EPSG:3857", target_crs="EPSG:4326",
+            geom_col="geom", simplify_tolerance=0.001,
+        )
+        assert "ST_SimplifyPreserveTopology" in sql
+        # simplify is the outer call (applied after) the reprojection, so its name
+        # appears before ST_Transform in the nested expression text.
+        assert sql.index("ST_SimplifyPreserveTopology") < sql.index("ST_Transform")
+        assert "ST_MakeValid" in sql
+
+    def test_no_simplify_by_default(self):
+        for source_crs in ("EPSG:3857", "EPSG:4326", None):
+            sql = build_read_reproject_query(
+                "dummy.gpkg", source_crs=source_crs, target_crs="EPSG:4326", geom_col="geom"
+            )
+            assert "ST_SimplifyPreserveTopology" not in sql
+
+    def test_simplify_reduces_vertices_end_to_end(self):
+        """A high-vertex polygon is simplified to fewer vertices, keeping a valid
+        non-empty geometry and the synthetic _cng_fid."""
+        import math
+        pts = [f"{0.01*math.cos(t):.6f} {0.01*math.sin(t):.6f}"
+               for t in (i / 60 * 2 * math.pi for i in range(60))]
+        wkt = "POLYGON((" + ",".join(pts) + "," + pts[0] + "))"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = duckdb.connect(); con.install_extension("spatial"); con.load_extension("spatial")
+            src = f"{tmpdir}/src.parquet"
+            out = f"{tmpdir}/out.parquet"
+            con.execute(f"COPY (SELECT 1 AS id, ST_GeomFromText('{wkt}') AS geom) TO '{src}' (FORMAT PARQUET)")
+            n_in = con.execute(f"SELECT ST_NPoints(geom) FROM read_parquet('{src}')").fetchone()[0]
+
+            convert_to_parquet(source_url=src, destination=out, simplify_tolerance=0.005, progress=False)
+
+            n_out, is_valid, is_empty = con.execute(
+                f"SELECT ST_NPoints(geom), ST_IsValid(geom), ST_IsEmpty(geom) FROM read_parquet('{out}')"
+            ).fetchone()
+            cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{out}')").fetchall()]
+            con.close()
+
+            assert 0 < n_out < n_in, f"expected simplification, got {n_in} -> {n_out}"
+            assert is_valid and not is_empty
+            assert "_cng_fid" in cols and "geom" in cols
+
+    def test_no_simplify_preserves_vertices(self):
+        """Without the flag, vertex count is unchanged (no accidental simplification)."""
+        import math
+        pts = [f"{0.01*math.cos(t):.6f} {0.01*math.sin(t):.6f}"
+               for t in (i / 40 * 2 * math.pi for i in range(40))]
+        wkt = "POLYGON((" + ",".join(pts) + "," + pts[0] + "))"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            con = duckdb.connect(); con.install_extension("spatial"); con.load_extension("spatial")
+            src = f"{tmpdir}/src.parquet"
+            out = f"{tmpdir}/out.parquet"
+            con.execute(f"COPY (SELECT 1 AS id, ST_GeomFromText('{wkt}') AS geom) TO '{src}' (FORMAT PARQUET)")
+            n_in = con.execute(f"SELECT ST_NPoints(geom) FROM read_parquet('{src}')").fetchone()[0]
+            convert_to_parquet(source_url=src, destination=out, progress=False)
+            n_out = con.execute(f"SELECT ST_NPoints(geom) FROM read_parquet('{out}')").fetchone()[0]
+            con.close()
+            assert n_out == n_in
+
+
 class TestConvertToParquet:
     """Test convert_to_parquet functionality."""
     

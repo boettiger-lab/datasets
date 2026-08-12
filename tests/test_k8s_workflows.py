@@ -497,6 +497,41 @@ class TestCalculateChunking:
             assert chunk_size * completions >= n, f"n={n} not fully covered"
 
 
+class TestSimplifyToleranceWiring:
+    """Issue #132: --simplify-tolerance reaches the generated convert job command."""
+
+    def test_convert_job_includes_simplify_flag(self, monkeypatch):
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="simp-ds",
+                source_url="https://example.com/big.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=10,           # skip network geometry detection
+                simplify_tolerance=0.0001,
+            )
+            convert_yaml = yaml.safe_load(open(Path(tmpdir) / "simp-ds-convert.yaml"))
+            cmd = str(convert_yaml["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--simplify-tolerance 0.0001" in cmd
+
+    def test_convert_job_omits_flag_by_default(self, monkeypatch):
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="nosimp-ds",
+                source_url="https://example.com/big.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=10,
+            )
+            convert_yaml = yaml.safe_load(open(Path(tmpdir) / "nosimp-ds-convert.yaml"))
+            cmd = str(convert_yaml["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--simplify-tolerance" not in cmd
+
+
 class TestEdgeCases:
     """Test edge cases and error handling."""
     
