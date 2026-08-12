@@ -211,6 +211,15 @@ def main():
     setup_bucket_parser.add_argument("--no-cors", action="store_true", help="Skip CORS configuration")
     setup_bucket_parser.add_argument("--verify", action="store_true", help="Verify bucket configuration after setup")
 
+    # PMTiles tile-accurate column inspection (issue #140)
+    pmtiles_cols_parser = subparsers.add_parser(
+        "pmtiles-columns",
+        help="Read tile-accurate STAC table:columns from a PMTiles footer")
+    pmtiles_cols_parser.add_argument("source", help="Path / http(s):// / s3:// to a .pmtiles archive")
+    pmtiles_cols_parser.add_argument("--layer", default=None, help="Restrict to a single vector layer id")
+    pmtiles_cols_parser.add_argument("--full-metadata", action="store_true",
+                                     help="Print the full PMTiles metadata JSON instead of table:columns")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -459,6 +468,14 @@ def _dispatch(args):
                 print(json.dumps(results, indent=2))
 
             sys.exit(0 if success else 1)
+
+    elif args.command == "pmtiles-columns":
+        from .vector.pmtiles import read_pmtiles_metadata, pmtiles_table_columns
+        import json
+        if args.full_metadata:
+            print(json.dumps(read_pmtiles_metadata(args.source), indent=2))
+        else:
+            print(json.dumps(pmtiles_table_columns(args.source, layer=args.layer), indent=2))
 
 
 if __name__ == "__main__":
