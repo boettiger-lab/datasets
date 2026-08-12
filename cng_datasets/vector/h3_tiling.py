@@ -144,6 +144,12 @@ def _native_res_case_sql(bins: List[Tuple[Optional[float], int]], geom_expr: str
 _TRANSMERIDIAN_MAX_SPAN_DEG = 180
 _TRANSMERIDIAN_BANDS = [(-180, -90), (-90, 0), (0, 90), (90, 180)]
 
+# Square of the equatorial metres-per-degree, for converting a planar ST_Area
+# (deg²) to an approximate area in m². Over-estimates away from the equator
+# (longitude degrees shrink with latitude), which is the safe direction for the
+# oversized-feature guard below.
+_DEG2_TO_M2 = 111_320.0 ** 2
+
 
 def _transmeridian_split_sql(carry_cols: str, source: str) -> str:
     """SQL for a CTE body that splits >180-deg-longitude-span polygons into bands.
@@ -619,21 +625,39 @@ class H3VectorProcessor:
         """Fail fast if any feature in `chunk_table` would produce an H3 cell
         array exceeding the single-array size limit (issue #107).
 
-        Estimates per-feature cell count as spheroid area / average hex area at
-        the target resolution and raises a clear RuntimeError naming the worst
-        offender (id, area, estimated cells) if it exceeds
-        ``self.max_cells_per_feature``. This converts an otherwise-fatal C++
-        page-size assertion in the Pass-1 COPY into an actionable error.
+        Estimates per-feature cell count as area / average hex area at the target
+        resolution and raises a clear RuntimeError naming the worst offender (id,
+        area, estimated cells) if it exceeds ``self.max_cells_per_feature``. This
+        converts an otherwise-fatal C++ page-size assertion in the Pass-1 COPY
+        into an actionable error.
+
+        Area is measured geodesically (``ST_Area_Spheroid``) for the common case,
+        but PLANARLY for antimeridian-crossing features — those whose longitude
+        bbox spans more than 180° (issue #167). ``h3_polygon_wkt_to_cells``
+        polyfills the planar WKT, so a narrow strip that crosses ±180° reads as a
+        near-hemisphere cartesian fill and enumerates billions of cells, hanging
+        Pass 1 for hours. ``ST_Area_Spheroid`` measures the geodesic (short-way)
+        region instead — small, or even NaN for such a polygon — so it slips past
+        the guard. Estimating these features from planar area (what the polyfill
+        actually walks) catches the explosion up front; a clean multipolygon of
+        islands either side of the dateline has small planar area and still passes.
 
         In variable-resolution mode (issue #98) the estimate uses each feature's
         own native resolution — large features map to a coarser resolution and far
         fewer cells, the per-feature back-off that complements this guardrail — and
         the reported resolution is the worst offender's native res.
         """
+        # Planar area (deg² → m²) for antimeridian-crossing features, geodesic
+        # area otherwise. See the docstring for why the choice matters (#167).
+        area_expr = (
+            f"CASE WHEN ST_XMax(geom) - ST_XMin(geom) > {_TRANSMERIDIAN_MAX_SPAN_DEG} "
+            f"THEN ST_Area(geom) * {_DEG2_TO_M2} "
+            f"ELSE ST_Area_Spheroid(geom) END"
+        )
         if self.resolution_by_area is not None:
             native_res_case = _native_res_case_sql(self.resolution_by_area, "geom")
             est_cells_expr = (
-                f"ST_Area_Spheroid(geom) / "
+                f"({area_expr}) / "
                 f"h3_get_hexagon_area_avg({native_res_case}, 'm^2')"
             )
             res_select = f"{native_res_case} AS native_res"
@@ -641,15 +665,16 @@ class H3VectorProcessor:
             avg_hex_m2 = self.con.execute(
                 f"SELECT h3_get_hexagon_area_avg({self.h3_resolution}, 'm^2')"
             ).fetchone()[0]
-            est_cells_expr = f"ST_Area_Spheroid(geom) / {avg_hex_m2}"
+            est_cells_expr = f"({area_expr}) / {avg_hex_m2}"
             res_select = f"{self.h3_resolution} AS native_res"
 
         worst = self.con.execute(f"""
             SELECT
                 "{id_col}" AS fid,
-                ST_Area_Spheroid(geom) AS area_m2,
+                {area_expr} AS area_m2,
                 {est_cells_expr} AS est_cells,
-                {res_select}
+                {res_select},
+                ST_XMax(geom) - ST_XMin(geom) AS lon_span
             FROM chunk_table
             WHERE ST_GeometryType(geom) NOT IN ('POINT', 'MULTIPOINT')
             ORDER BY est_cells DESC
@@ -658,13 +683,23 @@ class H3VectorProcessor:
 
         if worst is None or worst[2] is None:
             return
-        fid, area_m2, est_cells, native_res = worst
+        fid, area_m2, est_cells, native_res, lon_span = worst
         if est_cells > self.max_cells_per_feature:
+            antimeridian_note = ""
+            if lon_span is not None and lon_span > _TRANSMERIDIAN_MAX_SPAN_DEG:
+                antimeridian_note = (
+                    f" Its longitude bbox spans {lon_span:.1f}°, so it crosses the "
+                    f"antimeridian (±180°): the planar H3 polyfill would enumerate "
+                    f"the whole span (a near-global cell set) and hang (issue #167). "
+                    f"Split the feature at ±180° upstream, or drop it from the hex "
+                    f"input if it is a dateline artifact."
+                )
             raise RuntimeError(
                 f"Chunk {chunk_id}: feature {id_col}={fid} is too large to hex at "
                 f"resolution {native_res} — estimated {int(est_cells):,} H3 "
                 f"cells ({area_m2 / 1e6:,.0f} km²) would exceed the per-feature "
-                f"cell-array limit ({self.max_cells_per_feature:,}). A single "
+                f"cell-array limit ({self.max_cells_per_feature:,})."
+                f"{antimeridian_note} A single "
                 f"feature's cells are written as one array value, which cannot "
                 f"exceed the ~268M-element (2GB) Arrow/parquet-page ceiling. "
                 f"Hex this feature at a coarser resolution (see #98 for adaptive "

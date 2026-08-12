@@ -931,6 +931,67 @@ class TestOversizedFeatureGuard:
             processor.con.close()
 
 
+class TestAntimeridianCrossingFeature:
+    """Issue #167: a polygon whose ring crosses the antimeridian (lon bbox span
+    > 180°) polyfills its full planar cartesian span — a near-global cell set —
+    and hangs Pass 1 for hours. ST_Area_Spheroid sees only the geodesic
+    short-way strip (small, or NaN), so the #107 oversized guard misses it. The
+    guard now estimates such features from planar area and fails fast."""
+
+    def _processor(self, tmpdir, wkt, resolution=10):
+        con = setup_duckdb_connection()
+        src = f"{tmpdir}/s.parquet"
+        con.execute(
+            f"COPY (SELECT 1 AS _cng_fid, ST_GeomFromText('{wkt}') AS geom) "
+            f"TO '{src}' (FORMAT PARQUET)"
+        )
+        con.close()
+        os.environ['AWS_ACCESS_KEY_ID'] = ''
+        os.environ['AWS_SECRET_ACCESS_KEY'] = ''
+        return H3VectorProcessor(
+            input_url=src, output_url=tmpdir,
+            h3_resolution=resolution, parent_resolutions=[0], chunk_size=10,
+        )
+
+    @pytest.mark.timeout(30)
+    def test_crossing_ring_fails_fast_instead_of_hanging(self):
+        """A single ring spanning ~358° of longitude must raise immediately
+        (planar-area estimate) rather than enumerate billions of cells."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor = self._processor(
+                tmpdir, 'POLYGON((179 51,-179 51,-179 57,179 57,179 51))',
+                resolution=10,
+            )
+            with pytest.raises(RuntimeError, match=r"too large to hex"):
+                processor._process_pass1(0)
+            # And the message must point at the antimeridian, not just "big".
+            try:
+                processor._process_pass1(0)
+            except RuntimeError as e:
+                assert 'antimeridian' in str(e)
+                assert '#167' in str(e)
+            processor.con.close()
+
+    @pytest.mark.timeout(60)
+    def test_clean_island_multipolygon_still_passes(self):
+        """Separate small islands either side of the dateline have a >180° bbox
+        span but tiny planar area — they must NOT be rejected (no false positive)
+        and must polyfill to real cells."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor = self._processor(
+                tmpdir,
+                'MULTIPOLYGON(((179.8 51,179.9 51,179.9 51.1,179.8 51.1,179.8 51)),'
+                '((-179.9 55,-179.8 55,-179.8 55.1,-179.9 55.1,-179.9 55)))',
+                resolution=8,
+            )
+            out = processor._process_pass1(0)  # must not raise
+            total = processor.con.execute(
+                f"SELECT sum(len(h3id)) FROM read_parquet('{out}')"
+            ).fetchone()[0]
+            assert total is not None and total > 0
+            processor.con.close()
+
+
 class TestGeometryColumnResolution:
     """Issue #171: an unrelated attribute column named GEOMETRY/SHAPE/GEOM (e.g.
     a DOUBLE carried over from a source DBF) must not shadow the real geometry
