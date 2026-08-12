@@ -18,7 +18,7 @@ internal-compression code at byte 97 (1 = none, 2 = gzip — what tippecanoe use
 import gzip
 import json
 import struct
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
 
 
