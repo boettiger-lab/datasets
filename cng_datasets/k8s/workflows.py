@@ -417,23 +417,48 @@ _DEFAULT_H3_RESOLUTION = {
 }
 
 
-def _calculate_chunking(total_rows: int, max_completions: int = 200, max_parallelism: int = 50) -> tuple[int, int, int]:
+# Target number of features per hex chunk. chunk_size is floored at this value
+# so a small dataset is not shredded into ~max_completions tiny chunks (issue
+# #144): every k8s completion pulls the multi-GB image and claims a
+# namespace-quota slot, so over-provisioning a 6-chunk job to 200 pods is pure
+# waste (and blocks other jobs on a shared quota). Larger datasets still shrink
+# chunk_size above this floor to keep completions within max_completions. 1000
+# matches the effective chunk_size the previous formula already produced at the
+# 200k-feature scale, so per-pod memory/time is unchanged for large builds.
+_DEFAULT_TARGET_CHUNK_SIZE = 1000
+
+
+def _calculate_chunking(
+    total_rows: int,
+    max_completions: int = 200,
+    max_parallelism: int = 50,
+    target_chunk_size: int = _DEFAULT_TARGET_CHUNK_SIZE,
+) -> tuple[int, int, int]:
     """
     Calculate optimal chunk size, completions, and parallelism.
+
+    chunk_size is the target (default 1000) unless the dataset is large enough
+    that hitting it would need more than ``max_completions`` chunks, in which
+    case chunk_size grows so completions caps at ``max_completions``. This
+    right-sizes ``completions`` to the chunks that actually hold data instead of
+    always provisioning up to ``max_completions`` pods (issue #144).
 
     Args:
         total_rows: Total number of rows/features in dataset
         max_completions: Maximum number of job completions (default: 200)
         max_parallelism: Maximum parallelism (default: 50)
+        target_chunk_size: Preferred features per chunk / floor for chunk_size
 
     Returns:
         Tuple of (chunk_size, completions, parallelism)
     """
-    # Calculate chunk size to stay under max_completions
-    chunk_size = math.ceil(total_rows / max_completions)
+    # Floor chunk_size at the target; grow it only when the dataset would
+    # otherwise exceed max_completions chunks.
+    chunk_size = max(target_chunk_size, math.ceil(total_rows / max_completions))
 
-    # Calculate actual number of completions needed
-    completions = math.ceil(total_rows / chunk_size)
+    # Actual number of completions needed (at least 1, so the job is never
+    # generated with completions=0 for an empty/near-empty count).
+    completions = max(1, math.ceil(total_rows / chunk_size))
 
     # Set parallelism to min of max_parallelism or completions
     parallelism = min(max_parallelism, completions)
