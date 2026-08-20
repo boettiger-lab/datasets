@@ -129,6 +129,7 @@ def main():
     workflow_parser.add_argument("--repartition-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for repartition job pod (default: 50Gi)")
     workflow_parser.add_argument("--repartition-memory", type=str, default="32Gi", help="Memory request/limit for repartition job pod (default: 32Gi)")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
+    workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
     # Cluster/storage configuration flags
     workflow_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file. Explicit flags below override profile values.")
     workflow_parser.add_argument("--s3-endpoint", default=None, metavar="HOST", help="Internal S3 endpoint for jobs (default from profile, or rook-ceph-rgw-nautiluss3.rook)")
@@ -171,6 +172,7 @@ def main():
     raster_workflow_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (multi-tile only)")
     raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif)")
     raster_workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
+    raster_workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
     # Cluster/storage configuration flags
     raster_workflow_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file. Explicit flags below override profile values.")
     raster_workflow_parser.add_argument("--s3-endpoint", default=None, metavar="HOST", help="Internal S3 endpoint for jobs (default from profile, or rook-ceph-rgw-nautiluss3.rook)")
@@ -388,6 +390,7 @@ def _dispatch(args):
             simplify_tolerance=args.simplify_tolerance,
             trim_strings=args.trim_strings,
             backend=args.backend,
+            armada_priority_class=args.armada_priority_class,
             hex_storage=args.hex_storage,
             repartition_storage=args.repartition_storage,
             repartition_memory=args.repartition_memory,
@@ -430,6 +433,7 @@ def _dispatch(args):
             band=getattr(args, 'band', None),
             output_cog_name=getattr(args, 'output_cog_name', None),
             backend=args.backend,
+            armada_priority_class=args.armada_priority_class,
             profile=args.profile,
             s3_endpoint=args.s3_endpoint,
             s3_public_endpoint=args.s3_public_endpoint,

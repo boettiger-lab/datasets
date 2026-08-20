@@ -13,7 +13,11 @@ import re
 import shlex
 import yaml
 from .jobs import K8sJobManager
-from .armada import convert_workflow_to_armada
+from .armada import (
+    convert_workflow_to_armada,
+    resolve_armada_priority_class,
+    DEFAULT_ARMADA_PRIORITY_CLASS,
+)
 
 # Keys that ClusterConfig accepts (used for profile validation)
 _CONFIG_KEYS = {
@@ -488,6 +492,7 @@ def generate_dataset_workflow(
     trim_strings: bool = False,
     pmtiles_max_zoom: Optional[int] = None,
     backend: str = "k8s",
+    armada_priority_class: Optional[str] = None,
     hex_storage: str = "10Gi",
     repartition_storage: str = "50Gi",
     repartition_memory: str = "32Gi",
@@ -529,6 +534,12 @@ def generate_dataset_workflow(
         hex_memory: Memory request/limit for hex job pods (default: "8Gi")
         max_parallelism: Maximum parallelism for hex jobs (default: 50)
         max_completions: Maximum job completions - increase to reduce chunk size (default: 200)
+        armada_priority_class: Armada priority class for the `armada` backend —
+            a literal name ("armada-default") or a shorthand ("default",
+            "preemptible", "high"). Defaults to non-preemptible, since a
+            preempted Armada job is not rescheduled and the k8s Job-level retry
+            settings do not survive conversion (issue #183). Ignored when
+            backend is "k8s".
         intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM (default: 10)
         source_url: (Deprecated) Use source_urls instead. Kept for backwards compatibility.
     """
@@ -649,8 +660,15 @@ def generate_dataset_workflow(
             k8s_yaml_dir=str(output_path),
             dataset_name=k8s_name,
             queue=namespace,
+            priority_class=armada_priority_class,
+        )
+        effective_priority = (
+            resolve_armada_priority_class(armada_priority_class)
+            or DEFAULT_ARMADA_PRIORITY_CLASS
         )
         print(f"\n✓ Generated Armada workflow for {dataset_name}")
+        print(f"  Armada priority class: {effective_priority} "
+              f"(override with --armada-priority-class)")
         print(f"\nArmada files created in {output_dir}:")
         for f in armada_files:
             print(f"  - {Path(f).name}")
@@ -710,6 +728,7 @@ def generate_raster_workflow(
     band: Optional[int] = None,
     output_cog_name: Optional[str] = None,
     backend: str = "k8s",
+    armada_priority_class: Optional[str] = None,
     # Cluster/storage configuration — all default to None so explicit values
     # can be distinguished from "not set" when merging with a profile.
     profile: Optional[str] = None,
@@ -763,6 +782,10 @@ def generate_raster_workflow(
         target_resolution: Output pixel size in degrees for mosaic step
         band: Extract single band from multi-band sources (1-indexed) for mosaic step
         output_cog_name: S3 key for intermediate COG (default: "{k8s_name}-cog.tif")
+        armada_priority_class: Armada priority class for the `armada` backend —
+            a literal name ("armada-default") or a shorthand ("default",
+            "preemptible", "high"). Defaults to non-preemptible (issue #183).
+            Ignored when backend is "k8s".
         source_url: Deprecated alias for source_urls (single URL).
     """
     # backwards compat
@@ -863,8 +886,15 @@ def generate_raster_workflow(
             k8s_yaml_dir=str(output_path),
             dataset_name=k8s_name,
             queue=namespace,
+            priority_class=armada_priority_class,
+        )
+        effective_priority = (
+            resolve_armada_priority_class(armada_priority_class)
+            or DEFAULT_ARMADA_PRIORITY_CLASS
         )
         print(f"\n✓ Generated Armada raster workflow for {dataset_name}")
+        print(f"  Armada priority class: {effective_priority} "
+              f"(override with --armada-priority-class)")
         print(f"\nArmada files created in {output_dir}:")
         for f in armada_files:
             print(f"  - {Path(f).name}")
