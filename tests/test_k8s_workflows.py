@@ -1380,3 +1380,38 @@ class TestProfileLoading:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestTrimStringsWiring:
+    """Issue #180: --trim-strings reaches the generated convert job command."""
+
+    def test_convert_job_includes_trim_flag(self, monkeypatch):
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="trim-ds",
+                source_url="https://example.com/wdpa.gdb",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=10,           # skip network geometry detection
+                trim_strings=True,
+            )
+            convert_yaml = yaml.safe_load(open(Path(tmpdir) / "trim-ds-convert.yaml"))
+            cmd = str(convert_yaml["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--trim-strings" in cmd
+
+    def test_convert_job_omits_flag_by_default(self, monkeypatch):
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="notrim-ds",
+                source_url="https://example.com/wdpa.gdb",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=10,
+            )
+            convert_yaml = yaml.safe_load(open(Path(tmpdir) / "notrim-ds-convert.yaml"))
+            cmd = str(convert_yaml["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "--trim-strings" not in cmd
