@@ -384,8 +384,40 @@ Monitor progress at https://armada-lookout.nrp-nautilus.io
 
 - **Single-pod steps** (setup-bucket, convert, pmtiles, repartition) become one Armada job each
 - **Indexed parallel steps** (hex) are expanded into N individual Armada jobs (one per chunk), each with the chunk index baked into the command. For vector workflows this is up to 200+ jobs; for raster workflows, 122 (one per H3 h0 region)
-- The k8s `priorityClassName: opportunistic` maps to `armada-preemptible`
+- Converted jobs run at the **non-preemptible `armada-default`** priority class (see below)
 - All existing k8s Job YAMLs are still generated alongside the Armada files, so you can switch between backends without regenerating
+
+### Priority Class and Retries
+
+Conversion reads the k8s podSpec (`spec.template.spec`), so **Job-level retry settings do not
+survive it** — `backoffLimit`, `backoffLimitPerIndex` and `maxFailedIndexes` are dropped, and
+Armada has no per-job equivalent (retries are a server-side setting). Generation warns when a
+real retry budget is discarded.
+
+That is why converted jobs default to the non-preemptible `armada-default` rather than
+`armada-preemptible`: a preempted Armada job is
+[not automatically rescheduled](https://nrp.ai/documentation/userdocs/running/scheduling/), so a
+preemptible long job with no retries loses its whole unit of work. The k8s `opportunistic` class
+is deliberately *not* mapped onto `armada-preemptible` for the same reason — an opportunistic pod
+is preempted but recreated by its Job controller, which the Armada equivalent would not be.
+
+Choose the class explicitly with `--armada-priority-class`, which accepts a shorthand or a literal
+class name:
+
+```bash
+cng-datasets workflow ... --backend armada --armada-priority-class preemptible
+```
+
+| Shorthand | Armada class | Preemptible? | Priority |
+|---|---|---|---|
+| `default` (default) | `armada-default` | no | 100 |
+| `preemptible` | `armada-preemptible` | yes | 50 |
+| `high` | `armada-high-priority` | no | 1000 |
+
+Preemptible is the right choice once the unit of work is small enough that losing one to a
+preemption is cheap. The converter currently reproduces the *shape* of the k8s job it reads — one
+Armada job per completion, at the same cpu/memory/runtime — so units are as large as the k8s ones
+until sub-h0 chunking lands (issue #173).
 
 ### Differences from Standard k8s Backend
 
@@ -396,7 +428,8 @@ Monitor progress at https://armada-lookout.nrp-nautilus.io
 | Parallel hex jobs | Single k8s Indexed Job | N individual Armada jobs |
 | Pod limit | Bounded by namespace quota | Armada queues excess jobs |
 | Monitoring | `kubectl logs` | Lookout UI |
-| Priority class | `opportunistic` | `armada-preemptible` |
+| Priority class | `opportunistic` | `armada-default` (set with `--armada-priority-class`) |
+| Retry on failure | Job-level `backoffLimit` | none (dropped in conversion) |
 
 ## Advanced Usage
 

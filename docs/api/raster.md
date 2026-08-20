@@ -21,6 +21,8 @@ Functions
 
 .. autofunction:: cng_datasets.raster.detect_optimal_h3_resolution
 
+.. autofunction:: cng_datasets.raster.h3_resolution_join_warning
+
 .. autofunction:: cng_datasets.raster.create_cog
 
 .. autofunction:: cng_datasets.raster.process_h0_region
