@@ -580,10 +580,100 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
         con.close()
 
 
+# Characters stripped from both ends of every string column when --trim-strings
+# is set (issue #180). DuckDB's one-argument trim() removes ASCII spaces only, so
+# the character set is passed explicitly to also catch tabs and stray newlines
+# that GDB/Shapefile attribute values sometimes carry.
+_TRIM_CHARS = " \\t\\n\\r"
+
+
+def string_columns_from_describe(columns: List[tuple]) -> List[str]:
+    """
+    Pick the plain string columns out of a DuckDB DESCRIBE result.
+
+    Only top-level VARCHAR columns are returned: those are the categorical
+    attribute fields where stray leading/trailing whitespace silently breaks
+    equality filters (issue #180). Nested types (VARCHAR[], STRUCT) are left
+    alone — trimming inside them needs a different expression and no source has
+    called for it.
+
+    Args:
+        columns: Rows from `DESCRIBE SELECT ...` — (column_name, column_type, ...)
+
+    Returns:
+        Names of the VARCHAR columns, in source order
+    """
+    return [name for name, col_type, *_ in columns if col_type.upper() == 'VARCHAR']
+
+
+def get_string_columns(source_url: str, layer: Optional[str] = None,
+                       verbose: bool = False) -> List[str]:
+    """
+    List the VARCHAR columns of an ST_Read-able source (issue #180).
+
+    Args:
+        source_url: Source dataset URL/path (GDAL-readable)
+        layer: Layer name for multi-layer datasets (e.g. GDB)
+        verbose: Print debug information
+
+    Returns:
+        Names of the VARCHAR columns; empty list if detection fails (trimming is
+        an opt-in convenience, so a failed probe must not fail the conversion).
+    """
+    con = duckdb.connect(':memory:')
+    con.install_extension("spatial")
+    con.load_extension("spatial")
+    con.execute("SET arrow_large_buffer_size=true")
+
+    try:
+        layer_param = f", layer='{layer}'" if layer else ""
+        columns = con.execute(
+            f"DESCRIBE SELECT * FROM ST_Read('{source_url}'{layer_param}) LIMIT 0"
+        ).fetchall()
+        string_cols = string_columns_from_describe(columns)
+        if verbose:
+            print(f"  String columns: {string_cols}")
+        return string_cols
+    except Exception as e:
+        print(f"  Warning: could not detect string columns ({e}) — "
+              f"proceeding WITHOUT trimming")
+        return []
+    finally:
+        con.close()
+
+
+def trim_replace_clause(string_columns: Optional[List[str]],
+                        exclude: Optional[List[str]] = None) -> str:
+    """
+    Build a DuckDB `REPLACE (...)` clause that trims each string column in place.
+
+    Using star-REPLACE keeps the projection a one-liner per column and leaves
+    every other column (and the source column order) untouched, so it composes
+    with `* EXCLUDE (geom)` and the synthetic `_cng_fid` wrapper.
+
+    Args:
+        string_columns: VARCHAR column names to trim (None/empty -> no clause)
+        exclude: Column names to skip (e.g. a geometry column already excluded
+            from the star, which REPLACE cannot refer to)
+
+    Returns:
+        " REPLACE (trim(...) AS ...)" or "" when there is nothing to trim
+    """
+    skip = {c.lower() for c in (exclude or [])}
+    cols = [c for c in (string_columns or []) if c.lower() not in skip]
+    if not cols:
+        return ""
+    replacements = ", ".join(
+        f'trim("{c}", E\'{_TRIM_CHARS}\') AS "{c}"' for c in cols
+    )
+    return f" REPLACE ({replacements})"
+
+
 def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str],
                                target_crs: str, geom_col: str = "geom", layer: Optional[str] = None,
                                verbose: bool = False, geom_is_blob: bool = False,
-                               simplify_tolerance: Optional[float] = None) -> str:
+                               simplify_tolerance: Optional[float] = None,
+                               trim_columns: Optional[List[str]] = None) -> str:
     """
     Build DuckDB query to read and reproject data. Can handle multiple input files.
 
@@ -599,6 +689,9 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         simplify_tolerance: When set, simplify each geometry to this tolerance (in
             target-CRS units) via ST_SimplifyPreserveTopology, applied AFTER
             reprojection so the tolerance is in the output CRS (issue #132).
+        trim_columns: String columns to strip leading/trailing whitespace from
+            (--trim-strings, issue #180). Applied via star-REPLACE so every other
+            column, and the column order, is untouched.
 
     Returns:
         DuckDB SQL query string
@@ -636,11 +729,15 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
 
     layer_param = f", layer='{layer}'" if layer else ""
 
+    # Trim string attributes in place (issue #180). REPLACE cannot name the
+    # geometry column, which the star already excludes, so it is filtered out.
+    replace_clause = trim_replace_clause(trim_columns, exclude=[geom_col])
+
     # helper to format a single SELECT
     def make_select(src):
         return f"""
         SELECT
-            * EXCLUDE ({geom_col}),
+            * EXCLUDE ({geom_col}){replace_clause},
             {geom_expr}
         FROM ST_Read('{src}'{layer_param})
         """
@@ -688,7 +785,8 @@ def process_parquet_input(
     progress: bool = True,
     target_crs: str = "EPSG:4326",
     verbose: bool = False,
-    simplify_tolerance: Optional[float] = None
+    simplify_tolerance: Optional[float] = None,
+    trim_strings: bool = False
 ):
     """
     Process a parquet input file to ensure it has global ID and cloud optimization.
@@ -710,6 +808,10 @@ def process_parquet_input(
         progress: Show progress during conversion
         target_crs: Target CRS for output (default: EPSG:4326)
         verbose: Print detailed debug information
+        simplify_tolerance: Optional geometry simplification tolerance in the
+            parquet's own CRS units (issue #132)
+        trim_strings: Strip leading/trailing whitespace from every VARCHAR column
+            (issue #180)
     """
     print(f"Processing parquet file: {source_url}")
     print(f"               Output to: {destination}")
@@ -812,6 +914,18 @@ def process_parquet_input(
                 f".to_parquet('fixed.parquet', geometry_encoding='WKB')"
             )
 
+        # Trim string attributes in place when asked (issue #180). Computed from
+        # the same DESCRIBE used above; the geometry column can never be VARCHAR
+        # here (it is GEOMETRY or BLOB), but exclude it anyway for safety since
+        # REPLACE cannot name a column the star excludes.
+        trim_clause = ""
+        if trim_strings:
+            string_cols = string_columns_from_describe(columns)
+            trim_clause = trim_replace_clause(
+                string_cols, exclude=[c for c in (geom_blob_col, geom_native_col) if c]
+            )
+            print(f"  Trimming whitespace from {len(string_cols)} string column(s)")
+
         # Build the geometry projection: cast a BLOB WKB column to GEOMETRY, and/or
         # apply simplification (issue #132). Tolerance is in the parquet's own CRS
         # units (assumed target_crs — this path does not reproject).
@@ -823,9 +937,9 @@ def process_parquet_input(
             if simplify_tolerance is not None:
                 print(f"  Simplifying geometry with tolerance {simplify_tolerance} (target-CRS units)")
                 base_geom = f'ST_SimplifyPreserveTopology({base_geom}, {simplify_tolerance})'
-            cols_expr = f'* EXCLUDE ("{geom_name}"), {base_geom} AS "{geom_name}"'
+            cols_expr = f'* EXCLUDE ("{geom_name}"){trim_clause}, {base_geom} AS "{geom_name}"'
         else:
-            cols_expr = "*"
+            cols_expr = f"*{trim_clause}"
 
         # Build query to read, cast geometry, and optionally add ID
         if needs_id:
@@ -892,6 +1006,7 @@ def process_csv_input(
     target_crs: str = "EPSG:4326",
     verbose: bool = False,
     simplify_tolerance: Optional[float] = None,
+    trim_strings: bool = False,
 ):
     """
     Convert a CSV with latitude/longitude columns into point GeoParquet (issue #78).
@@ -914,6 +1029,8 @@ def process_csv_input(
             this differs.
         verbose: Print detailed debug information
         simplify_tolerance: Unused for points (kept for a uniform call signature)
+        trim_strings: Strip leading/trailing whitespace from every VARCHAR column
+            (issue #180)
     """
     print(f"Processing CSV point file: {source_url}")
     print(f"                Output to: {destination}")
@@ -978,9 +1095,18 @@ def process_csv_input(
             point_expr = f"ST_Transform({point_expr}, 'EPSG:4326', '{target_crs}', always_xy := true)"
         geom_expr = f"ST_MakeValid({point_expr}) AS geom"
 
+        # Trim string attributes in place when asked (issue #180). The lat/lon
+        # columns are numeric after read_csv_auto's type inference, so they are
+        # untouched even when they are carried through as attributes.
+        trim_clause = ""
+        if trim_strings:
+            string_cols = string_columns_from_describe(columns)
+            trim_clause = trim_replace_clause(string_cols)
+            print(f"  Trimming whitespace from {len(string_cols)} string column(s)")
+
         id_prefix = f"ROW_NUMBER() OVER () AS {id_col_name}, " if needs_id else ""
         query = f"""
-            SELECT {id_prefix}*, {geom_expr}
+            SELECT {id_prefix}*{trim_clause}, {geom_expr}
             FROM read_csv_auto('{read_url}')
         """
 
@@ -1119,7 +1245,8 @@ def convert_to_parquet(
     verbose: bool = False,
     simplify_tolerance: Optional[float] = None,
     lat_column: Optional[str] = None,
-    lon_column: Optional[str] = None
+    lon_column: Optional[str] = None,
+    trim_strings: bool = False
 ):
     """
     Convert a vector dataset to optimized GeoParquet.
@@ -1151,6 +1278,10 @@ def convert_to_parquet(
             not given, issue #78)
         lon_column: Longitude column name for CSV point input (auto-detected if
             not given, issue #78)
+        trim_strings: Strip leading/trailing whitespace from every string
+            (VARCHAR) attribute column. Off by default so outputs stay faithful
+            to the source; opt in for sources whose categorical fields carry
+            stray whitespace (e.g. WDPA NO_TAKE = 'All ', issue #180).
     """
     # CSV with lat/lon columns -> point geometry (issue #78). Handled before the
     # ST_Read path since CSV is not a spatial format GDAL/ST_Read opens directly.
@@ -1168,6 +1299,7 @@ def convert_to_parquet(
             progress=progress,
             target_crs=target_crs,
             verbose=verbose,
+            trim_strings=trim_strings,
         )
 
     # Check if input is already parquet
@@ -1200,7 +1332,8 @@ def convert_to_parquet(
             progress=progress,
             target_crs=target_crs,
             verbose=verbose,
-            simplify_tolerance=simplify_tolerance
+            simplify_tolerance=simplify_tolerance,
+            trim_strings=trim_strings
         )
 
     # Original processing for non-parquet inputs
@@ -1333,6 +1466,14 @@ def convert_to_parquet(
                 geom_col, geom_is_blob = get_geometry_column(flattened_source, layer=flat_layer, verbose=verbose)
                 print(f"  Geometry column (flattened): {geom_col}")
 
+        # Step 1d: List string columns to trim (issue #180). Detected on the
+        # representative source; a UNION ALL of multiple sources is positional
+        # and already requires matching schemas, so one probe covers them all.
+        trim_columns = None
+        if trim_strings:
+            trim_columns = get_string_columns(representative_source, layer=layer, verbose=verbose)
+            print(f"  Trimming whitespace from {len(trim_columns)} string column(s)")
+
         # Step 2: Build read/reproject query
         print("  Building read/reproject query...")
         query = build_read_reproject_query(
@@ -1344,6 +1485,7 @@ def convert_to_parquet(
             verbose=verbose,
             geom_is_blob=geom_is_blob,
             simplify_tolerance=simplify_tolerance,
+            trim_columns=trim_columns,
         )
 
         # Step 3: Check ID column and wrap query if needed
@@ -1429,6 +1571,9 @@ Examples:
 
   # Convert and specify ID column
   cng-convert-to-parquet input.shp output.parquet --id-column objectid
+
+  # Convert a GDB layer, trimming whitespace from string attributes
+  cng-convert-to-parquet WDPA.gdb wdpa.parquet --layer WDPA_poly --trim-strings
         """
     )
 
@@ -1456,6 +1601,12 @@ Examples:
                             "(degrees for EPSG:4326; e.g. 0.0001 ~ 10 m at the equator) "
                             "via ST_SimplifyPreserveTopology, applied after reprojection. "
                             "Right-sizes high-vertex sources for tiling/hex.")
+    parser.add_argument("--trim-strings", action="store_true",
+                       help="Strip leading/trailing whitespace (spaces, tabs, newlines) "
+                            "from every string column. Off by default: conversion stays "
+                            "faithful to the source. Opt in for sources whose categorical "
+                            "fields carry stray whitespace, which silently breaks equality "
+                            "filters (e.g. WDPA NO_TAKE = 'All ' vs 'All').")
     parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")
     parser.add_argument("--lat-column", default=None,
                        help="Latitude column for CSV point input (auto-detected from "
@@ -1490,7 +1641,8 @@ Examples:
             verbose=args.verbose,
             simplify_tolerance=args.simplify_tolerance,
             lat_column=args.lat_column,
-            lon_column=args.lon_column
+            lon_column=args.lon_column,
+            trim_strings=args.trim_strings
         )
         sys.exit(0)
     except Exception as e:

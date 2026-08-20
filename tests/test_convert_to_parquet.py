@@ -18,6 +18,9 @@ from cng_datasets.vector.convert_to_parquet import (
     _localize_gdb,
     is_csv_file,
     _resolve_latlon_columns,
+    string_columns_from_describe,
+    trim_replace_clause,
+    get_string_columns,
 )
 
 
@@ -253,6 +256,157 @@ class TestSimplifyTolerance:
             n_out = con.execute(f"SELECT ST_NPoints(geom) FROM read_parquet('{out}')").fetchone()[0]
             con.close()
             assert n_out == n_in
+
+
+class TestTrimStrings:
+    """Issue #180: opt-in --trim-strings strips leading/trailing whitespace from
+    string attributes, so equality filters like NO_TAKE = 'All' stop silently
+    returning zero rows on sources that store 'All ' (WDPA)."""
+
+    def test_string_columns_from_describe_picks_varchar_only(self):
+        described = [
+            ("NO_TAKE", "VARCHAR"), ("WDPAID", "BIGINT"), ("tags", "VARCHAR[]"),
+            ("meta", 'STRUCT("a" VARCHAR)'), ("geom", "GEOMETRY"),
+        ]
+        assert string_columns_from_describe(described) == ["NO_TAKE"]
+
+    def test_trim_replace_clause_quotes_and_excludes(self):
+        clause = trim_replace_clause(["NO_TAKE", "Odd Name"], exclude=["geom"])
+        assert clause.startswith(" REPLACE (")
+        assert 'trim("NO_TAKE"' in clause and 'AS "NO_TAKE"' in clause
+        assert 'trim("Odd Name"' in clause
+        # A geometry column named in the star's EXCLUDE cannot be REPLACEd
+        assert trim_replace_clause(["geom"], exclude=["GEOM"]) == ""
+
+    def test_trim_replace_clause_empty_without_columns(self):
+        assert trim_replace_clause(None) == ""
+        assert trim_replace_clause([]) == ""
+
+    def test_trim_clause_strips_space_tab_newline(self):
+        """The emitted SQL trims tabs and newlines too, not just spaces (DuckDB's
+        one-argument trim() only removes spaces)."""
+        con = duckdb.connect()
+        try:
+            clause = trim_replace_clause(["a", "b"])
+            row = con.execute(
+                f"SELECT *{clause} FROM (SELECT 'All ' AS a, e'\t x \n' AS b)"
+            ).fetchone()
+        finally:
+            con.close()
+        assert row == ("All", "x")
+
+    def test_query_builder_trims_only_requested_columns(self):
+        sql = build_read_reproject_query(
+            "dummy.gpkg", source_crs=None, target_crs="EPSG:4326", geom_col="geom",
+            trim_columns=["NO_TAKE"],
+        )
+        assert 'trim("NO_TAKE"' in sql
+        assert "* EXCLUDE (geom) REPLACE (" in sql
+
+    def test_query_builder_no_trim_by_default(self):
+        sql = build_read_reproject_query(
+            "dummy.gpkg", source_crs=None, target_crs="EPSG:4326", geom_col="geom"
+        )
+        assert "REPLACE" not in sql and "trim(" not in sql
+
+    def _write_geojson(self, path, value):
+        feature = {
+            "type": "FeatureCollection",
+            "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}},
+            "features": [{
+                "type": "Feature",
+                "properties": {"NO_TAKE": value, "WDPAID": 1},
+                "geometry": {"type": "Point", "coordinates": [-122.3, 37.9]},
+            }],
+        }
+        Path(path).write_text(json.dumps(feature))
+
+    def test_st_read_path_trims_end_to_end(self):
+        """A GDB/GeoJSON-style source whose category carries a trailing space
+        becomes filterable by the clean value, with other columns intact."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src, out = f"{tmpdir}/src.geojson", f"{tmpdir}/out.parquet"
+            self._write_geojson(src, "All ")
+
+            convert_to_parquet(source_url=src, destination=out, trim_strings=True, progress=False)
+
+            con = duckdb.connect()
+            try:
+                value, wdpaid = con.execute(
+                    f"SELECT NO_TAKE, WDPAID FROM read_parquet('{out}')"
+                ).fetchone()
+                n_match = con.execute(
+                    f"SELECT COUNT(*) FROM read_parquet('{out}') WHERE NO_TAKE = 'All'"
+                ).fetchone()[0]
+                cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{out}')").fetchall()]
+            finally:
+                con.close()
+            assert value == "All"
+            assert n_match == 1
+            assert wdpaid == 1
+            assert "_cng_fid" in cols and "geom" in cols
+
+    def test_st_read_path_faithful_by_default(self):
+        """Off by default: the source's trailing space is preserved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src, out = f"{tmpdir}/src.geojson", f"{tmpdir}/out.parquet"
+            self._write_geojson(src, "All ")
+
+            convert_to_parquet(source_url=src, destination=out, progress=False)
+
+            con = duckdb.connect()
+            try:
+                value = con.execute(f"SELECT NO_TAKE FROM read_parquet('{out}')").fetchone()[0]
+            finally:
+                con.close()
+            assert value == "All "
+
+    def test_parquet_path_trims_end_to_end(self):
+        """The already-parquet path trims too, keeping the geometry column."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src, out = f"{tmpdir}/src.parquet", f"{tmpdir}/out.parquet"
+            con = duckdb.connect(); con.install_extension("spatial"); con.load_extension("spatial")
+            con.execute(f"""
+                COPY (SELECT ' All ' AS NO_TAKE, 42 AS WDPAID,
+                             ST_Point(-122.3, 37.9) AS geom)
+                TO '{src}' (FORMAT PARQUET)
+            """)
+
+            convert_to_parquet(source_url=src, destination=out, trim_strings=True, progress=False)
+
+            value, wdpaid, is_point = con.execute(f"""
+                SELECT NO_TAKE, WDPAID, ST_GeometryType(geom) = 'POINT'
+                FROM read_parquet('{out}')
+            """).fetchone()
+            untrimmed = con.execute(f"SELECT NO_TAKE FROM read_parquet('{src}')").fetchone()[0]
+            con.close()
+            assert value == "All"
+            assert untrimmed == " All "
+            assert wdpaid == 42 and is_point
+
+    def test_csv_path_trims_end_to_end(self):
+        """CSV point input trims string attributes but leaves coordinates alone."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src, out = f"{tmpdir}/pts.csv", f"{tmpdir}/out.parquet"
+            Path(src).write_text('name,latitude,longitude\n"All ",37.9,-122.3\n')
+
+            convert_to_parquet(source_url=src, destination=out, trim_strings=True, progress=False)
+
+            con = duckdb.connect(); con.install_extension("spatial"); con.load_extension("spatial")
+            try:
+                name, lat, is_point = con.execute(f"""
+                    SELECT name, latitude, ST_GeometryType(geom) = 'POINT'
+                    FROM read_parquet('{out}')
+                """).fetchone()
+            finally:
+                con.close()
+            assert name == "All"
+            assert lat == 37.9 and is_point
+
+    def test_get_string_columns_survives_unreadable_source(self):
+        """Detection failure must not fail the conversion — trimming is opt-in
+        convenience, so an unreadable probe degrades to 'trim nothing'."""
+        assert get_string_columns("/nonexistent/nope.gpkg") == []
 
 
 class TestCsvPointInput:
