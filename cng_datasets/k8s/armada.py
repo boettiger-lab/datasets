@@ -93,10 +93,10 @@ def _warn_dropped_retry_settings(job_spec: Dict[str, Any], priority_class: str):
     )
     if priority_class == ARMADA_PRIORITY_CLASSES["preemptible"]:
         message += (
-            f"\n  This job is also preemptible, and preempted Armada jobs are "
-            f"not rescheduled — a preemption\n"
-            f"  loses the whole unit. Consider "
-            f"--armada-priority-class default for long-running units."
+            "\n  This job is also preemptible, and preempted Armada jobs are "
+            "not rescheduled — a preemption\n"
+            "  loses the whole unit. Consider "
+            "--armada-priority-class default for long-running units."
         )
     print(message)
 
