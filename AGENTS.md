@@ -2,6 +2,13 @@
 
 You are working in a repository that uses `cng-datasets` to process geospatial data into cloud-native formats on a Kubernetes cluster. This document tells you everything you need to know.
 
+Alongside it, `.claude/skills/` carries three skills that load automatically for
+agents working in this repo: `nrp-k8s-batch` (cluster batch jobs), `nrp-s3`
+(Ceph S3 endpoints, credentials, buckets) and `gdal-remote` (reading remote
+rasters/vectors without downloading). They live here rather than in a global
+skills directory so they are version-matched to this code and reviewed in the
+same PR as the changes they describe.
+
 ## What You Are Doing
 
 You are taking source geospatial data and producing three outputs per dataset:

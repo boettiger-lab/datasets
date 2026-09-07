@@ -19,6 +19,8 @@ metadata:
 
 # NRP S3 Storage
 
+> **Scope.** This copy is the fuller one: it carries the DuckDB and GDAL/OGR sections and a longer pitfalls list that the `boettiger-lab/agent-skills` copy lacks. Fix S3 facts here first; port upstream if they are not specific to this repo.
+
 The NRP Nautilus cluster provides S3-compatible object storage powered by Ceph (Rook). This is **not** AWS S3 — it has its own endpoints, credential system, and quirks.
 
 ## Two Endpoints
@@ -59,7 +61,7 @@ https://s3-west.nrp-nautilus.io/public-padus/padus-4-1/fee.parquet
 
 ### Kubernetes secrets
 
-Two secrets are pre-configured in the `biodiversity` namespace:
+Two secrets are pre-configured in the `biodiversity` namespace (dataset workflows run in `geo-workflows`, but these secrets did not move):
 
 1. **`aws`** — Contains `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
 2. **`rclone-config`** — Contains a complete rclone configuration file (includes remotes for both `nrp` and `source` for source.coop)
