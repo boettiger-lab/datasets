@@ -22,6 +22,7 @@ from cng_datasets.vector.convert_to_parquet import (
     trim_replace_clause,
     get_string_columns,
     detect_crs,
+    FeatureCountMismatch,
 )
 
 
@@ -1922,3 +1923,154 @@ class TestCrsWithoutAuthorityCode:
         ).fetchone()
         assert -106 < x < -104, f"longitude {x} is not degrees"
         assert 39 < y < 41, f"latitude {y} is not degrees"
+
+
+def _write_csv(path, n_null=20_480, n_valued=20):
+    """
+    A CSV whose `late_count` column is empty for the first `n_null` rows and
+    integral after that — the shape of any time-ordered file with a column
+    introduced in a later reporting era.
+    """
+    with open(path, "w") as f:
+        f.write("id,latitude,longitude,late_count\n")
+        for i in range(n_null):
+            f.write(f"{i},40.0,-105.0,\n")
+        for i in range(n_valued):
+            f.write(f"{n_null + i},41.0,-106.0,{i}\n")
+    return str(path)
+
+
+class TestCsvSampleSize:
+    """
+    A numeric column that is empty in the head of the file must not be typed
+    VARCHAR (issue #188).
+
+    read_csv_auto's default 20480-row sample types such a column as VARCHAR
+    even though it is cleanly numeric over the whole file, so counts get
+    published as strings and SUM() fails outright until the consumer casts.
+    """
+
+    def _column_type(self, parquet_path, column):
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{parquet_path}')").fetchall()
+        return dict((r[0], r[1]) for r in rows)[column]
+
+    @pytest.mark.timeout(120)
+    def test_late_numeric_column_is_typed_numerically(self, tmp_path):
+        source = _write_csv(tmp_path / "mre.csv")
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(source, out, lat_column="latitude", lon_column="longitude")
+        assert self._column_type(out, "late_count") == "BIGINT"
+
+    @pytest.mark.timeout(120)
+    def test_sum_works_without_a_cast(self, tmp_path):
+        """The consumer-visible symptom: SUM() on a count column."""
+        source = _write_csv(tmp_path / "mre.csv")
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(source, out, lat_column="latitude", lon_column="longitude")
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        total = con.execute(f"SELECT SUM(late_count) FROM read_parquet('{out}')").fetchone()[0]
+        assert total == sum(range(20))
+
+    @pytest.mark.timeout(120)
+    def test_explicit_small_sample_still_available(self, tmp_path):
+        """The old behaviour stays reachable for a file too large to scan."""
+        source = _write_csv(tmp_path / "mre.csv")
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(source, out, lat_column="latitude", lon_column="longitude",
+                           csv_sample_size=20_480)
+        assert self._column_type(out, "late_count") == "VARCHAR"
+
+
+class TestFeatureCountReporting:
+    """
+    A conversion must say how many rows it wrote, and be able to assert it
+    (issue #186).
+
+    A truncated source converted cleanly, exited 0, and produced a log
+    byte-identical to a complete run — no signal for a human or a pipeline.
+    """
+
+    def _gpkg(self, tmp_path, name, n):
+        import geopandas as gpd
+        import shapely.geometry as g
+        boxes = [g.box(-120.0 + i, 38.0, -119.5 + i, 38.5) for i in range(n)]
+        path = str(tmp_path / f"{name}.gpkg")
+        gpd.GeoDataFrame({"id": list(range(n))}, geometry=boxes, crs="EPSG:4326").to_file(
+            path, driver="GPKG"
+        )
+        return path
+
+    @pytest.mark.timeout(60)
+    def test_row_count_is_logged(self, tmp_path, capsys):
+        source = self._gpkg(tmp_path, "full", 6)
+        convert_to_parquet(source, str(tmp_path / "out.parquet"))
+        assert "Wrote 6 rows" in capsys.readouterr().out
+
+    @pytest.mark.timeout(60)
+    def test_a_short_read_is_visible_in_the_log(self, tmp_path, capsys):
+        """The two runs must no longer produce identical output."""
+        full = self._gpkg(tmp_path, "full", 6)
+        convert_to_parquet(full, str(tmp_path / "full.parquet"))
+        full_log = capsys.readouterr().out
+
+        truncated = self._gpkg(tmp_path, "truncated", 2)
+        convert_to_parquet(truncated, str(tmp_path / "trunc.parquet"))
+        trunc_log = capsys.readouterr().out
+
+        assert "Wrote 6 rows" in full_log
+        assert "Wrote 2 rows" in trunc_log
+
+    @pytest.mark.timeout(60)
+    def test_expect_features_accepts_a_match(self, tmp_path, capsys):
+        source = self._gpkg(tmp_path, "full", 6)
+        convert_to_parquet(source, str(tmp_path / "out.parquet"), expect_features=6)
+        assert "Matches --expect-features 6" in capsys.readouterr().out
+
+    @pytest.mark.timeout(60)
+    def test_expect_features_rejects_a_short_read(self, tmp_path):
+        source = self._gpkg(tmp_path, "truncated", 2)
+        with pytest.raises(FeatureCountMismatch) as exc:
+            convert_to_parquet(source, str(tmp_path / "out.parquet"), expect_features=6)
+        message = str(exc.value)
+        assert "Expected 6" in message and "wrote 2" in message
+
+    @pytest.mark.timeout(60)
+    def test_csv_path_also_counts_and_asserts(self, tmp_path):
+        source = _write_csv(tmp_path / "mre.csv", n_null=10, n_valued=5)
+        with pytest.raises(FeatureCountMismatch):
+            convert_to_parquet(source, str(tmp_path / "out.parquet"),
+                               lat_column="latitude", lon_column="longitude",
+                               expect_features=99)
+
+    @pytest.mark.timeout(30)
+    def test_write_returns_the_count_copy_reported(self, tmp_path):
+        out = str(tmp_path / "rows.parquet")
+        assert write_with_duckdb("SELECT * FROM range(7) t(i)", out) == 7
+
+    @pytest.mark.timeout(60)
+    def test_mismatch_blocks_the_s3_upload(self, tmp_path, monkeypatch):
+        """
+        The count is checked before the upload, so a short read never reaches
+        the bucket — the FMMP case was consumed from S3 for two months.
+        """
+        import cng_datasets.vector.convert_to_parquet as cp
+        uploads = []
+        monkeypatch.setattr(cp, "upload_to_s3", lambda *a, **k: uploads.append(a))
+
+        source = self._gpkg(tmp_path, "truncated", 2)
+        with pytest.raises(FeatureCountMismatch):
+            cp.convert_to_parquet(source, "s3://bucket/out.parquet", expect_features=6)
+        assert uploads == [], "a short read must not be uploaded"
+
+    @pytest.mark.timeout(60)
+    def test_matching_count_still_uploads(self, tmp_path, monkeypatch):
+        import cng_datasets.vector.convert_to_parquet as cp
+        uploads = []
+        monkeypatch.setattr(cp, "upload_to_s3", lambda *a, **k: uploads.append(a))
+
+        source = self._gpkg(tmp_path, "full", 6)
+        cp.convert_to_parquet(source, "s3://bucket/out.parquet", expect_features=6)
+        assert len(uploads) == 1

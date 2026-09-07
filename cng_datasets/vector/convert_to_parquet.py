@@ -830,7 +830,8 @@ def process_parquet_input(
     target_crs: str = "EPSG:4326",
     verbose: bool = False,
     simplify_tolerance: Optional[float] = None,
-    trim_strings: bool = False
+    trim_strings: bool = False,
+    expect_features: Optional[int] = None,
 ):
     """
     Process a parquet input file to ensure it has global ID and cloud optimization.
@@ -856,6 +857,10 @@ def process_parquet_input(
             parquet's own CRS units (issue #132)
         trim_strings: Strip leading/trailing whitespace from every VARCHAR column
             (issue #180)
+        expect_features: Row count this conversion is expected to produce, known
+            independently by the caller (issue #186). The count is always logged;
+            when this is given and the written count differs, the conversion
+            raises FeatureCountMismatch so a pipeline can gate on it.
     """
     print(f"Processing parquet file: {source_url}")
     print(f"               Output to: {destination}")
@@ -1010,8 +1015,11 @@ def process_parquet_input(
                 if verbose:
                     print(f"  Writing to temporary file: {tmp_path}")
 
-                write_with_duckdb(query, tmp_path, compression, compression_level,
+                rows_written = write_with_duckdb(query, tmp_path, compression, compression_level,
                                 row_group_size, verbose)
+                # Checked before the upload, so a short read never reaches the
+                # bucket to be consumed by anything downstream (issue #186).
+                _report_row_count(rows_written, expect_features)
 
                 # Upload to S3
                 upload_to_s3(tmp_path, destination, verbose=progress)
@@ -1021,8 +1029,9 @@ def process_parquet_input(
                     os.unlink(tmp_path)
         else:
             # Write directly to destination
-            write_with_duckdb(query, destination, compression, compression_level,
+            rows_written = write_with_duckdb(query, destination, compression, compression_level,
                             row_group_size, verbose)
+            _report_row_count(rows_written, expect_features)
 
         print("✓ Parquet processing completed successfully!")
 
@@ -1051,6 +1060,8 @@ def process_csv_input(
     verbose: bool = False,
     simplify_tolerance: Optional[float] = None,
     trim_strings: bool = False,
+    expect_features: Optional[int] = None,
+    csv_sample_size: int = -1,
 ):
     """
     Convert a CSV with latitude/longitude columns into point GeoParquet (issue #78).
@@ -1075,6 +1086,14 @@ def process_csv_input(
         simplify_tolerance: Unused for points (kept for a uniform call signature)
         trim_strings: Strip leading/trailing whitespace from every VARCHAR column
             (issue #180)
+        expect_features: Row count this conversion is expected to produce, known
+            independently by the caller (issue #186). The count is always logged;
+            when this is given and the written count differs, the conversion
+            raises FeatureCountMismatch so a pipeline can gate on it.
+        csv_sample_size: Rows read_csv_auto samples for type inference. -1 (the
+            default) scans the whole file, so a numeric column that is entirely
+            NULL in the head of the file is still typed numerically rather than
+            as VARCHAR (issue #188).
     """
     print(f"Processing CSV point file: {source_url}")
     print(f"                Output to: {destination}")
@@ -1089,9 +1108,21 @@ def process_csv_input(
         if source_url.startswith('s3://'):
             read_url = f"https://s3-west.nrp-nautilus.io/{source_url[len('s3://'):]}"
 
+        # Type inference reads csv_sample_size rows; -1 scans the whole file.
+        # DuckDB's 20480-row default types a column that is entirely NULL in the
+        # head of the file as VARCHAR even when it is cleanly numeric further
+        # down — the normal shape for a time-ordered file with columns
+        # introduced in a later reporting era (issue #188). The same reader
+        # argument is used for the range check and the write below, so all three
+        # agree on the schema.
+        csv_read = f"read_csv_auto('{read_url}', sample_size={int(csv_sample_size)})"
+        if csv_sample_size != -1:
+            print(f"  Type inference sample: {csv_sample_size:,} rows "
+                  f"(a late-appearing numeric column may be typed VARCHAR)")
+
         # Detect columns
         columns = con.execute(
-            f"DESCRIBE SELECT * FROM read_csv_auto('{read_url}') LIMIT 0"
+            f"DESCRIBE SELECT * FROM {csv_read} LIMIT 0"
         ).fetchall()
         column_names = [col[0] for col in columns]
         column_names_lower = [c.lower() for c in column_names]
@@ -1119,7 +1150,7 @@ def process_csv_input(
             SELECT
                 COUNT(*) FILTER (WHERE abs(CAST("{lat_col}" AS DOUBLE)) > 90) AS bad_lat,
                 COUNT(*) FILTER (WHERE abs(CAST("{lon_col}" AS DOUBLE)) > 180) AS bad_lon
-            FROM read_csv_auto('{read_url}')
+            FROM {csv_read}
             WHERE "{lat_col}" IS NOT NULL AND "{lon_col}" IS NOT NULL
         """).fetchone()
         if bad and (bad[0] or bad[1]):
@@ -1151,7 +1182,7 @@ def process_csv_input(
         id_prefix = f"ROW_NUMBER() OVER () AS {id_col_name}, " if needs_id else ""
         query = f"""
             SELECT {id_prefix}*{trim_clause}, {geom_expr}
-            FROM read_csv_auto('{read_url}')
+            FROM {csv_read}
         """
 
         is_s3_dest = destination.startswith('s3://')
@@ -1159,15 +1190,17 @@ def process_csv_input(
             with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
                 tmp_path = tmp.name
             try:
-                write_with_duckdb(query, tmp_path, compression, compression_level,
+                rows_written = write_with_duckdb(query, tmp_path, compression, compression_level,
                                   row_group_size, verbose)
+                _report_row_count(rows_written, expect_features)
                 upload_to_s3(tmp_path, destination, verbose=progress)
             finally:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
         else:
-            write_with_duckdb(query, destination, compression, compression_level,
+            rows_written = write_with_duckdb(query, destination, compression, compression_level,
                               row_group_size, verbose)
+            _report_row_count(rows_written, expect_features)
 
         print("✓ CSV point processing completed successfully!")
 
@@ -1186,9 +1219,12 @@ def write_with_duckdb(query: str, output_path: str,
                       compression_level: int = 15,
                       row_group_size: int = 100000,
                       verbose: bool = False,
-                      row_group_bytes: str = DEFAULT_ROW_GROUP_BYTES) -> None:
+                      row_group_bytes: str = DEFAULT_ROW_GROUP_BYTES) -> int:
     """
     Write parquet file using DuckDB COPY. Simple and reliable.
+
+    Returns the number of rows written, which COPY reports for free — the
+    caller logs it so a short read is visible in any job log (issue #186).
 
     Args:
         query: DuckDB query that produces the data to write
@@ -1203,6 +1239,9 @@ def write_with_duckdb(query: str, output_path: str,
             chunks. This is what keeps the geometry column chunk small enough to
             be read over httpfs (issue #106 — see DEFAULT_ROW_GROUP_BYTES).
         verbose: Print debug information
+
+    Returns:
+        Number of rows written to output_path
     """
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
@@ -1222,22 +1261,59 @@ def write_with_duckdb(query: str, output_path: str,
             print(f"  Writing with DuckDB to {output_path}...")
             print(f"    row group cap: {row_group_size:,} rows / {row_group_bytes} bytes")
 
-        # Use COPY - it works!
-        con.execute(f"""
+        # Use COPY - it works!  It also reports how many rows it wrote, which
+        # costs nothing extra and is the only count the caller needs: the query
+        # is row-preserving, so this is the source feature count as well.
+        written = con.execute(f"""
             COPY ({query})
             TO '{output_path}'
             (FORMAT PARQUET,
              COMPRESSION {compression},
              ROW_GROUP_SIZE {row_group_size},
              ROW_GROUP_SIZE_BYTES '{row_group_bytes}')
-        """)
+        """).fetchone()
+        rows_written = int(written[0]) if written else 0
 
         if verbose:
             print(f"  ✓ Wrote {output_path}")
 
+        return rows_written
+
     finally:
         con.close()
 
+
+
+class FeatureCountMismatch(Exception):
+    """Raised when the written row count does not match --expect-features."""
+
+
+def _report_row_count(rows_written: int, expect_features: Optional[int]) -> None:
+    """
+    Report how many rows were written, and enforce --expect-features.
+
+    A conversion that silently reads a truncated source produces a log
+    byte-identical to a complete run, so nothing downstream — human or
+    pipeline — can tell (issue #186). The count is always printed; passing an
+    independently-known expected count turns a short read into a non-zero exit.
+
+    Args:
+        rows_written: Rows COPY reported writing
+        expect_features: Row count the caller independently expects, or None
+    """
+    print(f"  Wrote {rows_written:,} rows")
+
+    if expect_features is None:
+        return
+
+    if rows_written != expect_features:
+        raise FeatureCountMismatch(
+            f"Expected {expect_features:,} features but wrote {rows_written:,} "
+            f"({rows_written - expect_features:+,}). The source may be truncated "
+            f"or filtered. Nothing further has been done with the output — an S3 "
+            f"destination has not been uploaded."
+        )
+    print(f"  ✓ Matches --expect-features {expect_features:,}")
 
 
 def upload_to_s3(local_path: str, s3_destination: str, verbose: bool = True) -> None:
@@ -1290,7 +1366,9 @@ def convert_to_parquet(
     simplify_tolerance: Optional[float] = None,
     lat_column: Optional[str] = None,
     lon_column: Optional[str] = None,
-    trim_strings: bool = False
+    trim_strings: bool = False,
+    expect_features: Optional[int] = None,
+    csv_sample_size: int = -1,
 ):
     """
     Convert a vector dataset to optimized GeoParquet.
@@ -1330,6 +1408,12 @@ def convert_to_parquet(
             (VARCHAR) attribute column. Off by default so outputs stay faithful
             to the source; opt in for sources whose categorical fields carry
             stray whitespace (e.g. WDPA NO_TAKE = 'All ', issue #180).
+        expect_features: Row count this conversion is expected to produce, known
+            independently by the caller (issue #186). The count is always logged;
+            when this is given and the written count differs, the conversion
+            raises FeatureCountMismatch so a pipeline can gate on it.
+        csv_sample_size: For CSV point sources, rows read_csv_auto samples for
+            type inference; -1 (the default) scans the whole file (issue #188).
     """
     # CSV with lat/lon columns -> point geometry (issue #78). Handled before the
     # ST_Read path since CSV is not a spatial format GDAL/ST_Read opens directly.
@@ -1348,6 +1432,8 @@ def convert_to_parquet(
             target_crs=target_crs,
             verbose=verbose,
             trim_strings=trim_strings,
+            expect_features=expect_features,
+            csv_sample_size=csv_sample_size,
         )
 
     # Check if input is already parquet
@@ -1381,7 +1467,8 @@ def convert_to_parquet(
             target_crs=target_crs,
             verbose=verbose,
             simplify_tolerance=simplify_tolerance,
-            trim_strings=trim_strings
+            trim_strings=trim_strings,
+            expect_features=expect_features,
         )
 
     # Original processing for non-parquet inputs
@@ -1573,8 +1660,11 @@ def convert_to_parquet(
 
             try:
                 # Write data
-                write_with_duckdb(query, tmp_path, compression, compression_level,
+                rows_written = write_with_duckdb(query, tmp_path, compression, compression_level,
                                  row_group_size, verbose)
+                # Checked before the upload, so a short read never reaches the
+                # bucket to be consumed by anything downstream (issue #186).
+                _report_row_count(rows_written, expect_features)
 
                 # Upload to S3
                 upload_to_s3(tmp_path, destination, verbose=progress)
@@ -1584,8 +1674,9 @@ def convert_to_parquet(
                     os.unlink(tmp_path)
         else:
             # Write directly to destination
-            write_with_duckdb(query, destination, compression, compression_level,
+            rows_written = write_with_duckdb(query, destination, compression, compression_level,
                             row_group_size, verbose)
+            _report_row_count(rows_written, expect_features)
 
         if verbose:
             print("✓ Conversion completed successfully!")
@@ -1679,6 +1770,18 @@ Examples:
                        help="Longitude column for CSV point input (auto-detected from "
                             "e.g. Longitude/lon/x if not given). Issue #78.")
 
+    parser.add_argument("--expect-features", type=int, default=None, metavar="N",
+                       help="Row count this conversion is expected to produce, known "
+                            "independently (e.g. from the source service's own count). "
+                            "Exits non-zero when the written count differs, so a "
+                            "silently truncated source is caught rather than published. "
+                            "The count is logged either way. Issue #186.")
+    parser.add_argument("--csv-sample-size", type=int, default=-1, metavar="ROWS",
+                       help="Rows sampled for CSV type inference (default: -1, the whole "
+                            "file). DuckDB's 20480-row default types a column that is "
+                            "empty in the head of the file as VARCHAR even when it is "
+                            "cleanly numeric later on. Issue #188.")
+
     parser.add_argument("--no-progress", action="store_true",
                        help="Disable progress output")
     parser.add_argument("--verbose", action="store_true",
@@ -1706,7 +1809,9 @@ Examples:
             simplify_tolerance=args.simplify_tolerance,
             lat_column=args.lat_column,
             lon_column=args.lon_column,
-            trim_strings=args.trim_strings
+            trim_strings=args.trim_strings,
+            expect_features=args.expect_features,
+            csv_sample_size=args.csv_sample_size,
         )
         sys.exit(0)
     except Exception as e:

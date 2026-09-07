@@ -541,6 +541,9 @@ def generate_dataset_workflow(
     row_group_size: int = 100000,
     simplify_tolerance: Optional[float] = None,
     trim_strings: bool = False,
+    lat_column: Optional[str] = None,
+    lon_column: Optional[str] = None,
+    expect_features: Optional[int] = None,
     pmtiles_max_zoom: Optional[int] = None,
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
@@ -585,6 +588,14 @@ def generate_dataset_workflow(
         hex_memory: Memory request/limit for hex job pods (default: "8Gi")
         max_parallelism: Maximum parallelism for hex jobs (default: 50)
         max_completions: Maximum job completions - increase to reduce chunk size (default: 200)
+        lat_column: Latitude column for a CSV point source, passed through to the
+            convert step. Without it a CSV source cannot be used here at all
+            (issue #188).
+        lon_column: Longitude column for a CSV point source (issue #188).
+        expect_features: Row count the convert step must produce, known
+            independently by the caller. The step exits non-zero on a mismatch,
+            so a silently truncated source fails the workflow rather than
+            flowing into the hex and PMTiles steps (issue #186).
         armada_priority_class: Armada priority class for the `armada` backend —
             a literal name ("armada-default") or a shorthand ("default",
             "preemptible", "high"). Defaults to non-preemptible, since a
@@ -651,7 +662,7 @@ def generate_dataset_workflow(
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo, config)
 
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config, simplify_tolerance=simplify_tolerance, trim_strings=trim_strings)
+    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config, simplify_tolerance=simplify_tolerance, trim_strings=trim_strings, lat_column=lat_column, lon_column=lon_column, expect_features=expect_features)
 
     # Generate pmtiles job (uses converted parquet, not source)
     _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config, h3_resolution=h3_resolution, max_zoom=pmtiles_max_zoom)
@@ -1346,7 +1357,7 @@ echo "Bucket setup complete!"
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-setup-bucket.yaml"))
 
 
-def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None, config: ClusterConfig = None, simplify_tolerance=None, trim_strings=False):
+def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None, config: ClusterConfig = None, simplify_tolerance=None, trim_strings=False, lat_column=None, lon_column=None, expect_features=None):
     """Generate GeoParquet conversion job."""
     if config is None:
         config = ClusterConfig()
@@ -1369,11 +1380,24 @@ def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_pat
         if simplify_tolerance is not None else ""
     )
     trim_flag = " \\\n  --trim-strings" if trim_strings else ""
+    # A CSV point source needs its lat/lon columns named here, or it cannot be a
+    # --source-url for a generated pipeline at all (issue #188).
+    latlon_flags = ""
+    if lat_column:
+        latlon_flags += f" \\\n  --lat-column {shlex.quote(lat_column)}"
+    if lon_column:
+        latlon_flags += f" \\\n  --lon-column {shlex.quote(lon_column)}"
+    # Gate the step on a count the caller knows independently, so a truncated
+    # source fails the job instead of flowing into hex and PMTiles (issue #186).
+    expect_flag = (
+        f" \\\n  --expect-features {int(expect_features)}"
+        if expect_features is not None else ""
+    )
     convert_cmd = f"""set -e
 cng-convert-to-parquet \\
   {sources_str} \\
   s3://{bucket}/{s3_dataset}.parquet \\
-  --row-group-size {row_group_size}{layer_flag}{simplify_flag}{trim_flag}
+  --row-group-size {row_group_size}{layer_flag}{simplify_flag}{trim_flag}{latlon_flags}{expect_flag}
 """
 
     pod_spec = {

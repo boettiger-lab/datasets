@@ -1665,3 +1665,50 @@ class TestH0Subset:
                 assert run.returncode == 1, f"index {index!r}: {run.stdout}"
                 assert "No h0 cell for completion index" in run.stderr
                 assert "RAN:" not in run.stdout
+
+
+class TestCsvAndCountFlagsReachTheConvertStep:
+    """
+    A CSV point source needs its lat/lon columns named on `workflow` (issue
+    #188), and the convert step can be gated on an expected count (issue #186).
+
+    Without the former a CSV source could not be a --source-url for a generated
+    pipeline at all; it had to be pre-converted in a separate job.
+    """
+
+    def _convert_command(self, tmpdir, monkeypatch, **kwargs):
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        generate_dataset_workflow(
+            dataset_name="ics209",
+            source_url="https://example.com/incidents.csv",
+            bucket="public-fire",
+            output_dir=tmpdir,
+            h3_resolution=10,
+            **kwargs,
+        )
+        job = yaml.safe_load(open(Path(tmpdir) / "ics209-convert.yaml"))
+        return job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+
+    @pytest.mark.timeout(10)
+    def test_latlon_columns_are_passed_through(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd = self._convert_command(
+                tmpdir, monkeypatch,
+                lat_column="POO_LATITUDE", lon_column="POO_LONGITUDE",
+            )
+            assert "--lat-column POO_LATITUDE" in cmd
+            assert "--lon-column POO_LONGITUDE" in cmd
+
+    @pytest.mark.timeout(10)
+    def test_expect_features_is_passed_through(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd = self._convert_command(tmpdir, monkeypatch, expect_features=127133)
+            assert "--expect-features 127133" in cmd
+
+    @pytest.mark.timeout(10)
+    def test_flags_are_absent_by_default(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd = self._convert_command(tmpdir, monkeypatch)
+            for flag in ("--lat-column", "--lon-column", "--expect-features"):
+                assert flag not in cmd
