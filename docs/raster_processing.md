@@ -305,6 +305,9 @@ Two raster→H3 algorithms are available via the `method` argument (CLI: `--meth
 | `hex_resampling` vocabulary | `sum`, `mean`, `mode`. | Any GDAL `resampleAlg` (`average`/`mean`, `sum`, `mode`, `near`/`nearest`, `bilinear`, `cubic`, ...). |
 | Cost | Higher memory and wall time at fine resolutions (exact per-cell coverage). | Fast and low-memory. |
 | Antimeridian | Handled. | Not antimeridian-correct by design (planar cutline). |
+| Requires | Any supported GDAL. | A GDAL whose Python bindings accept `WarpOptions(cutlineWKT=...)` — each h0 is warped clipped to its own boundary. Absent from GDAL 3.8.4 (what Ubuntu noble ships); present in the project image. |
+
+`warp-centroid` checks for that GDAL capability when the processor is constructed, before any raster is opened or localized, and raises naming the requirement. It does **not** fall back to `exact-extract`: the two produce different output (one row per cell versus one row per warped pixel), so the substitution is a decision for the caller, not a silent downgrade.
 
 **Use `exact-extract` (the default) for stock/quantity rasters** (population, carbon) where mass conservation matters. When the two methods are both valid (hex pitch ≤ source pitch) they agree closely, and `exact-extract` is never worse — so reach for `warp-centroid` only when its speed/memory advantage is needed at scale.
 

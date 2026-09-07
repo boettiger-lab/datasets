@@ -386,6 +386,29 @@ VALID_HEX_REDUCERS = ("sum", "mean", "mode", "max", "min", "fractions")
 #   source pitch (per the analysis in issue #84).
 VALID_METHODS = ("exact-extract", "warp-centroid")
 
+
+def gdal_supports_cutline_wkt() -> bool:
+    """
+    Whether this GDAL's Python bindings accept ``gdal.WarpOptions(cutlineWKT=)``.
+
+    `_hex_warp_centroid_h0` clips each warp to the h0 boundary with that
+    argument, so the whole warp-centroid method needs it. It is absent from
+    GDAL 3.8.4 (what Ubuntu noble ships), where the call fails with a bare
+    ``TypeError: WarpOptions() got an unexpected keyword argument
+    'cutlineWKT'`` after the raster has already been opened — a build-time
+    dependency surfacing as a mid-run crash.
+
+    Detected by feature rather than by version number: the bindings can lag or
+    lead the library, and what matters is whether this call will work.
+    """
+    import inspect
+
+    try:
+        return "cutlineWKT" in inspect.signature(gdal.WarpOptions).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic builds
+        # Signature not introspectable; assume support and let the call speak.
+        return True
+
 # GDAL resampleAlg values accepted in warp-centroid mode. exactextract has
 # a smaller vocabulary (sum / mean / mode) — warp-centroid forwards to
 # gdal.Warp so it supports the full GDAL set.
@@ -1106,6 +1129,26 @@ class RasterProcessor:
         # many times over. Pass local_cache_dir=None to opt out and stream
         # directly via /vsis3/ (useful for small rasters or non-cluster
         # environments without local disk headroom).
+        # Checked here rather than at the warp so the build fails before it
+        # localizes a multi-GB COG. Not silently downgraded to exact-extract:
+        # the two methods do not produce the same thing (warp-centroid emits
+        # one row per warped pixel, not one per cell, and is not
+        # antimeridian-correct), so substituting one for the other would be a
+        # wrong answer rather than a slower one.
+        if method == "warp-centroid" and not gdal_supports_cutline_wkt():
+            raise RuntimeError(
+                f"method='warp-centroid' needs a GDAL whose Python bindings accept "
+                f"WarpOptions(cutlineWKT=...); this GDAL is {gdal.__version__}, which "
+                f"does not.\n"
+                f"  Each h0 is warped clipped to its own boundary, so there is no "
+                f"fallback within this method.\n"
+                f"  Run in the project image (ghcr.io/boettiger-lab/datasets:latest), "
+                f"or upgrade GDAL.\n"
+                f"  method='exact-extract' works on this GDAL, but it is a different "
+                f"aggregation — one area-weighted row per cell, rather than one row "
+                f"per warped pixel — so switch to it deliberately, not as a drop-in."
+            )
+
         if local_cache_dir and (isinstance(input_path, str) and
                                  (input_path.startswith("s3://") or
                                   input_path.startswith("http://") or
