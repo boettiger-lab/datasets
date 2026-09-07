@@ -39,6 +39,23 @@ requires_gdal = pytest.mark.skipif(
 )
 
 
+def _cutline_wkt_available():
+    """warp-centroid clips each warp with WarpOptions(cutlineWKT=...)."""
+    if not GDAL_AVAILABLE:
+        return False
+    from cng_datasets.raster.cog import gdal_supports_cutline_wkt
+    return gdal_supports_cutline_wkt()
+
+
+# Marks the warp-centroid tests, which cannot run on a GDAL without
+# cutlineWKT (Ubuntu noble's 3.8.4, for one) — the method raises there by
+# design rather than silently doing something else (issue #173).
+requires_cutline_wkt = pytest.mark.skipif(
+    not _cutline_wkt_available(),
+    reason="GDAL lacks WarpOptions(cutlineWKT=); warp-centroid is unavailable"
+)
+
+
 @requires_gdal_array
 class TestRasterProcessor:
     """Test the RasterProcessor class with small synthetic rasters."""
@@ -1222,6 +1239,7 @@ class TestProjDbSelection:
         assert len(calls) == 1
 
 
+@requires_cutline_wkt
 class TestWarpCentroidMethod:
     """PR #86: the opt-in warp-centroid fallback method (gdal.Warp -> XYZ ->
     centroid). Default stays exact-extract; warp-centroid trades the one-row-
@@ -1830,6 +1848,71 @@ class TestBoundariesDerivedInWorkers:
         out = _boundary_wkt_for(np.array([cell, cell, cell], dtype=np.uint64))
         assert len(out) == 3
         assert len({w for _, w in out}) == 1
+
+
+class TestWarpCentroidGdalGuard:
+    """
+    warp-centroid needs WarpOptions(cutlineWKT=) and says so up front
+    (issue #173).
+
+    Every h0 is warped clipped to its own boundary, so on a GDAL without that
+    argument the method cannot work at all. It used to surface as a bare
+    `TypeError: WarpOptions() got an unexpected keyword argument 'cutlineWKT'`
+    from inside the warp — after the pod had already localized the COG — which
+    reads as a bug in the tool rather than a missing dependency.
+    """
+
+    @requires_gdal
+    def test_detection_matches_the_installed_bindings(self):
+        import inspect
+        from osgeo import gdal
+        from cng_datasets.raster.cog import gdal_supports_cutline_wkt
+
+        expected = "cutlineWKT" in inspect.signature(gdal.WarpOptions).parameters
+        assert gdal_supports_cutline_wkt() is expected
+
+    @requires_gdal
+    def test_unsupported_gdal_is_refused_before_any_io(self, monkeypatch):
+        """
+        The source is an s3:// URL that would be downloaded first, so a guard
+        that fired later would cost a multi-GB localize before failing.
+        """
+        import cng_datasets.raster.cog as cog
+        from cng_datasets.raster import RasterProcessor
+
+        monkeypatch.setattr(cog, "gdal_supports_cutline_wkt", lambda: False)
+        monkeypatch.setattr(cog, "_localize_input",
+                            lambda *a, **k: pytest.fail("localized before the guard ran"))
+
+        with pytest.raises(RuntimeError) as exc:
+            RasterProcessor(input_path="s3://bucket/big.tif", h3_resolution=8,
+                            method="warp-centroid")
+
+        message = str(exc.value)
+        assert "cutlineWKT" in message
+        # Names the remedy and does not offer exact-extract as a drop-in.
+        assert "exact-extract" in message
+        assert "deliberately" in message
+
+    @requires_gdal
+    def test_exact_extract_is_unaffected(self, monkeypatch, tmp_path):
+        """The guard must not block the default method on the same GDAL."""
+        import cng_datasets.raster.cog as cog
+        from cng_datasets.raster import RasterProcessor
+        from osgeo import gdal, osr
+
+        path = str(tmp_path / "tiny.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 5, 5, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([-100.0, 0.01, 0, 40.0, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((5, 5), dtype=np.int16))
+        ds.FlushCache(); ds = None
+
+        monkeypatch.setattr(cog, "gdal_supports_cutline_wkt", lambda: False)
+        proc = RasterProcessor(input_path=path, h3_resolution=8,
+                               method="exact-extract")
+        assert proc.method == "exact-extract"
 
 
 if __name__ == "__main__":
