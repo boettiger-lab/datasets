@@ -666,6 +666,91 @@ def detect_optimal_h3_resolution(raster_path: str, verbose: bool = True) -> int:
     return best_res
 
 
+# The catalog's universal join key. A dataset whose finest H3 resolution is
+# coarser than this carries no h8 column at all, so it cannot be joined against
+# the rest of the catalog on h8 (issue #182).
+CATALOG_JOIN_RESOLUTION = 8
+
+
+def h3_resolution_join_warning(
+    resolution: int,
+    user_specified: bool,
+    parent_resolutions: Optional[List[int]] = None,
+) -> Optional[str]:
+    """
+    Build the warning text when a build carries no path to the h8 join key.
+
+    Two ways to lose it, both silent today (issue #182):
+
+    * **Target too coarse.** `detect_optimal_h3_resolution` targets ~3x the
+      source pixel edge, which agrees with the catalog convention at fine pixels
+      and diverges as pixels coarsen — a ~1 km global raster auto-detects h6,
+      two levels below h8. Detection is only a suggestion, so a caller who omits
+      ``--h3-resolution`` gets a non-joinable dataset with no error, only an
+      informational log line.
+    * **h8 not among the parents.** A finer target only carries h8 if h8 is a
+      requested parent resolution, and the default is ``--parent-resolutions 0``
+      — so an h10 build emits h10 and h0 and nothing to join on.
+
+    Args:
+        resolution: The H3 resolution the build will actually use
+        user_specified: Whether the caller passed the resolution explicitly
+        parent_resolutions: Parent resolutions the build will emit. None skips
+            the parent check, for callers that do not know them yet.
+
+    Returns:
+        Warning text, or None when the build can join on h8
+    """
+    if resolution == CATALOG_JOIN_RESOLUTION:
+        return None
+
+    if resolution > CATALOG_JOIN_RESOLUTION:
+        if parent_resolutions is None:
+            return None
+        if CATALOG_JOIN_RESOLUTION in parent_resolutions:
+            return None
+        emitted = ", ".join(
+            f"h{r}" for r in [resolution] + sorted(parent_resolutions, reverse=True)
+        )
+        return (
+            f"⚠ This build emits {emitted} — no "
+            f"h{CATALOG_JOIN_RESOLUTION} column.\n"
+            f"  h{CATALOG_JOIN_RESOLUTION} is the catalog's universal join key, "
+            f"so the output cannot be joined against the\n"
+            f"  rest of the catalog. Add {CATALOG_JOIN_RESOLUTION} to "
+            f"--parent-resolutions to emit it."
+        )
+
+    consequence = (
+        f"  A dataset built at h{resolution} carries no "
+        f"h{CATALOG_JOIN_RESOLUTION} column, so it cannot be joined against "
+        f"the rest of the catalog\n"
+        f"  on h{CATALOG_JOIN_RESOLUTION} — the universal join key.\n"
+    )
+
+    if user_specified:
+        return (
+            f"⚠ Using h{resolution}, coarser than the "
+            f"h{CATALOG_JOIN_RESOLUTION} catalog join key.\n"
+            f"{consequence}"
+            f"  Proceeding: the resolution was specified explicitly."
+        )
+
+    return (
+        f"⚠ Auto-detected h{resolution} is coarser than the "
+        f"h{CATALOG_JOIN_RESOLUTION} catalog join key.\n"
+        f"{consequence}"
+        f"  Auto-detection targets ~3x the source pixel edge (~9 pixels per "
+        f"cell), which is coarser than the\n"
+        f"  catalog convention of roughly one cell per pixel at this pixel "
+        f"size.\n"
+        f"  Pass --h3-resolution {CATALOG_JOIN_RESOLUTION} to build a "
+        f"joinable dataset, or --h3-resolution {resolution} to make this "
+        f"coarse\n"
+        f"  build a deliberate choice."
+    )
+
+
 def create_mosaic_cog(
     source_urls: List[str],
     output_path: str,
@@ -1072,6 +1157,16 @@ class RasterProcessor:
                 print(f"✓ Using h{h3_resolution} (matches auto-detected resolution)")
 
         self.parent_resolutions = parent_resolutions or []
+
+        # A build with no path to h8 — target too coarse, or h8 missing from the
+        # parents — is silently non-joinable unless we say so (issue #182).
+        join_warning = h3_resolution_join_warning(
+            self.h3_resolution,
+            user_specified=h3_resolution is not None,
+            parent_resolutions=self.parent_resolutions,
+        )
+        if join_warning:
+            print(join_warning)
 
         # Set up DuckDB connection
         self.con = self._setup_duckdb()

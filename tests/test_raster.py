@@ -535,6 +535,84 @@ class TestH3EdgeLengths:
         assert sig.return_annotation == int or str(sig.return_annotation) == 'int'
 
 
+@requires_gdal
+class TestCatalogJoinResolutionWarning:
+    """
+    A target resolution below h8 carries no h8 column, so the dataset cannot
+    join the rest of the catalog on the universal join key. Auto-detection
+    targets ~3x the source pixel edge and lands on h6 for a ~1 km global
+    raster, so the coarse case must be announced (issue #182).
+    """
+
+    @pytest.mark.timeout(5)
+    def test_no_warning_when_h8_is_present(self):
+        from cng_datasets.raster import h3_resolution_join_warning
+
+        # h8 as the target itself, whatever the parents
+        assert h3_resolution_join_warning(8, user_specified=False, parent_resolutions=[0]) is None
+        assert h3_resolution_join_warning(8, user_specified=True, parent_resolutions=[]) is None
+        # h8 as a requested parent of a finer target
+        for res in (9, 10, 12):
+            assert h3_resolution_join_warning(
+                res, user_specified=True, parent_resolutions=[9, 8, 0]
+            ) is None
+
+    @pytest.mark.timeout(5)
+    def test_fine_target_without_h8_parent_warns(self):
+        """
+        The raster default is --parent-resolutions 0, so an h10 build emits h10
+        and h0 and nothing to join the catalog on (issue #182).
+        """
+        from cng_datasets.raster import h3_resolution_join_warning
+
+        msg = h3_resolution_join_warning(10, user_specified=True, parent_resolutions=[0])
+
+        assert msg is not None
+        assert msg.startswith("⚠")
+        assert "no h8 column" in msg
+        assert "h10, h0" in msg
+        assert "--parent-resolutions" in msg
+
+    @pytest.mark.timeout(5)
+    def test_unknown_parents_skips_the_parent_check(self):
+        """A caller that does not know its parents must not be warned falsely."""
+        from cng_datasets.raster import h3_resolution_join_warning
+
+        assert h3_resolution_join_warning(10, user_specified=True) is None
+
+    @pytest.mark.timeout(5)
+    def test_auto_detected_coarse_resolution_warns_with_remedy(self):
+        from cng_datasets.raster import h3_resolution_join_warning
+
+        msg = h3_resolution_join_warning(6, user_specified=False)
+
+        assert msg is not None
+        assert msg.startswith("⚠")
+        # Names the consequence, not just the number
+        assert "no h8 column" in msg
+        assert "join" in msg
+        # And the actionable remedy
+        assert "--h3-resolution 8" in msg
+
+    @pytest.mark.timeout(5)
+    def test_explicit_coarse_resolution_is_acknowledged_not_second_guessed(self):
+        from cng_datasets.raster import h3_resolution_join_warning
+
+        msg = h3_resolution_join_warning(6, user_specified=True)
+
+        assert msg is not None
+        assert "no h8 column" in msg
+        assert "specified explicitly" in msg
+        # An explicit choice should not be told to pass the flag it just passed
+        assert "--h3-resolution 8" not in msg
+
+    @pytest.mark.timeout(5)
+    def test_join_resolution_is_h8(self):
+        from cng_datasets.raster import CATALOG_JOIN_RESOLUTION
+
+        assert CATALOG_JOIN_RESOLUTION == 8
+
+
 @requires_gdal_array
 class TestCOGOptimization:
     """Test COG creation options and optimizations."""

@@ -12,6 +12,8 @@ from cng_datasets.k8s.armada import (
     k8s_indexed_job_to_armada,
     convert_workflow_to_armada,
     save_armada_yaml,
+    resolve_armada_priority_class,
+    DEFAULT_ARMADA_PRIORITY_CLASS,
     _extract_pod_spec,
     _replace_completion_index,
 )
@@ -157,15 +159,25 @@ class TestK8sJobToArmada:
 
         armada_job = result["jobs"][0]
         assert armada_job["namespace"] == "my-ns"
-        assert armada_job["priorityClassName"] == "armada-preemptible"
+        assert armada_job["priorityClassName"] == "armada-default"
         assert "podSpec" in armada_job
         assert armada_job["podSpec"]["containers"][0]["image"] == "alpine:latest"
 
     @pytest.mark.timeout(5)
-    def test_priority_class_mapping(self):
+    def test_opportunistic_does_not_become_preemptible(self):
+        """
+        A k8s 'opportunistic' job must not convert to armada-preemptible.
+
+        Opportunistic pods are preempted but recreated by their Job controller;
+        preempted Armada jobs are not rescheduled at all, and the Job-level
+        retry settings do not survive conversion. The default is therefore
+        non-preemptible (issue #183).
+        """
         job = _make_simple_job()
+        assert job["spec"]["template"]["spec"]["priorityClassName"] == "opportunistic"
         result = k8s_job_to_armada(job, queue="q", job_set_id="s")
-        assert result["jobs"][0]["priorityClassName"] == "armada-preemptible"
+        assert result["jobs"][0]["priorityClassName"] == "armada-default"
+        assert result["jobs"][0]["priorityClassName"] == DEFAULT_ARMADA_PRIORITY_CLASS
 
     @pytest.mark.timeout(5)
     def test_custom_priority_class(self):
@@ -174,6 +186,14 @@ class TestK8sJobToArmada:
             job, queue="q", job_set_id="s", priority_class="armada-default"
         )
         assert result["jobs"][0]["priorityClassName"] == "armada-default"
+
+    @pytest.mark.timeout(5)
+    def test_priority_class_shorthand(self):
+        job = _make_simple_job()
+        result = k8s_job_to_armada(
+            job, queue="q", job_set_id="s", priority_class="preemptible"
+        )
+        assert result["jobs"][0]["priorityClassName"] == "armada-preemptible"
 
     @pytest.mark.timeout(5)
     def test_pod_spec_has_no_priority_class(self):
@@ -225,6 +245,89 @@ class TestK8sIndexedJobToArmada:
         assert result["jobSetId"] == "my-hex"
         for armada_job in result["jobs"]:
             assert armada_job["namespace"] == "bio"
+
+
+class TestResolveArmadaPriorityClass:
+    """Shorthand resolution for --armada-priority-class (issue #183)."""
+
+    @pytest.mark.timeout(5)
+    def test_shorthands(self):
+        assert resolve_armada_priority_class("default") == "armada-default"
+        assert resolve_armada_priority_class("preemptible") == "armada-preemptible"
+        assert resolve_armada_priority_class("high") == "armada-high-priority"
+
+    @pytest.mark.timeout(5)
+    def test_literal_class_passes_through(self):
+        """Cluster-specific class names must stay usable."""
+        assert resolve_armada_priority_class("armada-default") == "armada-default"
+        assert resolve_armada_priority_class("some-other-class") == "some-other-class"
+
+    @pytest.mark.timeout(5)
+    def test_unset_returns_none(self):
+        assert resolve_armada_priority_class(None) is None
+        assert resolve_armada_priority_class("") is None
+
+
+class TestDroppedRetrySettingsWarning:
+    """
+    Conversion takes spec.template.spec, so Job-level retry settings are left
+    behind. That must be announced, not silent (issue #183).
+    """
+
+    @pytest.mark.timeout(5)
+    def test_warns_on_backoff_limit_per_index(self, capsys):
+        job = _make_indexed_job(completions=2)
+        job["spec"]["backoffLimitPerIndex"] = 4
+        job["spec"]["maxFailedIndexes"] = 10
+
+        k8s_indexed_job_to_armada(job, queue="q", job_set_id="hex")
+
+        out = capsys.readouterr().out
+        assert "backoffLimitPerIndex=4" in out
+        assert "maxFailedIndexes=10" in out
+
+    @pytest.mark.timeout(5)
+    def test_no_warning_when_no_retries_were_granted(self, capsys):
+        """backoffLimit=0 grants no retries, so dropping it loses nothing."""
+        job = _make_simple_job()
+        job["spec"]["backoffLimit"] = 0
+
+        k8s_job_to_armada(job, queue="q", job_set_id="s")
+
+        assert "Dropping k8s Job-level retry settings" not in capsys.readouterr().out
+
+    @pytest.mark.timeout(5)
+    def test_no_warning_when_retry_fields_absent(self, capsys):
+        k8s_job_to_armada(_make_simple_job(), queue="q", job_set_id="s")
+        assert "Dropping k8s Job-level retry settings" not in capsys.readouterr().out
+
+    @pytest.mark.timeout(5)
+    def test_preemptible_warning_names_the_lost_unit(self, capsys):
+        """
+        Dropped retries plus preemptible priority is the trap from #183: a
+        preempted Armada job is not rescheduled, so the whole unit is lost.
+        """
+        job = _make_indexed_job(completions=2)
+        job["spec"]["backoffLimitPerIndex"] = 4
+
+        k8s_indexed_job_to_armada(
+            job, queue="q", job_set_id="hex", priority_class="preemptible"
+        )
+
+        out = capsys.readouterr().out
+        assert "not rescheduled" in out
+        assert "--armada-priority-class default" in out
+
+    @pytest.mark.timeout(5)
+    def test_no_preemptible_note_at_default_priority(self, capsys):
+        job = _make_indexed_job(completions=2)
+        job["spec"]["backoffLimitPerIndex"] = 4
+
+        k8s_indexed_job_to_armada(job, queue="q", job_set_id="hex")
+
+        out = capsys.readouterr().out
+        assert "backoffLimitPerIndex=4" in out
+        assert "not rescheduled" not in out
 
 
 class TestSaveArmadaYaml:
@@ -326,6 +429,62 @@ class TestConvertWorkflowToArmada:
                 assert len(spec["jobs"]) == 1, f"{step} should have exactly 1 Armada job"
 
     @pytest.mark.timeout(30)
+    def test_priority_class_forwarded_to_every_job(self, monkeypatch):
+        """
+        convert_workflow_to_armada must forward priority_class, otherwise the
+        class cannot be chosen from the CLI at all (issue #183, finding 3).
+        """
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=10,
+            )
+
+            armada_files = convert_workflow_to_armada(
+                k8s_yaml_dir=tmpdir,
+                dataset_name="test-ds",
+                queue="geo-workflows",
+                priority_class="preemptible",
+            )
+
+            assert armada_files
+            for fpath in armada_files:
+                with open(fpath) as f:
+                    spec = yaml.safe_load(f)
+                for job in spec["jobs"]:
+                    assert job["priorityClassName"] == "armada-preemptible"
+
+    @pytest.mark.timeout(30)
+    def test_default_priority_class_is_non_preemptible(self, monkeypatch):
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=10,
+            )
+
+            armada_files = convert_workflow_to_armada(
+                k8s_yaml_dir=tmpdir,
+                dataset_name="test-ds",
+                queue="geo-workflows",
+            )
+
+            for fpath in armada_files:
+                with open(fpath) as f:
+                    spec = yaml.safe_load(f)
+                for job in spec["jobs"]:
+                    assert job["priorityClassName"] == DEFAULT_ARMADA_PRIORITY_CLASS
+
+    @pytest.mark.timeout(30)
     def test_skips_non_job_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
@@ -375,6 +534,26 @@ class TestWorkflowBackendFlag:
             )
             armada_files = list(Path(tmpdir).glob("armada-*.yaml"))
             assert len(armada_files) > 0
+
+    @pytest.mark.timeout(5)
+    def test_raster_armada_priority_class_flag(self):
+        """--armada-priority-class reaches the generated raster Armada YAML."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-raster",
+                source_urls="https://example.com/tile.tif",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                backend="armada",
+                armada_priority_class="high",
+            )
+
+            hex_file = Path(tmpdir) / "armada-test-raster-hex.yaml"
+            with open(hex_file) as f:
+                spec = yaml.safe_load(f)
+            assert spec["jobs"]
+            for job in spec["jobs"]:
+                assert job["priorityClassName"] == "armada-high-priority"
 
     @pytest.mark.timeout(5)
     def test_raster_backend_armada(self):

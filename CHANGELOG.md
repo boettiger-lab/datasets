@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--armada-priority-class` on `workflow` and `raster-workflow`: the Armada priority class was previously unreachable from the CLI, since `convert_workflow_to_armada` neither accepted nor forwarded one. Accepts a shorthand (`default`, `preemptible`, `high`) or a literal class name, and the generated-workflow summary now reports the class in effect (#183)
+
+### Changed
+- **Breaking (Armada backend):** converted jobs now default to the non-preemptible `armada-default` instead of `armada-preemptible`, and a k8s `opportunistic` priority class no longer maps onto `armada-preemptible`. An opportunistic k8s pod is preempted but recreated by its Job controller; a preempted Armada job is not rescheduled at all, and the Job-level retry settings do not survive conversion — so the old default turned multi-hour work into preemptible work with no retry and no rescheduling. Pass `--armada-priority-class preemptible` to opt back in, which is the right default once units are small enough that losing one is cheap (#183)
+
+### Fixed
+- Converting a k8s Job to Armada now warns when Job-level retry settings (`backoffLimit`, `backoffLimitPerIndex`, `maxFailedIndexes`) are dropped, naming what is lost; conversion reads `spec.template.spec`, so these were silently discarded. Settings that grant no retries (a `0` value) are not reported, and the warning additionally flags the preemptible case, where a preemption loses the whole unit (#183)
+- `raster` now warns when a build has no path to `h8`, the catalog's universal join key, naming the consequence: the output cannot be joined against the rest of the catalog. Two cases, both previously silent — the target resolution is coarser than h8 (`detect_optimal_h3_resolution` targets ~3x the source pixel edge, which agrees with the catalog at fine pixels but lands on h6 for a ~1 km global raster, so a caller who omitted `--h3-resolution` got a non-joinable dataset with only an informational log line), or the target is finer than h8 and h8 is not among `--parent-resolutions`, whose raster default is `0` alone. Resolution detection itself is unchanged (#182)
+- Stale default Armada queue in `convert_workflow_to_armada` (`biodiversity` → `geo-workflows`); the workflow generators pass the namespace explicitly, so this affects direct API callers (#183)
+
 ## [0.3.1] - 2026-07-21
 
 ### Fixed

@@ -75,16 +75,41 @@ print(f"Recommended H3 resolution: {h3_res}")
 
 ### Resolution Mapping
 
-| Pixel Size | Recommended H3 | Use Case |
-|------------|---------------|----------|
-| 0.5-2m | h14-h15 | High-res imagery |
-| 7-25m | h12-h13 | Sentinel/aerial |
-| 30-300m | h9-h10 | Landsat/regional |
-| 1-12km | h7-h9 | Climate/global |
+Detection targets an H3 edge length of ~3x the source pixel width (about 9 source pixels per
+cell):
+
+| Pixel Size | Detected H3 | Use Case |
+|------------|-------------|----------|
+| 0.5-2m | h13-h14 | High-res imagery |
+| 7-25m | h10-h11 | Sentinel/aerial |
+| 30-300m | h7-h10 | Landsat/regional |
+| 1-12km | h4-h6 | Climate/global |
 
 The processor provides helpful feedback when you choose a resolution different from the detected one:
 - **Finer resolution**: "Using h12 instead of detected h10 - will create more cells"
 - **Coarser resolution**: "Using h8 instead of detected h10 - will aggregate more pixels"
+
+### h8 is the catalog join key
+
+The `3x edge` target agrees with the catalog convention (roughly one cell per pixel) at fine
+pixels and diverges as pixels coarsen — a ~1 km global raster detects **h6**, two levels below
+h8. **A dataset whose finest resolution is coarser than h8 carries no `h8` column at all**, so it
+cannot be joined against the rest of the catalog on the universal join key.
+
+A finer target only carries h8 if h8 is among the parent resolutions, and the raster default is
+`--parent-resolutions 0` — so an h10 build emits h10 and h0, and nothing to join on either.
+
+`raster` warns in both cases, naming the consequence and the flag that fixes it. Pass
+`--h3-resolution 8` for a coarse global product, or add `8` to `--parent-resolutions` for a finer
+one, whenever a joinable output matters (issue #182):
+
+```bash
+cng-datasets raster --input chelsa-bio1.tif ... \
+    --h3-resolution 8 --parent-resolutions "7,6,0"
+
+cng-datasets raster --input nlcd-2021.tif ... \
+    --resolution 10 --parent-resolutions "9,8,0"
+```
 
 ## Parameters
 
