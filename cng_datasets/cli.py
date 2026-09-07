@@ -165,6 +165,11 @@ def main():
                                              "for peak/extremum (species richness). Default: mean.")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
+    raster_workflow_parser.add_argument("--h0-subset", type=str, default=None, metavar="CELLS",
+                                        help="Comma-separated h0 base cells the source overlaps, e.g. "
+                                             "'12,14,20,50,71,78' for CONUS. The hex job runs one completion "
+                                             "per listed cell instead of all 122, so pods that could only find "
+                                             "no overlap are never started. Omit for a global source.")
     raster_workflow_parser.add_argument("--hex-storage", type=str, default="20Gi", help="Ephemeral storage request/limit per hex job pod (default: 20Gi)")
     raster_workflow_parser.add_argument("--cog-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for COG preprocess job pod (default: 50Gi)")
     raster_workflow_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in EPSG:4326 (multi-tile only)")
@@ -413,6 +418,9 @@ def _dispatch(args):
         if getattr(args, 'target_extent', None):
             parts = [float(x) for x in args.target_extent.split(',')]
             target_extent = tuple(parts)
+        h0_subset = None
+        if getattr(args, 'h0_subset', None):
+            h0_subset = [int(x.strip()) for x in args.h0_subset.split(',') if x.strip()]
         generate_raster_workflow(
             dataset_name=args.dataset,
             source_urls=args.source_urls,
@@ -426,6 +434,7 @@ def _dispatch(args):
             hex_resampling=args.hex_resampling,
             hex_memory=args.hex_memory,
             max_parallelism=args.max_parallelism,
+            h0_subset=h0_subset,
             hex_storage=args.hex_storage,
             cog_storage=args.cog_storage,
             target_extent=target_extent,

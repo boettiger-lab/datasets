@@ -181,6 +181,43 @@ This enables:
 - Parallel processing via Kubernetes
 - Independent failure handling per region
 
+### Regional rasters: restrict the fan-out with `--h0-subset`
+
+A generated hex job runs one completion per h0 base cell, 122 in all. A regional source
+overlaps only a few of them, and every other pod localizes the whole COG, finds no overlap
+and exits — CONUS occupies **6** of the 122 cells, so 116 pods (95%) start only to do
+nothing, each first pulling a multi-GB COG.
+
+Pass the cells the source covers:
+
+```bash
+cng-datasets raster-workflow \
+  --dataset landfire-2024-cbd \
+  --source-url s3://public-landfire/landfire-2024-cbd/landfire-2024-cbd-cog.tif \
+  --bucket public-landfire --namespace geo-workflows \
+  --h3-resolution 10 --parent-resolutions "9,8,0" --value-column cbd \
+  --h0-subset "12,14,20,50,71,78"        # CONUS
+```
+
+The hex job then carries `completions: 6`, and the completion index selects from the list:
+
+```yaml
+completions: 6
+...
+H0S=(12 14 20 50 71 78)
+H0=${H0S[$JOB_COMPLETION_INDEX]}
+cng-datasets raster ... --h0-index ${H0} ...
+```
+
+The list is sorted and de-duplicated, so a completion index maps to the same cell across
+regenerations. Cells outside 0-121 are rejected, and a subset naming all 122 is the default
+fan-out. Omit the flag for a global source.
+
+To find the cells for a bounding box, intersect it with the h0 grid
+(`s3://public-grids/hex/h0-valid.parquet`). Inferring the set from the source footprint at
+generation time is [issue #191](https://github.com/boettiger-lab/datasets/issues/191)'s
+option 2 and is not implemented — the subset is explicit.
+
 ## Kubernetes Processing
 
 Process global rasters in parallel using Kubernetes:
