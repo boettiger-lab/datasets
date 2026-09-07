@@ -18,7 +18,7 @@ import os
 import shutil
 import subprocess
 import zipfile
-from typing import Optional, Tuple, List, Union
+from typing import NamedTuple, Optional, Tuple, List, Union
 import duckdb
 import geopandas as gpd
 from urllib.request import urlretrieve
@@ -413,14 +413,42 @@ def find_vector_sources(directory: str) -> List[str]:
     return sorted(shapefiles) or sorted(gdbs) or sorted(others)
 
 
-def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = False) -> Optional[str]:
+class DetectedCRS(NamedTuple):
+    """
+    Outcome of CRS detection, kept distinct so the caller can tell apart the
+    three ways a source can lack an EPSG code (issue #187).
+
+    Attributes:
+        crs: What to hand ST_Transform — an authority string ("EPSG:4326") or,
+            when the CRS carries no authority code, its full WKT definition.
+            None only when there is no CRS to reproject from.
+        kind: "code" (authority code), "definition" (WKT, no code available),
+            "absent" (the dataset declares no CRS) or "undetectable"
+            (detection itself failed).
+        detail: The CRS name for "definition", the error for "undetectable".
+    """
+    crs: Optional[str]
+    kind: str
+    detail: str = ""
+
+
+def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = False) -> DetectedCRS:
     """
     Detect the CRS of a vector dataset using geopandas.
+
+    A CRS with no EPSG code and no authority string is reported as a
+    "definition" carrying its WKT rather than as no CRS at all. ST_Transform
+    accepts WKT, so the reprojection path works unchanged — whereas returning
+    None made the caller skip reprojection and tag projected metres as lon/lat
+    (issue #187). Every MODIS-derived product ships such a CRS.
 
     Args:
         source_input: Source dataset URL or path
         layer: Layer name
         verbose: Print debug information
+
+    Returns:
+        DetectedCRS — see that class for how to read `kind`.
     """
     try:
         # Read just the first row to get CRS info quickly
@@ -436,25 +464,27 @@ def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = F
         if gdf.crs is None:
             if verbose:
                 print("Warning: No CRS found in dataset")
-            return None
+            return DetectedCRS(None, "absent")
 
         # Try to get EPSG code
         if gdf.crs.to_epsg():
-            return f"EPSG:{gdf.crs.to_epsg()}"
+            return DetectedCRS(f"EPSG:{gdf.crs.to_epsg()}", "code")
 
         # Fallback to authority string if available
         if gdf.crs.to_authority():
             auth, code = gdf.crs.to_authority()
-            return f"{auth}:{code}"
+            return DetectedCRS(f"{auth}:{code}", "code")
 
+        # No code anywhere, but the CRS itself is fully specified — pass the
+        # definition through instead of discarding it.
         if verbose:
-            print(f"Warning: Could not determine EPSG code, CRS is: {gdf.crs}")
-        return None
+            print(f"Note: CRS has no authority code, using its WKT definition: {gdf.crs}")
+        return DetectedCRS(gdf.crs.to_wkt(), "definition", gdf.crs.name or "unnamed")
 
     except Exception as e:
         if verbose:
             print(f"Warning: CRS detection failed: {e}")
-        return None
+        return DetectedCRS(None, "undetectable", str(e))
 
 
 _GEOM_COLUMN_NAMES = {'geom', 'geometry', 'shape', 'wkb_geometry'}
@@ -669,6 +699,12 @@ def trim_replace_clause(string_columns: Optional[List[str]],
     return f" REPLACE ({replacements})"
 
 
+def _sql_string(value: str) -> str:
+    """Quote a value as a SQL string literal, doubling any embedded quote."""
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
+
 def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str],
                                target_crs: str, geom_col: str = "geom", layer: Optional[str] = None,
                                verbose: bool = False, geom_is_blob: bool = False,
@@ -679,7 +715,8 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
 
     Args:
         source_inputs: Source dataset URL or list of file paths
-        source_crs: Source CRS (None = no reprojection needed)
+        source_crs: Source CRS — an authority string ("EPSG:3857") or a full WKT
+            definition for a CRS with no authority code (None = no reprojection needed)
         target_crs: Target CRS
         geom_col: Geometry column name
         layer: Layer name
@@ -715,7 +752,14 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         # axis-order edge cases — geographic CRSs that are longitude-first (OGC:CRS84)
         # and geographic compound/3D CRSs with codes >= 5000 (EPSG:5498
         # "NAD83 + NAVD88 height", EPSG:4979) — swapping lat/lon for them (see #128).
-        geom_inner = f"ST_Transform({raw_geom}, '{source_crs}', '{target_crs}', always_xy := true)"
+        # The source CRS may now be a full WKT definition rather than a short
+        # "EPSG:4326" token (issue #187), and a definition can carry a quote in
+        # a datum or projection name, so both operands are escaped before they
+        # reach the query.
+        geom_inner = (
+            f"ST_Transform({raw_geom}, {_sql_string(source_crs)}, "
+            f"{_sql_string(target_crs)}, always_xy := true)"
+        )
     else:
         # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
         geom_inner = raw_geom
@@ -1268,7 +1312,11 @@ def convert_to_parquet(
         id_column: Specific ID column to use (auto-detected if not specified)
         force_id: Create _cng_fid if no suitable ID column exists
         progress: Show progress during conversion
-        target_crs: Target CRS for output (default: EPSG:4326)
+        target_crs: Target CRS for output (default: EPSG:4326). The source is
+            reprojected whenever its own CRS differs, including when that CRS
+            carries no EPSG or authority code and is only available as a WKT
+            definition (issue #187). A source that declares no CRS at all is
+            assumed to be in target_crs already and written unchanged.
         layer: Layer name for multi-layer datasets (e.g., GDB)
         verbose: Print detailed debug information
         simplify_tolerance: Optional geometry simplification tolerance in
@@ -1419,7 +1467,8 @@ def convert_to_parquet(
 
         # Step 1: Detect source CRS and geometry column
         print("  Detecting source CRS...")
-        source_crs = detect_crs(representative_source, layer=layer, verbose=verbose)
+        detected = detect_crs(representative_source, layer=layer, verbose=verbose)
+        source_crs = detected.crs
 
         print("  Detecting geometry column...")
         geom_col, geom_is_blob = get_geometry_column(representative_source, layer=layer, verbose=verbose)
@@ -1429,13 +1478,28 @@ def convert_to_parquet(
         needs_reprojection = False
         if source_crs:
             if source_crs != target_crs:
-                print(f"  Source CRS: {source_crs} -> Reprojecting to {target_crs}")
+                if detected.kind == "definition":
+                    # The WKT itself is long and unreadable in a log line; name
+                    # the CRS and say where the definition came from instead.
+                    print(f"  Source CRS: {detected.detail} (no EPSG or authority code — "
+                          f"reprojecting from its full definition)")
+                    print(f"  -> Reprojecting to {target_crs}")
+                else:
+                    print(f"  Source CRS: {source_crs} -> Reprojecting to {target_crs}")
                 needs_reprojection = True
             else:
                 print(f"  Source already in {target_crs}")
+        elif detected.kind == "undetectable":
+            # Not the same as a dataset that declares no CRS: something went
+            # wrong reading this one, so the assumption below is a guess made on
+            # no evidence. Say so at normal verbosity — the output is tagged
+            # {target_crs} either way, and nothing downstream can tell.
+            print(f"  ⚠ Could not read the source CRS: {detected.detail}")
+            print(f"  Assuming the data is already in {target_crs} and writing it unchanged.")
+            print(f"  If it is not, the output will carry {target_crs} metadata over coordinates")
+            print("  in some other system. Reproject first (ogr2ogr -t_srs) if unsure.")
         else:
-            print(f"  Warning: Could not detect source CRS, assuming {target_crs}")
-            source_crs = None
+            print(f"  Warning: dataset declares no CRS, assuming {target_crs}")
 
         # Step 1b: Linearize curved geometries if needed (e.g., MULTISURFACE -> MULTIPOLYGON)
         linearized_source, effective_layer, linearize_dir = _linearize_source(
