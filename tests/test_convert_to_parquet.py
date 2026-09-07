@@ -21,6 +21,7 @@ from cng_datasets.vector.convert_to_parquet import (
     string_columns_from_describe,
     trim_replace_clause,
     get_string_columns,
+    detect_crs,
 )
 
 
@@ -1821,3 +1822,103 @@ class TestDownloadAndExtractS3Rewrite:
 
             with patch("cng_datasets.vector.convert_to_parquet.urlretrieve", fake_retrieve):
                 download_and_extract("s3://nrp-nautilus.io/some/path.zip", d)
+
+
+# MODIS sinusoidal, exactly as products like FIRED ship it: a complete
+# projection definition with no EPSG code and no authority string.
+SINUSOIDAL_WKT = (
+    'PROJCS["unknown",GEOGCS["unknown",DATUM["unknown",'
+    'SPHEROID["unknown",6371007.181,0]],PRIMEM["Greenwich",0],'
+    'UNIT["degree",0.0174532925199433]],PROJECTION["Sinusoidal"],'
+    'PARAMETER["longitude_of_center",0],PARAMETER["false_easting",0],'
+    'PARAMETER["false_northing",0],UNIT["metre",1]]'
+)
+
+
+def _write_gpkg(path, crs):
+    """One square polygon in `crs`, at roughly -105.0 lon / 40.0 lat."""
+    import geopandas as gpd
+    import shapely.geometry as g
+    box = g.box(-8_960_000, 4_440_000, -8_959_000, 4_441_000)
+    gpd.GeoDataFrame({"id": [1]}, geometry=[box], crs=crs).to_file(path, driver="GPKG")
+    return str(path)
+
+
+class TestCrsWithoutAuthorityCode:
+    """
+    A source CRS with no EPSG/authority code must still drive reprojection
+    (issue #187).
+
+    detect_crs() used to return None for it, and build_read_reproject_query()
+    reads None as "no reprojection needed" — so the geometries were written
+    unchanged while the GeoParquet claimed lon/lat. Exit code 0, one Warning
+    line, projected metres presented as degrees.
+    """
+
+    @pytest.mark.timeout(20)
+    def test_detect_reports_a_definition_not_nothing(self, tmp_path):
+        source = _write_gpkg(tmp_path / "sinu.gpkg", SINUSOIDAL_WKT)
+        detected = detect_crs(source)
+        assert detected.kind == "definition"
+        assert detected.crs is not None
+        assert "Sinusoidal" in detected.crs
+
+    @pytest.mark.timeout(20)
+    def test_detect_still_prefers_an_epsg_code(self, tmp_path):
+        source = _write_gpkg(tmp_path / "epsg.gpkg", "EPSG:3310")
+        detected = detect_crs(source)
+        assert detected == ("EPSG:3310", "code", "")
+
+    @pytest.mark.timeout(20)
+    def test_absent_crs_is_distinct_from_undetectable(self, tmp_path):
+        """Assuming the target CRS is defensible for one and a guess for the other."""
+        source = _write_gpkg(tmp_path / "nocrs.gpkg", None)
+        assert detect_crs(source).kind == "absent"
+
+        missing = detect_crs(str(tmp_path / "does-not-exist.gpkg"))
+        assert missing.kind == "undetectable"
+        assert missing.crs is None
+        assert missing.detail  # carries the reason
+
+    @pytest.mark.timeout(10)
+    def test_query_reprojects_from_a_wkt_definition(self):
+        query = build_read_reproject_query(
+            "dummy.gpkg", source_crs=SINUSOIDAL_WKT,
+            target_crs="EPSG:4326", geom_col="geom",
+        )
+        assert "ST_Transform" in query
+        assert "Sinusoidal" in query
+        assert "always_xy := true" in query
+
+    @pytest.mark.timeout(10)
+    def test_quote_in_a_crs_definition_does_not_break_the_query(self):
+        """A definition is interpolated into SQL; a name may contain a quote."""
+        quoted = 'PROJCS["Côte d\'Ivoire",UNIT["metre",1]]'
+        query = build_read_reproject_query(
+            "dummy.gpkg", source_crs=quoted,
+            target_crs="EPSG:4326", geom_col="geom",
+        )
+        assert "d''Ivoire" in query
+        # The escaped literal must leave the statement parseable.
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        with pytest.raises(duckdb.Error) as exc:
+            con.execute(query)
+        # It fails on the missing file, not on a syntax error from the quote.
+        assert "syntax" not in str(exc.value).lower()
+
+    @pytest.mark.timeout(60)
+    def test_end_to_end_output_is_lon_lat_not_metres(self, tmp_path):
+        """The regression: coordinates must be degrees, not sinusoidal metres."""
+        source = _write_gpkg(tmp_path / "sinu.gpkg", SINUSOIDAL_WKT)
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(source, out, target_crs="EPSG:4326")
+
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        x, y = con.execute(
+            f"SELECT ST_X(ST_Centroid(geom)), ST_Y(ST_Centroid(geom)) "
+            f"FROM read_parquet('{out}')"
+        ).fetchone()
+        assert -106 < x < -104, f"longitude {x} is not degrees"
+        assert 39 < y < 41, f"latitude {y} is not degrees"
