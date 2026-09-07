@@ -106,14 +106,70 @@ def _explode_fractions(df):
     )
 
 
+# One DuckDB connection per worker process, reused across chunks. Creating it
+# per chunk would repeat an extension load thousands of times over a large h0
+# (282M cells / CNG_HEX_CHUNK_SIZE); ProcessPoolExecutor reuses its processes,
+# so this is created at most once per worker.
+_BOUNDARY_CON = None
+
+
+def _boundary_wkt_for(h3_ids):
+    """
+    Map H3 cell ids to their boundary WKT, in the caller's order.
+
+    The parent used to fetch these alongside the ids and ship both to the
+    worker, which made the boundary strings ~96% of a cell list materialised
+    in full before any work starts — the dominant term in the parent's peak
+    RSS (issue #173). A boundary is a pure function of the cell id, so each
+    worker derives its own chunk's and the parent carries 8 bytes per cell
+    instead of ~183.
+
+    Uses the same `h3_cell_to_boundary_wkt` as before, so the WKT — and every
+    geometry and value downstream of it — is byte-for-byte what it was.
+    """
+    global _BOUNDARY_CON
+    if _BOUNDARY_CON is None:
+        con = duckdb.connect(':memory:')
+        try:
+            con.execute("LOAD h3")
+        except duckdb.Error:
+            con.execute("INSTALL h3 FROM community")
+            con.execute("LOAD h3")
+        _BOUNDARY_CON = con
+
+    ids = [int(h) for h in h3_ids]
+    rows = _BOUNDARY_CON.execute(
+        "SELECT cell, h3_cell_to_boundary_wkt(cell) "
+        "FROM (SELECT UNNEST(?::UBIGINT[]) AS cell)",
+        [ids],
+    ).fetchall()
+    # Paired by id rather than by position, so the result cannot depend on the
+    # engine returning rows in argument order.
+    wkt_by_id = dict(rows)
+    return [(h, wkt_by_id[h]) for h in ids]
+
+
 def _exact_extract_chunk(args):
     """Worker for chunked-parallel exact_extract over one slice of cells.
 
-    Top-level so it pickles cleanly across processes. Each worker reopens
-    the raster itself (each process has its own /vsicurl/ handle and
-    pixel cache), receives a primitive list of (h3_id, boundary_wkt) pairs,
-    and returns a pandas DataFrame with the op output plus the cell id
-    column as a string (the caller casts back to uint64).
+    Top-level so it pickles cleanly across processes. Receives a primitive
+    array of h3 cell ids — 8 bytes each, no boundary strings, which is what
+    keeps the parent's memory off the cell count (issue #173) — derives the
+    boundaries for its own chunk, and delegates to `_exact_extract_cells`.
+    """
+    raster_path, op_name, chunk_ids = args
+    if len(chunk_ids) == 0:
+        return None
+    return _exact_extract_cells(raster_path, op_name, _boundary_wkt_for(chunk_ids))
+
+
+def _exact_extract_cells(raster_path, op_name, chunk_cells):
+    """Run exact_extract over (h3_id, boundary_wkt) pairs.
+
+    Each worker reopens the raster itself (each process has its own
+    /vsicurl/ handle and pixel cache) and returns a pandas DataFrame with the
+    op output plus the cell id column as a string (the caller casts back to
+    uint64).
 
     For the "fractions" reducer (#142) the worker requests exactextract's
     ["unique", "frac"] ops and returns the LONG (_h3_str, value, frac) shape;
@@ -130,7 +186,6 @@ def _exact_extract_chunk(args):
     from shapely import wkt as shapely_wkt
     from exactextract import exact_extract
 
-    raster_path, op_name, chunk_cells = args
     if not chunk_cells:
         return None
 
@@ -1391,8 +1446,17 @@ class RasterProcessor:
         return output_path
 
     def _native_cells_for_h0(self, h0_cell: int):
-        """Return the native-resolution H3 cells of one h0 partition, with each
-        cell's boundary WKT, as a DataFrame (columns: h{res}, boundary_wkt).
+        """Return the native-resolution H3 cell ids of one h0 partition as a
+        uint64 numpy array.
+
+        Ids only: the boundary WKT each worker needs is derived from the id
+        inside the worker (`_boundary_wkt_for`). Fetching boundaries here made
+        them ~96% of a list that is materialised in full before any work
+        starts, which was the dominant term in this process's peak RSS —
+        183 bytes per cell against 8 for the id alone, and ~485 vs ~121 bytes
+        of peak RSS per cell once DuckDB's own materialisation is counted
+        (issue #173). A numpy array is also what keeps the chunking below from
+        building one Python object per cell.
 
         Cells come from h3_cell_to_children(h0, res) — the exact H3 hierarchy
         traversal. Every native cell has exactly one res-0 parent, so the 122
@@ -1407,17 +1471,22 @@ class RasterProcessor:
         tens-of-millions at h11; the caller chunks it across worker processes.
         """
         h3_col = f"h{self.h3_resolution}"
-        return self.con.execute(f"""
+        import numpy as np
+
+        cells = self.con.execute(f"""
             WITH native_cells AS (
                 SELECT UNNEST(
                     h3_cell_to_children({h0_cell}, {self.h3_resolution})
                 ) AS cell
             )
-            SELECT
-                cell AS {h3_col},
-                h3_cell_to_boundary_wkt(cell) AS boundary_wkt
+            SELECT cell AS {h3_col}
             FROM native_cells
-        """).fetchdf()
+        """).fetchnumpy()[h3_col]
+        # fetchnumpy hands UBIGINT back as int64. Bit 63 of an H3 index is
+        # reserved and always 0, so every cell id fits in an int64 and the two
+        # views share a bit pattern — .view() relabels in place rather than
+        # copying an array that is 2.3 GB at res 10.
+        return cells.view(np.uint64)
 
     def _h0_overlaps_raster(self, h0_geom_wkt: str) -> bool:
         """Whether the source raster's extent overlaps an h0 cell's true
@@ -1508,9 +1577,9 @@ class RasterProcessor:
         import pandas as pd
 
         h3_col = f"h{self.h3_resolution}"
-        cells_df = self._native_cells_for_h0(h0_cell)
+        cells_arr = self._native_cells_for_h0(h0_cell)
 
-        if len(cells_df) == 0:
+        if len(cells_arr) == 0:
             print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells")
             return None
 
@@ -1566,13 +1635,14 @@ class RasterProcessor:
             n_workers = int(os.environ.get("CNG_HEX_WORKERS", str(_cgroup_cpu_count())))
             n_workers = max(1, n_workers)
 
-            # Build chunks as plain Python lists of (h3_id, wkt) pairs.
-            # uint64 + string pickles fast and small; shapely geometries
-            # do not (deserialize is slow), so reconstruct inside workers.
-            cells = list(zip(cells_df[h3_col].tolist(),
-                              cells_df["boundary_wkt"].tolist()))
-            chunks = [cells[i:i + chunk_size] for i in range(0, len(cells), chunk_size)]
-            del cells, cells_df
+            # Chunks are views into the uint64 id array, so nothing here is
+            # proportional to the cell count beyond the array itself: no
+            # per-cell Python objects, no boundary strings. Each worker turns
+            # its own chunk of ids into (id, wkt) pairs and reconstructs the
+            # geometries — shapely objects still must not cross the process
+            # boundary, since deserializing them is slow (issue #173).
+            chunks = [cells_arr[i:i + chunk_size]
+                      for i in range(0, len(cells_arr), chunk_size)]
 
             args_iter = [(rast_arg, self.hex_resampling, c) for c in chunks]
             print(
