@@ -115,7 +115,10 @@ kubectl apply -f my-dataset/repartition-job.yaml
 --namespace biodiversity  # Kubernetes namespace (must exist)
 ```
 
-All jobs and RBAC use the specified namespace.
+All jobs and RBAC use the specified namespace. Every generated manifest carries
+`metadata.namespace`, including the per-step Job manifests, so applying one on its own
+(`kubectl apply -f <dataset>-hex.yaml`) targets the workflow's namespace rather than
+whatever `kubectl` currently defaults to.
 
 ### Cluster and Storage Configuration
 
@@ -383,7 +386,7 @@ Monitor progress at https://armada-lookout.nrp-nautilus.io
 ### How It Works
 
 - **Single-pod steps** (setup-bucket, convert, pmtiles, repartition) become one Armada job each
-- **Indexed parallel steps** (hex) are expanded into N individual Armada jobs (one per chunk), each with the chunk index baked into the command. For vector workflows this is up to 200+ jobs; for raster workflows, 122 (one per H3 h0 region)
+- **Indexed parallel steps** (hex) are expanded into N individual Armada jobs (one per chunk), each with the chunk index baked into the command. For vector workflows this is up to 200+ jobs; for raster workflows, one per H3 h0 region the build covers — 122 by default, or the length of `--h0-subset`
 - Converted jobs run at the **non-preemptible `armada-default`** priority class (see below)
 - All existing k8s Job YAMLs are still generated alongside the Armada files, so you can switch between backends without regenerating
 

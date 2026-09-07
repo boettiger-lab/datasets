@@ -211,3 +211,48 @@ class TestCLIValidation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestH0SubsetFlag:
+    """--h0-subset must actually reach the generator (issue #191)."""
+
+    @pytest.mark.timeout(10)
+    def test_flag_parses_to_a_cell_list(self, tmp_path):
+        captured = {}
+
+        def fake_generate(**kwargs):
+            captured.update(kwargs)
+
+        test_args = [
+            "cng-datasets", "raster-workflow",
+            "--dataset", "cli-h0",
+            "--source-url", "https://example.com/x-cog.tif",
+            "--bucket", "test-bucket",
+            "--h0-subset", "12,14, 20 ,50,71,78",
+            "--output-dir", str(tmp_path),
+        ]
+        with patch("cng_datasets.k8s.generate_raster_workflow", fake_generate):
+            with patch.object(sys, 'argv', test_args):
+                main()
+
+        assert captured["h0_subset"] == [12, 14, 20, 50, 71, 78]
+
+    @pytest.mark.timeout(10)
+    def test_omitting_the_flag_passes_none(self, tmp_path):
+        captured = {}
+
+        def fake_generate(**kwargs):
+            captured.update(kwargs)
+
+        test_args = [
+            "cng-datasets", "raster-workflow",
+            "--dataset", "cli-h0",
+            "--source-url", "https://example.com/x-cog.tif",
+            "--bucket", "test-bucket",
+            "--output-dir", str(tmp_path),
+        ]
+        with patch("cng_datasets.k8s.generate_raster_workflow", fake_generate):
+            with patch.object(sys, 'argv', test_args):
+                main()
+
+        assert captured["h0_subset"] is None

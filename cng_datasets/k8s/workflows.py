@@ -212,6 +212,57 @@ def _apply_scheduling(pod_spec: Dict[str, Any], config: ClusterConfig) -> None:
         pod_spec["affinity"] = affinity
 
 
+def _job_metadata(manager, job_name: str) -> Dict[str, Any]:
+    """
+    Build a Job's ``metadata`` block, stamped with the workflow's namespace.
+
+    Every step manifest is meant to be applicable on its own — the docs sanction
+    `kubectl apply -f <dataset>-hex.yaml` for step-by-step control, and the
+    orchestrator itself passes `-n <namespace>`. Without
+    ``metadata.namespace`` a direct apply silently targets whatever namespace
+    kubectl defaults to, which on a least-privilege cluster fails with an RBAC
+    error naming "default" rather than the missing field (issue #190).
+
+    ``generate_sync_job`` already stamps it; this is the same block for the
+    generators, which built their metadata inline and left it out.
+    """
+    return {
+        "name": job_name,
+        "namespace": manager.namespace,
+        "labels": {"k8s-app": job_name},
+    }
+
+
+def _normalize_h0_subset(h0_subset: Optional[List[int]]) -> Optional[List[int]]:
+    """
+    Validate and canonicalize an ``--h0-subset``, or return None when unset.
+
+    Sorted and de-duplicated so the emitted ``H0S`` array is deterministic and
+    the completion index maps to a stable h0 across regenerations. A subset
+    covering all 122 base cells is the default fan-out, so it collapses to None
+    rather than emitting a redundant index mapping (issue #191).
+    """
+    if h0_subset is None:
+        return None
+
+    cells = sorted({int(h) for h in h0_subset})
+    if not cells:
+        raise ValueError(
+            "h0_subset was given but empty. Omit it to fan out over all 122 h0 "
+            "base cells, or pass the cells the source overlaps, e.g. "
+            "--h0-subset \"12,14,20,50,71,78\"."
+        )
+    out_of_range = [h for h in cells if not 0 <= h <= 121]
+    if out_of_range:
+        raise ValueError(
+            f"h0_subset contains invalid h0 index/indices {out_of_range}. "
+            "There are 122 H3 base cells, so each must be in 0-121."
+        )
+    if len(cells) == 122:
+        return None
+    return cells
+
+
 def _validate_k8s_name(k8s_name: str, original: str) -> None:
     """Raise ValueError if k8s_name is not a valid Kubernetes resource name."""
     pattern = re.compile(r'^[a-z0-9][a-z0-9\-]*[a-z0-9]$')
@@ -721,6 +772,7 @@ def generate_raster_workflow(
     hex_resampling: str = "mean",
     hex_memory: str = "32Gi",
     max_parallelism: int = 61,
+    h0_subset: Optional[List[int]] = None,
     hex_storage: str = "20Gi",
     cog_storage: str = "50Gi",
     target_extent: Optional[tuple] = None,
@@ -778,6 +830,10 @@ def generate_raster_workflow(
             rows (value, frac) per cell so areas are exact, not mode-biased (#142).
         hex_memory: Memory per hex pod (default: "32Gi")
         max_parallelism: Max parallel hex pods (default: 61)
+        h0_subset: The h0 base cells the source actually overlaps, e.g.
+            [12, 14, 20, 50, 71, 78] for CONUS. The hex job then runs one
+            completion per listed cell instead of all 122, and the completion
+            index selects from the list. Omit for a global source (issue #191).
         target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step
         target_resolution: Output pixel size in degrees for mosaic step
         band: Extract single band from multi-band sources (1-indexed) for mosaic step
@@ -816,6 +872,8 @@ def generate_raster_workflow(
     if parent_resolutions is None:
         parent_resolutions = [0]
 
+    h0_subset = _normalize_h0_subset(h0_subset)
+
     # Decide whether a preprocess-cog step is needed
     needs_preprocess = len(source_urls) > 1 or target_extent is not None or band is not None
 
@@ -829,7 +887,7 @@ def generate_raster_workflow(
             needs_preprocess = True
 
     if needs_preprocess:
-        cog_key = output_cog_name or f"{k8s_name}-cog.tif"
+        cog_key = output_cog_name or f"{dataset_name}-cog.tif"
         cog_s3_url = f"s3://{bucket}/{cog_key}"
         hex_input_url = cog_s3_url
     else:
@@ -865,6 +923,7 @@ def generate_raster_workflow(
         h3_resolution, parent_resolutions, value_column, hex_nodata,
         hex_memory, max_parallelism, hex_storage=hex_storage,
         hex_resampling=hex_resampling, config=config,
+        s3_dataset=dataset_name, h0_subset=h0_subset,
     )
 
     # Generate workflow RBAC
@@ -908,6 +967,12 @@ def generate_raster_workflow(
         print("\nMonitor at: https://armada-lookout.nrp-nautilus.io")
     else:
         print(f"\n✓ Generated raster workflow for {dataset_name}")
+        if h0_subset:
+            print(f"  Hex completions: {len(h0_subset)} "
+                  f"(h0 {', '.join(str(h) for h in h0_subset)})")
+        else:
+            print("  Hex completions: 122 (every h0 base cell) — pass "
+                  "--h0-subset to skip the ones the source does not cover")
         print(f"\nFiles created in {output_dir}:")
         print(f"  - {k8s_name}-setup-bucket.yaml")
         if needs_preprocess:
@@ -994,10 +1059,7 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": f"{dataset_name}-preprocess-cog",
-            "labels": {"k8s-app": f"{dataset_name}-preprocess-cog"},
-        },
+        "metadata": _job_metadata(manager, f"{dataset_name}-preprocess-cog"),
         "spec": {
             "completions": 1,
             "parallelism": 1,
@@ -1017,14 +1079,47 @@ def _generate_raster_hex_job(
     h3_resolution, parent_resolutions, value_column, nodata_value,
     hex_memory, max_parallelism, hex_storage="20Gi",
     hex_resampling: str = "mean", config: ClusterConfig = None,
+    s3_dataset=None, h0_subset: Optional[List[int]] = None,
 ):
     """Generate raster H3 hex tiling job."""
     if config is None:
         config = ClusterConfig()
+    # dataset_name is the k8s name, with '/' flattened to '-' so it is a legal
+    # object name. S3 paths want the original hierarchical name, as the vector
+    # generators already do for their own jobs (issue #189).
+    s3_dataset = s3_dataset or dataset_name
     parent_res_str = ','.join(map(str, parent_resolutions))
 
+    # One completion per h0 cell the build actually needs. Without a subset
+    # every raster fans out over all 122 base cells, so a regional source
+    # starts a large majority of pods that localize the whole COG, find no
+    # overlap with their h0 and exit (issue #191).
+    h0_index = "${JOB_COMPLETION_INDEX}"
+    h0_preamble = ""
+    if h0_subset:
+        h0_index = "${H0}"
+        # The guard matters because the lookup is indirect: an unset index
+        # would read as 0 and an index past the end would expand to nothing,
+        # either way processing the wrong cell (or none) and still exiting 0.
+        # It also catches the manifest being hand-edited to more completions
+        # than the list has cells. Written with the plain ${JOB_COMPLETION_INDEX}
+        # form so it stays valid bash after the Armada converter rewrites that
+        # to a literal index.
+        h0_preamble = (
+            "# Only the h0 base cells this source overlaps (--h0-subset); the\n"
+            "# completion index selects one of them.\n"
+            f"H0S=({' '.join(str(h) for h in h0_subset)})\n"
+            "H0=${H0S[$JOB_COMPLETION_INDEX]}\n"
+            'if [ -z "${JOB_COMPLETION_INDEX}" ] || [ -z "$H0" ]; then\n'
+            '  echo "No h0 cell for completion index '
+            "'${JOB_COMPLETION_INDEX}' in (${H0S[*]}) — completions must match "
+            'the --h0-subset length" >&2\n'
+            "  exit 1\n"
+            "fi\n\n"
+        )
+
     # Build command
-    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{dataset_name}/hex/ --h0-index ${{JOB_COMPLETION_INDEX}} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
+    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{s3_dataset}/hex/ --h0-index {h0_index} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
     nodata_cli = _nodata_cli_value(nodata_value)
     if nodata_cli is not None:
         cng_cmd += f' --nodata "{nodata_cli}"'
@@ -1035,7 +1130,7 @@ def _generate_raster_hex_job(
     # stale PROJ_DATA — see issue #91.
     command_str = f"""set -e
 
-{cng_cmd}"""
+{h0_preamble}{cng_cmd}"""
 
     pod_spec = {
         "restartPolicy": "Never",
@@ -1065,13 +1160,12 @@ def _generate_raster_hex_job(
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": f"{dataset_name}-hex",
-            "labels": {"k8s-app": f"{dataset_name}-hex"}
-        },
+        "metadata": _job_metadata(manager, f"{dataset_name}-hex"),
         "spec": {
-            "completions": 122,  # Always 122 h0 regions
-            "parallelism": max_parallelism,
+            "completions": len(h0_subset) if h0_subset else 122,
+            # No point starting more pods than there are completions — the
+            # extras would sit against the namespace quota with nothing to do.
+            "parallelism": min(max_parallelism, len(h0_subset)) if h0_subset else max_parallelism,
             "completionMode": "Indexed",
             "backoffLimit": 0,
             "podFailurePolicy": {
@@ -1237,10 +1331,7 @@ echo "Bucket setup complete!"
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": f"{dataset_name}-setup-bucket",
-            "labels": {"k8s-app": f"{dataset_name}-setup-bucket"}
-        },
+        "metadata": _job_metadata(manager, f"{dataset_name}-setup-bucket"),
         "spec": {
             "completions": 1,
             "parallelism": 1,
@@ -1311,10 +1402,7 @@ cng-convert-to-parquet \\
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": f"{dataset_name}-convert",
-            "labels": {"k8s-app": f"{dataset_name}-convert"}
-        },
+        "metadata": _job_metadata(manager, f"{dataset_name}-convert"),
         "spec": {
             "completions": 1,
             "parallelism": 1,
@@ -1411,10 +1499,7 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": f"{dataset_name}-pmtiles",
-            "labels": {"k8s-app": f"{dataset_name}-pmtiles"}
-        },
+        "metadata": _job_metadata(manager, f"{dataset_name}-pmtiles"),
         "spec": {
             "completions": 1,
             "parallelism": 1,
@@ -1492,10 +1577,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": f"{dataset_name}-hex",
-            "labels": {"k8s-app": f"{dataset_name}-hex"}
-        },
+        "metadata": _job_metadata(manager, f"{dataset_name}-hex"),
         "spec": {
             "completions": completions,
             "parallelism": parallelism,
@@ -1567,10 +1649,7 @@ cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": f"{dataset_name}-repartition",
-            "labels": {"k8s-app": f"{dataset_name}-repartition"}
-        },
+        "metadata": _job_metadata(manager, f"{dataset_name}-repartition"),
         "spec": {
             "completions": 1,
             "parallelism": 1,

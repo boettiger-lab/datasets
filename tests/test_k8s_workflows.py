@@ -1415,3 +1415,253 @@ class TestTrimStringsWiring:
             convert_yaml = yaml.safe_load(open(Path(tmpdir) / "notrim-ds-convert.yaml"))
             cmd = str(convert_yaml["spec"]["template"]["spec"]["containers"][0]["command"])
             assert "--trim-strings" not in cmd
+
+
+class TestStepManifestNamespace:
+    """
+    Every generated step manifest carries metadata.namespace (issue #190).
+
+    The docs sanction applying a step manifest on its own for step-by-step
+    control, and the orchestrator passes `-n <namespace>`. A manifest without
+    the field targets kubectl's default namespace instead, which fails with an
+    RBAC error naming "default" rather than the missing field — or, on a
+    permissive cluster, silently runs the job in the wrong namespace.
+    """
+
+    NAMESPACE = "geo-workflows"
+
+    def _manifest_namespaces(self, tmpdir):
+        found = {}
+        for path in sorted(Path(tmpdir).glob("*.yaml")):
+            # workflow-rbac.yaml holds several documents.
+            for doc in yaml.safe_load_all(open(path)):
+                if doc and doc.get("kind") == "Job":
+                    found[path.name] = doc["metadata"].get("namespace")
+        return found
+
+    @pytest.mark.timeout(10)
+    def test_raster_step_manifests_are_namespaced(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="ns-raster",
+                source_urls=["https://example.com/a.tif", "https://example.com/b.tif"],
+                bucket="test-bucket",
+                namespace=self.NAMESPACE,
+                output_dir=tmpdir,
+            )
+            found = self._manifest_namespaces(tmpdir)
+            expected = {
+                "ns-raster-setup-bucket.yaml",
+                "ns-raster-preprocess-cog.yaml",
+                "ns-raster-hex.yaml",
+                "workflow.yaml",   # the orchestrator, which already had it
+            }
+            assert set(found) == expected, found
+            assert all(ns == self.NAMESPACE for ns in found.values()), found
+
+    @pytest.mark.timeout(10)
+    def test_vector_step_manifests_are_namespaced(self, monkeypatch):
+        """The gap was filed against raster, but the vector jobs had it too."""
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="ns-vector",
+                source_url="https://example.com/wdpa.gdb",
+                bucket="test-bucket",
+                namespace=self.NAMESPACE,
+                output_dir=tmpdir,
+                h3_resolution=10,
+            )
+            found = self._manifest_namespaces(tmpdir)
+            expected = {
+                "ns-vector-setup-bucket.yaml",
+                "ns-vector-convert.yaml",
+                "ns-vector-pmtiles.yaml",
+                "ns-vector-hex.yaml",
+                "ns-vector-repartition.yaml",
+                "workflow.yaml",   # the orchestrator, which already had it
+            }
+            assert set(found) == expected, found
+            assert all(ns == self.NAMESPACE for ns in found.values()), found
+
+
+class TestRasterHierarchicalDatasetPaths:
+    """
+    A hierarchical --dataset keeps its shape in S3 paths (issue #189).
+
+    k8s object names must flatten 'a/b' to 'a-b', but the S3 path wants the
+    original, as the vector generator already does via s3_dataset.
+    """
+
+    DATASET = "seafloor-carbon-flux/avg"
+
+    def _hex_command(self, tmpdir):
+        job = yaml.safe_load(open(Path(tmpdir) / "seafloor-carbon-flux-avg-hex.yaml"))
+        return job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+
+    @pytest.mark.timeout(5)
+    def test_hex_output_keeps_the_dataset_prefix(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name=self.DATASET,
+                source_urls="https://example.com/x-cog.tif",
+                bucket="public-high-seas",
+                output_dir=tmpdir,
+            )
+            cmd = self._hex_command(tmpdir)
+            assert "--output-parquet s3://public-high-seas/seafloor-carbon-flux/avg/hex/" in cmd
+            assert "seafloor-carbon-flux-avg/hex/" not in cmd
+
+    @pytest.mark.timeout(5)
+    def test_k8s_object_names_still_flatten(self):
+        """The S3 fix must not leak a '/' into a Kubernetes resource name."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name=self.DATASET,
+                source_urls="https://example.com/x-cog.tif",
+                bucket="public-high-seas",
+                output_dir=tmpdir,
+            )
+            job = yaml.safe_load(open(Path(tmpdir) / "seafloor-carbon-flux-avg-hex.yaml"))
+            assert job["metadata"]["name"] == "seafloor-carbon-flux-avg-hex"
+
+    @pytest.mark.timeout(10)
+    def test_preprocess_cog_lands_beside_the_dataset(self):
+        """The COG mirrors the vector convention: '{dataset}-cog.tif'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name=self.DATASET,
+                source_urls=["https://example.com/a.tif", "https://example.com/b.tif"],
+                bucket="public-high-seas",
+                output_dir=tmpdir,
+            )
+            job = yaml.safe_load(
+                open(Path(tmpdir) / "seafloor-carbon-flux-avg-preprocess-cog.yaml")
+            )
+            cmd = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert "s3://public-high-seas/seafloor-carbon-flux/avg-cog.tif" in cmd
+
+    @pytest.mark.timeout(5)
+    def test_flat_dataset_paths_are_unchanged(self):
+        """A flat name has no hierarchy to preserve; its paths must not move."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="flat-raster",
+                source_urls="https://example.com/x-cog.tif",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            job = yaml.safe_load(open(Path(tmpdir) / "flat-raster-hex.yaml"))
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "--output-parquet s3://test-bucket/flat-raster/hex/" in cmd
+
+
+class TestH0Subset:
+    """
+    --h0-subset right-sizes the hex fan-out (issue #191).
+
+    Without it every raster starts 122 pods, one per h0 base cell, so a CONUS
+    source runs 116 pods that localize a multi-GB COG, find no overlap and exit.
+    """
+
+    CONUS = [12, 14, 20, 50, 71, 78]
+
+    def _hex_job(self, tmpdir, **kwargs):
+        generate_raster_workflow(
+            dataset_name="h0-demo",
+            source_urls="https://example.com/x-cog.tif",
+            bucket="test-bucket",
+            output_dir=tmpdir,
+            **kwargs,
+        )
+        return yaml.safe_load(open(Path(tmpdir) / "h0-demo-hex.yaml"))
+
+    @pytest.mark.timeout(5)
+    def test_default_still_covers_every_base_cell(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._hex_job(tmpdir)
+            assert job["spec"]["completions"] == 122
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "--h0-index ${JOB_COMPLETION_INDEX}" in cmd
+            assert "H0S=(" not in cmd
+
+    @pytest.mark.timeout(5)
+    def test_subset_sets_completions_and_index_mapping(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._hex_job(tmpdir, h0_subset=self.CONUS)
+            assert job["spec"]["completions"] == 6
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "H0S=(12 14 20 50 71 78)" in cmd
+            assert "H0=${H0S[$JOB_COMPLETION_INDEX]}" in cmd
+            assert "--h0-index ${H0}" in cmd
+
+    @pytest.mark.timeout(5)
+    def test_parallelism_does_not_exceed_completions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._hex_job(tmpdir, h0_subset=self.CONUS, max_parallelism=61)
+            assert job["spec"]["parallelism"] == 6
+
+    @pytest.mark.timeout(5)
+    def test_subset_is_sorted_and_deduplicated(self):
+        """The emitted list must be stable so an index maps to the same cell."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._hex_job(tmpdir, h0_subset=[50, 12, 50, 14])
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "H0S=(12 14 50)" in cmd
+            assert job["spec"]["completions"] == 3
+
+    @pytest.mark.timeout(5)
+    def test_full_subset_collapses_to_the_default_fan_out(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._hex_job(tmpdir, h0_subset=list(range(122)))
+            assert job["spec"]["completions"] == 122
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "H0S=(" not in cmd
+
+    @pytest.mark.timeout(5)
+    def test_out_of_range_cell_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="0-121"):
+                self._hex_job(tmpdir, h0_subset=[12, 122])
+
+    @pytest.mark.timeout(5)
+    def test_empty_subset_is_rejected(self):
+        """Silently falling back to 122 would hide a mis-parsed flag."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="empty"):
+                self._hex_job(tmpdir, h0_subset=[])
+
+    @pytest.mark.timeout(5)
+    def test_index_mapping_resolves_the_right_cell_in_bash(self):
+        """The emitted preamble is bash — run it rather than trust the string."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._hex_job(tmpdir, h0_subset=self.CONUS)
+            script = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            script = script.replace("cng-datasets raster", "echo RAN:")
+            run = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True,
+                env={"PATH": "/usr/bin:/bin", "JOB_COMPLETION_INDEX": "3"},
+            )
+            assert run.returncode == 0, run.stderr
+            assert "--h0-index 50" in run.stdout
+
+    @pytest.mark.timeout(5)
+    def test_index_past_the_end_fails_loudly(self):
+        """An out-of-range index must not silently process cell 0 of the list."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._hex_job(tmpdir, h0_subset=self.CONUS)
+            script = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            script = script.replace("cng-datasets raster", "echo RAN:")
+            for index in ("9", ""):
+                run = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True, text=True,
+                    env={"PATH": "/usr/bin:/bin", "JOB_COMPLETION_INDEX": index},
+                )
+                assert run.returncode == 1, f"index {index!r}: {run.stdout}"
+                assert "No h0 cell for completion index" in run.stderr
+                assert "RAN:" not in run.stdout
