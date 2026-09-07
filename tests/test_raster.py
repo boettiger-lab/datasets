@@ -918,8 +918,7 @@ class TestChildrenCellSelection:
 
         # Cell selection depends only on the h0 id (h3_cell_to_children),
         # never on the stored polygon.
-        df = proc._native_cells_for_h0(h0)
-        cells = [int(c) for c in df["h3"].tolist()]
+        cells = [int(c) for c in proc._native_cells_for_h0(h0)]
         assert len(cells) > 0, "antimeridian h0 produced no cells"
 
         n_total, n_strays = proc.con.execute(
@@ -1715,28 +1714,122 @@ class TestFractionsWorker:
 
     def test_chunk_worker_fractions_returns_long_rows(self, tmp_path):
         from shapely.geometry import box
-        from cng_datasets.raster.cog import _exact_extract_chunk
+        from cng_datasets.raster.cog import _exact_extract_cells
 
         raster = self._categorical_raster(str(tmp_path))
         # A "cell" fully inside the raster footprint: fractions sum to 1.0.
         cell_wkt = box(-122.0, 37.96, -121.96, 38.0).wkt
-        out = _exact_extract_chunk((raster, "fractions", [(123, cell_wkt)]))
+        out = _exact_extract_cells(raster, "fractions", [(123, cell_wkt)])
         assert list(out.columns) == ["_h3_str", "value", "frac"]
         assert set(out["value"]) == {11, 22, 33}
         assert out["frac"].sum() == pytest.approx(1.0)
 
     def test_chunk_worker_fractions_excludes_band_nodata(self, tmp_path):
         from shapely.geometry import box
-        from cng_datasets.raster.cog import _exact_extract_chunk
+        from cng_datasets.raster.cog import _exact_extract_cells
 
         # Band nodata declared: the worker (no nodata-clearing VRT) leaves it to
         # exactextract, which excludes it — nodata-keeping is _hex_aggregate_h0's
         # job via a no-nodata VRT, not the worker's.
         raster = self._categorical_raster(str(tmp_path), nodata=33)
         cell_wkt = box(-122.0, 37.96, -121.96, 38.0).wkt
-        out = _exact_extract_chunk((raster, "fractions", [(123, cell_wkt)]))
+        out = _exact_extract_cells(raster, "fractions", [(123, cell_wkt)])
         assert 33 not in out["value"].values
         assert out["frac"].sum() == pytest.approx(1.0)
+
+
+class TestBoundariesDerivedInWorkers:
+    """
+    The parent ships cell ids; each worker derives its own boundaries
+    (issue #173).
+
+    Fetching boundary WKT for every cell up front made those strings ~96% of a
+    list materialised in full before any work began — the dominant term in the
+    parent's peak RSS. A boundary is a pure function of the cell id, so the
+    work moves to the workers and the parent carries 8 bytes per cell.
+    """
+
+    H0 = 577164439745200127  # a CONUS h0
+
+    @pytest.fixture
+    def tiny_raster(self, tmp_path):
+        from osgeo import gdal, osr
+        path = str(tmp_path / "tiny.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 5, 5, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([-100.0, 0.01, 0, 40.0, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((5, 5), dtype=np.int16))
+        ds.FlushCache(); ds = None
+        return path
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_parent_gets_ids_only(self, tiny_raster):
+        """8 bytes per cell, not a frame carrying a WKT string each."""
+        from cng_datasets.raster import RasterProcessor
+
+        proc = RasterProcessor(input_path=tiny_raster, h3_resolution=3)
+        cells = proc._native_cells_for_h0(self.H0)
+
+        assert isinstance(cells, np.ndarray)
+        assert cells.dtype == np.uint64
+        assert cells.nbytes == 8 * len(cells)
+        assert len(cells) == 7 ** 3
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_worker_derives_the_same_boundaries(self, tiny_raster):
+        """The moved work must produce byte-identical WKT."""
+        from cng_datasets.raster import RasterProcessor
+        from cng_datasets.raster.cog import _boundary_wkt_for
+
+        proc = RasterProcessor(input_path=tiny_raster, h3_resolution=3)
+        cells = proc._native_cells_for_h0(self.H0)[:50]
+
+        expected = proc.con.execute(
+            "SELECT cell, h3_cell_to_boundary_wkt(cell) "
+            "FROM (SELECT UNNEST(?::UBIGINT[]) AS cell)",
+            [[int(c) for c in cells]],
+        ).fetchall()
+
+        derived = _boundary_wkt_for(cells)
+        assert derived == [(int(c), w) for c, w in expected]
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_order_follows_the_ids_given(self, tiny_raster):
+        """
+        Cells are paired to boundaries by id, not by row position, and come
+        back in the caller's order — the output rows keep chunk order, so a
+        reordering here would silently permute the result.
+        """
+        from cng_datasets.raster import RasterProcessor
+        from cng_datasets.raster.cog import _boundary_wkt_for
+
+        proc = RasterProcessor(input_path=tiny_raster, h3_resolution=3)
+        cells = proc._native_cells_for_h0(self.H0)[:20]
+        reversed_cells = cells[::-1]
+
+        forward = _boundary_wkt_for(cells)
+        backward = _boundary_wkt_for(reversed_cells)
+
+        assert [h for h, _ in forward] == [int(c) for c in cells]
+        assert backward == forward[::-1]
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_duplicate_ids_are_all_returned(self, tiny_raster):
+        """The id->WKT map must not collapse repeats into fewer rows."""
+        from cng_datasets.raster import RasterProcessor
+        from cng_datasets.raster.cog import _boundary_wkt_for
+
+        proc = RasterProcessor(input_path=tiny_raster, h3_resolution=3)
+        cell = int(proc._native_cells_for_h0(self.H0)[0])
+
+        out = _boundary_wkt_for(np.array([cell, cell, cell], dtype=np.uint64))
+        assert len(out) == 3
+        assert len({w for _, w in out}) == 1
 
 
 if __name__ == "__main__":
