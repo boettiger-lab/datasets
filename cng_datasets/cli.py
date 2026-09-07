@@ -128,6 +128,18 @@ def main():
     workflow_parser.add_argument("--hex-storage", type=str, default="10Gi", help="Ephemeral storage request/limit per hex job pod (default: 10Gi)")
     workflow_parser.add_argument("--repartition-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for repartition job pod (default: 50Gi)")
     workflow_parser.add_argument("--repartition-memory", type=str, default="32Gi", help="Memory request/limit for repartition job pod (default: 32Gi)")
+    workflow_parser.add_argument("--lat-column", default=None, metavar="NAME",
+                                 help="Latitude column when the source is a CSV of points "
+                                      "(auto-detected from e.g. Latitude/lat/y if not given)")
+    workflow_parser.add_argument("--lon-column", default=None, metavar="NAME",
+                                 help="Longitude column when the source is a CSV of points "
+                                      "(auto-detected from e.g. Longitude/lon/x if not given)")
+    workflow_parser.add_argument("--expect-features", type=int, default=None, metavar="N",
+                                 help="Feature count the convert step must produce, known "
+                                      "independently (e.g. from the source service's own "
+                                      "count). The step exits non-zero on a mismatch, so a "
+                                      "silently truncated source fails the workflow instead "
+                                      "of flowing into the hex and PMTiles steps")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
     # Cluster/storage configuration flags
@@ -394,6 +406,9 @@ def _dispatch(args):
             row_group_size=args.row_group_size,
             simplify_tolerance=args.simplify_tolerance,
             trim_strings=args.trim_strings,
+            lat_column=args.lat_column,
+            lon_column=args.lon_column,
+            expect_features=args.expect_features,
             backend=args.backend,
             armada_priority_class=args.armada_priority_class,
             hex_storage=args.hex_storage,
