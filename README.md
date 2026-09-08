@@ -106,6 +106,7 @@ The `/` in `--dataset` creates nested S3 paths (e.g., `mydata/layer-a.parquet`) 
 | `cng-datasets vector` | Run H3 hex tiling (used inside k8s pods) |
 | `cng-datasets raster` | Run raster H3 tiling (used inside k8s pods) |
 | `cng-datasets repartition` | Consolidate hex chunks (used inside k8s pods) |
+| `cng-datasets merge-chunks` | Consolidate sub-h0 raster hex chunks (used inside k8s pods) |
 
 Commands marked "used inside k8s pods" are called by the generated jobs — you don't run them directly.
 
@@ -170,6 +171,8 @@ docker pull ghcr.io/boettiger-lab/datasets:latest
 ## Troubleshooting
 
 **OOM on hex jobs (vector):** Increase `--hex-memory` (e.g., 32Gi → 64Gi), increase `--max-completions` for smaller chunks, or decrease `--intermediate-chunk-size`.
+
+**Raster hex pod too big even at one worker:** the pod's memory tracks the *largest chunk's* H3-cell count, and the default chunk is a whole h0 base cell (~282M cells at res 10). Pass `--chunk-resolution 1` or `2` to `cng-datasets raster` to make the unit a descendant of an h0 instead — roughly 7x fewer cells per level — then consolidate with `cng-datasets merge-chunks`, which restores the usual `h0={cell}/data_0.parquet` layout.
 
 **OOM on hex jobs (raster):** Lower `--hex-workers` before raising `--hex-memory`. Peak RSS is roughly `--hex-workers × --hex-chunk-size × bytes per cell`, and a memory request large enough to matter (past ~128Gi) makes the pod contend for scarce large-RAM nodes, turning a retryable OOM into an unschedulable one. Both knobs are always written into the manifest as `CNG_HEX_WORKERS` / `CNG_HEX_CHUNK_SIZE`, so a tuned pod survives regeneration.
 
