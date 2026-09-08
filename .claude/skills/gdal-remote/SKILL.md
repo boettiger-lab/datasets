@@ -16,6 +16,8 @@ metadata:
 
 # GDAL, OGR, and DuckDB for Remote Geospatial Data
 
+> **Scope.** Remote reads for this repo's workflows. `boettiger-lab/agent-skills` carries a related `gdal-spatial`; keep changes that are not specific to this repo in sync with it.
+
 GDAL/OGR is the foundational library for reading and writing geospatial formats. DuckDB with its spatial extension is often a better choice for analytical queries on Parquet. Understanding which tool to use when — and what each can and cannot do — is essential.
 
 ## Choosing the Right Tool

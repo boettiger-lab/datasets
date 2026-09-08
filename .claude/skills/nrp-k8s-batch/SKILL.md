@@ -8,8 +8,9 @@ description: >
   or needs to run batch workloads on a shared academic cluster.
 license: Apache-2.0
 compatibility: >
-  Requires kubectl configured for the NRP Nautilus cluster (namespace: biodiversity).
-  Works with any agent that can run shell commands.
+  Requires kubectl configured for the NRP Nautilus cluster. This repo's workflows use
+  the `geo-workflows` namespace; the CLI still defaults to `biodiversity`, so pass
+  --namespace explicitly. Works with any agent that can run shell commands.
 metadata:
   author: boettiger-lab
   version: "1.0"
@@ -17,15 +18,23 @@ metadata:
 
 # NRP Kubernetes Batch Jobs
 
+> **Scope.** Batch jobs only — that is what this repo generates. `boettiger-lab/agent-skills` carries a broader `nrp-k8s` covering ingress, dedicated nodes and deployment rollouts; if you need those, read it there. Named `nrp-k8s-batch` so the two do not collide when both are installed.
+
 The NRP (National Research Platform) Nautilus cluster is a shared academic Kubernetes cluster primarily designed for GPU workloads. CPU-only batch jobs require specific configuration to coexist properly.
 
 ## Namespace
 
-All our jobs run in the `biodiversity` namespace:
+This repo's workflows run in **`geo-workflows`**:
 
 ```bash
-kubectl -n biodiversity get jobs
+kubectl -n geo-workflows get jobs
 ```
+
+Note the CLI has not caught up: `cng-datasets workflow` and `raster-workflow`
+still default `--namespace` to `biodiversity`, so **pass it explicitly**.
+`biodiversity` is not dead — other services live there (llm-proxy and
+duckdb-mcp pods, and the pre-configured S3 secrets below) — it is just no
+longer where dataset workflows run.
 
 ## Mandatory Requirements for CPU Jobs
 
@@ -116,7 +125,7 @@ spec:
 
 ## Secrets
 
-Two secrets are available in the `biodiversity` namespace. See the [nrp-s3 skill](../nrp-s3/SKILL.md) for full details on S3 environment variables.
+Two secrets are available in the `biodiversity` namespace (they have not moved with the workflows). See the [nrp-s3 skill](../nrp-s3/SKILL.md) for full details on S3 environment variables.
 
 ### `aws` — S3 credentials (environment variables)
 

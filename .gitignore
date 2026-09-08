@@ -231,5 +231,9 @@ build/
 *.egg-info/
 node_modules/
 
-# Local Claude Code session/worktree state
-.claude/
+# Local Claude Code session/worktree state — but skills are part of the repo.
+# `.claude/*` (not `.claude/`) so git still descends into the directory and the
+# negation below can take effect; a bare `.claude/` excludes it outright and no
+# `!` rule inside it can be reached.
+.claude/*
+!.claude/skills/
