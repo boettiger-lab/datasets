@@ -56,6 +56,12 @@ def main():
     raster_parser.add_argument("--chunk-index", type=int, default=None, metavar="K",
                                help="Which chunk to process. At --chunk-resolution 0 this is "
                                     "exactly --h0-index; give one or the other.")
+    raster_parser.add_argument("--window-reads", choices=["auto", "always", "never"], default="auto",
+                               help="Read only this chunk's window of the source COG instead of "
+                                    "localizing the whole file. 'auto' (default) windows whenever "
+                                    "--chunk-resolution > 0. Full localization is a per-pod cost, so "
+                                    "total transfer scales with the fan-out — fine across 122 h0 "
+                                    "pods, ruinous across the thousands sub-h0 chunking creates.")
     raster_parser.add_argument("--h0-subset", type=str, default=None, metavar="CELLS",
                                help="Restrict the chunk list to descendants of these h0 base cell "
                                     "indices, e.g. '12,14,20,50,71,78' for CONUS, so a regional "
@@ -360,6 +366,7 @@ def _dispatch(args):
                 h0_index=args.h0_index,
                 chunk_resolution=args.chunk_resolution,
                 chunk_index=args.chunk_index,
+                window_reads=args.window_reads,
                 h0_subset=raster_h0_subset,
                 value_column=args.value_column,
                 nodata_value=args.nodata,

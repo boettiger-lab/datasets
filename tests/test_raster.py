@@ -2139,3 +2139,248 @@ class TestSubH0Chunking:
         assert len(proc.chunk_cells()) > 0
         empty, _ = self._processor(raster, temp_dir, "sub3", chunk_resolution=1, h0_subset=[7])
         assert empty.chunk_cells() == []
+
+
+class TestWindowedCogReads:
+    """
+    A chunk reads only its own window of the source (issue #173, lever C).
+
+    Full localization copies the whole COG into every pod, so total transfer
+    scales with the fan-out rather than with the data: tolerable across 122 h0
+    pods, ruinous across the thousands of pods sub-h0 chunking creates. These
+    tests pin both halves of the claim — that windowing reads materially less,
+    and that it does not change the answer.
+    """
+
+    H0_CELL = 577199624117288959
+    RES = 3
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        from osgeo import gdal, osr
+        width = height = 256
+        xmin, ymin, pixel = -123.0, 37.0, 1.0 / 256
+        path = os.path.join(temp_dir, "big.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(
+            path, width, height, 1, gdal.GDT_Float32,
+            options=["TILED=YES", "BLOCKXSIZE=64", "BLOCKYSIZE=64"],
+        )
+        ds.SetGeoTransform([xmin, pixel, 0, ymin + height * pixel, 0, -pixel])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:height, 0:width]
+        ds.GetRasterBand(1).WriteArray((yy * width + xx).astype("float32"))
+        ds.FlushCache()
+        ds = None
+        return path
+
+    def _grid(self, temp_dir):
+        import geopandas as gpd
+        from shapely.geometry import box
+        g = gpd.GeoDataFrame(
+            {"i": [0], "h0": [self.H0_CELL], "geometry": [box(-124, 36, -122, 38)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom")
+        path = os.path.join(temp_dir, "h0-test.parquet")
+        g.to_parquet(path)
+        return path
+
+    def _processor(self, raster, temp_dir, name, **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        out = os.path.join(temp_dir, name)
+        os.makedirs(out, exist_ok=True)
+        return RasterProcessor(
+            input_path=raster,
+            output_parquet_path=out,
+            h3_resolution=self.RES,
+            parent_resolutions=[0],
+            h0_grid_path=self._grid(temp_dir),
+            value_column="v",
+            local_cache_dir=os.path.join(temp_dir, f"cache-{name}"),
+            **kwargs,
+        ), out
+
+    @pytest.mark.timeout(300)
+    def test_windowed_output_matches_unwindowed(self, raster, temp_dir):
+        """The gate: windowing is an I/O optimisation, not a different answer."""
+        plain, plain_out = self._processor(
+            raster, temp_dir, "plain", chunk_resolution=2, window_reads="never")
+        for i in range(len(plain.chunk_cells())):
+            plain.process_chunk(i)
+
+        windowed, win_out = self._processor(
+            raster, temp_dir, "win", chunk_resolution=2, window_reads="always")
+        for i in range(len(windowed.chunk_cells())):
+            windowed.process_chunk(i)
+
+        con = duckdb.connect()
+        a = con.execute(
+            f"SELECT v, h{self.RES} FROM read_parquet('{plain_out}/h0=*/part-*.parquet') "
+            f"ORDER BY h{self.RES}").fetchall()
+        b = con.execute(
+            f"SELECT v, h{self.RES} FROM read_parquet('{win_out}/h0=*/part-*.parquet') "
+            f"ORDER BY h{self.RES}").fetchall()
+        assert a, "unwindowed run produced nothing"
+        assert b == a, "windowed read changed the values"
+
+    @pytest.mark.timeout(300)
+    def test_window_is_smaller_than_the_whole_raster(self, raster, temp_dir):
+        """The point of the exercise: a chunk must not pull the whole file."""
+        proc, _ = self._processor(
+            raster, temp_dir, "size", chunk_resolution=2, window_reads="always")
+        full_bytes = os.path.getsize(raster)
+
+        from shapely import wkt as shapely_wkt
+        from cng_datasets.raster.cog import _H3_PROTRUSION_MARGIN, _WINDOW_NO_OVERLAP
+
+        sizes = []
+        for chunk_cell, _, _ in proc.chunk_cells():
+            geom = proc.con.execute(
+                f"SELECT h3_cell_to_boundary_wkt({chunk_cell})").fetchone()[0]
+            _, cminy, _, cmaxy = shapely_wkt.loads(geom).bounds
+            path = proc._windowed_source_for(
+                geom, _H3_PROTRUSION_MARGIN * (cmaxy - cminy), chunk_cell)
+            if path is _WINDOW_NO_OVERLAP or path is None:
+                continue
+            sizes.append(os.path.getsize(path))
+            os.remove(path)
+
+        assert sizes, "no chunk produced a window"
+        assert max(sizes) < full_bytes, (
+            f"largest window {max(sizes)} B is not smaller than the source {full_bytes} B"
+        )
+        # The point is not just "smaller" but "proportional to the chunk", so
+        # total transfer stops scaling with the fan-out.
+        assert sum(sizes) < len(sizes) * full_bytes, (
+            "windowing every chunk moved as many bytes as copying the file to each"
+        )
+
+    @pytest.mark.timeout(120)
+    def test_window_missing_the_source_skips_rather_than_reading_it_all(self, raster, temp_dir):
+        """
+        An empty window means the chunk provably has nothing, not "read everything".
+
+        The pruning test runs a deliberately looser margin, so a chunk can pass
+        it and still have a window that misses the raster. Returning the same
+        None that signals "could not window" would send that chunk off to read
+        the entire source to discover it is empty.
+        """
+        from cng_datasets.raster.cog import _WINDOW_NO_OVERLAP
+        proc, _ = self._processor(
+            raster, temp_dir, "miss", chunk_resolution=2, window_reads="always")
+        # A cell on the far side of the planet from the fixture raster.
+        far = proc.con.execute("SELECT h3_latlng_to_cell(-33.9, 18.4, 2)").fetchone()[0]
+        geom = proc.con.execute(f"SELECT h3_cell_to_boundary_wkt({far})").fetchone()[0]
+        assert proc._windowed_source_for(geom, 0.01, far) is _WINDOW_NO_OVERLAP
+
+    @pytest.mark.timeout(120)
+    def test_auto_leaves_a_local_source_alone(self, raster, temp_dir):
+        """
+        A window over a local file transfers nothing and buys nothing.
+
+        It would only decode and re-encode the region, so 'auto' windows a
+        remote source and leaves a local read as it is.
+        """
+        local, _ = self._processor(raster, temp_dir, "auto-local", chunk_resolution=2)
+        assert local._windowing is False
+        forced, _ = self._processor(
+            raster, temp_dir, "auto-forced", chunk_resolution=2, window_reads="always")
+        assert forced._windowing is True
+
+    @pytest.mark.timeout(120)
+    def test_auto_is_off_without_sub_chunking(self, raster, temp_dir):
+        """At h0 granularity the whole-file copy is still the right trade."""
+        proc, _ = self._processor(raster, temp_dir, "auto-h0")
+        assert proc._windowing is False
+
+    @pytest.mark.timeout(60)
+    def test_invalid_mode_is_rejected(self, raster, temp_dir):
+        with pytest.raises(ValueError, match="window_reads"):
+            self._processor(raster, temp_dir, "bad", window_reads="sometimes")
+
+
+class TestH3ProtrusionMargin:
+    """
+    The margin constant is derived from a measurement, so pin the measurement.
+
+    H3's hierarchy is only approximately containing: a descendant cell can
+    protrude beyond its ancestor's boundary polygon. Both the chunk-pruning
+    test and the read window depend on a bound for that protrusion — too small
+    and cells are silently dropped or read as nodata (issue #173). If a future
+    H3 version widens it, this fails here rather than in a build's output.
+    """
+
+    SAMPLE = [(0, 0), (37.7, -122.4), (51.5, -0.1), (-33.9, 18.4), (35.7, 139.7),
+              (-23.5, -46.6), (64.1, -21.9), (1.3, 103.8), (-41.3, 174.8), (55.7, 37.6)]
+
+    def _max_protrusion(self, con, chunk_res, levels_down):
+        from shapely import wkt as swkt
+        values = ",".join(str(p) for p in self.SAMPLE)
+        parents = {
+            r[0] for r in con.execute(
+                f"SELECT h3_latlng_to_cell(lat, lon, {chunk_res}) "
+                f"FROM (VALUES {values}) t(lat, lon)"
+            ).fetchall()
+        }
+        worst = 0.0
+        for parent in parents:
+            pg = swkt.loads(
+                con.execute(f"SELECT h3_cell_to_boundary_wkt({parent})").fetchone()[0])
+            pminx, pminy, pmaxx, pmaxy = pg.bounds
+            if pmaxx - pminx > 180:      # antimeridian: planar bounds are meaningless
+                continue
+            extent = pmaxy - pminy
+            for (desc,) in con.execute(
+                f"SELECT UNNEST(h3_cell_to_children({parent}, {chunk_res + levels_down}))"
+            ).fetchall():
+                dg = swkt.loads(
+                    con.execute(f"SELECT h3_cell_to_boundary_wkt({desc})").fetchone()[0])
+                dminx, dminy, dmaxx, dmaxy = dg.bounds
+                if dmaxx - dminx > 180:
+                    continue
+                worst = max(worst, max(pminy - dminy, dmaxy - pmaxy,
+                                       pminx - dminx, dmaxx - pmaxx, 0.0) / extent)
+        return worst
+
+    @pytest.mark.timeout(300)
+    def test_margin_covers_measured_protrusion(self):
+        from cng_datasets.raster.cog import _H3_PROTRUSION_MARGIN
+        con = duckdb.connect()
+        con.execute("INSTALL h3 FROM community; LOAD h3; INSTALL spatial; LOAD spatial;")
+        worst = max(
+            self._max_protrusion(con, chunk_res, levels)
+            for chunk_res in (1, 2, 3)
+            for levels in (1, 3)
+        )
+        assert worst > 0, "measurement found no protrusion at all — check the harness"
+        assert worst < _H3_PROTRUSION_MARGIN, (
+            f"measured protrusion {worst:.3f} of the chunk's extent meets or exceeds the "
+            f"margin {_H3_PROTRUSION_MARGIN}. Raise _H3_PROTRUSION_MARGIN: too small a "
+            f"margin drops cells from the prune test and reads nodata in the window."
+        )
+
+    @pytest.mark.timeout(300)
+    def test_protrusion_converges_rather_than_compounding(self):
+        """
+        Why one constant works for every chunk depth.
+
+        Each level is only approximately inside its parent, so a naive reading
+        says the error accumulates with depth and no fixed margin is safe. It
+        does not: the union of a cell's descendants converges on a region just
+        larger than the cell.
+        """
+        con = duckdb.connect()
+        con.execute("INSTALL h3 FROM community; LOAD h3; INSTALL spatial; LOAD spatial;")
+        one = self._max_protrusion(con, 2, 1)
+        deep = self._max_protrusion(con, 2, 4)
+        assert deep < 2 * one, (
+            f"protrusion grew from {one:.3f} at one level to {deep:.3f} at four — if it "
+            f"compounds with depth, a depth-independent margin is not sound"
+        )

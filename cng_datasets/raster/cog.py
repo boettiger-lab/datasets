@@ -243,6 +243,29 @@ def _exact_extract_cells(raster_path, op_name, chunk_cells):
     raise RuntimeError(f"Unreachable; last={last_exc}")
 
 
+# How far an H3 descendant can protrude beyond its ancestor's boundary polygon,
+# as a fraction of the ancestor's latitude extent. H3's hierarchy is only
+# approximately containing, so a chunk's own polygon does not bound the pixels
+# its native cells actually cover (issue #173).
+#
+# Measured over cells sampled across the globe at chunk resolutions 1-3, for
+# descendants 1 to 4 levels down: the protrusion *converges* rather than
+# compounding — 0.127 at one level, 0.150 by three, unchanged at four. 0.25
+# carries a ~1.7x safety factor over that worst case.
+#
+# Two callers want different sides of the trade. Pruning a chunk uses a
+# deliberately looser multiple: a false positive there costs one pod that exits
+# in seconds, so generosity is nearly free. A read window pays for its margin in
+# bytes on every chunk, so it uses the measured bound directly.
+_H3_PROTRUSION_MARGIN = 0.25
+_H3_PRUNE_MARGIN_FACTOR = 2.0
+
+# Returned by _windowed_source_for when the chunk's window does not intersect
+# the source at all. Distinct from None ("could not window, read the source
+# directly"), because conflating the two turns a chunk that provably has
+# nothing to contribute into one that reads the entire raster to find out.
+_WINDOW_NO_OVERLAP = "__no_overlap__"
+
 # Warn at most once per process that the CPU quota could not be read.
 _CPU_QUOTA_WARNED = False
 
@@ -1054,6 +1077,7 @@ class RasterProcessor:
         h0_index: Optional[int] = None,
         chunk_resolution: int = 0,
         chunk_index: Optional[int] = None,
+        window_reads: str = "auto",
         h0_subset: Optional[List[int]] = None,
         h0_grid_path: str = "s3://public-grids/hex/h0-valid.parquet",
         value_column: str = "value",
@@ -1091,6 +1115,14 @@ class RasterProcessor:
             chunk_index: Which chunk to process, indexing the ordered chunk list
                 for chunk_resolution. At chunk_resolution 0 this is exactly
                 h0_index; either may be given.
+            window_reads: Whether a chunk reads only its own window of the
+                source COG instead of localizing the whole file. "auto"
+                (default) windows whenever chunk_resolution > 0, "always" and
+                "never" force it. Full localization costs one whole-file copy
+                per pod, which is tolerable across 122 h0 pods and ruinous
+                across the thousands of pods sub-h0 chunking creates — the
+                transfer scales with the fan-out, not with the data (issue
+                #173, lever C).
             h0_subset: Restrict the chunk list to descendants of these h0 base
                 cell indices, so a regional source never enumerates chunks it
                 cannot overlap (issue #191, applied at chunk granularity).
@@ -1185,10 +1217,32 @@ class RasterProcessor:
                 f"per warped pixel — so switch to it deliberately, not as a drop-in."
             )
 
-        if local_cache_dir and (isinstance(input_path, str) and
-                                 (input_path.startswith("s3://") or
-                                  input_path.startswith("http://") or
-                                  input_path.startswith("https://"))):
+        if window_reads not in ("auto", "always", "never"):
+            raise ValueError(
+                f"window_reads must be 'auto', 'always' or 'never', got {window_reads!r}"
+            )
+        self.window_reads = window_reads
+        # Windowing replaces the whole-file copy, so the two must not both run:
+        # localizing first would pay exactly the cost windowing exists to avoid.
+        # "auto" also requires the source to be remote — a window over a local
+        # file transfers nothing and buys nothing, it just decodes and re-encodes
+        # the region, so the honest default is to leave a local read alone.
+        remote_source = isinstance(input_path, str) and (
+            input_path.startswith("s3://")
+            or input_path.startswith("http://")
+            or input_path.startswith("https://")
+        )
+        self._windowing = (
+            window_reads == "always"
+            or (window_reads == "auto" and chunk_resolution > 0 and remote_source)
+        )
+        self._window_cache_dir = local_cache_dir
+
+        if (local_cache_dir and not self._windowing
+                and isinstance(input_path, str)
+                and (input_path.startswith("s3://")
+                     or input_path.startswith("http://")
+                     or input_path.startswith("https://"))):
             input_path = _localize_input(input_path, local_cache_dir)
 
         # Use /vsis3/ so reads honor AWS_S3_ENDPOINT — inside the cluster this
@@ -1638,7 +1692,7 @@ class RasterProcessor:
             return False
         return any(not (sxmax < lo or sxmin > hi) for lo, hi in lon_intervals)
 
-    def _collapsed_aggregation_input(self) -> str:
+    def _collapsed_aggregation_input(self, source_path: Optional[str] = None) -> str:
         """Local raster with every fill code collapsed to the primary nodata.
 
         Built once and reused across all h0 regions. Needed only when more than
@@ -1652,14 +1706,24 @@ class RasterProcessor:
         codes, so the hex job is handed only the primary value and never reaches
         this path; it covers running the hex step directly on a multi-fill source.
         """
-        if getattr(self, "_collapsed_input", None) is not None:
-            return self._collapsed_input
+        source_path = source_path or self.input_path
+        # Keyed by source: with windowed reads (issue #173 lever C) each chunk
+        # collapses its own window, so a single cached copy would hand one
+        # chunk another chunk's pixels.
+        cache = getattr(self, "_collapsed_inputs", None)
+        if cache is None:
+            cache = self._collapsed_inputs = {}
+        if source_path in cache:
+            return cache[source_path]
         primary = self.nodata_values[0]
-        collapsed = os.path.join(tempfile.gettempdir(), "cng_collapsed_input.tif")
+        collapsed = os.path.join(
+            tempfile.gettempdir(),
+            f"cng_collapsed_{abs(hash(source_path)) % (10 ** 12)}.tif",
+        )
         print(f"  Collapsing fill codes {self.nodata_values} → {primary} for hex aggregation...")
         result = gdal.Translate(
             collapsed,
-            self.input_path,
+            source_path,
             format="GTiff",
             creationOptions=["BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS"],
         )
@@ -1669,10 +1733,11 @@ class RasterProcessor:
             )
         result = None
         _collapse_fill_values(collapsed, self.nodata_values, primary)
-        self._collapsed_input = collapsed
+        cache[source_path] = collapsed
         return collapsed
 
-    def _hex_aggregate_h0(self, chunk_cell: int, h0_cell: Optional[int] = None) -> Optional[str]:
+    def _hex_aggregate_h0(self, chunk_cell: int, h0_cell: Optional[int] = None,
+                          source_path: Optional[str] = None) -> Optional[str]:
         """Area-weighted aggregation of source raster into native H3 cells
         inside one h0 partition.
 
@@ -1698,6 +1763,9 @@ class RasterProcessor:
         # differ whenever chunk_resolution > 0 (issue #173).
         if h0_cell is None:
             h0_cell = chunk_cell
+        # source_path is the windowed copy when lever C is active; everything
+        # below reads it in place of the full raster.
+        source_path = source_path or self.input_path
         cells_arr = self._native_cells_for_h0(chunk_cell)
 
         if len(cells_arr) == 0:
@@ -1718,21 +1786,21 @@ class RasterProcessor:
         # would). Cells with at least one nodata code that we still want labelled
         # explicitly are filtered below; the codes that mark "nodata" downstream:
         nodata_codes = [nodata_values[0]] if (is_fractions and nodata_values) else []
-        with rasterio.open(self.input_path) as rast:
+        with rasterio.open(source_path) as rast:
             src_nodata = rast.nodata
 
         vrt_path = None
         try:
             if not nodata_values:
-                rast_arg = self.input_path
+                rast_arg = source_path
             elif is_fractions:
                 # Collapse multi-fill to the primary first (#108), then CLEAR the
                 # band nodata so exactextract returns it as a normal class. The
                 # collapse step sets band nodata = primary, so a no-nodata VRT is
                 # built over whichever base we use.
                 base = (
-                    self._collapsed_aggregation_input()
-                    if len(nodata_values) > 1 else self.input_path
+                    self._collapsed_aggregation_input(source_path)
+                    if len(nodata_values) > 1 else source_path
                 )
                 vrt_path = f"/tmp/raster_{chunk_cell}_keepnodata.vrt"
                 gdal.Translate(vrt_path, base, format="VRT", noData="none")
@@ -1742,15 +1810,15 @@ class RasterProcessor:
                     vrt_path = f"/tmp/raster_{chunk_cell}_nodata.vrt"
                     gdal.Translate(
                         vrt_path,
-                        self.input_path,
+                        source_path,
                         format="VRT",
                         noData=nodata_values[0],
                     )
                     rast_arg = vrt_path
                 else:
-                    rast_arg = self.input_path
+                    rast_arg = source_path
             else:
-                rast_arg = self._collapsed_aggregation_input()
+                rast_arg = self._collapsed_aggregation_input(source_path)
 
             chunk_size = int(os.environ.get("CNG_HEX_CHUNK_SIZE", "100000"))
             n_workers = int(os.environ.get("CNG_HEX_WORKERS", str(_cgroup_cpu_count())))
@@ -1932,6 +2000,79 @@ class RasterProcessor:
         self._chunk_cells_cache = cells
         return self._chunk_cells_cache
 
+    def _windowed_source_for(self, geom_wkt: str, margin_deg: float,
+                             chunk_cell: int) -> Optional[str]:
+        """Localize only the window of the source COG a chunk actually reads.
+
+        Full localization copies the whole file into every pod. That is a fixed
+        cost per pod, so total transfer scales with the fan-out: fine at 122 h0
+        pods, ruinous at the thousands of pods sub-h0 chunking creates (issue
+        #173, lever C). A COG is internally tiled, so GDAL fetches only the
+        tiles intersecting the window — the transfer becomes proportional to
+        the chunk's area rather than to the number of chunks.
+
+        The window is the chunk's bounding box widened by the same margin the
+        overlap test uses, because H3 children can protrude past the parent
+        boundary and their pixels have to be in the window or the aggregation
+        silently reads nodata there.
+
+        Returns a local path; None to fall back to reading the source directly
+        (a chunk straddling the antimeridian, whose window is two disjoint
+        longitude ranges a single projWin cannot express); or
+        _WINDOW_NO_OVERLAP when the window misses the source entirely, which
+        the pruning test can allow through because it deliberately runs a looser
+        margin.
+        """
+        from shapely import wkt as shapely_wkt
+
+        poly = shapely_wkt.loads(geom_wkt)
+        minx, miny, maxx, maxy = poly.bounds
+        if maxx - minx > 180:
+            print("  ℹ chunk straddles the antimeridian; reading the source directly")
+            return None
+
+        sxmin, symin, sxmax, symax = self._src_bounds_4326
+        lat = min(max(abs(miny), abs(maxy)), 89.0)
+        lon_margin = min(margin_deg / max(math.cos(math.radians(lat)), 1e-6), 180.0)
+
+        # Clamp to the source's own extent: projWin outside it either errors or
+        # pads with nodata, and either way costs more than it reads.
+        wxmin = max(minx - lon_margin, sxmin)
+        wxmax = min(maxx + lon_margin, sxmax)
+        wymin = max(miny - margin_deg, symin)
+        wymax = min(maxy + margin_deg, symax)
+        if wxmin >= wxmax or wymin >= wymax:
+            return _WINDOW_NO_OVERLAP
+
+        cache_dir = self._window_cache_dir or tempfile.gettempdir()
+        os.makedirs(cache_dir, exist_ok=True)
+        window_path = os.path.join(cache_dir, f"window_{chunk_cell}.tif")
+
+        print(f"  Windowing source to [{wxmin:.4f},{wymin:.4f},{wxmax:.4f},{wymax:.4f}]...")
+        try:
+            result = gdal.Translate(
+                window_path,
+                self.input_path,
+                format="GTiff",
+                projWin=[wxmin, wymax, wxmax, wymin],
+                projWinSRS="EPSG:4326",
+                creationOptions=["TILED=YES", "BIGTIFF=IF_SAFER",
+                                 "NUM_THREADS=ALL_CPUS"],
+                noData=None,
+            )
+        except RuntimeError as e:
+            print(f"  ⚠ Windowed read failed ({e}); reading the source directly")
+            return None
+        if result is None:
+            print("  ⚠ Windowed read produced nothing; reading the source directly")
+            return None
+        result = None
+
+        if os.path.exists(window_path):
+            print(f"  ✓ Window localized: {os.path.getsize(window_path)} bytes")
+            return window_path
+        return None
+
     def _chunk_output_path(self, chunk_cell: int, h0_cell: Optional[int] = None) -> str:
         """Where one chunk's parquet goes.
 
@@ -1989,21 +2130,38 @@ class RasterProcessor:
             f"SELECT h3_cell_to_boundary_wkt({chunk_cell})"
         ).fetchone()[0]
 
-        # Half the chunk's own latitude extent — roughly one cell edge, which
-        # comfortably exceeds the child-outside-parent protrusion at every
-        # resolution while still pruning the vast majority of non-overlapping
-        # chunks.
         from shapely import wkt as _shapely_wkt
         _, cminy, _, cmaxy = _shapely_wkt.loads(geom_wkt).bounds
-        margin_deg = 0.5 * (cmaxy - cminy)
+        chunk_extent = cmaxy - cminy
+        window_margin = _H3_PROTRUSION_MARGIN * chunk_extent
+        prune_margin = _H3_PRUNE_MARGIN_FACTOR * window_margin
 
-        if not self._h0_overlaps_raster(geom_wkt, margin_deg=margin_deg):
+        if not self._h0_overlaps_raster(geom_wkt, margin_deg=prune_margin):
             print(f"  ℹ No overlap between source raster and chunk {chunk_cell}, skipping")
             return None
 
         if self.method == "warp-centroid":
+            # warp-centroid already warps clipped to the chunk's own cutline, so
+            # it reads only what it needs without a separate window.
             return self._hex_warp_centroid_h0(geom_wkt, chunk_cell, chunk_index, h0_cell=h0_cell)
-        return self._hex_aggregate_h0(chunk_cell, h0_cell=h0_cell)
+
+        source_path = None
+        if self._windowing:
+            source_path = self._windowed_source_for(geom_wkt, window_margin, chunk_cell)
+            if source_path is _WINDOW_NO_OVERLAP:
+                # The looser pruning margin let this chunk through, but its own
+                # window misses the raster, so there is provably nothing here.
+                print(f"  ℹ Chunk {chunk_cell} window misses the source, skipping")
+                return None
+        try:
+            return self._hex_aggregate_h0(
+                chunk_cell, h0_cell=h0_cell, source_path=source_path
+            )
+        finally:
+            # The window is this chunk's alone; a pod that processed several
+            # would otherwise accumulate one file per chunk on local disk.
+            if source_path and os.path.exists(source_path):
+                os.remove(source_path)
 
     def process_h0_region(self, h0_index: Optional[int] = None) -> Optional[str]:
         """
