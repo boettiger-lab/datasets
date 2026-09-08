@@ -183,6 +183,20 @@ def main():
                                              "per listed cell instead of all 122, so pods that could only find "
                                              "no overlap are never started. Omit for a global source.")
     raster_workflow_parser.add_argument("--hex-storage", type=str, default="20Gi", help="Ephemeral storage request/limit per hex job pod (default: 20Gi)")
+    raster_workflow_parser.add_argument("--hex-cpu", type=str, default=None, metavar="N",
+                                        help="CPU request/limit per hex job pod (default: 4)")
+    raster_workflow_parser.add_argument("--hex-workers", type=int, default=None, metavar="N",
+                                        help="Worker processes per hex job pod, emitted as "
+                                             "CNG_HEX_WORKERS (default: one per --hex-cpu). This is "
+                                             "the memory lever: peak RSS is roughly workers × "
+                                             "--hex-chunk-size × bytes per cell. Lower it before "
+                                             "raising --hex-memory, which on a scarce large-RAM node "
+                                             "turns a retryable OOM into an unschedulable pod (#195).")
+    raster_workflow_parser.add_argument("--hex-chunk-size", type=int, default=None, metavar="N",
+                                        help="Cells per exact_extract call in the hex job, emitted as "
+                                             "CNG_HEX_CHUNK_SIZE (default: 100000). The other half of "
+                                             "the peak-memory product; lower it when fewer workers "
+                                             "alone is too coarse a step.")
     raster_workflow_parser.add_argument("--cog-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for COG preprocess job pod (default: 50Gi)")
     raster_workflow_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in EPSG:4326 (multi-tile only)")
     raster_workflow_parser.add_argument("--target-resolution", type=float, help="Output pixel size in degrees (multi-tile only)")
@@ -436,6 +450,17 @@ def _dispatch(args):
         h0_subset = None
         if getattr(args, 'h0_subset', None):
             h0_subset = [int(x.strip()) for x in args.h0_subset.split(',') if x.strip()]
+        # Only forward the sizing knobs that were actually given, so the
+        # generator's own defaults stay the single source of truth for them.
+        hex_sizing = {
+            name: value
+            for name, value in (
+                ("hex_cpu", args.hex_cpu),
+                ("hex_workers", args.hex_workers),
+                ("hex_chunk_size", args.hex_chunk_size),
+            )
+            if value is not None
+        }
         generate_raster_workflow(
             dataset_name=args.dataset,
             source_urls=args.source_urls,
@@ -451,6 +476,7 @@ def _dispatch(args):
             max_parallelism=args.max_parallelism,
             h0_subset=h0_subset,
             hex_storage=args.hex_storage,
+            **hex_sizing,
             cog_storage=args.cog_storage,
             target_extent=target_extent,
             target_resolution=getattr(args, 'target_resolution', None),

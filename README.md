@@ -127,6 +127,25 @@ Commands marked "used inside k8s pods" are called by the generated jobs — you 
 --row-group-size N         Rows per parquet row group (default: 100000).
 ```
 
+### `cng-datasets raster-workflow` options
+
+```
+--dataset NAME             Dataset name for S3 paths. Use / for hierarchy.
+--source-url URL           Public URL to a source raster. Repeat to mosaic tiles.
+--bucket BUCKET            Target S3 bucket name.
+--h3-resolution N          H3 resolution for hex tiling (default: 8).
+--parent-resolutions STR   Comma-separated parent resolutions (default: "0").
+--hex-resampling R         mean | sum | mode | fractions | max | min (default: mean).
+--nodata VALS              NoData value(s) to exclude, comma-separated.
+--hex-memory SIZE          Memory per hex pod (default: 32Gi).
+--hex-cpu N                CPU request/limit per hex pod (default: 4).
+--hex-workers N            Worker processes per hex pod (default: one per --hex-cpu).
+--hex-chunk-size N         Cells per exact_extract call (default: 100000).
+--h0-subset CELLS          The h0 base cells the source overlaps (default: all 122).
+--max-parallelism N        Max concurrent hex pods (default: 61).
+--output-dir DIR           Directory for generated YAML files.
+```
+
 ## S3 Output Layout
 
 ```
@@ -150,7 +169,9 @@ docker pull ghcr.io/boettiger-lab/datasets:latest
 
 ## Troubleshooting
 
-**OOM on hex jobs:** Increase `--hex-memory` (e.g., 32Gi → 64Gi), increase `--max-completions` for smaller chunks, or decrease `--intermediate-chunk-size`.
+**OOM on hex jobs (vector):** Increase `--hex-memory` (e.g., 32Gi → 64Gi), increase `--max-completions` for smaller chunks, or decrease `--intermediate-chunk-size`.
+
+**OOM on hex jobs (raster):** Lower `--hex-workers` before raising `--hex-memory`. Peak RSS is roughly `--hex-workers × --hex-chunk-size × bytes per cell`, and a memory request large enough to matter (past ~128Gi) makes the pod contend for scarce large-RAM nodes, turning a retryable OOM into an unschedulable one. Both knobs are always written into the manifest as `CNG_HEX_WORKERS` / `CNG_HEX_CHUNK_SIZE`, so a tuned pod survives regeneration.
 
 **Convert fails on curved geometries (MULTISURFACE):** Handled automatically — the converter linearizes curved geometry types via ogr2ogr before processing.
 
