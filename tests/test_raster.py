@@ -1917,3 +1917,225 @@ class TestWarpCentroidGdalGuard:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestSubH0Chunking:
+    """
+    --chunk-resolution splits an h0 into its descendants (issue #173).
+
+    The unit of work used to be fixed at one h0 base cell, so peak memory
+    tracked the densest h0's native-cell count (~282M at res 10, ~140 GiB
+    measured). Chunking below h0 cuts that by ~7x per level. H3 nests exactly,
+    so the descendants tile their parent with no seams and no gaps — which is
+    the property the gate below actually verifies: sub-chunked output must be
+    the same rows, with the same values, as the h0 baseline.
+    """
+
+    H0_CELL = 577199624117288959   # res-0 cell over San Francisco
+    RES = 3                        # native resolution: 7^3 children per h0
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        """A small raster with a value gradient, so a wrong cell is a wrong value."""
+        from osgeo import gdal, osr
+        import numpy as np
+
+        width = height = 64
+        xmin, ymin, pixel = -123.0, 37.0, 1.0 / 64
+        path = os.path.join(temp_dir, "grad.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, width, height, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([xmin, pixel, 0, ymin + height * pixel, 0, -pixel])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:height, 0:width]
+        ds.GetRasterBand(1).WriteArray((yy * width + xx).astype("float32"))
+        ds.FlushCache()
+        ds = None
+        return path
+
+    def _grid(self, temp_dir):
+        import geopandas as gpd
+        from shapely.geometry import box
+        h0_gdf = gpd.GeoDataFrame(
+            {"i": [0], "h0": [self.H0_CELL], "geometry": [box(-124, 36, -122, 38)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom")
+        path = os.path.join(temp_dir, "h0-test.parquet")
+        h0_gdf.to_parquet(path)
+        return path
+
+    def _processor(self, raster, temp_dir, out_name, **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        out = os.path.join(temp_dir, out_name)
+        os.makedirs(out, exist_ok=True)
+        return RasterProcessor(
+            input_path=raster,
+            output_parquet_path=out,
+            h3_resolution=self.RES,
+            parent_resolutions=[0],
+            h0_grid_path=self._grid(temp_dir),
+            value_column="v",
+            **kwargs,
+        ), out
+
+    @pytest.mark.timeout(120)
+    def test_chunk_list_tiles_the_parent_exactly(self, raster, temp_dir):
+        """Every native cell has exactly one chunk: no gaps, no overlaps."""
+        proc, _ = self._processor(raster, temp_dir, "cl", chunk_resolution=2)
+        chunks = proc.chunk_cells()
+        # H3 res-0 cells have 7 children each except the 12 pentagons (6), so
+        # the count comes from the hierarchy, never from 7**n arithmetic.
+        expected = proc.con.execute(
+            f"SELECT len(h3_cell_to_children({self.H0_CELL}, 2))"
+        ).fetchone()[0]
+        assert len(chunks) == expected
+        assert all(h0 == self.H0_CELL for _, h0, _ in chunks)
+        # Deterministic and unique
+        cells = [c for c, _, _ in chunks]
+        assert len(set(cells)) == len(cells)
+        assert cells == sorted(cells)
+
+    @pytest.mark.timeout(120)
+    def test_chunk_resolution_zero_is_the_historical_path(self, raster, temp_dir):
+        """Default chunking writes the documented data_0.parquet, unchanged."""
+        proc, out = self._processor(raster, temp_dir, "z", chunk_resolution=0)
+        result = proc.process_chunk(0)
+        assert result is not None
+        assert result.endswith(f"h0={self.H0_CELL}/data_0.parquet")
+        assert os.path.exists(result)
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("chunk_res,reducer", [(1, "mean"), (2, "mean"), (2, "mode"), (3, "mean")])
+    def test_subchunked_output_matches_the_h0_baseline(self, raster, temp_dir, chunk_res, reducer):
+        """
+        The correctness gate: same rows, same values, chunked or not.
+
+        This is what makes --chunk-resolution a memory optimisation rather than
+        a different computation. Run across chunk depths and reducers because
+        the failure it guards against — a native cell assigned to no chunk —
+        depends on the chunk geometry, not on the aggregation.
+        """
+        base_proc, base_out = self._processor(
+            raster, temp_dir, f"base{chunk_res}{reducer}", hex_resampling=reducer)
+        assert base_proc.process_chunk(0) is not None
+
+        sub_proc, sub_out = self._processor(
+            raster, temp_dir, f"sub{chunk_res}{reducer}",
+            chunk_resolution=chunk_res, hex_resampling=reducer)
+        produced = [
+            sub_proc.process_chunk(i) for i in range(len(sub_proc.chunk_cells()))
+        ]
+        assert any(p is not None for p in produced), "sub-chunked run produced nothing"
+
+        con = duckdb.connect()
+        baseline = con.execute(
+            f"SELECT v, h{self.RES}, h0 FROM read_parquet("
+            f"'{base_out}/h0=*/data_0.parquet') ORDER BY h{self.RES}"
+        ).fetchall()
+        chunked = con.execute(
+            f"SELECT v, h{self.RES}, h0 FROM read_parquet("
+            f"'{sub_out}/h0=*/part-*.parquet') ORDER BY h{self.RES}"
+        ).fetchall()
+
+        assert len(chunked) == len(baseline), (
+            f"row count differs: baseline {len(baseline)}, chunked {len(chunked)} — "
+            "sub-chunks must tile the h0 exactly"
+        )
+        assert chunked == baseline, "sub-chunked values differ from the h0 baseline"
+
+    @pytest.mark.timeout(300)
+    def test_merge_restores_the_published_layout(self, raster, temp_dir):
+        """part-*.parquet in, one data_0.parquet out, same rows."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+
+        base_proc, base_out = self._processor(raster, temp_dir, "mbase")
+        base_proc.process_chunk(0)
+
+        sub_proc, chunks_dir = self._processor(raster, temp_dir, "mchunks", chunk_resolution=2)
+        for i in range(len(sub_proc.chunk_cells())):
+            sub_proc.process_chunk(i)
+
+        merged_dir = os.path.join(temp_dir, "merged")
+        os.makedirs(merged_dir, exist_ok=True)
+        written = merge_raster_chunks(chunks_dir, merged_dir, cleanup=False)
+        assert written == 1
+
+        merged_file = os.path.join(merged_dir, f"h0={self.H0_CELL}", "data_0.parquet")
+        assert os.path.exists(merged_file), "merge must restore h0={cell}/data_0.parquet"
+
+        con = duckdb.connect()
+        baseline = con.execute(
+            f"SELECT v, h{self.RES}, h0 FROM read_parquet("
+            f"'{base_out}/h0=*/data_0.parquet') ORDER BY h{self.RES}"
+        ).fetchall()
+        merged = con.execute(
+            f"SELECT v, h{self.RES}, h0 FROM read_parquet('{merged_file}') "
+            f"ORDER BY h{self.RES}"
+        ).fetchall()
+        assert merged == baseline
+
+        # Schema must not drift: a merged build and an unchunked one are the
+        # same dataset and have to be readable by the same query.
+        base_cols = con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{base_out}/h0=*/data_0.parquet')"
+        ).fetchall()
+        merged_cols = con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{merged_file}')"
+        ).fetchall()
+        assert merged_cols == base_cols
+
+    @pytest.mark.timeout(120)
+    def test_pruning_allows_for_children_outside_the_parent(self, raster, temp_dir):
+        """
+        Regression: H3 children are not strictly inside the parent polygon.
+
+        Pruning a sub-chunk on its own boundary dropped a native cell that
+        really did overlap the raster — silently, exit 0, with output that
+        looked complete. The overlap test is widened by roughly one cell edge
+        to cover the protrusion; this asserts the widening is load-bearing by
+        checking that no chunk containing a baseline cell is pruned away.
+        """
+        base_proc, base_out = self._processor(raster, temp_dir, "pbase")
+        base_proc.process_chunk(0)
+        con = duckdb.connect()
+        baseline_cells = {
+            r[0] for r in con.execute(
+                f"SELECT h{self.RES} FROM read_parquet('{base_out}/h0=*/data_0.parquet')"
+            ).fetchall()
+        }
+        assert baseline_cells, "baseline produced no cells"
+
+        sub_proc, sub_out = self._processor(raster, temp_dir, "psub", chunk_resolution=2)
+        for i in range(len(sub_proc.chunk_cells())):
+            sub_proc.process_chunk(i)
+        chunked_cells = {
+            r[0] for r in con.execute(
+                f"SELECT h{self.RES} FROM read_parquet('{sub_out}/h0=*/part-*.parquet')"
+            ).fetchall()
+        }
+        missing = baseline_cells - chunked_cells
+        assert not missing, (
+            f"{len(missing)} native cell(s) reached by the h0 baseline were pruned away "
+            f"when chunked: {sorted(missing)[:5]}. The overlap margin is too small."
+        )
+
+    @pytest.mark.timeout(60)
+    def test_chunk_index_past_the_end_is_rejected(self, raster, temp_dir):
+        """A fan-out wider than the chunk list must fail, not silently do nothing."""
+        proc, _ = self._processor(raster, temp_dir, "oob", chunk_resolution=2)
+        with pytest.raises(ValueError, match="outside the"):
+            proc.process_chunk(len(proc.chunk_cells()))
+
+    @pytest.mark.timeout(60)
+    def test_h0_subset_restricts_the_chunk_list(self, raster, temp_dir):
+        proc, _ = self._processor(raster, temp_dir, "sub2", chunk_resolution=1, h0_subset=[0])
+        assert len(proc.chunk_cells()) > 0
+        empty, _ = self._processor(raster, temp_dir, "sub3", chunk_resolution=1, h0_subset=[7])
+        assert empty.chunk_cells() == []

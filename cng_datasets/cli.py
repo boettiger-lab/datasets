@@ -46,6 +46,20 @@ def main():
     raster_parser.add_argument("--resolution", type=int, help="H3 resolution (auto-detected if not specified)")
     raster_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
     raster_parser.add_argument("--h0-index", type=int, help="Process specific h0 region (0-121), or omit to process all")
+    raster_parser.add_argument("--chunk-resolution", type=int, default=0, metavar="N",
+                               help="H3 resolution of the unit of work (default: 0, one h0 base "
+                                    "cell). A higher value splits each h0 into its res-N "
+                                    "descendants, cutting peak memory ~7x per level, since RAM "
+                                    "tracks the largest chunk's cell count (#173). Sub-chunks are "
+                                    "written as part-{cell}.parquet and must be consolidated by "
+                                    "`cng-datasets merge-chunks`.")
+    raster_parser.add_argument("--chunk-index", type=int, default=None, metavar="K",
+                               help="Which chunk to process. At --chunk-resolution 0 this is "
+                                    "exactly --h0-index; give one or the other.")
+    raster_parser.add_argument("--h0-subset", type=str, default=None, metavar="CELLS",
+                               help="Restrict the chunk list to descendants of these h0 base cell "
+                                    "indices, e.g. '12,14,20,50,71,78' for CONUS, so a regional "
+                                    "source never enumerates chunks it cannot overlap.")
     raster_parser.add_argument("--value-column", default="value", help="Name for raster value column (default: 'value')")
     raster_parser.add_argument("--nodata", type=str,
                                help="NoData value(s) to exclude. Accepts a single value or a "
@@ -87,6 +101,16 @@ def main():
                                                 "copying to local disk first.")
 
     # Repartition command
+    merge_parser = subparsers.add_parser(
+        "merge-chunks",
+        help="Merge sub-h0 raster hex chunks into one file per h0 partition")
+    merge_parser.add_argument("--chunks-dir", required=True, help="Where the sub-chunked hex step wrote part-*.parquet")
+    merge_parser.add_argument("--output-dir", required=True, help="Published hex tree to write h0=*/data_0.parquet into")
+    merge_parser.add_argument("--no-cleanup", dest="cleanup", action="store_false", default=True,
+                              help="Keep the chunks prefix after a verified merge")
+    merge_parser.add_argument("--memory-limit", type=str, default=None,
+                              help="DuckDB memory limit (e.g. '8GiB'). Overrides DUCKDB_MEMORY_LIMIT.")
+
     repartition_parser = subparsers.add_parser("repartition", help="Repartition chunks by h0")
     repartition_parser.add_argument("--chunks-dir", required=True, help="Input chunks directory URL")
     repartition_parser.add_argument("--output-dir", required=True, help="Output directory URL")
@@ -301,6 +325,10 @@ def _dispatch(args):
             parts = [float(x) for x in args.target_extent.split(',')]
             target_extent = tuple(parts)
 
+        raster_h0_subset = None
+        if getattr(args, 'h0_subset', None):
+            raster_h0_subset = [int(x.strip()) for x in args.h0_subset.split(',') if x.strip()]
+
         input_path = args.inputs if len(args.inputs) > 1 else args.inputs[0]
 
         # If multiple inputs and only --output-cog requested, use create_mosaic_cog directly
@@ -330,6 +358,9 @@ def _dispatch(args):
                 h3_resolution=args.resolution,
                 parent_resolutions=parent_res,
                 h0_index=args.h0_index,
+                chunk_resolution=args.chunk_resolution,
+                chunk_index=args.chunk_index,
+                h0_subset=raster_h0_subset,
                 value_column=args.value_column,
                 nodata_value=args.nodata,
                 compression=args.compression,
@@ -348,10 +379,25 @@ def _dispatch(args):
                 processor.create_cog()
 
             if args.output_parquet:
-                if args.h0_index is not None:
-                    processor.process_h0_region()
+                if args.chunk_index is not None or args.h0_index is not None:
+                    processor.process_chunk()
+                elif args.chunk_resolution:
+                    raise ValueError(
+                        "--chunk-resolution needs a --chunk-index: there is no "
+                        "process-everything mode for sub-h0 chunks, which exist "
+                        "precisely so each unit runs in its own pod."
+                    )
                 else:
                     processor.process_all_h0_regions()
+
+    elif args.command == "merge-chunks":
+        from .raster.merge import merge_raster_chunks
+        merge_raster_chunks(
+            chunks_dir=args.chunks_dir,
+            output_dir=args.output_dir,
+            cleanup=args.cleanup,
+            memory_limit=args.memory_limit,
+        )
 
     elif args.command == "repartition":
         from .vector import repartition_by_h0

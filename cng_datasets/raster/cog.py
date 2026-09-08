@@ -1052,6 +1052,9 @@ class RasterProcessor:
         h3_resolution: Optional[int] = None,
         parent_resolutions: Optional[List[int]] = None,
         h0_index: Optional[int] = None,
+        chunk_resolution: int = 0,
+        chunk_index: Optional[int] = None,
+        h0_subset: Optional[List[int]] = None,
         h0_grid_path: str = "s3://public-grids/hex/h0-valid.parquet",
         value_column: str = "value",
         compression: str = "deflate",
@@ -1080,6 +1083,17 @@ class RasterProcessor:
             h3_resolution: Target H3 resolution (auto-detected if None)
             parent_resolutions: List of parent resolutions to include (e.g., [9, 8, 0])
             h0_index: Specific h0 cell index to process (0-121), or None for all
+            chunk_resolution: H3 resolution of the unit of work. 0 (default) is
+                one h0 base cell per invocation, the historical behaviour. A
+                higher value splits each h0 into its res-N descendants, so peak
+                memory — which tracks the largest chunk's cell count, not the
+                raster's size — falls by roughly 7x per level (issue #173).
+            chunk_index: Which chunk to process, indexing the ordered chunk list
+                for chunk_resolution. At chunk_resolution 0 this is exactly
+                h0_index; either may be given.
+            h0_subset: Restrict the chunk list to descendants of these h0 base
+                cell indices, so a regional source never enumerates chunks it
+                cannot overlap (issue #191, applied at chunk granularity).
             h0_grid_path: Path to h0 grid parquet file
             value_column: Name for the raster value column in parquet
             compression: Compression method for COG (deflate, lzw, zstd, etc.)
@@ -1205,6 +1219,23 @@ class RasterProcessor:
         self.output_cog_path = output_cog_path
         self.output_parquet_path = output_parquet_path
         self.h0_index = h0_index
+        if chunk_resolution < 0:
+            raise ValueError(
+                f"chunk_resolution must be >= 0, got {chunk_resolution}"
+            )
+        self.chunk_resolution = chunk_resolution
+        # h0_index and chunk_index are the same selector at chunk_resolution 0;
+        # accepting both keeps every existing caller and manifest working.
+        if chunk_index is None:
+            chunk_index = h0_index
+        elif h0_index is not None and chunk_index != h0_index:
+            raise ValueError(
+                f"chunk_index ({chunk_index}) and h0_index ({h0_index}) both given "
+                "and disagree; pass only one"
+            )
+        self.chunk_index = chunk_index
+        self.h0_subset = sorted({int(h) for h in h0_subset}) if h0_subset else None
+        self._chunk_cells_cache = None
         self.h0_grid_path = h0_grid_path
         self.value_column = value_column
         self.compression = compression
@@ -1553,9 +1584,18 @@ class RasterProcessor:
         # copying an array that is 2.3 GB at res 10.
         return cells.view(np.uint64)
 
-    def _h0_overlaps_raster(self, h0_geom_wkt: str) -> bool:
+    def _h0_overlaps_raster(self, h0_geom_wkt: str, margin_deg: float = 0.0) -> bool:
         """Whether the source raster's extent overlaps an h0 cell's true
-        footprint.
+        footprint, optionally widened by a margin.
+
+        The margin exists because H3's hierarchy is only *approximately*
+        containing: a child cell can protrude slightly beyond its parent's
+        boundary polygon. Pruning a sub-chunk on its own boundary therefore
+        drops native cells that really do overlap the raster — silently, with
+        a clean exit and a plausible output (issue #173). Callers processing a
+        sub-chunk pass a margin that generously bounds the protrusion. The
+        asymmetry is deliberate: a false positive costs one pod that exits in
+        seconds, a false negative costs data with nothing to show for it.
 
         The stored h0 polygon is in planar lat/lon, so antimeridian h0s
         (vertices on both sides of +/-180) have a bounding box ~360 deg wide
@@ -1581,6 +1621,17 @@ class RasterProcessor:
                 lon_intervals.append((-180.0, umax - 360.0))
         else:
             lon_intervals = [(minx, maxx)]
+
+        if margin_deg:
+            miny -= margin_deg
+            maxy += margin_deg
+            # A degree of longitude shrinks with latitude, so a margin fixed in
+            # degrees of latitude under-covers near the poles. Scale it by
+            # 1/cos(lat) at the cell's furthest-from-equator edge, capped so a
+            # near-polar cell widens to the whole globe rather than overflowing.
+            lat = min(max(abs(miny), abs(maxy)), 89.0)
+            lon_margin = min(margin_deg / max(math.cos(math.radians(lat)), 1e-6), 180.0)
+            lon_intervals = [(lo - lon_margin, hi + lon_margin) for lo, hi in lon_intervals]
 
         sxmin, symin, sxmax, symax = self._src_bounds_4326  # (xmin,ymin,xmax,ymax)
         if symax < miny or symin > maxy:  # no latitude overlap
@@ -1621,7 +1672,7 @@ class RasterProcessor:
         self._collapsed_input = collapsed
         return collapsed
 
-    def _hex_aggregate_h0(self, h0_cell: int) -> Optional[str]:
+    def _hex_aggregate_h0(self, chunk_cell: int, h0_cell: Optional[int] = None) -> Optional[str]:
         """Area-weighted aggregation of source raster into native H3 cells
         inside one h0 partition.
 
@@ -1642,10 +1693,15 @@ class RasterProcessor:
         import pandas as pd
 
         h3_col = f"h{self.h3_resolution}"
-        cells_arr = self._native_cells_for_h0(h0_cell)
+        # chunk_cell is the unit of work and defines which native cells are
+        # enumerated; h0_cell is only the partition the output lands in. They
+        # differ whenever chunk_resolution > 0 (issue #173).
+        if h0_cell is None:
+            h0_cell = chunk_cell
+        cells_arr = self._native_cells_for_h0(chunk_cell)
 
         if len(cells_arr) == 0:
-            print(f"  ℹ h0 {h0_cell}: no h{self.h3_resolution} cells")
+            print(f"  ℹ chunk {chunk_cell}: no h{self.h3_resolution} cells")
             return None
 
         # exactextract excludes pixels equal to the raster's single declared
@@ -1678,12 +1734,12 @@ class RasterProcessor:
                     self._collapsed_aggregation_input()
                     if len(nodata_values) > 1 else self.input_path
                 )
-                vrt_path = f"/tmp/raster_{h0_cell}_keepnodata.vrt"
+                vrt_path = f"/tmp/raster_{chunk_cell}_keepnodata.vrt"
                 gdal.Translate(vrt_path, base, format="VRT", noData="none")
                 rast_arg = vrt_path
             elif len(nodata_values) == 1:
                 if src_nodata != nodata_values[0]:
-                    vrt_path = f"/tmp/raster_{h0_cell}_nodata.vrt"
+                    vrt_path = f"/tmp/raster_{chunk_cell}_nodata.vrt"
                     gdal.Translate(
                         vrt_path,
                         self.input_path,
@@ -1723,7 +1779,7 @@ class RasterProcessor:
 
             chunk_results = [r for r in chunk_results if r is not None and len(r) > 0]
             if not chunk_results:
-                print(f"  ℹ h0 {h0_cell}: no cells produced values (all chunks empty)")
+                print(f"  ℹ chunk {chunk_cell}: no cells produced values (all chunks empty)")
                 return None
             results = pd.concat(chunk_results, ignore_index=True)
         finally:
@@ -1755,7 +1811,7 @@ class RasterProcessor:
             results = results[results[self.value_column].notna()]
 
         if len(results) == 0:
-            print(f"  ℹ h0 {h0_cell}: no cells produced values (all nodata)")
+            print(f"  ℹ chunk {chunk_cell}: no cells produced values (all nodata)")
             return None
 
         # Write to DuckDB to add parent columns and emit parquet.
@@ -1770,9 +1826,7 @@ class RasterProcessor:
                 )
         parent_sql = ", " + ", ".join(parent_exprs) if parent_exprs else ""
 
-        output_path = (
-            f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"
-        )
+        output_path = self._chunk_output_path(chunk_cell, h0_cell)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         if is_fractions:
@@ -1818,6 +1872,138 @@ class RasterProcessor:
         unit = "class rows" if is_fractions else "cells"
         print(f"  ✓ Wrote: {output_path} ({len(results)} {unit})")
         return output_path
+
+    def chunk_cells(self):
+        """Ordered [(chunk_cell, h0_cell, h0_index)] — the units of work.
+
+        The unit of parallelism used to be fixed at one h0 base cell, which is
+        why peak memory tracked the densest h0 (~282M cells at res 10). At
+        chunk_resolution N the unit becomes an h0's res-N descendant instead,
+        and since H3 nests perfectly those descendants tile their parent
+        exactly: no seams to dedup and no gaps, unlike bbox tiling where a
+        native cell straddling an edge would be split or double-counted
+        (issue #173).
+
+        Ordering is (h0 index, chunk cell id) — deterministic and independent
+        of the order h3_cell_to_children happens to return, so a chunk index
+        maps to the same cell in the generator that sized the fan-out and in
+        the pod that runs it, across regenerations and DuckDB versions.
+
+        At chunk_resolution 0 this is the h0 grid itself, in grid order, so the
+        index -> cell mapping is byte-identical to the historical --h0-index.
+        """
+        if self._chunk_cells_cache is not None:
+            return self._chunk_cells_cache
+
+        where_sql = ""
+        if self.h0_subset:
+            where_sql = f"WHERE i IN ({', '.join(str(h) for h in self.h0_subset)})"
+
+        base = self.con.execute(f"""
+            SELECT i, h0
+            FROM read_parquet('{self.h0_grid_path}')
+            {where_sql}
+            ORDER BY i
+        """).fetchall()
+
+        if self.chunk_resolution == 0:
+            self._chunk_cells_cache = [
+                (int(h0), int(h0), int(i)) for i, h0 in base
+            ]
+            return self._chunk_cells_cache
+
+        # Expanded one h0 at a time with the cell as a literal. The obvious
+        # single query — UNNEST(h3_cell_to_children(h0, N)) selected alongside
+        # i and h0 over a parquet scan — is not merely slow, it aborts DuckDB
+        # with "INTERNAL Error: Calling GetValueInternal on a value that is
+        # NULL" and invalidates the connection, so every later query in the
+        # process fails too. The literal form is the one already proven in
+        # _native_cells_for_h0, and there are at most 122 of these.
+        cells = []
+        for i, h0 in base:
+            children = self.con.execute(
+                f"SELECT UNNEST(h3_cell_to_children({int(h0)}, {self.chunk_resolution}))"
+            ).fetchall()
+            cells.extend(
+                (int(child), int(h0), int(i)) for (child,) in children
+            )
+        # (h0 index, chunk cell) — see the ordering note above.
+        cells.sort(key=lambda row: (row[2], row[0]))
+        self._chunk_cells_cache = cells
+        return self._chunk_cells_cache
+
+    def _chunk_output_path(self, chunk_cell: int, h0_cell: Optional[int] = None) -> str:
+        """Where one chunk's parquet goes.
+
+        At chunk_resolution 0 the historical `h0={cell}/data_0.parquet` is
+        preserved exactly — that literal path is published in STAC READMEs that
+        users copy from, so it is not ours to change. Sub-chunks cannot share
+        one filename, so they are written as siblings named by their own cell
+        and merged back into `data_0.parquet` by `merge_raster_chunks`, which
+        keeps the published layout identical either way.
+        """
+        if h0_cell is None:
+            h0_cell = chunk_cell
+        base = f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}"
+        if self.chunk_resolution == 0:
+            return f"{base}/data_0.parquet"
+        return f"{base}/part-{chunk_cell}.parquet"
+
+    def process_chunk(self, chunk_index: Optional[int] = None) -> Optional[str]:
+        """Process one chunk (an h0 cell, or a sub-cell of one) to parquet.
+
+        Generalizes process_h0_region to any chunk_resolution. At
+        chunk_resolution 0 it resolves to the same h0 cell, the same geometry
+        from the stored grid and the same output path, so the default path is
+        unchanged.
+
+        Returns the output parquet path, or None when the chunk has no data.
+        """
+        if chunk_index is None:
+            chunk_index = self.chunk_index
+        if chunk_index is None:
+            raise ValueError("chunk_index (or h0_index) must be specified")
+
+        if self.chunk_resolution == 0:
+            return self.process_h0_region(chunk_index)
+
+        cells = self.chunk_cells()
+        if not 0 <= chunk_index < len(cells):
+            raise ValueError(
+                f"chunk_index {chunk_index} is outside the {len(cells)} chunks at "
+                f"chunk-resolution {self.chunk_resolution}"
+                + (f" over h0 subset {self.h0_subset}" if self.h0_subset else "")
+                + ". The fan-out size and the chunk resolution must match."
+            )
+        chunk_cell, h0_cell, h0_index = cells[chunk_index]
+
+        print(
+            f"\nProcessing chunk {chunk_index} of {len(cells)} "
+            f"(res-{self.chunk_resolution} cell {chunk_cell}, h0 {h0_index})..."
+        )
+
+        # A sub-chunk has no row in the h0 grid, so its footprint comes from the
+        # cell id itself. _h0_overlaps_raster's antimeridian unwrapping applies
+        # unchanged — a res-N cell can straddle +/-180 just as an h0 can.
+        geom_wkt = self.con.execute(
+            f"SELECT h3_cell_to_boundary_wkt({chunk_cell})"
+        ).fetchone()[0]
+
+        # Half the chunk's own latitude extent — roughly one cell edge, which
+        # comfortably exceeds the child-outside-parent protrusion at every
+        # resolution while still pruning the vast majority of non-overlapping
+        # chunks.
+        from shapely import wkt as _shapely_wkt
+        _, cminy, _, cmaxy = _shapely_wkt.loads(geom_wkt).bounds
+        margin_deg = 0.5 * (cmaxy - cminy)
+
+        if not self._h0_overlaps_raster(geom_wkt, margin_deg=margin_deg):
+            print(f"  ℹ No overlap between source raster and chunk {chunk_cell}, skipping")
+            return None
+
+        if self.method == "warp-centroid":
+            return self._hex_warp_centroid_h0(geom_wkt, chunk_cell, chunk_index, h0_cell=h0_cell)
+        return self._hex_aggregate_h0(chunk_cell, h0_cell=h0_cell)
 
     def process_h0_region(self, h0_index: Optional[int] = None) -> Optional[str]:
         """
@@ -1876,7 +2062,8 @@ class RasterProcessor:
         return self._hex_aggregate_h0(h0_cell)
 
     def _hex_warp_centroid_h0(
-        self, h0_geom_wkt: str, h0_cell: int, h0_index: int
+        self, h0_geom_wkt: str, chunk_cell: int, h0_index: int,
+        h0_cell: Optional[int] = None,
     ) -> Optional[str]:
         """Restored gdal.Warp → XYZ → centroid pipeline (Plan B, opt-in via
         method="warp-centroid").
@@ -1964,9 +2151,7 @@ class RasterProcessor:
             else:
                 where_clause = ""
 
-            output_path = (
-                f"{self.output_parquet_path.rstrip('/')}/h0={h0_cell}/data_0.parquet"
-            )
+            output_path = self._chunk_output_path(chunk_cell, h0_cell)
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
             self.con.execute(f"""
