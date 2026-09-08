@@ -107,6 +107,15 @@ rclone copy catalog/<dataset>/stac/stac-collection.json nrp:<bucket>/
 | `--parent-resolutions` | "9,8,0" | Almost never change this |
 | `--intermediate-chunk-size` | auto | Decrease if hex pods OOM during unnest step |
 
+`raster-workflow` additionally takes:
+
+| Parameter | Default | When to change |
+|-----------|---------|----------------|
+| `--hex-cpu` | 4 | Raise for faster hex pods; also raises the default `--hex-workers` |
+| `--hex-workers` | one per `--hex-cpu` | **Lower it first when a raster hex pod OOMs** — see Troubleshooting |
+| `--hex-chunk-size` | 100000 | Lower when fewer workers alone is too coarse a step |
+| `--h0-subset` | all 122 cells | List the h0 cells a regional source overlaps |
+
 ## S3 Bucket Layout
 
 ```
@@ -130,6 +139,21 @@ kubectl logs job/<name>-convert
 
 **Hex pods OOM → increase memory or chunks:**
 Regenerate with `--hex-memory 64Gi` or `--max-completions 200`, delete failed job, reapply.
+
+**Raster hex pods OOM → fewer chunks in flight, not more memory:**
+A raster hex pod's peak RSS is roughly `--hex-workers × --hex-chunk-size × bytes
+per cell`, and `--hex-workers` is the lever to reach for first. Raising
+`--hex-memory` past ~128Gi makes the pod contend for scarce large-RAM nodes,
+which converts a retryable OOM into an unschedulable pod — strictly worse.
+
+```bash
+cng-datasets raster-workflow ... --hex-cpu 8 --hex-workers 8
+```
+
+Both knobs are written into the manifest as `CNG_HEX_WORKERS` /
+`CNG_HEX_CHUNK_SIZE` whether or not you pass them, so a tuned pod survives
+regeneration and its memory profile is readable from the YAML alone. The
+generator prints the resulting profile when it runs.
 
 **S3 throttling (503 SlowDown):** Transient. Wait a few minutes and retry.
 

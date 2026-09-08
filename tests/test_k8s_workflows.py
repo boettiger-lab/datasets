@@ -1712,3 +1712,142 @@ class TestCsvAndCountFlagsReachTheConvertStep:
             cmd = self._convert_command(tmpdir, monkeypatch)
             for flag in ("--lat-column", "--lon-column", "--expect-features"):
                 assert flag not in cmd
+
+
+class TestHexWorkerSizing:
+    """
+    The hex pod's worker count is pinned in the manifest (issue #195).
+
+    Left unset, `cng-datasets raster` sizes its pool from the cgroup CPU quota
+    and falls back to the node's core count when that is unreadable — so one
+    manifest produced 48 workers on one node and 64 on another, on a pod that
+    requested 4 CPUs, and peak RSS followed. Emitting CNG_HEX_WORKERS and
+    CNG_HEX_CHUNK_SIZE makes the pod's memory profile a property of the
+    manifest, and makes a tuned value survive regeneration.
+    """
+
+    def _hex_container(self, tmpdir, monkeypatch, **kwargs):
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+        generate_raster_workflow(
+            dataset_name="hexdemo",
+            source_urls="https://example.com/x.tif",
+            bucket="test-bucket",
+            output_dir=tmpdir,
+            **kwargs,
+        )
+        job = yaml.safe_load(open(Path(tmpdir) / "hexdemo-hex.yaml"))
+        return job["spec"]["template"]["spec"]["containers"][0]
+
+    @staticmethod
+    def _env(container, name):
+        for entry in container["env"]:
+            if entry["name"] == name:
+                return entry["value"]
+        return None
+
+    @pytest.mark.timeout(5)
+    def test_defaults_are_pinned_not_inherited(self, monkeypatch):
+        """Even an untuned manifest states both halves of the peak-RSS product."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = self._hex_container(tmpdir, monkeypatch)
+            # One worker per requested CPU — not the 48/64 the runtime inferred.
+            assert self._env(c, "CNG_HEX_WORKERS") == "4"
+            assert self._env(c, "CNG_HEX_CHUNK_SIZE") == "100000"
+            assert c["resources"]["requests"]["cpu"] == "4"
+
+    @pytest.mark.timeout(5)
+    def test_explicit_workers_override_the_cpu_default(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = self._hex_container(tmpdir, monkeypatch, hex_workers=8)
+            assert self._env(c, "CNG_HEX_WORKERS") == "8"
+            assert c["resources"]["requests"]["cpu"] == "4"
+
+    @pytest.mark.timeout(5)
+    def test_hex_cpu_sets_the_request_and_the_worker_default(self, monkeypatch):
+        """The #590 hand-rolled shape — cpu 8, 8 workers — is now generatable."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = self._hex_container(tmpdir, monkeypatch, hex_cpu="8")
+            assert self._env(c, "CNG_HEX_WORKERS") == "8"
+            assert c["resources"]["requests"]["cpu"] == "8"
+            assert c["resources"]["limits"]["cpu"] == "8"
+
+    @pytest.mark.timeout(5)
+    def test_millicpu_request_floors_to_whole_workers(self, monkeypatch):
+        """A fractional CPU request still has to yield at least one worker."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = self._hex_container(tmpdir, monkeypatch, hex_cpu="3500m")
+            assert self._env(c, "CNG_HEX_WORKERS") == "3"
+            assert c["resources"]["requests"]["cpu"] == "3500m"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = self._hex_container(tmpdir, monkeypatch, hex_cpu="500m")
+            assert self._env(c, "CNG_HEX_WORKERS") == "1"
+
+    @pytest.mark.timeout(5)
+    def test_chunk_size_is_emitted(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = self._hex_container(tmpdir, monkeypatch, hex_chunk_size=25000)
+            assert self._env(c, "CNG_HEX_CHUNK_SIZE") == "25000"
+
+    @pytest.mark.timeout(5)
+    @pytest.mark.parametrize("kwargs", [
+        {"hex_workers": 0},
+        {"hex_workers": -1},
+        {"hex_chunk_size": 0},
+        {"hex_cpu": "0"},
+        {"hex_cpu": "four"},
+    ])
+    def test_unusable_sizing_is_rejected_at_generation(self, monkeypatch, kwargs):
+        """A knob that cannot produce a working pod fails before the YAML is written."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError):
+                self._hex_container(tmpdir, monkeypatch, **kwargs)
+
+    @pytest.mark.timeout(5)
+    def test_rejection_leaves_no_partial_workflow(self, monkeypatch):
+        """The check runs before the first manifest, not between two of them."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError):
+                self._hex_container(tmpdir, monkeypatch, hex_workers=0)
+            assert list(Path(tmpdir).iterdir()) == []
+
+    @pytest.mark.timeout(10)
+    def test_armada_conversion_preserves_the_worker_count(self, monkeypatch):
+        """--backend armada must not drop the lever (issue #183 is about what it does drop)."""
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="hexdemo",
+                source_urls="https://example.com/x.tif",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                backend="armada",
+                hex_workers=8,
+                hex_chunk_size=25000,
+            )
+            text = (Path(tmpdir) / "armada-hexdemo-hex.yaml").read_text()
+            assert "CNG_HEX_WORKERS" in text
+            assert "CNG_HEX_CHUNK_SIZE" in text
+
+    @pytest.mark.timeout(5)
+    def test_vector_hex_job_does_not_advertise_the_knob(self, monkeypatch):
+        """
+        Only the raster hex step runs a worker pool.
+
+        `cng-datasets vector` never reads CNG_HEX_WORKERS, so emitting it on the
+        vector hex job would be a knob that silently does nothing — the exact
+        failure mode #195 exists to remove.
+        """
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="vec",
+                source_url="https://example.com/x.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            job = yaml.safe_load(open(Path(tmpdir) / "vec-hex.yaml"))
+            env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+            assert not [e for e in env if e["name"].startswith("CNG_HEX")]

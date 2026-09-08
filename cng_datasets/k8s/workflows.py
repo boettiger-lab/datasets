@@ -263,6 +263,60 @@ def _normalize_h0_subset(h0_subset: Optional[List[int]]) -> Optional[List[int]]:
     return cells
 
 
+# Default cells per exact_extract call in the hex step; mirrors
+# cng_datasets.raster.cog's CNG_HEX_CHUNK_SIZE default. Generated manifests
+# pin it explicitly rather than inherit it, so a pod's peak memory is a
+# function of the manifest alone (issue #195).
+DEFAULT_HEX_CHUNK_SIZE = 100000
+
+# CPU request/limit for a hex pod. Also the default worker count, since one
+# process per requested CPU is the point at which the pod stops oversubscribing
+# the cores it actually asked for.
+DEFAULT_HEX_CPU = "4"
+
+
+def _cpu_quantity_to_workers(cpu: str) -> int:
+    """Whole CPUs in a Kubernetes CPU quantity ("4", "3500m"), floored at 1."""
+    text = str(cpu).strip()
+    try:
+        cores = float(text[:-1]) / 1000.0 if text.endswith("m") else float(text)
+    except ValueError:
+        raise ValueError(
+            f"hex_cpu must be a Kubernetes CPU quantity such as '4' or '3500m', got {cpu!r}"
+        ) from None
+    if cores <= 0:
+        raise ValueError(f"hex_cpu must be greater than zero, got {cpu!r}")
+    return max(1, int(cores))
+
+
+def _resolve_hex_workers(hex_workers: Optional[int], hex_cpu: str) -> int:
+    """
+    Worker-process count for a hex pod: the request, else the pod's CPU request.
+
+    Left unset in the pod, `cng-datasets raster` sizes its pool from the cgroup
+    quota and falls back to the node's core count when that is unreadable — 64
+    workers on a 4-CPU pod, and a different number on a differently sized node
+    (issue #195). Peak RSS is roughly workers x chunk size x bytes per cell, so
+    an unpinned worker count makes peak memory a property of the scheduler
+    rather than of the manifest. Resolving it here means every generated hex
+    job carries an explicit number.
+    """
+    if hex_workers is None:
+        return _cpu_quantity_to_workers(hex_cpu)
+    hex_workers = int(hex_workers)
+    if hex_workers < 1:
+        raise ValueError(f"hex_workers must be at least 1, got {hex_workers}")
+    return hex_workers
+
+
+def _validate_hex_chunk_size(hex_chunk_size) -> int:
+    """Cells per exact_extract call, as a positive int."""
+    hex_chunk_size = int(hex_chunk_size)
+    if hex_chunk_size < 1:
+        raise ValueError(f"hex_chunk_size must be at least 1, got {hex_chunk_size}")
+    return hex_chunk_size
+
+
 def _validate_k8s_name(k8s_name: str, original: str) -> None:
     """Raise ValueError if k8s_name is not a valid Kubernetes resource name."""
     pattern = re.compile(r'^[a-z0-9][a-z0-9\-]*[a-z0-9]$')
@@ -785,6 +839,9 @@ def generate_raster_workflow(
     max_parallelism: int = 61,
     h0_subset: Optional[List[int]] = None,
     hex_storage: str = "20Gi",
+    hex_workers: Optional[int] = None,
+    hex_chunk_size: int = DEFAULT_HEX_CHUNK_SIZE,
+    hex_cpu: str = DEFAULT_HEX_CPU,
     cog_storage: str = "50Gi",
     target_extent: Optional[tuple] = None,
     target_resolution: Optional[float] = None,
@@ -845,6 +902,16 @@ def generate_raster_workflow(
             [12, 14, 20, 50, 71, 78] for CONUS. The hex job then runs one
             completion per listed cell instead of all 122, and the completion
             index selects from the list. Omit for a global source (issue #191).
+        hex_workers: Worker processes per hex pod, emitted as CNG_HEX_WORKERS.
+            Defaults to hex_cpu, i.e. one worker per requested core. This is
+            the memory lever: peak RSS is roughly workers x hex_chunk_size x
+            bytes per cell, and unlike hex_memory it stays schedulable — a
+            larger memory request on an already-scarce large-RAM node turns a
+            retryable OOM into an unschedulable pod (issue #195).
+        hex_chunk_size: Cells per exact_extract call, emitted as
+            CNG_HEX_CHUNK_SIZE (default 100000). The other half of the peak-RSS
+            product; lower it when fewer workers alone is too coarse a step.
+        hex_cpu: CPU request and limit per hex pod (default "4").
         target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step
         target_resolution: Output pixel size in degrees for mosaic step
         band: Extract single band from multi-band sources (1-indexed) for mosaic step
@@ -884,6 +951,13 @@ def generate_raster_workflow(
         parent_resolutions = [0]
 
     h0_subset = _normalize_h0_subset(h0_subset)
+
+    # Resolve the hex pod's sizing before anything is written, so an unusable
+    # knob fails the generation outright rather than leaving a partial workflow
+    # on disk for the next kubectl apply to pick up (issue #195).
+    hex_cpu = str(hex_cpu).strip()
+    hex_workers = _resolve_hex_workers(hex_workers, hex_cpu)
+    hex_chunk_size = _validate_hex_chunk_size(hex_chunk_size)
 
     # Decide whether a preprocess-cog step is needed
     needs_preprocess = len(source_urls) > 1 or target_extent is not None or band is not None
@@ -935,6 +1009,7 @@ def generate_raster_workflow(
         hex_memory, max_parallelism, hex_storage=hex_storage,
         hex_resampling=hex_resampling, config=config,
         s3_dataset=dataset_name, h0_subset=h0_subset,
+        hex_workers=hex_workers, hex_chunk_size=hex_chunk_size, hex_cpu=hex_cpu,
     )
 
     # Generate workflow RBAC
@@ -951,6 +1026,19 @@ def generate_raster_workflow(
     _generate_raster_configmap(k8s_name, namespace, output_path, gen_command, needs_preprocess)
     _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir, needs_preprocess)
 
+    # The hex pod's memory profile, stated at generation time. Peak RSS tracks
+    # workers × chunk size, and both are now pinned in the manifest; printing
+    # the product is what makes an oversubscribed pod visible before it is
+    # applied rather than after it OOMs (issue #195).
+    hex_profile = (
+        f"  Hex pod: cpu {hex_cpu}, memory {hex_memory}, "
+        f"{hex_workers} workers × {hex_chunk_size} cells/chunk"
+    )
+    hex_profile_hint = (
+        "    Peak memory scales with that product — lower --hex-workers first "
+        "(a bigger --hex-memory can make the pod unschedulable)"
+    )
+
     if backend == "armada":
         armada_files = convert_workflow_to_armada(
             k8s_yaml_dir=str(output_path),
@@ -965,6 +1053,8 @@ def generate_raster_workflow(
         print(f"\n✓ Generated Armada raster workflow for {dataset_name}")
         print(f"  Armada priority class: {effective_priority} "
               f"(override with --armada-priority-class)")
+        print(hex_profile)
+        print(hex_profile_hint)
         print(f"\nArmada files created in {output_dir}:")
         for f in armada_files:
             print(f"  - {Path(f).name}")
@@ -984,6 +1074,8 @@ def generate_raster_workflow(
         else:
             print("  Hex completions: 122 (every h0 base cell) — pass "
                   "--h0-subset to skip the ones the source does not cover")
+        print(hex_profile)
+        print(hex_profile_hint)
         print(f"\nFiles created in {output_dir}:")
         print(f"  - {k8s_name}-setup-bucket.yaml")
         if needs_preprocess:
@@ -1091,10 +1183,16 @@ def _generate_raster_hex_job(
     hex_memory, max_parallelism, hex_storage="20Gi",
     hex_resampling: str = "mean", config: ClusterConfig = None,
     s3_dataset=None, h0_subset: Optional[List[int]] = None,
+    hex_workers: Optional[int] = None,
+    hex_chunk_size: int = DEFAULT_HEX_CHUNK_SIZE,
+    hex_cpu: str = DEFAULT_HEX_CPU,
 ):
     """Generate raster H3 hex tiling job."""
     if config is None:
         config = ClusterConfig()
+    hex_cpu = str(hex_cpu).strip()
+    hex_workers = _resolve_hex_workers(hex_workers, hex_cpu)
+    hex_chunk_size = _validate_hex_chunk_size(hex_chunk_size)
     # dataset_name is the k8s name, with '/' flattened to '-' so it is a legal
     # object name. S3 paths want the original hierarchical name, as the vector
     # generators already do for their own jobs (issue #189).
@@ -1152,15 +1250,21 @@ def _generate_raster_hex_job(
             "env": _s3_env_vars(config) + [
                 {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
                 {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
-                {"name": "BUCKET", "value": bucket}
+                {"name": "BUCKET", "value": bucket},
+                # Peak RSS of a hex pod is roughly workers x chunk size x bytes
+                # per cell. Both are pinned here, never left to the runtime, so
+                # the manifest alone determines the pod's memory profile and a
+                # tuned value survives regeneration (issue #195).
+                {"name": "CNG_HEX_WORKERS", "value": str(hex_workers)},
+                {"name": "CNG_HEX_CHUNK_SIZE", "value": str(hex_chunk_size)},
             ],
             "volumeMounts": [
                 {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
             ],
             "command": ["bash", "-c", command_str],
             "resources": {
-                "requests": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": hex_storage},
-                "limits": {"cpu": "4", "memory": hex_memory, "ephemeral-storage": hex_storage}
+                "requests": {"cpu": hex_cpu, "memory": hex_memory, "ephemeral-storage": hex_storage},
+                "limits": {"cpu": hex_cpu, "memory": hex_memory, "ephemeral-storage": hex_storage}
             }
         }],
         "volumes": [

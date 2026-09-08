@@ -256,3 +256,45 @@ class TestH0SubsetFlag:
                 main()
 
         assert captured["h0_subset"] is None
+
+
+class TestHexSizingFlags:
+    """--hex-workers and friends must reach the generator (issue #195)."""
+
+    def _captured(self, tmp_path, *extra):
+        captured = {}
+        test_args = [
+            "cng-datasets", "raster-workflow",
+            "--dataset", "cli-hex",
+            "--source-url", "https://example.com/x-cog.tif",
+            "--bucket", "test-bucket",
+            "--output-dir", str(tmp_path),
+            *extra,
+        ]
+        with patch("cng_datasets.k8s.generate_raster_workflow",
+                   lambda **kwargs: captured.update(kwargs)):
+            with patch.object(sys, 'argv', test_args):
+                main()
+        return captured
+
+    @pytest.mark.timeout(10)
+    def test_flags_parse_and_reach_the_generator(self, tmp_path):
+        captured = self._captured(
+            tmp_path,
+            "--hex-workers", "8", "--hex-cpu", "8", "--hex-chunk-size", "25000",
+        )
+        assert captured["hex_workers"] == 8
+        assert captured["hex_cpu"] == "8"
+        assert captured["hex_chunk_size"] == 25000
+
+    @pytest.mark.timeout(10)
+    def test_omitted_flags_leave_the_generator_defaults_alone(self, tmp_path):
+        """
+        Unset knobs are not forwarded at all.
+
+        Passing None through would override the generator's own defaults with
+        nothing, so the default worker count has to be decided in one place.
+        """
+        captured = self._captured(tmp_path)
+        for key in ("hex_workers", "hex_cpu", "hex_chunk_size"):
+            assert key not in captured

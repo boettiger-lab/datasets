@@ -243,12 +243,24 @@ def _exact_extract_cells(raster_path, op_name, chunk_cells):
     raise RuntimeError(f"Unreachable; last={last_exc}")
 
 
+# Warn at most once per process that the CPU quota could not be read.
+_CPU_QUOTA_WARNED = False
+
+
 def _cgroup_cpu_count() -> int:
     """Return the cgroup CPU quota (kubernetes pod limit) or os.cpu_count() fallback.
 
     os.cpu_count() returns the node's CPU count inside a k8s pod, which
     over-provisions workers when the pod is limited to e.g. 8 CPU on a
     64-core node. Read cgroup v2 cpu.max if present.
+
+    The fallback is not merely imprecise, it is non-deterministic: a container
+    whose /sys/fs/cgroup is the host root rather than its own cgroup namespace
+    reads cpu.max as "max" even though the pod *is* CPU-limited, so the worker
+    count silently becomes whatever node the pod landed on — 48 cores here, 64
+    there, from one manifest, and with it the peak RSS (issue #195). Say so
+    when it happens; generated manifests now pin CNG_HEX_WORKERS so they never
+    reach this path.
     """
     try:
         with open("/sys/fs/cgroup/cpu.max") as f:
@@ -266,7 +278,17 @@ def _cgroup_cpu_count() -> int:
             return max(1, int(quota / period))
     except (FileNotFoundError, ValueError):
         pass
-    return os.cpu_count() or 1
+    n_cpus = os.cpu_count() or 1
+    global _CPU_QUOTA_WARNED
+    if not _CPU_QUOTA_WARNED:
+        _CPU_QUOTA_WARNED = True
+        print(
+            f"  ⚠ No cgroup CPU quota readable — falling back to {n_cpus} host CPUs. "
+            "Inside a pod that is the node's core count, not the pod's limit, so "
+            "peak memory depends on which node you land on. Set CNG_HEX_WORKERS "
+            "to pin it."
+        )
+    return n_cpus
 
 # Set GDAL to use exceptions for better error handling
 gdal.UseExceptions()
