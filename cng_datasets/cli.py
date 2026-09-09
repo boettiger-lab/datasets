@@ -232,7 +232,25 @@ def main():
     raster_workflow_parser.add_argument("--target-resolution", type=float, help="Output pixel size in degrees (multi-tile only)")
     raster_workflow_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (multi-tile only)")
     raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif)")
-    raster_workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
+    raster_workflow_parser.add_argument("--backend", choices=["k8s", "armada", "auto"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission, 'auto' to pick armada once the chunk count exceeds the ~200-pod namespace guideline")
+    raster_workflow_parser.add_argument("--chunk-resolution", type=int, default=0, metavar="N",
+                                        help="H3 resolution of one hex pod's unit of work (default: 0, "
+                                             "one h0 base cell). A higher value splits each h0 into its "
+                                             "res-N descendants, cutting peak memory ~7x per level since "
+                                             "RAM tracks the largest chunk's cell count (#173). Adds a "
+                                             "merge step that restores the published one-file-per-"
+                                             "partition layout.")
+    raster_workflow_parser.add_argument("--max-hex-memory", type=str, default=None, metavar="SIZE",
+                                        help="Pick --chunk-resolution automatically as the coarsest that "
+                                             "fits this budget, e.g. '8Gi'. Coarsest rather than finest "
+                                             "because each extra level multiplies the pod count ~7x. "
+                                             "Mutually exclusive with --chunk-resolution.")
+    raster_workflow_parser.add_argument("--merge-memory", type=str, default="16Gi",
+                                        help="Memory request/limit for the merge job pod (default: 16Gi). "
+                                             "It streams one partition at a time, so this does not track "
+                                             "the dataset's size.")
+    raster_workflow_parser.add_argument("--merge-storage", type=str, default="100Gi",
+                                        help="Ephemeral storage request/limit for the merge job pod (default: 100Gi)")
     raster_workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
     # Cluster/storage configuration flags
     raster_workflow_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file. Explicit flags below override profile values.")
@@ -530,6 +548,10 @@ def _dispatch(args):
             h0_subset=h0_subset,
             hex_storage=args.hex_storage,
             **hex_sizing,
+            chunk_resolution=args.chunk_resolution,
+            max_hex_memory=args.max_hex_memory,
+            merge_memory=args.merge_memory,
+            merge_storage=args.merge_storage,
             cog_storage=args.cog_storage,
             target_extent=target_extent,
             target_resolution=getattr(args, 'target_resolution', None),

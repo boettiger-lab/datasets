@@ -309,6 +309,84 @@ def _resolve_hex_workers(hex_workers: Optional[int], hex_cpu: str) -> int:
     return hex_workers
 
 
+# Bytes of parent-process peak RSS per H3 cell enumerated in a hex chunk.
+#
+# Measured in issue #173 after boundary derivation moved into the workers: the
+# parent now carries 8 B/cell of ids, and ~121 B/cell of peak RSS once DuckDB's
+# own materialisation of the child list is counted. The constant is taken from
+# the res-9 run rather than a smaller one because peak RSS grows *sub*-linearly
+# in cell count (4.58x for 7x the cells), so extrapolating from a small run
+# over-predicts. It reproduces the three measured points: 282M cells -> ~32 GiB,
+# 40.4M -> 4.6 GiB, 5.8M -> 0.68 GiB.
+#
+# This models the parent's enumeration, which is the term that scales with chunk
+# size. Worker memory is already bounded by CNG_HEX_WORKERS x CNG_HEX_CHUNK_SIZE
+# and does not enter here, and the output-side accumulation is not modelled — so
+# treat the estimate as a floor, not a guarantee.
+HEX_BYTES_PER_CELL = 121
+
+# Above this many chunks a build is past the namespace pod guideline and belongs
+# on an external queue rather than in one indexed Job (issue #173 lever D, #39).
+K8S_CHUNK_COUNT_GUIDELINE = 200
+
+# Hard ceiling on the fan-out. Armada's regime is thousands of small jobs — the
+# reference build in #183 ran 4,270 — not hundreds of thousands, and each chunk
+# is a pod that schedules, pulls the image and reads its own window. The ceiling
+# also protects generation itself: enumerating the chunk list means materialising
+# one row per chunk, so an unguarded --chunk-resolution 10 would try to build a
+# 282-million-entry list here and hang before writing a single manifest.
+MAX_CHUNK_COUNT = 50000
+
+
+def _parse_memory_to_bytes(quantity: str) -> int:
+    """Bytes in a Kubernetes memory quantity ("32Gi", "512Mi", "1000000")."""
+    text = str(quantity).strip()
+    units = {"Ki": 2 ** 10, "Mi": 2 ** 20, "Gi": 2 ** 30, "Ti": 2 ** 40,
+             "K": 10 ** 3, "M": 10 ** 6, "G": 10 ** 9, "T": 10 ** 12}
+    for suffix, factor in sorted(units.items(), key=lambda kv: -len(kv[0])):
+        if text.endswith(suffix):
+            return int(float(text[:-len(suffix)]) * factor)
+    return int(float(text))
+
+
+def estimate_chunk_peak_bytes(h3_resolution: int, chunk_resolution: int) -> int:
+    """Estimated parent peak RSS for one chunk, from the #173 measurements.
+
+    Cells per chunk is 7 ** (h3_resolution - chunk_resolution): every level
+    between the chunk and the native resolution multiplies the count by seven.
+    Pentagons have six children rather than seven, so this over-counts slightly
+    for the twelve pentagon lineages — the safe direction for a memory budget.
+    """
+    if chunk_resolution > h3_resolution:
+        raise ValueError(
+            f"chunk_resolution {chunk_resolution} is finer than the target "
+            f"h3_resolution {h3_resolution}; a chunk would contain no cells"
+        )
+    return 7 ** (h3_resolution - chunk_resolution) * HEX_BYTES_PER_CELL
+
+
+def select_chunk_resolution(h3_resolution: int, budget: str) -> int:
+    """Coarsest chunk resolution whose estimated peak fits the memory budget.
+
+    Coarsest rather than finest because every extra level multiplies the pod
+    count by seven, and pods are not free: each one schedules, pulls the image
+    and reads its own window of the source. The aim is the smallest fan-out that
+    fits, not the smallest possible chunk.
+    """
+    budget_bytes = _parse_memory_to_bytes(budget)
+    if budget_bytes <= 0:
+        raise ValueError(f"max_hex_memory must be positive, got {budget!r}")
+    for chunk_resolution in range(0, h3_resolution + 1):
+        if estimate_chunk_peak_bytes(h3_resolution, chunk_resolution) <= budget_bytes:
+            return chunk_resolution
+    raise ValueError(
+        f"No chunk resolution fits {budget} at h3_resolution {h3_resolution}: even a "
+        f"single native cell per chunk needs about "
+        f"{estimate_chunk_peak_bytes(h3_resolution, h3_resolution) / 2 ** 20:.1f} MiB. "
+        f"Raise --max-hex-memory or lower --h3-resolution."
+    )
+
+
 def _validate_hex_chunk_size(hex_chunk_size) -> int:
     """Cells per exact_extract call, as a positive int."""
     hex_chunk_size = int(hex_chunk_size)
@@ -842,6 +920,10 @@ def generate_raster_workflow(
     hex_workers: Optional[int] = None,
     hex_chunk_size: int = DEFAULT_HEX_CHUNK_SIZE,
     hex_cpu: str = DEFAULT_HEX_CPU,
+    chunk_resolution: int = 0,
+    max_hex_memory: Optional[str] = None,
+    merge_memory: str = "16Gi",
+    merge_storage: str = "100Gi",
     cog_storage: str = "50Gi",
     target_extent: Optional[tuple] = None,
     target_resolution: Optional[float] = None,
@@ -912,6 +994,19 @@ def generate_raster_workflow(
             CNG_HEX_CHUNK_SIZE (default 100000). The other half of the peak-RSS
             product; lower it when fewer workers alone is too coarse a step.
         hex_cpu: CPU request and limit per hex pod (default "4").
+        chunk_resolution: H3 resolution of one hex pod's unit of work. 0
+            (default) is one h0 base cell, as before. A higher value splits each
+            h0 into its res-N descendants, cutting the largest chunk's cell
+            count — and so the pod's peak memory — about sevenfold per level
+            (issue #173). Sub-h0 builds gain a merge step that restores the
+            published one-file-per-partition layout.
+        max_hex_memory: Pick chunk_resolution automatically as the coarsest that
+            fits this budget, e.g. "8Gi". Mutually exclusive with an explicit
+            chunk_resolution. Coarsest rather than finest because each extra
+            level multiplies the pod count sevenfold.
+        merge_memory: Memory for the merge pod (default "16Gi"). It streams one
+            partition at a time, so this does not track the dataset's size.
+        merge_storage: Ephemeral storage for the merge pod (default "100Gi").
         target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step
         target_resolution: Output pixel size in degrees for mosaic step
         band: Extract single band from multi-band sources (1-indexed) for mosaic step
@@ -959,6 +1054,47 @@ def generate_raster_workflow(
     hex_workers = _resolve_hex_workers(hex_workers, hex_cpu)
     hex_chunk_size = _validate_hex_chunk_size(hex_chunk_size)
 
+    if max_hex_memory is not None and chunk_resolution:
+        raise ValueError(
+            "max_hex_memory and chunk_resolution both given: the first picks the "
+            "second. Pass one."
+        )
+    auto_chunking = max_hex_memory is not None
+    if auto_chunking:
+        chunk_resolution = select_chunk_resolution(h3_resolution, max_hex_memory)
+    if chunk_resolution < 0:
+        raise ValueError(f"chunk_resolution must be >= 0, got {chunk_resolution}")
+    if chunk_resolution > h3_resolution:
+        raise ValueError(
+            f"chunk_resolution {chunk_resolution} is finer than --h3-resolution "
+            f"{h3_resolution}; a chunk would contain no cells"
+        )
+
+    # The fan-out and the list a pod indexes into come from one enumeration, so
+    # they cannot disagree — a Job narrower than the chunk list would drop whole
+    # chunks with a clean exit (issue #173).
+    chunk_count = None
+    if chunk_resolution:
+        # Bound the fan-out *before* enumerating it: 7 children per level is an
+        # upper bound (pentagons have six), so this over-estimates in the safe
+        # direction and costs nothing.
+        upper_bound = (len(h0_subset) if h0_subset else 122) * 7 ** chunk_resolution
+        if upper_bound > MAX_CHUNK_COUNT:
+            raise ValueError(
+                f"chunk-resolution {chunk_resolution} would fan out to as many as "
+                f"{upper_bound:,} chunks, past the {MAX_CHUNK_COUNT:,} ceiling. Each "
+                f"chunk is a pod that schedules, pulls the image and reads the source, "
+                f"so this trades a memory problem for a scheduling one — and "
+                f"enumerating a list that size would hang generation itself. Use a "
+                f"coarser --chunk-resolution, or narrow the build with --h0-subset."
+            )
+        from cng_datasets.raster.cog import enumerate_chunk_cells
+        chunk_count = len(enumerate_chunk_cells(chunk_resolution, h0_subset=h0_subset))
+        if chunk_count == 0:
+            raise ValueError(
+                f"No chunks at chunk-resolution {chunk_resolution} for h0 subset "
+                f"{h0_subset}. Check --h0-subset."
+            )
     # Decide whether a preprocess-cog step is needed
     needs_preprocess = len(source_urls) > 1 or target_extent is not None or band is not None
 
@@ -1010,7 +1146,14 @@ def generate_raster_workflow(
         hex_resampling=hex_resampling, config=config,
         s3_dataset=dataset_name, h0_subset=h0_subset,
         hex_workers=hex_workers, hex_chunk_size=hex_chunk_size, hex_cpu=hex_cpu,
+        chunk_resolution=chunk_resolution, chunk_count=chunk_count,
     )
+
+    if chunk_resolution:
+        _generate_raster_merge_job(
+            manager, k8s_name, bucket, output_path, s3_dataset=dataset_name,
+            merge_memory=merge_memory, merge_storage=merge_storage, config=config,
+        )
 
     # Generate workflow RBAC
     _generate_workflow_rbac(namespace, output_path)
@@ -1023,8 +1166,10 @@ def generate_raster_workflow(
                    f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
 
     # Generate ConfigMap and orchestrator workflow
-    _generate_raster_configmap(k8s_name, namespace, output_path, gen_command, needs_preprocess)
-    _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir, needs_preprocess)
+    _generate_raster_configmap(k8s_name, namespace, output_path, gen_command,
+                               needs_preprocess, needs_merge=bool(chunk_resolution))
+    _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir,
+                                   needs_preprocess, needs_merge=bool(chunk_resolution))
 
     # The hex pod's memory profile, stated at generation time. Peak RSS tracks
     # workers × chunk size, and both are now pinned in the manifest; printing
@@ -1038,6 +1183,31 @@ def generate_raster_workflow(
         "    Peak memory scales with that product — lower --hex-workers first "
         "(a bigger --hex-memory can make the pod unschedulable)"
     )
+    if chunk_resolution:
+        est = estimate_chunk_peak_bytes(h3_resolution, chunk_resolution)
+        chosen = (f" (chosen for --max-hex-memory {max_hex_memory})"
+                  if auto_chunking else "")
+        hex_profile_hint += (
+            f"\n  Chunking: res-{chunk_resolution} cells, {chunk_count} chunks{chosen}"
+            f"\n    Estimated peak per pod ≈ {est / 2 ** 30:.1f} GiB against a "
+            f"{hex_memory} request. This models the cell enumeration, which is the "
+            f"term that scales with chunk size — it is a floor, not a guarantee."
+            f"\n  Merge: {k8s_name}-merge consolidates hex-chunks/ into "
+            f"hex/h0=*/data_0.parquet"
+        )
+
+    # Fine chunking is what makes an external queue necessary: an indexed Job of
+    # thousands of completions is past the namespace pod guideline, and small
+    # uniform pods schedule on any node (issue #173 lever D, #39).
+    if backend == "auto":
+        backend = "armada" if (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE else "k8s"
+        print(f"  Backend: {backend} (--backend auto; "
+              f"{chunk_count if chunk_count else 'no sub-h0'} chunks vs the "
+              f"{K8S_CHUNK_COUNT_GUIDELINE}-pod k8s guideline)")
+    elif (backend == "k8s" and (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE):
+        print(f"  ⚠ {chunk_count} chunks exceeds the ~{K8S_CHUNK_COUNT_GUIDELINE}-pod "
+              f"namespace guideline for a single indexed Job.")
+        print("    Consider --backend armada (or --backend auto), which has no pod cap.")
 
     if backend == "armada":
         armada_files = convert_workflow_to_armada(
@@ -1063,12 +1233,19 @@ def generate_raster_workflow(
         if needs_preprocess:
             steps.append("preprocess-cog")
         steps.append("hex")
+        if chunk_resolution:
+            steps.append("merge")
         for step in steps:
             print(f"  armadactl submit {output_dir}/armada-{k8s_name}-{step}.yaml")
         print("\nMonitor at: https://armada-lookout.nrp-nautilus.io")
     else:
         print(f"\n✓ Generated raster workflow for {dataset_name}")
-        if h0_subset:
+        if chunk_resolution:
+            print(f"  Hex completions: {chunk_count} "
+                  f"(res-{chunk_resolution} chunks"
+                  + (f" under h0 {', '.join(str(h) for h in h0_subset)}" if h0_subset else "")
+                  + ")")
+        elif h0_subset:
             print(f"  Hex completions: {len(h0_subset)} "
                   f"(h0 {', '.join(str(h) for h in h0_subset)})")
         else:
@@ -1081,6 +1258,8 @@ def generate_raster_workflow(
         if needs_preprocess:
             print(f"  - {k8s_name}-preprocess-cog.yaml  (mosaic {len(source_urls)} tiles → {cog_key})")
         print(f"  - {k8s_name}-hex.yaml")
+        if chunk_resolution:
+            print(f"  - {k8s_name}-merge.yaml")
         print("  - workflow-rbac.yaml")
         print("  - configmap.yaml")
         print("  - workflow.yaml")
@@ -1177,6 +1356,74 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-preprocess-cog.yaml"))
 
 
+def _generate_raster_merge_job(
+    manager, dataset_name, bucket, output_path, s3_dataset=None,
+    merge_memory="16Gi", merge_storage="100Gi", config: ClusterConfig = None,
+):
+    """Generate the job that consolidates sub-h0 chunks into one file per h0.
+
+    Only emitted when --chunk-resolution > 0. Sub-h0 chunks each write their own
+    part file, but `h0={cell}/data_0.parquet` is a literal path published in
+    STAC READMEs, so the layout must not depend on how finely the build was
+    chunked (issue #173). Merging is per partition and streamed, so this does
+    not re-materialise what the chunking avoided.
+    """
+    if config is None:
+        config = ClusterConfig()
+    s3_dataset = s3_dataset or dataset_name
+
+    command_str = f"""set -e
+
+cng-datasets merge-chunks \\
+  --chunks-dir s3://{bucket}/{s3_dataset}/hex-chunks \\
+  --output-dir s3://{bucket}/{s3_dataset}/hex
+"""
+
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "merge-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [
+                {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
+                {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
+                {"name": "BUCKET", "value": bucket},
+                # The merge streams one partition at a time, but DuckDB will
+                # happily size its buffers off the node rather than the pod
+                # unless told otherwise.
+                {"name": "DUCKDB_MEMORY_LIMIT", "value": merge_memory},
+            ],
+            "volumeMounts": [
+                {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+            ],
+            "command": ["bash", "-c", command_str],
+            "resources": {
+                "requests": {"cpu": "4", "memory": merge_memory, "ephemeral-storage": merge_storage},
+                "limits": {"cpu": "4", "memory": merge_memory, "ephemeral-storage": merge_storage},
+            },
+        }],
+        "volumes": [
+            {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
+        ],
+    }
+    _apply_scheduling(pod_spec, config)
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": _job_metadata(manager, f"{dataset_name}-merge"),
+        "spec": {
+            "backoffLimit": 0,
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-merge"}},
+                "spec": pod_spec,
+            },
+        },
+    }
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-merge.yaml"))
+
+
 def _generate_raster_hex_job(
     manager, dataset_name, source_url, bucket, output_path, git_repo,
     h3_resolution, parent_resolutions, value_column, nodata_value,
@@ -1186,6 +1433,8 @@ def _generate_raster_hex_job(
     hex_workers: Optional[int] = None,
     hex_chunk_size: int = DEFAULT_HEX_CHUNK_SIZE,
     hex_cpu: str = DEFAULT_HEX_CPU,
+    chunk_resolution: int = 0,
+    chunk_count: Optional[int] = None,
 ):
     """Generate raster H3 hex tiling job."""
     if config is None:
@@ -1193,6 +1442,17 @@ def _generate_raster_hex_job(
     hex_cpu = str(hex_cpu).strip()
     hex_workers = _resolve_hex_workers(hex_workers, hex_cpu)
     hex_chunk_size = _validate_hex_chunk_size(hex_chunk_size)
+
+    # One completion per unit of work: the chunk list at chunk_resolution, or
+    # the h0 fan-out as before. Emitting fewer than the chunk list holds would
+    # drop whole chunks with a clean exit, so this number and the list a pod
+    # indexes into come from the same enumeration.
+    if chunk_resolution:
+        if chunk_count is None:
+            raise ValueError("chunk_count is required when chunk_resolution > 0")
+        completions = chunk_count
+    else:
+        completions = len(h0_subset) if h0_subset else 122
     # dataset_name is the k8s name, with '/' flattened to '-' so it is a legal
     # object name. S3 paths want the original hierarchical name, as the vector
     # generators already do for their own jobs (issue #189).
@@ -1205,7 +1465,7 @@ def _generate_raster_hex_job(
     # overlap with their h0 and exit (issue #191).
     h0_index = "${JOB_COMPLETION_INDEX}"
     h0_preamble = ""
-    if h0_subset:
+    if h0_subset and not chunk_resolution:
         h0_index = "${H0}"
         # The guard matters because the lookup is indirect: an unset index
         # would read as 0 and an index past the end would expand to nothing,
@@ -1228,7 +1488,17 @@ def _generate_raster_hex_job(
         )
 
     # Build command
-    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet s3://{bucket}/{s3_dataset}/hex/ --h0-index {h0_index} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
+    if chunk_resolution:
+        # Sub-h0 chunks are staged outside the published tree and merged back by
+        # the merge step, so a reader globbing hex/ mid-build never sees parts.
+        out_url = f"s3://{bucket}/{s3_dataset}/hex-chunks/"
+        selector = f"--chunk-resolution {chunk_resolution} --chunk-index {h0_index}"
+        if h0_subset:
+            selector += f" --h0-subset \"{','.join(str(h) for h in h0_subset)}\""
+    else:
+        out_url = f"s3://{bucket}/{s3_dataset}/hex/"
+        selector = f"--h0-index {h0_index}"
+    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet {out_url} {selector} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
     nodata_cli = _nodata_cli_value(nodata_value)
     if nodata_cli is not None:
         cng_cmd += f' --nodata "{nodata_cli}"'
@@ -1277,10 +1547,10 @@ def _generate_raster_hex_job(
         "kind": "Job",
         "metadata": _job_metadata(manager, f"{dataset_name}-hex"),
         "spec": {
-            "completions": len(h0_subset) if h0_subset else 122,
+            "completions": completions,
             # No point starting more pods than there are completions — the
             # extras would sit against the namespace quota with nothing to do.
-            "parallelism": min(max_parallelism, len(h0_subset)) if h0_subset else max_parallelism,
+            "parallelism": min(max_parallelism, completions),
             "completionMode": "Indexed",
             "backoffLimit": 0,
             "podFailurePolicy": {
@@ -1299,7 +1569,8 @@ def _generate_raster_hex_job(
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-hex.yaml"))
 
 
-def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command, needs_preprocess=False):
+def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command,
+                               needs_preprocess=False, needs_merge=False):
     """Generate ConfigMap for raster workflow."""
     import yaml
 
@@ -1307,6 +1578,10 @@ def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command
     if needs_preprocess:
         job_files.append(f"{dataset_name}-preprocess-cog.yaml")
     job_files.append(f"{dataset_name}-hex.yaml")
+    if needs_merge:
+        # The orchestrator applies this from /yamls, so leaving it out of the
+        # ConfigMap fails the build at the merge step rather than at generation.
+        job_files.append(f"{dataset_name}-merge.yaml")
 
     data = {}
     for job_file in job_files:
@@ -1331,7 +1606,8 @@ def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command
         yaml.dump(configmap, f, default_flow_style=False)
 
 
-def _generate_raster_argo_workflow(dataset_name, namespace, output_path, output_dir, needs_preprocess=False):
+def _generate_raster_argo_workflow(dataset_name, namespace, output_path, output_dir,
+                                   needs_preprocess=False, needs_merge=False):
     """Generate orchestrator job for raster workflow."""
     import yaml
 
@@ -1352,6 +1628,20 @@ kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-preproc
         cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-preprocess-cog {dataset_name}-hex {dataset_name}-workflow"
     else:
         hex_step_num = "1"
+
+    merge_steps = ""
+    if needs_merge:
+        # Sub-h0 chunks land outside the published tree; nothing reads hex/
+        # until this has consolidated each partition (issue #173).
+        merge_steps = f"""
+# Step {int(hex_step_num) + 1}: Merge sub-h0 chunks into one file per h0 partition
+echo "Step {int(hex_step_num) + 1}: Merging hex chunks..."
+kubectl apply -f /yamls/{dataset_name}-merge.yaml -n {namespace}
+kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-merge -n {namespace}
+"""
+        cleanup_jobs = cleanup_jobs.replace(
+            f"{dataset_name}-workflow", f"{dataset_name}-merge {dataset_name}-workflow"
+        )
 
     workflow_job = {
         "apiVersion": "batch/v1",
@@ -1382,7 +1672,7 @@ kubectl wait --for=condition=complete --timeout=600s job/{dataset_name}-setup-bu
 echo "Step {hex_step_num}: H3 hexagonal tiling..."
 kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
 kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
-
+{merge_steps}
 echo "✓ Workflow complete!"
 echo "Clean up with:"
 echo "  kubectl delete jobs {cleanup_jobs} -n {namespace}"

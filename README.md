@@ -143,6 +143,9 @@ Commands marked "used inside k8s pods" are called by the generated jobs — you 
 --hex-workers N            Worker processes per hex pod (default: one per --hex-cpu).
 --hex-chunk-size N         Cells per exact_extract call (default: 100000).
 --h0-subset CELLS          The h0 base cells the source overlaps (default: all 122).
+--chunk-resolution N       H3 resolution of one hex pod's unit of work (default: 0, one h0).
+--max-hex-memory SIZE      Pick --chunk-resolution automatically to fit this budget.
+--backend BACKEND          k8s (default) | armada | auto (armada past ~200 chunks).
 --max-parallelism N        Max concurrent hex pods (default: 61).
 --output-dir DIR           Directory for generated YAML files.
 ```
@@ -172,7 +175,7 @@ docker pull ghcr.io/boettiger-lab/datasets:latest
 
 **OOM on hex jobs (vector):** Increase `--hex-memory` (e.g., 32Gi → 64Gi), increase `--max-completions` for smaller chunks, or decrease `--intermediate-chunk-size`.
 
-**Raster hex pod too big even at one worker:** the pod's memory tracks the *largest chunk's* H3-cell count, and the default chunk is a whole h0 base cell (~282M cells at res 10). Pass `--chunk-resolution 1` or `2` to `cng-datasets raster` to make the unit a descendant of an h0 instead — roughly 7x fewer cells per level — then consolidate with `cng-datasets merge-chunks`, which restores the usual `h0={cell}/data_0.parquet` layout. Sub-chunked pods read only their own window of the source COG rather than localizing the whole file (`--window-reads`), so total transfer stays proportional to the data instead of to the number of chunks.
+**Raster hex pod too big even at one worker:** the pod's memory tracks the *largest chunk's* H3-cell count, and the default chunk is a whole h0 base cell (~282M cells at res 10). Pass `--chunk-resolution 1` or `2` to `raster-workflow` to make the unit a descendant of an h0 instead — roughly 7x fewer cells per level — or `--max-hex-memory 8Gi` to have it chosen for you. The generated workflow gains a merge step that restores the usual `h0={cell}/data_0.parquet` layout, so the published layout is unchanged. Past ~200 chunks a single indexed Job exceeds the namespace pod guideline; `--backend auto` routes to Armada at that point. Sub-chunked pods read only their own window of the source COG rather than localizing the whole file (`--window-reads`), so total transfer stays proportional to the data instead of to the number of chunks.
 
 **OOM on hex jobs (raster):** Lower `--hex-workers` before raising `--hex-memory`. Peak RSS is roughly `--hex-workers × --hex-chunk-size × bytes per cell`, and a memory request large enough to matter (past ~128Gi) makes the pod contend for scarce large-RAM nodes, turning a retryable OOM into an unschedulable one. Both knobs are always written into the manifest as `CNG_HEX_WORKERS` / `CNG_HEX_CHUNK_SIZE`, so a tuned pod survives regeneration.
 

@@ -586,6 +586,72 @@ def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     return path
 
 
+def enumerate_chunk_cells(chunk_resolution: int,
+                          h0_subset: Optional[List[int]] = None,
+                          h0_grid_path: str = "s3://public-grids/hex/h0-valid.parquet",
+                          con=None):
+    """Ordered [(chunk_cell, h0_cell, h0_index)] — the units of work for a build.
+
+    Shared by `RasterProcessor` and the workflow generator on purpose. The
+    generator sizes a Job's completions from this list and a pod indexes into
+    it; if the two computed it separately they could disagree, and a fan-out
+    narrower than the list drops whole chunks with nothing to show for it.
+
+    Ordering is (h0 index, chunk cell id) — deterministic and independent of the
+    order h3_cell_to_children happens to return, so an index maps to the same
+    cell across regenerations and DuckDB versions.
+
+    At chunk_resolution 0 this is the h0 grid itself, in grid order, so the
+    index -> cell mapping is identical to the historical --h0-index.
+    """
+    if chunk_resolution < 0:
+        raise ValueError(f"chunk_resolution must be >= 0, got {chunk_resolution}")
+
+    own_con = con is None
+    if own_con:
+        con = duckdb.connect(":memory:")
+        try:
+            con.execute("LOAD h3")
+        except duckdb.Error:
+            con.execute("INSTALL h3 FROM community")
+            con.execute("LOAD h3")
+        configure_s3_credentials(con)
+
+    try:
+        where_sql = ""
+        if h0_subset:
+            where_sql = f"WHERE i IN ({', '.join(str(int(h)) for h in sorted(set(h0_subset)))})"
+
+        base = con.execute(f"""
+            SELECT i, h0
+            FROM read_parquet('{h0_grid_path}')
+            {where_sql}
+            ORDER BY i
+        """).fetchall()
+
+        if chunk_resolution == 0:
+            return [(int(h0), int(h0), int(i)) for i, h0 in base]
+
+        # Expanded one h0 at a time with the cell as a literal. The obvious
+        # single query — UNNEST(h3_cell_to_children(h0, N)) selected alongside
+        # i and h0 over a parquet scan — is not merely slow, it aborts DuckDB
+        # with "INTERNAL Error: Calling GetValueInternal on a value that is
+        # NULL" and invalidates the connection, so every later query in the
+        # process fails too. The literal form is the one already proven in
+        # _native_cells_for_h0, and there are at most 122 of these.
+        cells = []
+        for i, h0 in base:
+            children = con.execute(
+                f"SELECT UNNEST(h3_cell_to_children({int(h0)}, {chunk_resolution}))"
+            ).fetchall()
+            cells.extend((int(child), int(h0), int(i)) for (child,) in children)
+        cells.sort(key=lambda row: (row[2], row[0]))
+        return cells
+    finally:
+        if own_con:
+            con.close()
+
+
 def _localize_input(input_path: str, cache_dir: str) -> str:
     """Copy a remote raster (s3:// or http(s)://) to local disk and return the local path.
 
@@ -1942,62 +2008,19 @@ class RasterProcessor:
         return output_path
 
     def chunk_cells(self):
-        """Ordered [(chunk_cell, h0_cell, h0_index)] — the units of work.
+        """Ordered [(chunk_cell, h0_cell, h0_index)] — this processor's units of work.
 
-        The unit of parallelism used to be fixed at one h0 base cell, which is
-        why peak memory tracked the densest h0 (~282M cells at res 10). At
-        chunk_resolution N the unit becomes an h0's res-N descendant instead,
-        and since H3 nests perfectly those descendants tile their parent
-        exactly: no seams to dedup and no gaps, unlike bbox tiling where a
-        native cell straddling an edge would be split or double-counted
-        (issue #173).
-
-        Ordering is (h0 index, chunk cell id) — deterministic and independent
-        of the order h3_cell_to_children happens to return, so a chunk index
-        maps to the same cell in the generator that sized the fan-out and in
-        the pod that runs it, across regenerations and DuckDB versions.
-
-        At chunk_resolution 0 this is the h0 grid itself, in grid order, so the
-        index -> cell mapping is byte-identical to the historical --h0-index.
+        Thin wrapper over `enumerate_chunk_cells`, which is shared with the
+        workflow generator so the fan-out it emits and the list a pod indexes
+        into cannot drift apart.
         """
-        if self._chunk_cells_cache is not None:
-            return self._chunk_cells_cache
-
-        where_sql = ""
-        if self.h0_subset:
-            where_sql = f"WHERE i IN ({', '.join(str(h) for h in self.h0_subset)})"
-
-        base = self.con.execute(f"""
-            SELECT i, h0
-            FROM read_parquet('{self.h0_grid_path}')
-            {where_sql}
-            ORDER BY i
-        """).fetchall()
-
-        if self.chunk_resolution == 0:
-            self._chunk_cells_cache = [
-                (int(h0), int(h0), int(i)) for i, h0 in base
-            ]
-            return self._chunk_cells_cache
-
-        # Expanded one h0 at a time with the cell as a literal. The obvious
-        # single query — UNNEST(h3_cell_to_children(h0, N)) selected alongside
-        # i and h0 over a parquet scan — is not merely slow, it aborts DuckDB
-        # with "INTERNAL Error: Calling GetValueInternal on a value that is
-        # NULL" and invalidates the connection, so every later query in the
-        # process fails too. The literal form is the one already proven in
-        # _native_cells_for_h0, and there are at most 122 of these.
-        cells = []
-        for i, h0 in base:
-            children = self.con.execute(
-                f"SELECT UNNEST(h3_cell_to_children({int(h0)}, {self.chunk_resolution}))"
-            ).fetchall()
-            cells.extend(
-                (int(child), int(h0), int(i)) for (child,) in children
+        if self._chunk_cells_cache is None:
+            self._chunk_cells_cache = enumerate_chunk_cells(
+                self.chunk_resolution,
+                h0_subset=self.h0_subset,
+                h0_grid_path=self.h0_grid_path,
+                con=self.con,
             )
-        # (h0 index, chunk cell) — see the ordering note above.
-        cells.sort(key=lambda row: (row[2], row[0]))
-        self._chunk_cells_cache = cells
         return self._chunk_cells_cache
 
     def _windowed_source_for(self, geom_wkt: str, margin_deg: float,

@@ -1851,3 +1851,304 @@ class TestHexWorkerSizing:
             job = yaml.safe_load(open(Path(tmpdir) / "vec-hex.yaml"))
             env = job["spec"]["template"]["spec"]["containers"][0]["env"]
             assert not [e for e in env if e["name"].startswith("CNG_HEX")]
+
+
+class TestChunkResolutionGeneration:
+    """
+    raster-workflow emits sub-h0 chunking end to end (issue #173).
+
+    The engine gained --chunk-resolution in #200 but nothing emitted it, so the
+    memory win was unreachable from generated output — the same gap #195 closed
+    for CNG_HEX_WORKERS. These tests cover the three things a generated
+    sub-h0 build must get right: a fan-out that matches the chunk list exactly,
+    a merge step that actually runs, and staging that keeps parts out of the
+    published tree until it does.
+    """
+
+    H0 = 577199624117288959
+
+    @pytest.fixture(autouse=True)
+    def _offline(self, monkeypatch):
+        """Chunk enumeration and COG detection without network."""
+        import duckdb
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+
+        def fake_enum(chunk_resolution, h0_subset=None, h0_grid_path=None, con=None):
+            if h0_subset is not None and 0 not in h0_subset:
+                return []
+            if chunk_resolution == 0:
+                return [(self.H0, self.H0, 0)]
+            c = duckdb.connect()
+            c.execute("INSTALL h3 FROM community; LOAD h3;")
+            kids = [r[0] for r in c.execute(
+                f"SELECT UNNEST(h3_cell_to_children({self.H0}, {chunk_resolution}))"
+            ).fetchall()]
+            return sorted(((int(k), self.H0, 0) for k in kids),
+                          key=lambda r: (r[2], r[0]))
+
+        monkeypatch.setattr(cog, "enumerate_chunk_cells", fake_enum)
+        self._enum = fake_enum
+
+    def _build(self, tmpdir, **kwargs):
+        generate_raster_workflow(
+            dataset_name="chunky",
+            source_urls="https://example.com/x.tif",
+            bucket="test-bucket",
+            output_dir=tmpdir,
+            h3_resolution=10,
+            **kwargs,
+        )
+        return Path(tmpdir)
+
+    def _load(self, path):
+        with open(path) as f:
+            return yaml.safe_load(f)
+
+    @pytest.mark.timeout(60)
+    def test_completions_match_the_chunk_list_exactly(self):
+        """
+        A fan-out narrower than the chunk list drops chunks with a clean exit.
+
+        Generator and pod must agree, which is why both go through
+        enumerate_chunk_cells rather than each counting for themselves.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2)
+            job = self._load(out / "chunky-hex.yaml")
+            assert job["spec"]["completions"] == len(self._enum(2))
+            assert job["spec"]["parallelism"] <= job["spec"]["completions"]
+
+    @pytest.mark.timeout(60)
+    def test_hex_command_carries_the_chunk_selector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2)
+            cmd = self._load(out / "chunky-hex.yaml")["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "--chunk-resolution 2" in cmd
+            assert "--chunk-index ${JOB_COMPLETION_INDEX}" in cmd
+            assert "--h0-index" not in cmd
+
+    @pytest.mark.timeout(60)
+    def test_chunks_are_staged_outside_the_published_tree(self):
+        """
+        A reader globbing hex/ mid-build must never see half-merged parts.
+
+        h0={cell}/data_0.parquet is a literal path in published STAC READMEs,
+        so parts land in hex-chunks/ and only the merge writes hex/.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2)
+            cmd = self._load(out / "chunky-hex.yaml")["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "s3://test-bucket/chunky/hex-chunks/" in cmd
+            assert "--output-parquet s3://test-bucket/chunky/hex/" not in cmd
+
+            merge = self._load(out / "chunky-merge.yaml")
+            mcmd = " ".join(merge["spec"]["template"]["spec"]["containers"][0]["command"][2].split())
+            assert "--chunks-dir s3://test-bucket/chunky/hex-chunks" in mcmd
+            assert "--output-dir s3://test-bucket/chunky/hex" in mcmd
+
+    @pytest.mark.timeout(60)
+    def test_merge_reaches_the_orchestrator_and_the_configmap(self):
+        """
+        The orchestrator applies manifests from /yamls, i.e. from the ConfigMap.
+
+        Emitting chunky-merge.yaml but leaving it out of the ConfigMap fails the
+        build at the merge step, long after generation looked fine.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2)
+            cm = self._load(out / "configmap.yaml")
+            assert "chunky-merge.yaml" in cm["data"]
+            args = self._load(out / "workflow.yaml")["spec"]["template"]["spec"]["containers"][0]["args"][0]
+            assert "chunky-merge.yaml" in args
+            assert args.index("chunky-hex.yaml") < args.index("chunky-merge.yaml")
+
+    @pytest.mark.timeout(60)
+    def test_no_merge_step_without_sub_chunking(self):
+        """The default path gains nothing and must stay exactly as it was."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir)
+            assert not (out / "chunky-merge.yaml").exists()
+            cm = self._load(out / "configmap.yaml")
+            assert "chunky-merge.yaml" not in cm["data"]
+            cmd = self._load(out / "chunky-hex.yaml")["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "--h0-index" in cmd
+            assert "--chunk-resolution" not in cmd
+            assert "s3://test-bucket/chunky/hex/" in cmd
+
+    @pytest.mark.timeout(60)
+    def test_h0_subset_is_passed_through_for_sub_chunks(self):
+        """The pod re-derives the chunk list, so it needs the same subset."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=1, h0_subset=[0])
+            cmd = self._load(out / "chunky-hex.yaml")["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert '--h0-subset "0"' in cmd
+            # The bash H0S index mapping belongs to the res-0 fan-out only.
+            assert "H0S=(" not in cmd
+
+
+class TestChunkResolutionBudget:
+    """
+    --max-hex-memory picks a chunk resolution from the #173 measurements.
+
+    The model is deliberately simple — cells per chunk times a measured
+    bytes-per-cell — because it only has to be right enough to pick a level, and
+    a model nobody can check is worse than a rough one they can.
+    """
+
+    @pytest.mark.timeout(30)
+    @pytest.mark.parametrize("chunk_res,measured_gib", [(0, 32.0), (1, 4.6), (2, 0.68)])
+    def test_model_reproduces_the_measured_points(self, chunk_res, measured_gib):
+        """The constant is only credible if it returns the numbers it came from."""
+        from cng_datasets.k8s.workflows import estimate_chunk_peak_bytes
+        est_gib = estimate_chunk_peak_bytes(10, chunk_res) / 2 ** 30
+        assert abs(est_gib - measured_gib) / measured_gib < 0.10, (
+            f"model says {est_gib:.2f} GiB at chunk res {chunk_res}, "
+            f"measurement in #173 says {measured_gib} GiB"
+        )
+
+    @pytest.mark.timeout(30)
+    def test_picks_the_coarsest_resolution_that_fits(self):
+        """
+        Coarsest, not finest: every extra level multiplies the pod count ~7x.
+
+        Picking the smallest chunk that fits would be defensible for memory
+        alone and badly wrong for everything else — scheduling, image pulls, and
+        the source reads each pod does.
+        """
+        from cng_datasets.k8s.workflows import select_chunk_resolution, estimate_chunk_peak_bytes
+        for budget, expected in [("32Gi", 0), ("8Gi", 1), ("1Gi", 2)]:
+            chosen = select_chunk_resolution(10, budget)
+            assert chosen == expected, f"{budget} chose res {chosen}, expected {expected}"
+            if chosen > 0:
+                # the next level coarser must genuinely not fit
+                assert estimate_chunk_peak_bytes(10, chosen - 1) > _parse(budget)
+
+    @pytest.mark.timeout(30)
+    def test_impossible_budget_says_so(self):
+        """Only a budget below one cell's cost is truly unsatisfiable."""
+        from cng_datasets.k8s.workflows import select_chunk_resolution
+        with pytest.raises(ValueError, match="No chunk resolution fits"):
+            select_chunk_resolution(10, "100")
+
+    @pytest.mark.timeout(30)
+    def test_a_tiny_budget_is_caught_by_the_fan_out_ceiling(self):
+        """
+        A budget the model can satisfy can still be a fan-out nobody wants.
+
+        1Ki fits seven native cells per chunk, so the model happily chooses
+        res 9 — tens of millions of pods, and a chunk list that hangs generation
+        before a single manifest is written.
+        """
+        import tempfile as _tf
+        from cng_datasets.k8s.workflows import select_chunk_resolution
+        assert select_chunk_resolution(10, "1Ki") >= 9
+        with _tf.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="ceiling"):
+                generate_raster_workflow(
+                    dataset_name="huge",
+                    source_urls="https://example.com/x.tif",
+                    bucket="b", output_dir=tmpdir,
+                    h3_resolution=10, max_hex_memory="1Ki",
+                )
+
+    @pytest.mark.timeout(30)
+    def test_memory_quantities_parse(self):
+        from cng_datasets.k8s.workflows import _parse_memory_to_bytes as p
+        assert p("32Gi") == 32 * 2 ** 30
+        assert p("512Mi") == 512 * 2 ** 20
+        assert p("1G") == 10 ** 9
+        assert p("1000") == 1000
+
+    @pytest.mark.timeout(30)
+    def test_chunk_finer_than_target_is_rejected(self):
+        from cng_datasets.k8s.workflows import estimate_chunk_peak_bytes
+        with pytest.raises(ValueError, match="finer than"):
+            estimate_chunk_peak_bytes(8, 9)
+
+
+def _parse(q):
+    from cng_datasets.k8s.workflows import _parse_memory_to_bytes
+    return _parse_memory_to_bytes(q)
+
+
+class TestChunkBackendRouting:
+    """
+    Fine chunking is what makes an external queue necessary (#173 lever D, #39).
+
+    An indexed Job of thousands of completions is past the namespace pod
+    guideline, which is the same problem #183's finding 1 describes from the
+    scheduler side.
+    """
+
+    H0 = 577199624117288959
+
+    @pytest.fixture(autouse=True)
+    def _offline(self, monkeypatch):
+        import duckdb
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+
+        def fake_enum(chunk_resolution, h0_subset=None, h0_grid_path=None, con=None):
+            if chunk_resolution == 0:
+                return [(self.H0, self.H0, 0)]
+            c = duckdb.connect()
+            c.execute("INSTALL h3 FROM community; LOAD h3;")
+            kids = [r[0] for r in c.execute(
+                f"SELECT UNNEST(h3_cell_to_children({self.H0}, {chunk_resolution}))"
+            ).fetchall()]
+            return sorted(((int(k), self.H0, 0) for k in kids),
+                          key=lambda r: (r[2], r[0]))
+        monkeypatch.setattr(cog, "enumerate_chunk_cells", fake_enum)
+
+    def _build(self, tmpdir, **kwargs):
+        generate_raster_workflow(
+            dataset_name="routed",
+            source_urls="https://example.com/x.tif",
+            bucket="test-bucket",
+            output_dir=tmpdir,
+            h3_resolution=10,
+            **kwargs,
+        )
+        return Path(tmpdir)
+
+    @pytest.mark.timeout(60)
+    def test_auto_stays_on_k8s_below_the_guideline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2, backend="auto")  # 49 chunks
+            assert (out / "workflow.yaml").exists()
+            assert not list(out.glob("armada-*.yaml"))
+
+    @pytest.mark.timeout(120)
+    def test_auto_routes_to_armada_above_the_guideline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=3, backend="auto")  # 343 chunks
+            assert list(out.glob("armada-*.yaml")), "343 chunks should route to Armada"
+            assert (out / "armada-routed-merge.yaml").exists(), "merge must convert too"
+
+    @pytest.mark.timeout(120)
+    def test_explicit_k8s_is_warned_not_overridden(self, capsys):
+        """
+        An explicit backend is the operator's call; say the cost, do not override.
+
+        Silently switching what someone asked for is the same class of surprise
+        the rest of this work exists to remove.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=3, backend="k8s")
+            assert not list(out.glob("armada-*.yaml"))
+            printed = capsys.readouterr().out
+            assert "343 chunks exceeds" in printed
+            assert "--backend armada" in printed
+
+    @pytest.mark.timeout(60)
+    def test_budget_and_explicit_resolution_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="both given"):
+                self._build(tmpdir, chunk_resolution=2, max_hex_memory="8Gi")
+
+    @pytest.mark.timeout(60)
+    def test_chunk_finer_than_target_resolution_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="finer than"):
+                self._build(tmpdir, chunk_resolution=11)

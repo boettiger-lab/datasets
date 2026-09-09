@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--chunk-resolution N` and `--max-hex-memory SIZE` on `raster-workflow`, closing the loop on #173: the engine gained sub-h0 chunking in 0.4.0 but nothing emitted it, so the memory win was unreachable from generated output — the same gap `--hex-workers` closed for `CNG_HEX_WORKERS`. `--max-hex-memory` picks the **coarsest** chunk resolution whose estimated peak fits the budget, coarsest rather than finest because each extra level multiplies the pod count about sevenfold and every pod schedules, pulls the image and reads the source. The estimate is `7 ** (h3_resolution - chunk_resolution)` cells times a measured 121 bytes per cell, a constant taken from the res-9 run in #173 because peak RSS grows sub-linearly in cell count; it reproduces all three measured points (282M cells → 31.8 GiB modelled against ~32 measured, 40.4M → 4.55 against 4.6, 5.8M → 0.65 against 0.68). It models the cell enumeration, which is the term that scales with chunk size — reported at generation time as a floor, not a guarantee (#173)
+- A merge step on sub-h0 raster builds. Chunks are staged to `hex-chunks/` and consolidated into `hex/h0=*/data_0.parquet`, so nothing reading the published tree ever sees half-merged parts and the layout does not depend on how finely the build was chunked. Emitted into the workflow ConfigMap and sequenced after the hex step; converted alongside every other step under `--backend armada` (#173)
+- `--backend auto` on `raster-workflow`: routes to Armada once the chunk count exceeds the ~200-pod namespace guideline, and to k8s below it, printing which it chose and why. Fine chunking is what makes an external queue necessary, which is #183's finding 1 seen from the scheduler side and the reason #39 was blocked on this work. An explicit `--backend k8s` past the guideline is **warned, not overridden** — silently switching what an operator asked for is the same class of surprise this work exists to remove (#39, #183)
+- `--merge-memory` / `--merge-storage` for the merge pod (defaults 16Gi / 100Gi). The merge streams one partition at a time, so neither tracks the dataset's size
+
+### Changed
+- Chunk enumeration moved to a shared `enumerate_chunk_cells`, used by both `RasterProcessor` and the workflow generator. The generator sizes a Job's completions from this list and a pod indexes into it; computing them separately would let them disagree, and a fan-out narrower than the list drops whole chunks with a clean exit (#173)
+
+### Fixed
+- A fan-out past a 50,000-chunk ceiling is now refused at generation. Nothing stopped `--chunk-resolution 10`, or a `--max-hex-memory` small enough to select it: the generator would try to materialise a 282-million-entry chunk list and hang before writing a single manifest, and had it succeeded it would have emitted a Job of 282 million pods. The bound is checked from `7 ** chunk_resolution` before any enumeration, so the check itself costs nothing (#173)
+
+
 ## [0.4.0] - 2026-09-09
 
 ### Added
