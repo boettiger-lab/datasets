@@ -6,5 +6,12 @@ s3_public_endpoint: s3-west.nrp-nautilus.io
 s3_secret_name: aws
 rclone_secret_name: rclone-config
 rclone_remote: nrp
-priority_class: opportunistic
+# Omitted deliberately (empty = no priorityClassName = default priority 0).
+# On NRP `opportunistic` is -2000000000, the lowest priority available, and
+# preemption exposure scales with pod runtime — so it was being applied to the
+# pods least able to absorb it. Measured in issue #201: six identical res-10
+# hex slices spread 5x in runtime, ~7 h to a projected ~52 h. Set
+# `--priority-class opportunistic` for work that really is interruptible, or to
+# exceed a namespace quota (which default priority cannot do).
+priority_class: ""
 node_affinity: gpu-avoid

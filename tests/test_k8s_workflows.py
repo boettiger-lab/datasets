@@ -1240,7 +1240,11 @@ class TestProfileLoading:
         assert profile["s3_public_endpoint"] == "s3-west.nrp-nautilus.io"
         assert profile["s3_secret_name"] == "aws"
         assert profile["rclone_remote"] == "nrp"
-        assert profile["priority_class"] == "opportunistic"
+        # Deliberately empty, i.e. no priorityClassName, i.e. default priority
+        # 0. On NRP `opportunistic` is -2000000000 and preemption exposure
+        # scales with pod runtime, so it was the wrong default for the
+        # multi-hour pods this profile mostly generates (issue #201).
+        assert profile["priority_class"] == ""
         assert profile["node_affinity"] == "gpu-avoid"
 
     @pytest.mark.timeout(5)
@@ -2152,3 +2156,130 @@ class TestChunkBackendRouting:
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(ValueError, match="finer than"):
                 self._build(tmpdir, chunk_resolution=11)
+
+
+class TestHexFanOutSchedulingSafety:
+    """
+    A long hex fan-out must not be lowest-priority and must not be retry-less
+    (issue #201).
+
+    Two separate defects that happened to land on the same job. `opportunistic`
+    is NRP's lowest priority (-2000000000) and preemption exposure scales with
+    runtime, so it was applied to exactly the pods least able to absorb it —
+    multi-hour, un-checkpointed, restarting from zero. And `backoffLimit: 0` is
+    a *job-wide* budget: one failure anywhere killed the whole fan-out.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _offline(self, monkeypatch):
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+
+    def _raster_hex(self, tmpdir, **kwargs):
+        generate_raster_workflow(
+            dataset_name="sched", source_urls="https://example.com/x.tif",
+            bucket="test-bucket", output_dir=tmpdir, **kwargs)
+        with open(Path(tmpdir) / "sched-hex.yaml") as f:
+            return yaml.safe_load(f)
+
+    def _vector_hex(self, tmpdir, monkeypatch, **kwargs):
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        generate_dataset_workflow(
+            dataset_name="vsched", source_url="https://example.com/x.gpkg",
+            bucket="test-bucket", output_dir=tmpdir, **kwargs)
+        with open(Path(tmpdir) / "vsched-hex.yaml") as f:
+            return yaml.safe_load(f)
+
+    @pytest.mark.timeout(60)
+    def test_hex_pods_are_not_lowest_priority_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pod = self._raster_hex(tmpdir)["spec"]["template"]["spec"]
+            assert "priorityClassName" not in pod, (
+                "hex pods must default to default priority; opportunistic is "
+                "NRP's lowest and preemption exposure scales with runtime"
+            )
+
+    @pytest.mark.timeout(60)
+    def test_nrp_profile_does_not_reimpose_opportunistic(self):
+        """
+        The profile is where the measured build got its priority from.
+
+        Fixing the dataclass default but leaving the profile would fix nothing
+        for anyone actually passing --profile nrp.
+        """
+        from cng_datasets.k8s import load_profile
+        assert not load_profile("nrp").get("priority_class")
+
+    @pytest.mark.timeout(60)
+    def test_opportunistic_is_still_reachable(self):
+        """It remains right for genuinely interruptible work, and for quota."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pod = self._raster_hex(tmpdir, priority_class="opportunistic")["spec"]["template"]["spec"]
+            assert pod["priorityClassName"] == "opportunistic"
+
+    @pytest.mark.timeout(60)
+    def test_fan_out_has_a_per_index_retry_budget(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spec = self._raster_hex(tmpdir)["spec"]
+            assert spec["backoffLimitPerIndex"] == 2
+            assert spec["maxFailedIndexes"] == 1
+            assert "backoffLimit" not in spec, (
+                "a job-wide backoffLimit alongside a per-index budget is ignored "
+                "by Kubernetes and misleads anyone reading the manifest"
+            )
+
+    @pytest.mark.timeout(60)
+    def test_vector_fan_out_gets_the_same_treatment(self, monkeypatch):
+        """
+        Filed against raster-workflow; the vector generator had it too.
+
+        Same shape, same fix — as with metadata.namespace in #190.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spec = self._vector_hex(tmpdir, monkeypatch)["spec"]
+            assert spec["backoffLimitPerIndex"] == 2
+            assert spec["maxFailedIndexes"] == 1
+            assert "backoffLimit" not in spec
+            assert "priorityClassName" not in spec["template"]["spec"]
+
+    @pytest.mark.timeout(60)
+    def test_preemption_is_still_ignored_by_the_pod_failure_policy(self):
+        """
+        The half of #201 that was already handled must survive the fix.
+
+        A preempted or drained pod sets DisruptionTarget; ignoring it means the
+        index retries without spending its budget. Dropping that while adding
+        retries would trade one gap for another.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rules = self._raster_hex(tmpdir)["spec"]["podFailurePolicy"]["rules"]
+            assert any(
+                r["action"] == "Ignore"
+                and any(c["type"] == "DisruptionTarget" for c in r["onPodConditions"])
+                for r in rules
+            )
+
+    @pytest.mark.timeout(60)
+    def test_merge_job_retries_rather_than_discarding_hours_of_hex(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="sched", source_urls="https://example.com/x.tif",
+                bucket="test-bucket", output_dir=tmpdir, chunk_resolution=1)
+            with open(Path(tmpdir) / "sched-merge.yaml") as f:
+                spec = yaml.safe_load(f)["spec"]
+            assert spec["backoffLimit"] >= 1
+
+    @pytest.mark.timeout(60)
+    def test_a_zero_tolerance_fan_out_is_rejected(self):
+        """max_failed_indexes=0 would reinstate exactly what this replaces."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="backoffLimit: 0 behaviour"):
+                self._raster_hex(tmpdir, max_failed_indexes=0)
+
+    @pytest.mark.timeout(60)
+    def test_retries_are_configurable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spec = self._raster_hex(tmpdir, hex_retries=5, max_failed_indexes=3)["spec"]
+            assert spec["backoffLimitPerIndex"] == 5
+            assert spec["maxFailedIndexes"] == 3

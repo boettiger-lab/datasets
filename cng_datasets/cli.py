@@ -155,6 +155,13 @@ def main():
     workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
     workflow_parser.add_argument("--simplify-tolerance", type=float, default=None, help="Simplify geometry to this tolerance in target-CRS units (degrees for EPSG:4326; e.g. 0.0001 ~ 10m) during the convert step. Right-sizes high-vertex sources for tiling/hex (issue #132).")
     workflow_parser.add_argument("--trim-strings", action="store_true", help="Strip leading/trailing whitespace from every string column during the convert step. Off by default; opt in for sources whose categorical fields carry stray whitespace, which silently breaks equality filters (issue #180).")
+    workflow_parser.add_argument("--hex-retries", type=int, default=2, metavar="N",
+                                 help="Per-index retry budget for the hex fan-out (backoffLimitPerIndex, "
+                                      "default 2). A preemption is already retried; this covers an OOM, a "
+                                      "truncated read, or a node going away mid-run (#201).")
+    workflow_parser.add_argument("--max-failed-indexes", type=int, default=1, metavar="N",
+                                 help="How many hex indexes may exhaust their retries before the Job stops "
+                                      "(default 1). Keeps a systematic failure from burning hours on the rest.")
     workflow_parser.add_argument("--hex-storage", type=str, default="10Gi", help="Ephemeral storage request/limit per hex job pod (default: 10Gi)")
     workflow_parser.add_argument("--repartition-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for repartition job pod (default: 50Gi)")
     workflow_parser.add_argument("--repartition-memory", type=str, default="32Gi", help="Memory request/limit for repartition job pod (default: 32Gi)")
@@ -179,7 +186,7 @@ def main():
     workflow_parser.add_argument("--s3-secret-name", default=None, metavar="SECRET", help="Kubernetes secret name for S3 credentials (default from profile, or 'aws')")
     workflow_parser.add_argument("--rclone-secret-name", default=None, metavar="SECRET", help="Kubernetes secret name for rclone config (default from profile, or 'rclone-config')")
     workflow_parser.add_argument("--rclone-remote", default=None, metavar="REMOTE", help="Rclone remote name for setup-bucket and pmtiles (default from profile, or 'nrp')")
-    workflow_parser.add_argument("--priority-class", default=None, metavar="CLASS", help="Kubernetes priorityClassName; '' to omit (default from profile, or 'opportunistic')")
+    workflow_parser.add_argument("--priority-class", default=None, metavar="CLASS", help="Kubernetes priorityClassName; '' to omit (default: omitted, i.e. default priority 0). Pass 'opportunistic' for genuinely interruptible work, or to exceed a namespace quota — on NRP it is the lowest priority available and preemption exposure scales with pod runtime (#201)")
     workflow_parser.add_argument("--node-affinity", default=None, choices=["gpu-avoid", "none"], help="Node affinity: 'gpu-avoid' (NRP GPU avoidance) or 'none' to omit (default from profile)")
 
     # Raster workflow generation command
@@ -212,6 +219,13 @@ def main():
                                              "'12,14,20,50,71,78' for CONUS. The hex job runs one completion "
                                              "per listed cell instead of all 122, so pods that could only find "
                                              "no overlap are never started. Omit for a global source.")
+    raster_workflow_parser.add_argument("--hex-retries", type=int, default=2, metavar="N",
+                                        help="Per-index retry budget for the hex fan-out (backoffLimitPerIndex, "
+                                             "default 2). A preemption is already retried; this covers an OOM, a "
+                                             "truncated read, or a node going away mid-run (#201).")
+    raster_workflow_parser.add_argument("--max-failed-indexes", type=int, default=1, metavar="N",
+                                        help="How many hex indexes may exhaust their retries before the Job stops "
+                                             "(default 1). Keeps a systematic failure from burning hours on the rest.")
     raster_workflow_parser.add_argument("--hex-storage", type=str, default="20Gi", help="Ephemeral storage request/limit per hex job pod (default: 20Gi)")
     raster_workflow_parser.add_argument("--hex-cpu", type=str, default=None, metavar="N",
                                         help="CPU request/limit per hex job pod (default: 4)")
@@ -259,7 +273,7 @@ def main():
     raster_workflow_parser.add_argument("--s3-secret-name", default=None, metavar="SECRET", help="Kubernetes secret name for S3 credentials (default from profile, or 'aws')")
     raster_workflow_parser.add_argument("--rclone-secret-name", default=None, metavar="SECRET", help="Kubernetes secret name for rclone config (default from profile, or 'rclone-config')")
     raster_workflow_parser.add_argument("--rclone-remote", default=None, metavar="REMOTE", help="Rclone remote name for setup-bucket (default from profile, or 'nrp')")
-    raster_workflow_parser.add_argument("--priority-class", default=None, metavar="CLASS", help="Kubernetes priorityClassName; '' to omit (default from profile, or 'opportunistic')")
+    raster_workflow_parser.add_argument("--priority-class", default=None, metavar="CLASS", help="Kubernetes priorityClassName; '' to omit (default: omitted, i.e. default priority 0). Pass 'opportunistic' for genuinely interruptible work, or to exceed a namespace quota — on NRP it is the lowest priority available and preemption exposure scales with pod runtime (#201)")
     raster_workflow_parser.add_argument("--node-affinity", default=None, choices=["gpu-avoid", "none"], help="Node affinity: 'gpu-avoid' (NRP GPU avoidance) or 'none' to omit (default from profile)")
 
     # Sync job generation command
@@ -487,6 +501,8 @@ def _dispatch(args):
             hex_memory=args.hex_memory,
             max_parallelism=args.max_parallelism,
             max_completions=args.max_completions,
+            hex_retries=args.hex_retries,
+            max_failed_indexes=args.max_failed_indexes,
             intermediate_chunk_size=args.intermediate_chunk_size,
             row_group_size=args.row_group_size,
             simplify_tolerance=args.simplify_tolerance,
@@ -546,6 +562,8 @@ def _dispatch(args):
             hex_memory=args.hex_memory,
             max_parallelism=args.max_parallelism,
             h0_subset=h0_subset,
+            hex_retries=args.hex_retries,
+            max_failed_indexes=args.max_failed_indexes,
             hex_storage=args.hex_storage,
             **hex_sizing,
             chunk_resolution=args.chunk_resolution,
