@@ -5,7 +5,7 @@ A toolkit for processing large geospatial datasets into cloud-native formats
 (COG, GeoParquet, PMTiles) with H3 hexagonal indexing.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # Lazy imports can be handled by users as needed,
 # or we can keep these commented out to allow core usage without all dependencies.
