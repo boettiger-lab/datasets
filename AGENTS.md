@@ -155,6 +155,13 @@ Both knobs are written into the manifest as `CNG_HEX_WORKERS` /
 regeneration and its memory profile is readable from the YAML alone. The
 generator prints the resulting profile when it runs.
 
+**Hex pods preempted or crawling:** generated pods use default priority (no
+`priorityClassName`). Do not add `opportunistic` to a long fan-out — on NRP it is
+priority -2000000000 and preemption exposure scales with runtime; a measured
+LANDFIRE build spread 5x in runtime because of it. It is still the right choice
+for genuinely interruptible work, or when a build must exceed its namespace
+quota, via `--priority-class opportunistic`.
+
 **S3 throttling (503 SlowDown):** Transient. Wait a few minutes and retry.
 
 **Workflow stuck → check what step it's on:**

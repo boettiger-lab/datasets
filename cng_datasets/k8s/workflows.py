@@ -80,8 +80,25 @@ class ClusterConfig:
     rclone_secret_name: str = "rclone-config"
     # Rclone remote name used in setup-bucket and pmtiles jobs
     rclone_remote: str = "nrp"
-    # Priority class (empty string = omit from spec)
-    priority_class: str = "opportunistic"
+    # Priority class (empty string = omit from spec, giving default priority 0).
+    #
+    # Default is now to omit it. On NRP `opportunistic` is priority
+    # -2000000000, the lowest available, and preemption exposure scales with
+    # pod runtime — so the class was applied to exactly the pods least able to
+    # absorb it: multi-hour hex and COG pods with no checkpointing, which
+    # restart from zero. Measured on a real LANDFIRE build (issue #201), six
+    # identical res-10 slices at `opportunistic` spread 5x in runtime, from
+    # ~7 h to a projected ~52 h, with every pod saturating its full CPU
+    # request — so this is contention, not scheduler CPU starvation. The
+    # counterfactual from an earlier build: raising priority while halving
+    # parallelism *improved* per-pod runtime, 117 min against 3h32m for
+    # identical work.
+    #
+    # Trade-off worth knowing: `opportunistic` lets a build exceed its
+    # namespace quota, and default priority does not. A large fan-out that
+    # relied on that will now hit the quota instead of running slowly — pass
+    # `--priority-class opportunistic` to restore the old behaviour.
+    priority_class: str = ""
     # Node affinity: "gpu-avoid" (default NRP rule) or "none" (disable)
     node_affinity: str = "gpu-avoid"
 
@@ -387,6 +404,48 @@ def select_chunk_resolution(h3_resolution: int, budget: str) -> int:
     )
 
 
+# Retry budget for an indexed hex fan-out.
+#
+# The fan-out used to carry `backoffLimit: 0`, which is a *job-wide* budget: one
+# pod failure anywhere fails the whole Job. A `podFailurePolicy` already ignores
+# DisruptionTarget, so a preemption or a node drain is retried and does not count
+# — that half of the problem was covered. What was not covered is every other
+# transient failure on a multi-hour pod: an OOM, a truncated Ceph read, a node
+# going away without setting the condition. Any one of those killed the run with
+# no retry at all.
+#
+# backoffLimitPerIndex makes the budget per index, so one flaky slice retries
+# instead of taking 342 healthy ones with it, and maxFailedIndexes stops the job
+# once a failure looks systematic rather than burning hours on the rest.
+DEFAULT_HEX_RETRIES = 2
+DEFAULT_MAX_FAILED_INDEXES = 1
+
+
+def _indexed_retry_spec(retries: int, max_failed_indexes: int) -> Dict[str, Any]:
+    """Job-spec fields giving an indexed fan-out a per-index retry budget.
+
+    `backoffLimit` is deliberately omitted rather than set alongside these: the
+    two express the same thing at different granularities, Kubernetes ignores
+    the job-wide one once a per-index budget exists, and emitting both invites
+    a reader to trust whichever they saw first. If the cluster is old enough to
+    prune these fields, the Job falls back to the API default backoffLimit of 6
+    — a weaker budget than intended, but not the zero-retry behaviour this
+    replaces (issue #201).
+    """
+    if retries < 0:
+        raise ValueError(f"hex_retries must be >= 0, got {retries}")
+    if max_failed_indexes < 1:
+        raise ValueError(
+            f"max_failed_indexes must be at least 1, got {max_failed_indexes}: "
+            "a fan-out that tolerates no failed index at all is the "
+            "backoffLimit: 0 behaviour this replaces"
+        )
+    return {
+        "backoffLimitPerIndex": retries,
+        "maxFailedIndexes": max_failed_indexes,
+    }
+
+
 def _validate_hex_chunk_size(hex_chunk_size) -> int:
     """Cells per exact_extract call, as a positive int."""
     hex_chunk_size = int(hex_chunk_size)
@@ -667,6 +726,8 @@ def generate_dataset_workflow(
     id_column: Optional[str] = None,
     layer: Optional[str] = None,
     hex_memory: str = "8Gi",
+    hex_retries: int = DEFAULT_HEX_RETRIES,
+    max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
     max_parallelism: int = 50,
     max_completions: int = 200,
     intermediate_chunk_size: int = 10,
@@ -718,6 +779,14 @@ def generate_dataset_workflow(
         parent_resolutions: List of parent H3 resolutions to include (default: [9, 8, 0])
         id_column: ID column name (auto-detected if not specified)
         hex_memory: Memory request/limit for hex job pods (default: "8Gi")
+        hex_retries: Per-index retry budget for the hex fan-out
+            (backoffLimitPerIndex, default 2). A preemption is already ignored
+            by the pod failure policy; this covers everything else that can end
+            a multi-hour pod — an OOM, a truncated read, a node going away
+            (issue #201).
+        max_failed_indexes: How many indexes may exhaust their retries before
+            the Job stops (default 1). Keeps a systematic failure from burning
+            hours on the remaining chunks.
         max_parallelism: Maximum parallelism for hex jobs (default: 50)
         max_completions: Maximum job completions - increase to reduce chunk size (default: 200)
         lat_column: Latitude column for a CSV point source, passed through to the
@@ -824,7 +893,7 @@ def generate_dataset_workflow(
     print(f"  Parent resolutions: {parent_resolutions}")
 
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config, resolution_by_area=resolution_by_area)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config, resolution_by_area=resolution_by_area, hex_retries=hex_retries, max_failed_indexes=max_failed_indexes)
 
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory, config=config)
@@ -922,6 +991,8 @@ def generate_raster_workflow(
     hex_cpu: str = DEFAULT_HEX_CPU,
     chunk_resolution: int = 0,
     max_hex_memory: Optional[str] = None,
+    hex_retries: int = DEFAULT_HEX_RETRIES,
+    max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
     merge_memory: str = "16Gi",
     merge_storage: str = "100Gi",
     cog_storage: str = "50Gi",
@@ -1007,6 +1078,14 @@ def generate_raster_workflow(
         merge_memory: Memory for the merge pod (default "16Gi"). It streams one
             partition at a time, so this does not track the dataset's size.
         merge_storage: Ephemeral storage for the merge pod (default "100Gi").
+        hex_retries: Per-index retry budget for the hex fan-out
+            (backoffLimitPerIndex, default 2). A preemption is already ignored
+            by the pod failure policy; this covers everything else that can end
+            a multi-hour pod — an OOM, a truncated read, a node going away
+            (issue #201).
+        max_failed_indexes: How many indexes may exhaust their retries before
+            the Job stops (default 1). Keeps a systematic failure from burning
+            hours on the remaining chunks.
         target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step
         target_resolution: Output pixel size in degrees for mosaic step
         band: Extract single band from multi-band sources (1-indexed) for mosaic step
@@ -1147,6 +1226,7 @@ def generate_raster_workflow(
         s3_dataset=dataset_name, h0_subset=h0_subset,
         hex_workers=hex_workers, hex_chunk_size=hex_chunk_size, hex_cpu=hex_cpu,
         chunk_resolution=chunk_resolution, chunk_count=chunk_count,
+        hex_retries=hex_retries, max_failed_indexes=max_failed_indexes,
     )
 
     if chunk_resolution:
@@ -1413,7 +1493,10 @@ cng-datasets merge-chunks \\
         "kind": "Job",
         "metadata": _job_metadata(manager, f"{dataset_name}-merge"),
         "spec": {
-            "backoffLimit": 0,
+            # One long job rather than a fan-out, so a plain job-wide budget is
+            # the right shape — but not zero: it runs after hours of hex work
+            # and a transient S3 failure should not throw that away (#201).
+            "backoffLimit": 2,
             "ttlSecondsAfterFinished": 10800,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-merge"}},
@@ -1435,6 +1518,8 @@ def _generate_raster_hex_job(
     hex_cpu: str = DEFAULT_HEX_CPU,
     chunk_resolution: int = 0,
     chunk_count: Optional[int] = None,
+    hex_retries: int = DEFAULT_HEX_RETRIES,
+    max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
 ):
     """Generate raster H3 hex tiling job."""
     if config is None:
@@ -1552,7 +1637,7 @@ def _generate_raster_hex_job(
             # extras would sit against the namespace quota with nothing to do.
             "parallelism": min(max_parallelism, completions),
             "completionMode": "Indexed",
-            "backoffLimit": 0,
+            **_indexed_retry_spec(hex_retries, max_failed_indexes),
             "podFailurePolicy": {
                 "rules": [{
                     "action": "Ignore",
@@ -1932,7 +2017,7 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-pmtiles.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None, resolution_by_area=None):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None, resolution_by_area=None, hex_retries: int = DEFAULT_HEX_RETRIES, max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES):
     """Generate H3 hex tiling job.
 
     Args:
@@ -2000,7 +2085,7 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
             "completions": completions,
             "parallelism": parallelism,
             "completionMode": "Indexed",
-            "backoffLimit": 0,
+            **_indexed_retry_spec(hex_retries, max_failed_indexes),
             "podFailurePolicy": {
                 "rules": [{
                     "action": "Ignore",
