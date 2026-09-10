@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-10
+
 ### Changed
 - **Behaviour change (scheduling):** hex and COG pods no longer default to `priorityClassName: opportunistic`; the default and the built-in `nrp` profile now omit it, giving default priority 0. On NRP `opportunistic` is priority **-2000000000**, the lowest available, and preemption exposure scales with pod runtime — so the class was applied to exactly the pods least able to absorb it: multi-hour, un-checkpointed work that restarts from zero. Measured on a real LANDFIRE build (#201), six identical res-10 slices spread **5x in runtime**, ~7 h to a projected ~52 h, with every pod saturating its full CPU request — contention, not scheduler CPU starvation. The counterfactual from an earlier build: raising priority while halving parallelism *improved* per-pod runtime, 117 min against 3h32m for identical work, so the old default was likely slower as well as riskier. **Trade-off to know before upgrading:** `opportunistic` lets a build exceed its namespace quota and default priority does not, so a large fan-out that relied on that will now hit the quota rather than running slowly. Pass `--priority-class opportunistic` to restore it (#201)
 - **Behaviour change (retries):** the hex fan-out no longer carries `backoffLimit: 0`. That is a *job-wide* budget, so one pod failure anywhere failed the whole fan-out. It is replaced by `backoffLimitPerIndex` (default 2) and `maxFailedIndexes` (default 1), so a flaky slice retries instead of taking hundreds of healthy ones with it, and a systematic failure stops the Job rather than burning hours on the rest. `backoffLimit` is deliberately omitted rather than set alongside them: Kubernetes ignores the job-wide budget once a per-index one exists, and emitting both misleads anyone reading the manifest. Configurable via `--hex-retries` and `--max-failed-indexes`. Note the existing `podFailurePolicy` already ignored `DisruptionTarget`, so **preemption was always retried** — the gap this closes is every *other* way a multi-hour pod can die: an OOM, a truncated Ceph read, a node going away without setting the condition. Filed against `raster-workflow`; the vector generator had the same shape and is fixed with it (#201)
@@ -178,6 +180,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.5.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.5.0
 [0.4.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.4.0
 [0.3.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.3.1
 [0.3.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.3.0
