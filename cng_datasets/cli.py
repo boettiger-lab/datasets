@@ -121,6 +121,23 @@ def main():
     merge_parser.add_argument("--memory-limit", type=str, default=None,
                               help="DuckDB memory limit (e.g. '8GiB'). Overrides DUCKDB_MEMORY_LIMIT.")
 
+    gapfill_parser = subparsers.add_parser(
+        "gapfill",
+        help="Emit an Armada job set re-running the sub-h0 chunks that never completed. "
+             "Exits 0 when nothing is missing and 1 when a job set was written, so a "
+             "pipeline can branch on it the way it would on diff.")
+    gapfill_parser.add_argument("--chunks-dir", required=True, help="Where the hex step wrote parts and markers")
+    gapfill_parser.add_argument("--expect-chunks", type=int, required=True, metavar="N",
+                                help="Size of the fan-out a complete build has")
+    gapfill_parser.add_argument("--hex-manifest", required=True, metavar="YAML",
+                                help="The generated <name>-hex.yaml the fan-out came from")
+    gapfill_parser.add_argument("--output", required=True, metavar="YAML", help="Where to write the gap-fill job set")
+    gapfill_parser.add_argument("--queue", default=None, help="Armada queue (default: the Job's namespace)")
+    gapfill_parser.add_argument("--job-set-id", default=None, help="Armada job set id (default: <job name>-gapfill)")
+    gapfill_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS",
+                                help="Armada priority class for the re-run; a shorthand ('default', "
+                                     "'preemptible', 'high') or a literal class name")
+
     repartition_parser = subparsers.add_parser("repartition", help="Repartition chunks by h0")
     repartition_parser.add_argument("--chunks-dir", required=True, help="Input chunks directory URL")
     repartition_parser.add_argument("--output-dir", required=True, help="Output directory URL")
@@ -443,6 +460,22 @@ def _dispatch(args):
             expect_chunks=args.expect_chunks,
         )
 
+    elif args.command == "gapfill":
+        from .raster.merge import generate_gapfill
+        missing = generate_gapfill(
+            chunks_dir=args.chunks_dir,
+            expect_chunks=args.expect_chunks,
+            hex_manifest=args.hex_manifest,
+            output_path=args.output,
+            queue=args.queue,
+            job_set_id=args.job_set_id,
+            priority_class=args.armada_priority_class,
+        )
+        # Non-zero when there were gaps, so a pipeline step can branch on it
+        # without parsing the output.
+        if missing:
+            return 1
+
     elif args.command == "repartition":
         from .vector import repartition_by_h0
         repartition_by_h0(
@@ -633,4 +666,4 @@ def _dispatch(args):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

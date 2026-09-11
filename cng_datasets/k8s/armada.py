@@ -168,6 +168,7 @@ def k8s_indexed_job_to_armada(
     queue: str,
     job_set_id: str,
     priority_class: Optional[str] = None,
+    indices: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Convert a k8s Indexed Job to multiple Armada jobs.
@@ -183,9 +184,14 @@ def k8s_indexed_job_to_armada(
         priority_class: Armada priority class, either a literal name
             ("armada-default") or a shorthand ("default", "preemptible",
             "high"). Defaults to DEFAULT_ARMADA_PRIORITY_CLASS when None.
+        indices: Expand only these completion indices instead of all of them.
+            Armada exposes no retry service on NRP (`armadactl get
+            retry-policies` returns Unimplemented) and a preempted job is not
+            rescheduled, so re-running the handful of units that failed is a
+            normal pipeline stage rather than an exception (issue #183).
 
     Returns:
-        Armada submission dict with N jobs (one per completion index)
+        Armada submission dict with one job per expanded completion index
     """
     priority_class = resolve_armada_priority_class(priority_class)
     if priority_class is None:
@@ -196,8 +202,20 @@ def k8s_indexed_job_to_armada(
     namespace = job_spec["metadata"].get("namespace", queue)
     base_pod_spec = _extract_pod_spec(job_spec)
 
+    if indices is None:
+        expand = list(range(completions))
+    else:
+        out_of_range = [i for i in indices if not 0 <= i < completions]
+        if out_of_range:
+            raise ValueError(
+                f"indices {out_of_range} are outside this Job's 0..{completions - 1} "
+                f"completions. Re-running an index the Job never had would submit a "
+                f"unit whose output belongs to no partition."
+            )
+        expand = sorted(set(indices))
+
     jobs = []
-    for i in range(completions):
+    for i in expand:
         pod = copy.deepcopy(base_pod_spec)
         _replace_completion_index(pod, i)
         jobs.append({
