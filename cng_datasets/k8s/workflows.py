@@ -1233,6 +1233,7 @@ def generate_raster_workflow(
         _generate_raster_merge_job(
             manager, k8s_name, bucket, output_path, s3_dataset=dataset_name,
             merge_memory=merge_memory, merge_storage=merge_storage, config=config,
+            expect_chunks=chunk_count,
         )
 
     # Generate workflow RBAC
@@ -1439,6 +1440,7 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
 def _generate_raster_merge_job(
     manager, dataset_name, bucket, output_path, s3_dataset=None,
     merge_memory="16Gi", merge_storage="100Gi", config: ClusterConfig = None,
+    expect_chunks: Optional[int] = None,
 ):
     """Generate the job that consolidates sub-h0 chunks into one file per h0.
 
@@ -1452,11 +1454,16 @@ def _generate_raster_merge_job(
         config = ClusterConfig()
     s3_dataset = s3_dataset or dataset_name
 
+    # The generator sized the fan-out, so it is the only place that knows how
+    # many chunks a complete build has. Passing it through means a partly failed
+    # fan-out fails the merge instead of publishing its survivors (issue #173).
+    expect_flag = (f" \\\n  --expect-chunks {expect_chunks}"
+                   if expect_chunks is not None else "")
     command_str = f"""set -e
 
 cng-datasets merge-chunks \\
   --chunks-dir s3://{bucket}/{s3_dataset}/hex-chunks \\
-  --output-dir s3://{bucket}/{s3_dataset}/hex
+  --output-dir s3://{bucket}/{s3_dataset}/hex{expect_flag}
 """
 
     pod_spec = {

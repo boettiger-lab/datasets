@@ -35,11 +35,54 @@ def _rclone_dest(output_dir: str) -> Optional[str]:
     return f"nrp:{parts[0]}"
 
 
+def _assert_all_chunks_ran(con, chunks_dir: str, expect_chunks: int) -> None:
+    """Fail unless every chunk of the fan-out recorded that it completed.
+
+    Counting part files cannot answer this: a chunk that does not overlap the
+    raster legitimately writes none, so a missing part is indistinguishable from
+    a chunk that never ran. Each chunk therefore leaves a marker whether or not
+    it produced data, and this compares markers against the fan-out the
+    generator sized.
+
+    Without the check a partly failed fan-out merges its survivors into a
+    complete-looking dataset and then, with cleanup on, deletes the evidence.
+    That is most likely on the Armada backend, whose jobs carry no retry budget
+    (issue #183) and which is where a large fan-out is routed (issue #173).
+    """
+    manifest_glob = f"{chunks_dir.rstrip('/')}/_manifest/chunk-*.parquet"
+    try:
+        rows = con.raw_sql(
+            f"SELECT COUNT(DISTINCT chunk_index) FROM read_parquet('{manifest_glob}')"
+        ).fetchall()
+        completed = rows[0][0] if rows else 0
+    except Exception as e:
+        raise RuntimeError(
+            f"--expect-chunks {expect_chunks} was given but no completion markers were "
+            f"found under '{manifest_glob}'. Either the hex step did not run, or it "
+            f"predates completion markers — rerun the hex step, or drop "
+            f"--expect-chunks to merge without the check."
+        ) from e
+
+    if completed != expect_chunks:
+        raise RuntimeError(
+            f"Incomplete fan-out: {completed} of {expect_chunks} chunks recorded "
+            f"completion. Merging now would publish a short dataset and, with "
+            f"cleanup on, delete the chunks that show which are missing.\n"
+            f"  Rerun the failed chunk indices, then merge again — completed chunks "
+            f"are skipped by nothing, but re-running one is cheap and idempotent.\n"
+            f"  On the Armada backend a failed job stays failed (no retry budget "
+            f"survives conversion), so check the job set before assuming a transient "
+            f"fault."
+        )
+    print(f"✓ All {expect_chunks} chunks recorded completion")
+
+
 def merge_raster_chunks(
     chunks_dir: str,
     output_dir: str,
     cleanup: bool = True,
     memory_limit: Optional[str] = None,
+    expect_chunks: Optional[int] = None,
 ) -> int:
     """
     Consolidate ``chunks_dir/h0=*/part-*.parquet`` into ``output_dir/h0=*/data_0.parquet``.
@@ -48,6 +91,9 @@ def merge_raster_chunks(
         chunks_dir: Where the sub-chunked hex step wrote its parts.
         output_dir: The published hex tree.
         cleanup: Remove the chunks prefix once the merge is verified.
+        expect_chunks: The number of chunks the hex fan-out was sized for. When
+            given, the merge refuses to run unless that many chunks recorded
+            completion.
         memory_limit: DuckDB memory limit (e.g. '8GiB'). Falls back to
             DUCKDB_MEMORY_LIMIT. Unset lets DuckDB auto-detect, which may
             ignore the container's cgroup limit.
@@ -66,6 +112,11 @@ def merge_raster_chunks(
         con.raw_sql(f"SET memory_limit='{effective_limit}'")
     con.raw_sql("SET http_timeout=1200")
     con.raw_sql("SET http_retries=30")
+
+    # Checked before anything is read or written, so an incomplete fan-out costs
+    # nothing and leaves every chunk in place to inspect.
+    if expect_chunks is not None:
+        _assert_all_chunks_ran(con, chunks_dir, expect_chunks)
 
     parts_glob = f"{chunks_dir.rstrip('/')}/h0=*/part-*.parquet"
 

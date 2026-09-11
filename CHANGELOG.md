@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A partly failed sub-h0 fan-out can no longer be published as a complete dataset. `merge-chunks` consolidated whatever part files it found and then, with cleanup on, purged the chunks prefix — so a build that lost chunks produced a short dataset, exit 0, with the evidence deleted. Counting parts cannot detect this: a chunk that does not overlap the raster legitimately writes none, so a missing part is indistinguishable from a chunk that never ran. Every chunk now records a completion marker **whether or not it wrote data**, and `--expect-chunks N` (emitted automatically by `raster-workflow`, which sized the fan-out) makes the merge refuse to run unless that many chunks completed. Checked before anything is read or written, so a refused merge costs nothing and leaves every chunk in place. The risk was concentrated on the Armada backend, whose converted jobs carry no retry budget (#183) and which is where `--backend auto` routes a large fan-out (#173)
+
 ### Added
 - `duckdb-bugreport.md`: a minimal reproducible case for `INTERNAL Error: Calling GetValueInternal on a value that is NULL`, which the H3 extension raises when a list-returning function reads a dictionary-encoded Parquet column — and which invalidates the DuckDB connection, so every later query in the process fails too. Dictionary encoding is the default in every common Parquet writer and applies to any column with repeated values, so this is reachable from ordinary data; the report isolates encoding from row count with controls, lists the four affected functions (all of which return a list from a scalar argument), and relates it to upstream #136 and #120. Worked around here by expanding the chunk list one h0 at a time with the cell as a literal
 

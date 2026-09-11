@@ -112,6 +112,10 @@ def main():
         help="Merge sub-h0 raster hex chunks into one file per h0 partition")
     merge_parser.add_argument("--chunks-dir", required=True, help="Where the sub-chunked hex step wrote part-*.parquet")
     merge_parser.add_argument("--output-dir", required=True, help="Published hex tree to write h0=*/data_0.parquet into")
+    merge_parser.add_argument("--expect-chunks", type=int, default=None, metavar="N",
+                              help="The number of chunks the hex fan-out was sized for. The merge "
+                                   "refuses to run unless that many chunks recorded completion, so a "
+                                   "partly failed fan-out cannot be published as a complete dataset.")
     merge_parser.add_argument("--no-cleanup", dest="cleanup", action="store_false", default=True,
                               help="Keep the chunks prefix after a verified merge")
     merge_parser.add_argument("--memory-limit", type=str, default=None,
@@ -436,6 +440,7 @@ def _dispatch(args):
             output_dir=args.output_dir,
             cleanup=args.cleanup,
             memory_limit=args.memory_limit,
+            expect_chunks=args.expect_chunks,
         )
 
     elif args.command == "repartition":
