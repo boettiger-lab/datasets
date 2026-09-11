@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `duckdb-bugreport.md`: a minimal reproducible case for `INTERNAL Error: Calling GetValueInternal on a value that is NULL`, which the H3 extension raises when a list-returning function reads a dictionary-encoded Parquet column — and which invalidates the DuckDB connection, so every later query in the process fails too. Dictionary encoding is the default in every common Parquet writer and applies to any column with repeated values, so this is reachable from ordinary data; the report isolates encoding from row count with controls, lists the four affected functions (all of which return a list from a scalar argument), and relates it to upstream #136 and #120. Worked around here by expanding the chunk list one h0 at a time with the cell as a literal
+
+
 ## [0.5.0] - 2026-09-10
 
 ### Changed
@@ -73,6 +77,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.zenodo.json` dropped an unresolvable NSF grant identifier that caused Zenodo DOI minting to fail on the 0.3.0 release; the archive/DOI can now be minted (#165)
 
 ## [0.3.0] - 2026-07-20
+
+### Fixed (added retroactively)
+These five shipped in 0.3.0 but were never written up; recorded here so the
+history matches what was released rather than what was remembered.
+
+- A `.gdb` File Geodatabase on `s3://` is localized before `ST_Read`. An FGDB is a multi-file *directory*, which DuckDB-spatial cannot open over `s3://`, and `/vsis3` on a directory FGDB is flaky across nodes. Remote `.gdb` sources are now rclone-copied to a local temp dir first, mirroring the raster path's `_localize_input`, and cleaned up in the convert `finally` block (#152)
+- A non-Parquet vector source on `s3://` is rewritten to its public HTTPS endpoint wrapped in `/vsicurl` before `ST_Read`. GDAL cannot open a bare `s3://` path without `/vsis3` credentials, which the convert tool does not set, so a GeoJSON source failed at `ST_Read` even though CRS and geometry detection over httpfs had already succeeded (#153)
+- Duplicate `(feature, cell)` rows are removed from vector hex output. Pass 1 dumps each feature into one row per part and Pass 2 unnests every part's cell array independently, so a cell touched by two or more parts of the same MultiPolygon was emitted once per part — byte-identical duplicate rows that silently inflated every downstream `SUM` and area aggregate (found on `ca30x30-ecoregion`). De-duplicated on the fully assembled per-chunk file, which is where it is correct: one feature's parts can span Pass-2 batches, but each feature lives entirely within one chunk (#150)
+- `RasterProcessor.__init__` no longer crashes on a global equal-area projection. Source bounds were reprojected corner-by-corner, and for e.g. World Mollweide the rectangle corners fall in the projection's undefined oval domain, so `TransformPoint` raised "Point outside of projection domain" before any work started. Now uses `gdal.AutoCreateWarpedVRT` — the machinery `gdalwarp` itself uses — with a whole-globe fallback, since these bounds only clip or skip h0 regions and over-approximating is safe where under-approximating would drop data (#151)
+- The PMTiles job raises its soft file-descriptor limit before invoking tippecanoe. On high-core nodes `os.cpu_count()` reports the node's full core count, so tippecanoe's per-thread per-tile temp shards exhausted the container's default soft `nofile` limit (often 1024) and aborted with "Too many open files" (#154)
+
 
 First release published to PyPI (`pip install cng-datasets`) via trusted publishing.
 
