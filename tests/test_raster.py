@@ -8,6 +8,8 @@ import pytest
 import os
 import math
 import tempfile
+import glob
+import yaml
 import shutil
 from pathlib import Path
 import duckdb
@@ -2384,3 +2386,269 @@ class TestH3ProtrusionMargin:
             f"protrusion grew from {one:.3f} at one level to {deep:.3f} at four — if it "
             f"compounds with depth, a depth-independent margin is not sound"
         )
+
+
+class TestChunkCompleteness:
+    """
+    A partly failed fan-out must not be published as a complete dataset (#173).
+
+    Counting part files cannot detect this: a chunk that does not overlap the
+    raster legitimately writes none, so a missing part is indistinguishable from
+    a chunk that never ran. Without a completion marker per chunk, merge
+    consolidated whatever survived and — with cleanup on — deleted the evidence.
+    The risk is concentrated on the Armada backend, whose jobs carry no retry
+    budget (#183) and which is where a large fan-out gets routed.
+    """
+
+    H0_CELL = 577199624117288959
+    RES = 3
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        from osgeo import gdal, osr
+        w = h = 64
+        path = os.path.join(temp_dir, "r.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-123.0, 1/64, 0, 37.0 + h/64, 0, -1/64])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:h, 0:w]
+        ds.GetRasterBand(1).WriteArray((yy * w + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _chunks(self, raster, temp_dir, name="chunks"):
+        import geopandas as gpd
+        from shapely.geometry import box
+        from cng_datasets.raster import RasterProcessor
+        grid = os.path.join(temp_dir, "h0.parquet")
+        gpd.GeoDataFrame({"i": [0], "h0": [self.H0_CELL],
+                          "geometry": [box(-124, 36, -122, 38)]},
+                         crs="EPSG:4326").rename_geometry("geom").to_parquet(grid)
+        out = os.path.join(temp_dir, name)
+        os.makedirs(out, exist_ok=True)
+        return RasterProcessor(
+            input_path=raster, output_parquet_path=out, h3_resolution=self.RES,
+            parent_resolutions=[0], h0_grid_path=grid, value_column="v",
+            chunk_resolution=2,
+        ), out
+
+    @pytest.mark.timeout(300)
+    def test_every_chunk_records_completion_including_empty_ones(self, raster, temp_dir):
+        """
+        The marker is the point: it exists even when the chunk wrote no data.
+
+        Most chunks of this fixture do not overlap the raster at all, so if
+        markers only followed output there would be far fewer than chunks.
+        """
+        proc, out = self._chunks(raster, temp_dir)
+        n = len(proc.chunk_cells())
+        for i in range(n):
+            proc.process_chunk(i)
+        markers = glob.glob(os.path.join(out, "_manifest", "chunk-*.parquet"))
+        parts = glob.glob(os.path.join(out, "h0=*", "part-*.parquet"))
+        assert len(markers) == n, f"{len(markers)} markers for {n} chunks"
+        assert len(parts) < n, (
+            "fixture no longer exercises the empty-chunk case — every chunk wrote "
+            "data, so counting parts would have sufficed"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_merge_refuses_an_incomplete_fan_out(self, raster, temp_dir):
+        """A chunk that never ran must stop the merge, not be merged around."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+        proc, out = self._chunks(raster, temp_dir)
+        n = len(proc.chunk_cells())
+        for i in range(n - 1):          # the last chunk "fails": never runs
+            proc.process_chunk(i)
+
+        merged = os.path.join(temp_dir, "merged")
+        os.makedirs(merged, exist_ok=True)
+        with pytest.raises(RuntimeError, match="Incomplete fan-out"):
+            merge_raster_chunks(out, merged, cleanup=False, expect_chunks=n)
+        assert not glob.glob(os.path.join(merged, "h0=*", "*.parquet")), (
+            "merge must write nothing when the fan-out is incomplete"
+        )
+        assert glob.glob(os.path.join(out, "h0=*", "part-*.parquet")), (
+            "chunks must survive a refused merge so the missing ones can be found"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_merge_proceeds_when_every_chunk_ran(self, raster, temp_dir):
+        from cng_datasets.raster.merge import merge_raster_chunks
+        proc, out = self._chunks(raster, temp_dir)
+        n = len(proc.chunk_cells())
+        for i in range(n):
+            proc.process_chunk(i)
+        merged = os.path.join(temp_dir, "merged2")
+        os.makedirs(merged, exist_ok=True)
+        assert merge_raster_chunks(out, merged, cleanup=False, expect_chunks=n) >= 1
+        assert os.path.exists(os.path.join(merged, f"h0={self.H0_CELL}", "data_0.parquet"))
+
+    @pytest.mark.timeout(300)
+    def test_check_is_opt_in(self, raster, temp_dir):
+        """Without --expect-chunks the merge behaves as before."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+        proc, out = self._chunks(raster, temp_dir)
+        for i in range(len(proc.chunk_cells()) - 1):
+            proc.process_chunk(i)
+        merged = os.path.join(temp_dir, "merged3")
+        os.makedirs(merged, exist_ok=True)
+        assert merge_raster_chunks(out, merged, cleanup=False) >= 1
+
+    @pytest.mark.timeout(120)
+    def test_expect_chunks_without_markers_says_why(self, raster, temp_dir):
+        """Chunks written before markers existed must fail legibly, not obscurely."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+        proc, out = self._chunks(raster, temp_dir)
+        for i in range(len(proc.chunk_cells())):
+            proc.process_chunk(i)
+        shutil.rmtree(os.path.join(out, "_manifest"))
+        merged = os.path.join(temp_dir, "merged4")
+        os.makedirs(merged, exist_ok=True)
+        with pytest.raises(RuntimeError, match="[Nn]o completion markers"):
+            merge_raster_chunks(out, merged, cleanup=False, expect_chunks=49)
+
+
+class TestGapfill:
+    """
+    Re-running the chunks that never completed (#183, #173).
+
+    Armada exposes no retry service on NRP — `armadactl get retry-policies`
+    returns Unimplemented — and a preempted job is not rescheduled, so a
+    transient fault leaves a permanently missing chunk. At an observed ~0.1%
+    failure rate a few-thousand-unit fan-out loses one or two every run, which
+    makes gap-fill a pipeline stage rather than an exception.
+    """
+
+    H0_CELL = 577199624117288959
+    RES = 3
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        from osgeo import gdal, osr
+        w = h = 64
+        path = os.path.join(temp_dir, "r.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-123.0, 1/64, 0, 37.0 + h/64, 0, -1/64])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:h, 0:w]
+        ds.GetRasterBand(1).WriteArray((yy * w + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _run_chunks(self, raster, temp_dir, skip=()):
+        import geopandas as gpd
+        from shapely.geometry import box
+        from cng_datasets.raster import RasterProcessor
+        grid = os.path.join(temp_dir, "h0.parquet")
+        gpd.GeoDataFrame({"i": [0], "h0": [self.H0_CELL],
+                          "geometry": [box(-124, 36, -122, 38)]},
+                         crs="EPSG:4326").rename_geometry("geom").to_parquet(grid)
+        out = os.path.join(temp_dir, "chunks")
+        os.makedirs(out, exist_ok=True)
+        proc = RasterProcessor(
+            input_path=raster, output_parquet_path=out, h3_resolution=self.RES,
+            parent_resolutions=[0], h0_grid_path=grid, value_column="v",
+            chunk_resolution=2)
+        n = len(proc.chunk_cells())
+        for i in range(n):
+            if i not in skip:
+                proc.process_chunk(i)
+        return out, n
+
+    def _hex_manifest(self, temp_dir, completions):
+        """A hex Job manifest of the shape the generator emits."""
+        path = os.path.join(temp_dir, "demo-hex.yaml")
+        with open(path, "w") as f:
+            yaml.safe_dump({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "demo-hex", "namespace": "geo-workflows"},
+                "spec": {
+                    "completions": completions, "parallelism": 4,
+                    "completionMode": "Indexed",
+                    "template": {"spec": {
+                        "restartPolicy": "Never",
+                        "containers": [{
+                            "name": "hex-task", "image": "img",
+                            "command": ["bash", "-c",
+                                        "cng-datasets raster --chunk-index ${JOB_COMPLETION_INDEX}"],
+                        }],
+                    }},
+                },
+            }, f)
+        return path
+
+    @pytest.mark.timeout(300)
+    def test_missing_chunks_are_enumerated_not_counted(self, raster, temp_dir):
+        """
+        A count says "48 of 49" and leaves you to find the one.
+
+        On a few-thousand-unit fan-out that is the entire problem, so the
+        missing set is reported explicitly.
+        """
+        from cng_datasets.raster.merge import find_missing_chunks
+        out, n = self._run_chunks(raster, temp_dir, skip={3, 11})
+        assert find_missing_chunks(out, n) == [3, 11]
+
+    @pytest.mark.timeout(300)
+    def test_gapfill_job_set_reruns_exactly_the_missing_indices(self, raster, temp_dir):
+        from cng_datasets.raster.merge import generate_gapfill
+        out, n = self._run_chunks(raster, temp_dir, skip={3, 11})
+        manifest = self._hex_manifest(temp_dir, n)
+        dest = os.path.join(temp_dir, "gapfill.yaml")
+
+        missing = generate_gapfill(out, n, manifest, dest, queue="geo-workflows")
+        assert missing == [3, 11]
+
+        spec = yaml.safe_load(open(dest))
+        assert spec["queue"] == "geo-workflows"
+        assert len(spec["jobs"]) == 2, "one job per missing chunk, and no others"
+        cmds = [j["podSpec"]["containers"][0]["command"][-1] for j in spec["jobs"]]
+        assert sorted(cmds) == sorted([
+            "cng-datasets raster --chunk-index 3",
+            "cng-datasets raster --chunk-index 11",
+        ]), "the completion index must be substituted, not left as a placeholder"
+
+    @pytest.mark.timeout(300)
+    def test_gapfill_writes_nothing_when_complete(self, raster, temp_dir):
+        from cng_datasets.raster.merge import generate_gapfill
+        out, n = self._run_chunks(raster, temp_dir)
+        dest = os.path.join(temp_dir, "gapfill.yaml")
+        assert generate_gapfill(out, n, self._hex_manifest(temp_dir, n), dest) == []
+        assert not os.path.exists(dest)
+
+    @pytest.mark.timeout(300)
+    def test_manifest_from_a_different_fan_out_is_refused(self, raster, temp_dir):
+        """
+        Re-running an index against the wrong chunk list processes the wrong cell.
+
+        The index only means something relative to the enumeration that produced
+        it, so a manifest whose completions disagree cannot be used.
+        """
+        from cng_datasets.raster.merge import generate_gapfill
+        out, n = self._run_chunks(raster, temp_dir, skip={3})
+        wrong = self._hex_manifest(temp_dir, n + 5)
+        with pytest.raises(RuntimeError, match="different generations"):
+            generate_gapfill(out, n, wrong, os.path.join(temp_dir, "g.yaml"))
+
+    @pytest.mark.timeout(300)
+    def test_markers_outside_the_expected_range_are_refused(self, raster, temp_dir):
+        """Two fan-outs writing into one prefix must not be merged together."""
+        from cng_datasets.raster.merge import find_missing_chunks
+        out, n = self._run_chunks(raster, temp_dir)
+        with pytest.raises(RuntimeError, match="outside the expected range"):
+            find_missing_chunks(out, n - 3)

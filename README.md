@@ -107,6 +107,7 @@ The `/` in `--dataset` creates nested S3 paths (e.g., `mydata/layer-a.parquet`) 
 | `cng-datasets raster` | Run raster H3 tiling (used inside k8s pods) |
 | `cng-datasets repartition` | Consolidate hex chunks (used inside k8s pods) |
 | `cng-datasets merge-chunks` | Consolidate sub-h0 raster hex chunks (used inside k8s pods) |
+| `cng-datasets gapfill` | Re-run the sub-h0 chunks that never completed (Armada backend) |
 
 Commands marked "used inside k8s pods" are called by the generated jobs — you don't run them directly.
 

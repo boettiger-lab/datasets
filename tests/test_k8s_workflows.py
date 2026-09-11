@@ -1968,6 +1968,23 @@ class TestChunkResolutionGeneration:
             assert args.index("chunky-hex.yaml") < args.index("chunky-merge.yaml")
 
     @pytest.mark.timeout(60)
+    def test_merge_is_told_how_many_chunks_to_expect(self):
+        """
+        The generator sized the fan-out, so it is the only place that knows.
+
+        Without this the merge consolidates whatever survived a partly failed
+        fan-out and publishes it as complete — and then deletes the chunks that
+        would have shown which were missing.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2)
+            expected = self._load(out / "chunky-hex.yaml")["spec"]["completions"]
+            mcmd = " ".join(
+                self._load(out / "chunky-merge.yaml")["spec"]["template"]["spec"]
+                ["containers"][0]["command"][2].split())
+            assert f"--expect-chunks {expected}" in mcmd
+
+    @pytest.mark.timeout(60)
     def test_no_merge_step_without_sub_chunking(self):
         """The default path gains nothing and must stay exactly as it was."""
         with tempfile.TemporaryDirectory() as tmpdir:

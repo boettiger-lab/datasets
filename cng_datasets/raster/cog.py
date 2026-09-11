@@ -2023,6 +2023,33 @@ class RasterProcessor:
             )
         return self._chunk_cells_cache
 
+    def _chunk_manifest_path(self, chunk_index: int) -> str:
+        """Where one chunk records that it ran.
+
+        Beside the parts rather than inside them, because the fact worth
+        recording is that the chunk *completed* — which is exactly the case a
+        chunk with no data cannot express by writing a part file. `_manifest`
+        does not match the `h0=*` glob the merge reads parts through, so the two
+        never collide.
+        """
+        base = self.output_parquet_path.rstrip("/")
+        return f"{base}/_manifest/chunk-{chunk_index}.parquet"
+
+    def _record_chunk_completion(self, chunk_index: int, chunk_cell: int,
+                                 h0_cell: int, result: Optional[str]) -> None:
+        """Write this chunk's completion marker."""
+        path = self._chunk_manifest_path(chunk_index)
+        if not path.startswith("s3://"):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.con.execute(f"""
+            COPY (
+                SELECT {int(chunk_index)}::BIGINT AS chunk_index,
+                       {int(chunk_cell)}::UBIGINT AS chunk_cell,
+                       {int(h0_cell)}::UBIGINT AS h0,
+                       {"true" if result else "false"}::BOOLEAN AS wrote_data
+            ) TO '{path}' (FORMAT PARQUET)
+        """)
+
     def _windowed_source_for(self, geom_wkt: str, margin_deg: float,
                              chunk_cell: int) -> Optional[str]:
         """Localize only the window of the source COG a chunk actually reads.
@@ -2146,6 +2173,18 @@ class RasterProcessor:
             f"(res-{self.chunk_resolution} cell {chunk_cell}, h0 {h0_index})..."
         )
 
+        result = self._process_one_chunk(chunk_cell, h0_cell, chunk_index)
+        # Recorded whether or not the chunk wrote anything. A chunk that does
+        # not overlap the raster legitimately writes no part file, so the merge
+        # step cannot tell "no data here" from "this chunk never ran" by
+        # counting parts — and merging the survivors of a partly failed fan-out
+        # produces a short dataset with a clean exit (issue #173).
+        self._record_chunk_completion(chunk_index, chunk_cell, h0_cell, result)
+        return result
+
+    def _process_one_chunk(self, chunk_cell: int, h0_cell: int,
+                           chunk_index: int) -> Optional[str]:
+        """Aggregate one sub-h0 chunk; returns its parquet path, or None."""
         # A sub-chunk has no row in the h0 grid, so its footprint comes from the
         # cell id itself. _h0_overlaps_raster's antimeridian unwrapping applies
         # unchanged — a res-N cell can straddle +/-180 just as an h0 can.
