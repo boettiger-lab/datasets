@@ -23,6 +23,7 @@ from .armada import (
 _CONFIG_KEYS = {
     "s3_endpoint", "s3_public_endpoint", "s3_secret_name",
     "rclone_secret_name", "rclone_remote", "priority_class", "node_affinity",
+    "namespace", "armada_queue",
 }
 
 
@@ -80,6 +81,13 @@ class ClusterConfig:
     rclone_secret_name: str = "rclone-config"
     # Rclone remote name used in setup-bucket and pmtiles jobs
     rclone_remote: str = "nrp"
+    # Kubernetes namespace the generated jobs run in. Also the default Armada
+    # queue, since NRP maps queues one-to-one onto namespaces — but the two are
+    # separate fields in a submitted job set, so `armada_queue` can differ.
+    namespace: str = "geo-workflows"
+    # Armada queue. None means "use the namespace", which is right on NRP and
+    # was the only possible behaviour before this was configurable.
+    armada_queue: Optional[str] = None
     # Priority class (empty string = omit from spec, giving default priority 0).
     #
     # Default is now to omit it. On NRP `opportunistic` is priority
@@ -717,7 +725,7 @@ def generate_dataset_workflow(
     source_urls: Union[str, List[str]] = None,
     bucket: str = None,
     output_dir: str = ".",
-    namespace: str = "biodiversity",
+    namespace: Optional[str] = None,
     image: str = "ghcr.io/boettiger-lab/datasets:latest",
     git_repo: str = "https://github.com/boettiger-lab/datasets.git",
     h3_resolution: Optional[int] = None,
@@ -740,6 +748,7 @@ def generate_dataset_workflow(
     pmtiles_max_zoom: Optional[int] = None,
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
+    armada_queue: Optional[str] = None,
     hex_storage: str = "10Gi",
     repartition_storage: str = "50Gi",
     repartition_memory: str = "32Gi",
@@ -824,7 +833,13 @@ def generate_dataset_workflow(
         rclone_remote=rclone_remote,
         priority_class=priority_class,
         node_affinity=node_affinity,
+        armada_queue=armada_queue,
     )
+
+    # See the note in generate_raster_workflow: namespace comes from the profile
+    # unless named, and the Armada queue follows it unless set separately.
+    namespace = namespace or config.namespace
+    armada_queue = config.armada_queue or namespace
 
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
@@ -922,7 +937,7 @@ def generate_dataset_workflow(
         armada_files = convert_workflow_to_armada(
             k8s_yaml_dir=str(output_path),
             dataset_name=k8s_name,
-            queue=namespace,
+            queue=armada_queue,
             priority_class=armada_priority_class,
         )
         effective_priority = (
@@ -974,7 +989,7 @@ def generate_raster_workflow(
     source_urls: Union[str, List[str]],
     bucket: str,
     output_dir: str = ".",
-    namespace: str = "biodiversity",
+    namespace: Optional[str] = None,
     image: str = "ghcr.io/boettiger-lab/datasets:latest",
     git_repo: str = "https://github.com/boettiger-lab/datasets.git",
     h3_resolution: int = 8,
@@ -1002,6 +1017,7 @@ def generate_raster_workflow(
     output_cog_name: Optional[str] = None,
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
+    armada_queue: Optional[str] = None,
     # Cluster/storage configuration — all default to None so explicit values
     # can be distinguished from "not set" when merging with a profile.
     profile: Optional[str] = None,
@@ -1112,7 +1128,14 @@ def generate_raster_workflow(
         rclone_remote=rclone_remote,
         priority_class=priority_class,
         node_affinity=node_affinity,
+        armada_queue=armada_queue,
     )
+
+    # Namespace comes from the profile unless the caller named one, so a site
+    # changes it in one place. The Armada queue follows the namespace unless it
+    # is set separately — they are 1:1 on NRP by convention, not by the format.
+    namespace = namespace or config.namespace
+    armada_queue = config.armada_queue or namespace
 
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
@@ -1294,7 +1317,7 @@ def generate_raster_workflow(
         armada_files = convert_workflow_to_armada(
             k8s_yaml_dir=str(output_path),
             dataset_name=k8s_name,
-            queue=namespace,
+            queue=armada_queue,
             priority_class=armada_priority_class,
         )
         effective_priority = (
