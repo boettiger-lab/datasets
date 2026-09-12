@@ -116,8 +116,9 @@ class TestCLI:
             rbac_file = Path(tmpdir) / "workflow-rbac.yaml"
             with open(rbac_file) as f:
                 docs = list(yaml.safe_load_all(f))
-                # Check default namespace is used
-                assert docs[0]["metadata"]["namespace"] == "biodiversity"
+                # geo-workflows is the site's namespace, supplied by the
+                # profile so it changes in one place (was "biodiversity").
+                assert docs[0]["metadata"]["namespace"] == "geo-workflows"
     
     @pytest.mark.timeout(5)
     def test_workflow_creates_expected_files(self):

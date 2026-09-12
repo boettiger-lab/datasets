@@ -2300,3 +2300,75 @@ class TestHexFanOutSchedulingSafety:
             spec = self._raster_hex(tmpdir, hex_retries=5, max_failed_indexes=3)["spec"]
             assert spec["backoffLimitPerIndex"] == 5
             assert spec["maxFailedIndexes"] == 3
+
+
+class TestNamespaceAndQueueConfig:
+    """
+    The namespace is configurable, and the Armada queue is separable from it.
+
+    A submitted job set carries `queue` at the top and `namespace` on each job.
+    NRP maps them one-to-one by convention, not by the format, and the generators
+    used to hardwire `queue = namespace` with no way to say otherwise.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _offline(self, monkeypatch):
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+
+    def _build(self, tmpdir, **kwargs):
+        generate_raster_workflow(
+            dataset_name="nsq", source_urls="https://example.com/x.tif",
+            bucket="b", output_dir=tmpdir, **kwargs)
+        return Path(tmpdir)
+
+    def _armada(self, out):
+        with open(out / "armada-nsq-hex.yaml") as f:
+            return [d for d in yaml.safe_load_all(f) if d][0]
+
+    @pytest.mark.timeout(60)
+    def test_default_namespace_is_the_sites(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir)
+            with open(out / "nsq-hex.yaml") as f:
+                assert yaml.safe_load(f)["metadata"]["namespace"] == "geo-workflows"
+
+    @pytest.mark.timeout(60)
+    def test_namespace_is_still_overridable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, namespace="biodiversity")
+            with open(out / "nsq-hex.yaml") as f:
+                assert yaml.safe_load(f)["metadata"]["namespace"] == "biodiversity"
+
+    @pytest.mark.timeout(120)
+    def test_queue_follows_the_namespace_by_default(self):
+        """The NRP convention, and the only behaviour available before now."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, namespace="biodiversity", backend="armada")
+            spec = self._armada(out)
+            assert spec["queue"] == "biodiversity"
+            assert spec["jobs"][0]["namespace"] == "biodiversity"
+
+    @pytest.mark.timeout(120)
+    def test_queue_can_differ_from_the_namespace(self):
+        """
+        Pods land in the namespace; the queue is only Armada's accounting.
+
+        Keeping them independent matters because a site whose queue is not named
+        after its namespace previously had no way to express that at all.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, namespace="biodiversity",
+                              armada_queue="geo-workflows", backend="armada")
+            spec = self._armada(out)
+            assert spec["queue"] == "geo-workflows"
+            assert spec["jobs"][0]["namespace"] == "biodiversity", (
+                "the queue must not rewrite where the pods actually run"
+            )
+
+    @pytest.mark.timeout(60)
+    def test_profile_supplies_the_namespace(self):
+        from cng_datasets.k8s import load_profile, cluster_config_from_args
+        assert load_profile("nrp")["namespace"] == "geo-workflows"
+        assert cluster_config_from_args(profile="nrp").namespace == "geo-workflows"
+        assert cluster_config_from_args(namespace="other").namespace == "other"

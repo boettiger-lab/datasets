@@ -159,7 +159,7 @@ def main():
     workflow_parser.add_argument("--source-url", action="append", required=True, dest="source_urls", help="Source data URL (can be specified multiple times for multiple inputs)")
     workflow_parser.add_argument("--bucket", required=True, help="S3 bucket for outputs")
     workflow_parser.add_argument("--output-dir", default="k8s", help="Output directory for YAML files")
-    workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
+    workflow_parser.add_argument("--namespace", default=None, help="Kubernetes namespace the jobs run in, and the Armada queue unless --armada-queue overrides it (default from profile, or 'geo-workflows')")
     workflow_parser.add_argument("--h3-resolution", type=int, default=None, help="Target H3 resolution (default: auto — 10 for polygons/points, 8 for lines)")
     workflow_parser.add_argument(
         "--resolution-by-area", type=str, default=None,
@@ -199,6 +199,7 @@ def main():
                                       "silently truncated source fails the workflow instead "
                                       "of flowing into the hex and PMTiles steps")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
+    workflow_parser.add_argument("--armada-queue", default=None, metavar="QUEUE", help="Armada queue when --backend armada/auto. Defaults to --namespace: NRP maps queues one-to-one onto namespaces, but they are separate fields in a job set, so set this to submit to a queue that is not named after the namespace the pods land in.")
     workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
     # Cluster/storage configuration flags
     workflow_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file. Explicit flags below override profile values.")
@@ -217,7 +218,7 @@ def main():
                                         help="Source raster URL. Repeat for multiple tiles to mosaic.")
     raster_workflow_parser.add_argument("--bucket", required=True, help="S3 bucket for outputs")
     raster_workflow_parser.add_argument("--output-dir", default="k8s", help="Output directory for YAML files")
-    raster_workflow_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace")
+    raster_workflow_parser.add_argument("--namespace", default=None, help="Kubernetes namespace the jobs run in, and the Armada queue unless --armada-queue overrides it (default from profile, or 'geo-workflows')")
     raster_workflow_parser.add_argument("--h3-resolution", type=int, default=8, help="Target H3 resolution (default: 8)")
     raster_workflow_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
     raster_workflow_parser.add_argument("--value-column", default="value", help="Name for raster value column")
@@ -286,6 +287,7 @@ def main():
                                              "the dataset's size.")
     raster_workflow_parser.add_argument("--merge-storage", type=str, default="100Gi",
                                         help="Ephemeral storage request/limit for the merge job pod (default: 100Gi)")
+    raster_workflow_parser.add_argument("--armada-queue", default=None, metavar="QUEUE", help="Armada queue when --backend armada/auto. Defaults to --namespace: NRP maps queues one-to-one onto namespaces, but they are separate fields in a job set, so set this to submit to a queue that is not named after the namespace the pods land in.")
     raster_workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
     # Cluster/storage configuration flags
     raster_workflow_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file. Explicit flags below override profile values.")
@@ -550,6 +552,7 @@ def _dispatch(args):
             expect_features=args.expect_features,
             backend=args.backend,
             armada_priority_class=args.armada_priority_class,
+            armada_queue=args.armada_queue,
             hex_storage=args.hex_storage,
             repartition_storage=args.repartition_storage,
             repartition_memory=args.repartition_memory,
@@ -615,6 +618,7 @@ def _dispatch(args):
             output_cog_name=getattr(args, 'output_cog_name', None),
             backend=args.backend,
             armada_priority_class=args.armada_priority_class,
+            armada_queue=args.armada_queue,
             profile=args.profile,
             s3_endpoint=args.s3_endpoint,
             s3_public_endpoint=args.s3_public_endpoint,
