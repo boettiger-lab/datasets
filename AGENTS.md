@@ -116,6 +116,33 @@ rclone copy catalog/<dataset>/stac/stac-collection.json nrp:<bucket>/
 | `--hex-chunk-size` | 100000 | Lower when fewer workers alone is too coarse a step |
 | `--h0-subset` | all 122 cells | List the h0 cells a regional source overlaps |
 
+## Resource norms
+
+Size generated pods to **50Gi ephemeral storage and 200 concurrent pods**, even
+though the default namespace does not enforce them.
+
+`geo-workflows` — the default since v0.6.0, and the standard now — carries no
+cpu, memory or pod quota at all, only priority-class bans. `biodiversity` caps
+pods at 200. Sizing for the stricter of the two keeps a build portable between
+namespaces and keeps it a good neighbour on a shared cluster, so treat the
+limits as house style rather than as something the cluster will tell you about.
+
+The pod limit binds on **parallelism, not completions** — a `pods: 200` quota
+counts pods alive at one moment, and an indexed Job creates at most
+`parallelism` of them at a time. An 842-completion fan-out at
+`--max-parallelism 61` is fine. Completions carry a separate ~200 guideline for
+a different reason (etcd pressure on one indexed Job); past it, use
+`--backend auto` to route to Armada, where microslicing into thousands of small
+units is the intended shape.
+
+`tests/test_k8s_workflows.py::TestResourceNorms` asserts this against the
+emitted manifests, so a new default cannot quietly exceed it.
+
+⚠️ Priority classes: `geo-workflows` bans `default`, `owner`, `nice`,
+`batch-low` and the system classes outright (`pods: 0`). Generated pods omit
+`priorityClassName` entirely, which is *not* the same as setting it to
+`default` — the latter is banned. Do not "fix" a manifest by adding it.
+
 ## S3 Bucket Layout
 
 ```

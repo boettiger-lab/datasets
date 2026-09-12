@@ -1009,7 +1009,7 @@ def generate_raster_workflow(
     hex_retries: int = DEFAULT_HEX_RETRIES,
     max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
     merge_memory: str = "16Gi",
-    merge_storage: str = "100Gi",
+    merge_storage: str = "50Gi",
     cog_storage: str = "50Gi",
     target_extent: Optional[tuple] = None,
     target_resolution: Optional[float] = None,
@@ -1093,7 +1093,11 @@ def generate_raster_workflow(
             level multiplies the pod count sevenfold.
         merge_memory: Memory for the merge pod (default "16Gi"). It streams one
             partition at a time, so this does not track the dataset's size.
-        merge_storage: Ephemeral storage for the merge pod (default "100Gi").
+        merge_storage: Ephemeral storage for the merge pod (default "50Gi", the
+            house limit — see the note on quota norms in
+            _generate_raster_merge_job). The merge holds one partition at a
+            time and deletes it after upload, so it does not scale with the
+            dataset.
         hex_retries: Per-index retry budget for the hex fan-out
             (backoffLimitPerIndex, default 2). A preemption is already ignored
             by the pod failure policy; this covers everything else that can end
@@ -1462,7 +1466,7 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
 
 def _generate_raster_merge_job(
     manager, dataset_name, bucket, output_path, s3_dataset=None,
-    merge_memory="16Gi", merge_storage="100Gi", config: ClusterConfig = None,
+    merge_memory="16Gi", merge_storage="50Gi", config: ClusterConfig = None,
     expect_chunks: Optional[int] = None,
 ):
     """Generate the job that consolidates sub-h0 chunks into one file per h0.
@@ -1472,6 +1476,13 @@ def _generate_raster_merge_job(
     STAC READMEs, so the layout must not depend on how finely the build was
     chunked (issue #173). Merging is per partition and streamed, so this does
     not re-materialise what the chunking avoided.
+
+    Storage is 50Gi rather than the 100Gi first shipped, to stay inside the
+    house limits (50Gi ephemeral per pod, 200 pods). `geo-workflows` enforces
+    neither — it carries no cpu, memory or pod quota, only priority-class bans —
+    but `biodiversity` caps pods at 200, and a build that fits the stricter
+    namespace stays portable between them. The merge holds one partition at a
+    time and deletes it after upload, so it never needed the larger figure.
     """
     if config is None:
         config = ClusterConfig()

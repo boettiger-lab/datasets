@@ -286,7 +286,7 @@ def main():
                                              "It streams one partition at a time, so this does not track "
                                              "the dataset's size.")
     raster_workflow_parser.add_argument("--merge-storage", type=str, default="100Gi",
-                                        help="Ephemeral storage request/limit for the merge job pod (default: 100Gi)")
+                                        help="Ephemeral storage request/limit for the merge job pod (default: 50Gi, the house limit)")
     raster_workflow_parser.add_argument("--armada-queue", default=None, metavar="QUEUE", help="Armada queue when --backend armada/auto. Defaults to --namespace: NRP maps queues one-to-one onto namespaces, but they are separate fields in a job set, so set this to submit to a queue that is not named after the namespace the pods land in.")
     raster_workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
     # Cluster/storage configuration flags
