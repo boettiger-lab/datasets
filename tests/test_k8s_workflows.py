@@ -2372,3 +2372,97 @@ class TestNamespaceAndQueueConfig:
         assert load_profile("nrp")["namespace"] == "geo-workflows"
         assert cluster_config_from_args(profile="nrp").namespace == "geo-workflows"
         assert cluster_config_from_args(namespace="other").namespace == "other"
+
+
+class TestResourceNorms:
+    """
+    Generated pods stay inside the house limits: 50Gi ephemeral, 200 pods.
+
+    `geo-workflows` enforces neither — it carries no cpu, memory or pod quota,
+    only priority-class bans — but `biodiversity` caps pods at 200, and a build
+    sized for the stricter namespace stays portable between them. Asserted on
+    the emitted manifests rather than on the flag defaults, because what the
+    cluster sees is the manifest.
+
+    The pod limit binds on **parallelism, not completions**. A `pods: 200`
+    ResourceQuota counts pods alive at one moment, and an indexed Job creates at
+    most `parallelism` of them at a time, so a 842-completion fan-out at
+    parallelism 61 never has more than ~61 pods in the namespace. Completions
+    carry their own ~200 guideline for a different reason — etcd pressure on a
+    single indexed Job — which `K8S_CHUNK_COUNT_GUIDELINE` and `--backend auto`
+    handle, and which `TestChunkBackendRouting` covers.
+    """
+
+    EPHEMERAL_GI = 50
+    MAX_PODS = 200
+
+    @pytest.fixture(autouse=True)
+    def _offline(self, monkeypatch):
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+
+    @staticmethod
+    def _gi(quantity):
+        from cng_datasets.k8s.workflows import _parse_memory_to_bytes
+        return _parse_memory_to_bytes(quantity) / 2 ** 30
+
+    def _manifests(self, tmpdir):
+        for path in sorted(Path(tmpdir).glob("*.yaml")):
+            if path.name in ("configmap.yaml", "workflow.yaml", "workflow-rbac.yaml"):
+                continue
+            with open(path) as f:
+                for doc in yaml.safe_load_all(f):
+                    if doc and doc.get("kind") == "Job":
+                        yield path.name, doc
+
+    @pytest.mark.timeout(120)
+    def test_raster_defaults_stay_within_the_house_limits(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="norms", source_urls="https://example.com/x.tif",
+                bucket="b", output_dir=tmpdir, chunk_resolution=1)
+            seen = 0
+            for name, job in self._manifests(tmpdir):
+                seen += 1
+                for c in job["spec"]["template"]["spec"]["containers"]:
+                    eph = c.get("resources", {}).get("requests", {}).get("ephemeral-storage")
+                    if eph:
+                        assert self._gi(eph) <= self.EPHEMERAL_GI, (
+                            f"{name}: ephemeral-storage {eph} exceeds the "
+                            f"{self.EPHEMERAL_GI}Gi house limit"
+                        )
+                n = job["spec"].get("parallelism")
+                if isinstance(n, int):
+                    assert n <= self.MAX_PODS, (
+                        f"{name}: parallelism={n} would put more than "
+                        f"{self.MAX_PODS} pods in the namespace at once"
+                    )
+            assert seen >= 2, "expected at least the setup-bucket and hex manifests"
+
+    @pytest.mark.timeout(120)
+    def test_vector_defaults_stay_within_the_house_limits(self, monkeypatch):
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="vnorms", source_url="https://example.com/x.gpkg",
+                bucket="b", output_dir=tmpdir)
+            for name, job in self._manifests(tmpdir):
+                for c in job["spec"]["template"]["spec"]["containers"]:
+                    eph = c.get("resources", {}).get("requests", {}).get("ephemeral-storage")
+                    if eph:
+                        assert self._gi(eph) <= self.EPHEMERAL_GI, f"{name}: {eph}"
+                n = job["spec"].get("parallelism")
+                if isinstance(n, int):
+                    assert n <= self.MAX_PODS, f"{name}: parallelism={n}"
+
+    @pytest.mark.timeout(60)
+    def test_the_k8s_chunk_guideline_matches_the_pod_limit(self):
+        """
+        The point past which --backend auto sends work to Armada is the pod cap.
+
+        If they drift apart, auto either keeps a fan-out on k8s past what the
+        namespace will hold, or sends work to a queue that did not need it.
+        """
+        from cng_datasets.k8s.workflows import K8S_CHUNK_COUNT_GUIDELINE
+        assert K8S_CHUNK_COUNT_GUIDELINE == self.MAX_PODS
