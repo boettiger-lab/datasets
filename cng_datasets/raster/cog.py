@@ -759,6 +759,68 @@ def is_cog(url: str) -> bool:
         return True  # Can't check — assume COG
 
 
+def band_count(raster_path: str) -> int:
+    """How many bands *raster_path* has."""
+    ds = gdal.Open(raster_path)
+    if ds is None:
+        raise ValueError(f"Could not open input raster: {raster_path}")
+    count = ds.RasterCount
+    ds = None
+    return count
+
+
+def band_subset_vrt(raster_path: str, band: int) -> str:
+    """A single-band VRT view of *raster_path*, selecting *band* (1-indexed).
+
+    Selecting the band once, at the source, is what keeps the rest of the
+    pipeline honest: nodata detection, the windowed read, the fill-code
+    collapse, exactextract and the warp all then see a raster with exactly one
+    band and no way to pick the wrong one. A VRT rather than a copy because it
+    costs nothing and defers every read to the original.
+    """
+    count = band_count(raster_path)
+    if not 1 <= band <= count:
+        raise ValueError(
+            f"--band {band} is out of range: {raster_path} has {count} "
+            f"band{'' if count == 1 else 's'}, numbered 1-{count}."
+        )
+    vrt_dir = tempfile.mkdtemp(prefix="cng_band_")
+    vrt_path = os.path.join(vrt_dir, f"band{band}.vrt")
+    result = gdal.Translate(vrt_path, raster_path, format="VRT", bandList=[band])
+    if result is None:
+        raise RuntimeError(
+            f"Could not select band {band} of {raster_path}: {gdal.GetLastErrorMsg()}"
+        )
+    result = None
+    return vrt_path
+
+
+def assert_band_is_unambiguous(raster_path: str, band: Optional[int]) -> None:
+    """Refuse to hex a multi-band raster that has not said which band it means.
+
+    exactextract defaults to the first band, the output column is named by
+    --value-column whichever band it came from, and both bands of a stacked
+    product usually share a value range — so a wrong-band build is
+    indistinguishable from a right one without re-measuring against the source.
+    That is how 384,922,346 rows of annual grass cover were published and
+    documented as perennial (issue #214). A job that refuses at submission is
+    the cheap failure; a dataset built from the wrong band is the expensive one.
+    """
+    if band is not None:
+        return
+    count = band_count(raster_path)
+    if count > 1:
+        raise ValueError(
+            f"Input raster has {count} bands and no band was selected, so which "
+            f"one to hex is ambiguous (issue #214).\n"
+            f"  The first band would be read silently, and the output column "
+            f"would carry the --value-column name either way.\n"
+            f"  Pass --band N (1-indexed) to choose one, or subset the band "
+            f"first:\n"
+            f"    gdal_translate -b N {raster_path} single-band.tif"
+        )
+
+
 def detect_nodata_value(raster_path: str, verbose: bool = True) -> Optional[float]:
     """
     Detect NoData value from raster metadata.
@@ -1232,10 +1294,14 @@ class RasterProcessor:
         _configure_proj()
         # If a list of tiles is provided, mosaic them into a temp COG first
         self._mosaic_tmpdir = None
+        # A mosaic selects the band while it builds, so the single-band view
+        # already exists by the time the selection below runs.
+        band_applied_by_mosaic = False
         if isinstance(input_path, list):
             if len(input_path) == 1:
                 input_path = input_path[0]
             else:
+                band_applied_by_mosaic = band is not None
                 import tempfile
                 self._mosaic_tmpdir = tempfile.mkdtemp(prefix="raster_processor_")
                 mosaic_path = os.path.join(self._mosaic_tmpdir, "mosaic.tif")
@@ -1315,6 +1381,21 @@ class RasterProcessor:
         # routes to the internal Ceph endpoint (e.g. rook-ceph-rgw-nautiluss3.rook),
         # not the external s3-west.nrp-nautilus.io load balancer.
         self.input_path = _ensure_vsi_path(input_path, use_public_endpoint=False)
+
+        # Band selection, before anything else reads the raster (issue #214).
+        # The hex path used to ignore --band entirely and let exactextract fall
+        # back to the first band, which is a silent wrong answer rather than a
+        # failure — so an unselected multi-band source is refused outright, and
+        # a selected one is narrowed here so no later step can pick differently.
+        self.band = band
+        if band is not None and not band_applied_by_mosaic:
+            total_bands = band_count(self.input_path)
+            self.input_path = band_subset_vrt(self.input_path, band)
+            # Detection below reads the local name, so point it at the same view.
+            input_path = self.input_path
+            print(f"✓ Using band {band} of {total_bands}")
+        if output_parquet_path is not None:
+            assert_band_is_unambiguous(self.input_path, band)
 
         # Warn if input is in a projected CRS — reprojection to EPSG:4326 will happen
         # internally, but a projected input can cause silent failures if PROJ is misconfigured.
