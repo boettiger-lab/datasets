@@ -114,7 +114,8 @@ rclone copy catalog/<dataset>/stac/stac-collection.json nrp:<bucket>/
 | `--hex-cpu` | 4 | Raise for faster hex pods; also raises the default `--hex-workers` |
 | `--hex-workers` | one per `--hex-cpu` | **Lower it first when a raster hex pod OOMs** — see Troubleshooting |
 | `--hex-chunk-size` | 100000 | Lower when fewer workers alone is too coarse a step |
-| `--h0-subset` | all 122 cells | List the h0 cells a regional source overlaps |
+| `--h0-subset` | all 122 cells | List the h0 grid **positions** a regional source overlaps |
+| `--h0-cells` | all 122 cells | The same list, as H3 **base cell numbers** — use this one if you computed the list with the H3 library, because the two numberings both run 0-121 and the wrong one is always in range (#213) |
 
 ## Resource norms
 

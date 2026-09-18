@@ -181,9 +181,9 @@ This enables:
 - Parallel processing via Kubernetes
 - Independent failure handling per region
 
-### Regional rasters: restrict the fan-out with `--h0-subset`
+### Regional rasters: restrict the fan-out with `--h0-subset` / `--h0-cells`
 
-A generated hex job runs one completion per h0 base cell, 122 in all. A regional source
+A generated hex job runs one completion per h0 cell, 122 in all. A regional source
 overlaps only a few of them, and every other pod localizes the whole COG, finds no overlap
 and exits — CONUS occupies **6** of the 122 cells, so 116 pods (95%) start only to do
 nothing, each first pulling a multi-GB COG.
@@ -210,13 +210,60 @@ cng-datasets raster ... --h0-index ${H0} ...
 ```
 
 The list is sorted and de-duplicated, so a completion index maps to the same cell across
-regenerations. Cells outside 0-121 are rejected, and a subset naming all 122 is the default
+regenerations. Values outside 0-121 are rejected, and a subset naming all 122 is the default
 fan-out. Omit the flag for a global source.
 
-To find the cells for a bounding box, intersect it with the h0 grid
-(`s3://public-grids/hex/h0-valid.parquet`). Inferring the set from the source footprint at
-generation time is [issue #191](https://github.com/boettiger-lab/datasets/issues/191)'s
-option 2 and is not implemented — the subset is explicit.
+#### Positions are not H3 base cell numbers
+
+`--h0-index` and `--h0-subset` take **positions** — values of the `i` column in the h0 grid
+(`s3://public-grids/hex/h0-valid.parquet`). That column is an arbitrary permutation of the
+122 H3 base cells, so position 12 is base cell 9, and exactly one of the 122 positions
+coincides with its own base cell. The CONUS set above is these six:
+
+| `--h0-subset` position | cell id | H3 base cell |
+|---:|---|---:|
+| 12 | 576812596024311807 | 9 |
+| 14 | 577692205326532607 | 34 |
+| 20 | 577164439745200127 | 19 |
+| 50 | 577199624117288959 | 20 |
+| 71 | 577762574070710271 | 36 |
+| 78 | 577234808489377791 | 21 |
+
+Note that **20 appears in both columns meaning different cells**. Both numberings run
+0-121, so a base-cell list passed to `--h0-subset` is always in range, never errors, and
+silently builds a different part of the world — the job succeeds and writes the expected
+number of partitions ([issue #213](https://github.com/boettiger-lab/datasets/issues/213)).
+
+If your list came from the H3 library — which is the obvious way to compute which cells a
+raster covers — pass it to `--h0-cells` instead and it is converted for you:
+
+```bash
+cng-datasets raster-workflow ... --h0-cells "9,19,20,21,34,36"
+# ✓ H3 base cells [9, 19, 20, 21, 34, 36] → h0 grid positions [12, 14, 20, 50, 71, 78]
+```
+
+The two flags are the same restriction in two numberings, so passing both is refused.
+Either way, each pod logs what its position resolved to in its first lines:
+
+```
+Processing h0 grid position 50...
+  h0 cell: 577199624117288959 (h3 8029fffffffffff, H3 base cell 20)
+```
+
+To derive the mapping yourself, read the grid's `i` column — **not** its row order, which
+sorts by cell id and therefore by base cell, giving position == base cell for every row and
+a wrong answer for all but one:
+
+```sql
+SELECT i AS position, h0, h3_get_base_cell_number(h0::ubigint) AS base_cell
+FROM read_parquet('https://s3-west.nrp-nautilus.io/public-grids/hex/h0-valid.parquet')
+ORDER BY i;
+```
+
+To find the cells for a bounding box, intersect it with the same grid. Inferring the set
+from the source footprint at generation time is
+[issue #191](https://github.com/boettiger-lab/datasets/issues/191)'s option 2 and is not
+implemented — the subset is explicit.
 
 ## Kubernetes Processing
 

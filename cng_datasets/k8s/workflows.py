@@ -1068,10 +1068,14 @@ def generate_raster_workflow(
             rows (value, frac) per cell so areas are exact, not mode-biased (#142).
         hex_memory: Memory per hex pod (default: "32Gi")
         max_parallelism: Max parallel hex pods (default: 61)
-        h0_subset: The h0 base cells the source actually overlaps, e.g.
-            [12, 14, 20, 50, 71, 78] for CONUS. The hex job then runs one
-            completion per listed cell instead of all 122, and the completion
-            index selects from the list. Omit for a global source (issue #191).
+        h0_subset: Positions in the h0 grid's ordering that the source actually
+            overlaps, e.g. [12, 14, 20, 50, 71, 78] for CONUS. The hex job then
+            runs one completion per listed cell instead of all 122, and the
+            completion index selects from the list. Omit for a global source
+            (issue #191). These are **not** H3 base cell numbers — the CONUS
+            set is base cells 9, 19, 20, 21, 34, 36 — and both numberings run
+            0-121, so the wrong one is always in range (issue #213); the CLI
+            takes base cell numbers via --h0-cells.
         hex_workers: Worker processes per hex pod, emitted as CNG_HEX_WORKERS.
             Defaults to hex_cpu, i.e. one worker per requested core. This is
             the memory lever: peak RSS is roughly workers x hex_chunk_size x
@@ -1352,14 +1356,15 @@ def generate_raster_workflow(
         if chunk_resolution:
             print(f"  Hex completions: {chunk_count} "
                   f"(res-{chunk_resolution} chunks"
-                  + (f" under h0 {', '.join(str(h) for h in h0_subset)}" if h0_subset else "")
+                  + (f" under h0 grid positions {', '.join(str(h) for h in h0_subset)}"
+                     if h0_subset else "")
                   + ")")
         elif h0_subset:
             print(f"  Hex completions: {len(h0_subset)} "
-                  f"(h0 {', '.join(str(h) for h in h0_subset)})")
+                  f"(h0 grid positions {', '.join(str(h) for h in h0_subset)})")
         else:
-            print("  Hex completions: 122 (every h0 base cell) — pass "
-                  "--h0-subset to skip the ones the source does not cover")
+            print("  Hex completions: 122 (every h0 cell) — pass --h0-subset "
+                  "or --h0-cells to skip the ones the source does not cover")
         print(hex_profile)
         print(hex_profile_hint)
         print(f"\nFiles created in {output_dir}:")
@@ -1605,8 +1610,8 @@ def _generate_raster_hex_job(
         # form so it stays valid bash after the Armada converter rewrites that
         # to a literal index.
         h0_preamble = (
-            "# Only the h0 base cells this source overlaps (--h0-subset); the\n"
-            "# completion index selects one of them.\n"
+            "# Positions in the h0 grid's own ordering, not H3 base cell numbers\n"
+            "# (--h0-subset / --h0-cells). The completion index selects one.\n"
             f"H0S=({' '.join(str(h) for h in h0_subset)})\n"
             "H0=${H0S[$JOB_COMPLETION_INDEX]}\n"
             'if [ -z "${JOB_COMPLETION_INDEX}" ] || [ -z "$H0" ]; then\n'
