@@ -143,7 +143,8 @@ Commands marked "used inside k8s pods" are called by the generated jobs — you 
 --hex-cpu N                CPU request/limit per hex pod (default: 4).
 --hex-workers N            Worker processes per hex pod (default: one per --hex-cpu).
 --hex-chunk-size N         Cells per exact_extract call (default: 100000).
---h0-subset CELLS          The h0 base cells the source overlaps (default: all 122).
+--h0-subset POSITIONS      h0 grid positions the source overlaps (default: all 122).
+--h0-cells BASECELLS       The same, as H3 base cell numbers (see the note below).
 --chunk-resolution N       H3 resolution of one hex pod's unit of work (default: 0, one h0).
 --max-hex-memory SIZE      Pick --chunk-resolution automatically to fit this budget.
 --backend BACKEND          k8s (default) | armada | auto (armada past ~200 chunks).

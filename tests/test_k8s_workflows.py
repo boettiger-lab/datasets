@@ -1653,6 +1653,25 @@ class TestH0Subset:
             assert "--h0-index 50" in run.stdout
 
     @pytest.mark.timeout(5)
+    def test_the_manifest_does_not_call_positions_base_cells(self):
+        """
+        The generated comment said "h0 base cells" for a list of positions
+        (issue #213). Two sessions read that comment and a peer's measured
+        base cells as the same thing, and both were right about different
+        things — the list is the manifest's only explanation of itself, so
+        the wrong word in it is a correctness hazard, not a wording nit.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._hex_job(tmpdir, h0_subset=self.CONUS)
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            preamble = cmd.split("H0S=(")[0].lower()
+            assert "position" in preamble, preamble
+            # Naming positions is not enough on its own: the old comment's
+            # reader had no reason to suspect a second numbering existed, so
+            # the comment has to deny the one they will otherwise assume.
+            assert "not h3 base cell numbers" in preamble, preamble
+
+    @pytest.mark.timeout(5)
     def test_index_past_the_end_fails_loudly(self):
         """An out-of-range index must not silently process cell 0 of the list."""
         import subprocess

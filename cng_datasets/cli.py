@@ -7,6 +7,41 @@ import sys
 
 from cng_datasets.raster.cog import VALID_HEX_REDUCERS
 
+# Repeated on every flag that takes h0 grid positions. The two numberings both
+# run 0-121, so a base-cell list passed as positions is always in range and
+# never errors — it just builds a different part of the world (issue #213).
+POS_NOTE = (
+    "These are **positions** in the h0 grid's own ordering, not H3 base cell "
+    "numbers — position 12 is base cell 9. Both run 0-121, so a base-cell list "
+    "passed here is always in range and silently builds a different part of the "
+    "world; pass --h0-cells for base cell numbers instead (#213)."
+)
+
+
+def _resolve_h0_subset(args):
+    """Grid positions from --h0-subset or --h0-cells, or None for a global run.
+
+    The two flags mean the same restriction in different numberings, so taking
+    both would leave which one won up to reading the code (issue #213).
+    """
+    subset = getattr(args, "h0_subset", None)
+    cells = getattr(args, "h0_cells", None)
+    if subset and cells:
+        raise ValueError(
+            "--h0-subset and --h0-cells are the same restriction in two "
+            "numberings; pass one. --h0-subset takes h0 grid positions, "
+            "--h0-cells takes H3 base cell numbers."
+        )
+    if subset:
+        return [int(x.strip()) for x in subset.split(",") if x.strip()]
+    if cells:
+        from cng_datasets.raster.cog import h0_positions_for_base_cells
+        base_cells = [int(x.strip()) for x in cells.split(",") if x.strip()]
+        positions = h0_positions_for_base_cells(base_cells)
+        print(f"✓ H3 base cells {base_cells} → h0 grid positions {positions}")
+        return positions
+    return None
+
 
 def main():
     """Main CLI entry point."""
@@ -45,7 +80,13 @@ def main():
     raster_parser.add_argument("--output-parquet", help="Output parquet directory (e.g., s3://bucket/dataset/hex/)")
     raster_parser.add_argument("--resolution", type=int, help="H3 resolution (auto-detected if not specified)")
     raster_parser.add_argument("--parent-resolutions", type=str, default="0", help="Comma-separated parent H3 resolutions (default: '0')")
-    raster_parser.add_argument("--h0-index", type=int, help="Process specific h0 region (0-121), or omit to process all")
+    raster_parser.add_argument("--h0-index", type=int,
+                               help="Process one h0 region by its **position** in the h0 grid's "
+                                    "ordering (0-121), or omit to process all. A position is not "
+                                    "an H3 base cell number — position 12 is base cell 9 — and "
+                                    "both run 0-121, so a base cell number passed here is always "
+                                    "in range and silently processes a different cell (#213). The "
+                                    "resolved cell and its base cell are logged at start-up.")
     raster_parser.add_argument("--chunk-resolution", type=int, default=0, metavar="N",
                                help="H3 resolution of the unit of work (default: 0, one h0 base "
                                     "cell). A higher value splits each h0 into its res-N "
@@ -62,10 +103,18 @@ def main():
                                     "--chunk-resolution > 0. Full localization is a per-pod cost, so "
                                     "total transfer scales with the fan-out — fine across 122 h0 "
                                     "pods, ruinous across the thousands sub-h0 chunking creates.")
-    raster_parser.add_argument("--h0-subset", type=str, default=None, metavar="CELLS",
-                               help="Restrict the chunk list to descendants of these h0 base cell "
-                                    "indices, e.g. '12,14,20,50,71,78' for CONUS, so a regional "
-                                    "source never enumerates chunks it cannot overlap.")
+    raster_parser.add_argument("--h0-subset", type=str, default=None, metavar="POSITIONS",
+                               help="Restrict the chunk list to descendants of these h0 grid "
+                                    "**positions**, e.g. '12,14,20,50,71,78' for CONUS, so a "
+                                    "regional source never enumerates chunks it cannot overlap. "
+                                    + POS_NOTE)
+    raster_parser.add_argument("--h0-cells", type=str, default=None, metavar="BASECELLS",
+                               help="The same restriction, given as H3 **base cell numbers** — "
+                                    "'9,19,20,21,34,36' is the CONUS set and resolves to the "
+                                    "positions above. Use this when the list came from the H3 "
+                                    "library (h3_get_base_cell_number and friends), which is the "
+                                    "obvious way to compute which cells a raster covers. Mutually "
+                                    "exclusive with --h0-subset (#213).")
     raster_parser.add_argument("--value-column", default="value", help="Name for raster value column (default: 'value')")
     raster_parser.add_argument("--nodata", type=str,
                                help="NoData value(s) to exclude. Accepts a single value or a "
@@ -241,11 +290,18 @@ def main():
                                              "for peak/extremum (species richness). Default: mean.")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
-    raster_workflow_parser.add_argument("--h0-subset", type=str, default=None, metavar="CELLS",
-                                        help="Comma-separated h0 base cells the source overlaps, e.g. "
+    raster_workflow_parser.add_argument("--h0-subset", type=str, default=None, metavar="POSITIONS",
+                                        help="Comma-separated h0 grid **positions** the source overlaps, e.g. "
                                              "'12,14,20,50,71,78' for CONUS. The hex job runs one completion "
                                              "per listed cell instead of all 122, so pods that could only find "
-                                             "no overlap are never started. Omit for a global source.")
+                                             "no overlap are never started. Omit for a global source. "
+                                             + POS_NOTE)
+    raster_workflow_parser.add_argument("--h0-cells", type=str, default=None, metavar="BASECELLS",
+                                        help="The same subset, given as H3 **base cell numbers** — "
+                                             "'9,19,20,21,34,36' is the CONUS set and resolves to the "
+                                             "positions above. Use this when the list came from the H3 "
+                                             "library, which is the obvious way to compute which cells a "
+                                             "raster covers. Mutually exclusive with --h0-subset (#213).")
     raster_workflow_parser.add_argument("--hex-retries", type=int, default=2, metavar="N",
                                         help="Per-index retry budget for the hex fan-out (backoffLimitPerIndex, "
                                              "default 2). A preemption is already retried; this covers an OOM, a "
@@ -396,9 +452,7 @@ def _dispatch(args):
             parts = [float(x) for x in args.target_extent.split(',')]
             target_extent = tuple(parts)
 
-        raster_h0_subset = None
-        if getattr(args, 'h0_subset', None):
-            raster_h0_subset = [int(x.strip()) for x in args.h0_subset.split(',') if x.strip()]
+        raster_h0_subset = _resolve_h0_subset(args)
 
         input_path = args.inputs if len(args.inputs) > 1 else args.inputs[0]
 
@@ -585,9 +639,7 @@ def _dispatch(args):
         if getattr(args, 'target_extent', None):
             parts = [float(x) for x in args.target_extent.split(',')]
             target_extent = tuple(parts)
-        h0_subset = None
-        if getattr(args, 'h0_subset', None):
-            h0_subset = [int(x.strip()) for x in args.h0_subset.split(',') if x.strip()]
+        h0_subset = _resolve_h0_subset(args)
         # Only forward the sizing knobs that were actually given, so the
         # generator's own defaults stay the single source of truth for them.
         hex_sizing = {

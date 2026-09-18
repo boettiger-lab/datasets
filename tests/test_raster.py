@@ -2868,3 +2868,142 @@ class TestMultiBandSelection:
         out = gdal.Open(cog)
         assert out.RasterCount == 1
         assert int(out.GetRasterBand(1).ReadAsArray(0, 0, 1, 1)[0][0]) == 22
+
+
+@pytest.mark.skipif(not GDAL_AVAILABLE, reason="GDAL not available")
+class TestH0PositionsAreNotBaseCells:
+    """
+    `--h0-index` / `--h0-subset` are positions, not H3 base cell numbers (#213).
+
+    The h0 grid's `i` column is an arbitrary permutation of the 122 base cells
+    — position 12 is base cell 9, and exactly one of the 122 positions
+    coincides with its own base cell. Both numberings run 0-121, so a
+    base-cell list passed as positions is always in range, never errors, and
+    builds a different part of the world. Nothing structural catches it: the
+    job succeeds and writes the expected number of partitions.
+
+    So the fix is not a guard — one is not possible — it is a correct path for
+    the list a user actually has (`--h0-cells`) plus enough logging to see the
+    mistake in the first lines of output rather than in the finished extent.
+    """
+
+    # The CONUS set from the issue, measured off a real build. The left column
+    # is what the manifests carry; the right is what the H3 library reports for
+    # the same six cells. Note 20 appears in both, meaning different cells.
+    CONUS = [
+        # (grid position, h3 string, H3 base cell)
+        (12, "8013fffffffffff", 9),
+        (14, "8045fffffffffff", 34),
+        (20, "8027fffffffffff", 19),
+        (50, "8029fffffffffff", 20),
+        (71, "8049fffffffffff", 36),
+        (78, "802bfffffffffff", 21),
+    ]
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def con(self):
+        c = duckdb.connect()
+        try:
+            c.execute("LOAD h3")
+        except duckdb.Error:
+            c.execute("INSTALL h3 FROM community")
+            c.execute("LOAD h3")
+        return c
+
+    @pytest.fixture
+    def grid(self, temp_dir, con):
+        """A stand-in h0 grid carrying the issue's six rows.
+
+        Local so the test does not need the network, and built from the same
+        `i`/`h0` shape as the published grid — the point being tested is the
+        relationship between those two columns, not the file's location.
+        """
+        path = os.path.join(temp_dir, "h0-grid.parquet")
+        values = ", ".join(
+            f"({pos}, h3_string_to_h3('{s}')::UBIGINT)" for pos, s, _ in self.CONUS
+        )
+        con.execute(
+            f"COPY (SELECT * FROM (VALUES {values}) AS t(i, h0)) "
+            f"TO '{path}' (FORMAT PARQUET)"
+        )
+        return path
+
+    @pytest.mark.timeout(30)
+    def test_the_two_numberings_really_do_disagree(self, con):
+        """Pins the premise the rest of the fix exists for."""
+        for position, h3_string, base_cell in self.CONUS:
+            measured = con.execute(
+                f"SELECT h3_get_base_cell_number(h3_string_to_h3('{h3_string}')::ubigint)"
+            ).fetchone()[0]
+            assert measured == base_cell
+            assert 0 <= position <= 121 and 0 <= base_cell <= 121, (
+                "both numberings must share a range — that is what makes the "
+                "confusion silent rather than an error"
+            )
+        positions = {p for p, _, _ in self.CONUS}
+        base_cells = {b for _, _, b in self.CONUS}
+        assert positions != base_cells
+        assert 20 in positions and 20 in base_cells, (
+            "20 means different cells in the two numberings — the worst case "
+            "for anyone eyeballing a list"
+        )
+
+    @pytest.mark.timeout(30)
+    def test_base_cells_resolve_to_the_measured_positions(self, grid, con):
+        """The issue's table, read in the direction a user needs it."""
+        from cng_datasets.raster.cog import h0_positions_for_base_cells
+
+        assert h0_positions_for_base_cells(
+            [9, 19, 20, 21, 34, 36], grid, con=con
+        ) == [12, 14, 20, 50, 71, 78]
+
+    @pytest.mark.timeout(30)
+    def test_a_single_base_cell_resolves_to_its_own_position(self, grid, con):
+        from cng_datasets.raster.cog import h0_positions_for_base_cells
+
+        for position, _, base_cell in self.CONUS:
+            assert h0_positions_for_base_cells([base_cell], grid, con=con) == [position]
+
+    @pytest.mark.timeout(30)
+    def test_a_base_cell_outside_the_range_is_refused(self, grid, con):
+        from cng_datasets.raster.cog import h0_positions_for_base_cells
+
+        with pytest.raises(ValueError, match="0-121"):
+            h0_positions_for_base_cells([122], grid, con=con)
+
+    @pytest.mark.timeout(30)
+    def test_a_base_cell_missing_from_the_grid_is_named(self, grid, con):
+        """Silently returning a short list would be the same class of bug."""
+        from cng_datasets.raster.cog import h0_positions_for_base_cells
+
+        with pytest.raises(ValueError, match=r"\[7\]"):
+            h0_positions_for_base_cells([9, 7], grid, con=con)
+
+    @pytest.mark.timeout(30)
+    def test_the_resolved_cell_is_described_by_base_cell(self, con):
+        """
+        The safety net: a mis-specified subset has to be visible at start-up.
+
+        Without this the only evidence is the extent of the finished product.
+        """
+        from cng_datasets.raster.cog import describe_h0
+
+        cell = con.execute(
+            "SELECT h3_string_to_h3('8029fffffffffff')::UBIGINT"
+        ).fetchone()[0]
+        described = describe_h0(cell, con)
+        assert "8029fffffffffff" in described
+        assert "base cell 20" in described
+
+    @pytest.mark.timeout(30)
+    def test_describe_h0_degrades_rather_than_failing_a_build(self):
+        """Logging must never be the thing that kills a multi-hour job."""
+        from cng_datasets.raster.cog import describe_h0
+
+        assert describe_h0(577199624117288959, duckdb.connect()) == "577199624117288959"
