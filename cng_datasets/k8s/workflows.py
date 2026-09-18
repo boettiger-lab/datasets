@@ -12,6 +12,7 @@ import math
 import re
 import shlex
 import yaml
+from ..duckdb_memory import to_duckdb_memory_limit
 from .jobs import K8sJobManager
 from .armada import (
     convert_workflow_to_armada,
@@ -1512,8 +1513,11 @@ cng-datasets merge-chunks \\
                 {"name": "BUCKET", "value": bucket},
                 # The merge streams one partition at a time, but DuckDB will
                 # happily size its buffers off the node rather than the pod
-                # unless told otherwise.
-                {"name": "DUCKDB_MEMORY_LIMIT", "value": merge_memory},
+                # unless told otherwise. This has to carry DuckDB's spelling of
+                # the quantity, not Kubernetes' — `SET memory_limit='16Gi'` is a
+                # parser error, and it used to kill every merge on its first
+                # statement, after the whole fan-out had run (issue #217).
+                {"name": "DUCKDB_MEMORY_LIMIT", "value": _duckdb_memory_limit(merge_memory)},
             ],
             "volumeMounts": [
                 {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
@@ -2146,17 +2150,12 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
 def _duckdb_memory_limit(memory_str: str, fraction: float = 0.85) -> str:
     """Return a DuckDB memory_limit string that is *fraction* of *memory_str*.
 
-    Parses strings like "32Gi", "8Gi", "512Mi" and returns e.g. "27GiB",
-    keeping DuckDB's preferred "GiB"/"MiB" suffix so the value is unambiguous.
-    Falls back to returning *memory_str* unchanged if it cannot be parsed.
+    Parses a Kubernetes quantity like "32Gi" and returns e.g. "27GiB", in
+    DuckDB's own spelling — it rejects the k8s one (issue #217). The default
+    fraction leaves headroom for everything the pod allocates outside DuckDB's
+    buffer manager.
     """
-    m = re.match(r'^(\d+(?:\.\d+)?)(Gi|Mi|G|M)$', memory_str)
-    if not m:
-        return memory_str
-    value, unit = float(m.group(1)), m.group(2)
-    result = int(value * fraction)
-    duckdb_unit = {"Gi": "GiB", "Mi": "MiB", "G": "GB", "M": "MB"}[unit]
-    return f"{result}{duckdb_unit}"
+    return to_duckdb_memory_limit(memory_str, fraction)
 
 
 def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_repo, s3_dataset=None, repartition_storage: str = "50Gi", repartition_memory: str = "32Gi", config: ClusterConfig = None):

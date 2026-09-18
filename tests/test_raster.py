@@ -2093,6 +2093,35 @@ class TestSubH0Chunking:
         ).fetchall()
         assert merged_cols == base_cols
 
+    @pytest.mark.timeout(300)
+    def test_merge_survives_a_kubernetes_spelled_memory_limit(self, raster, temp_dir, monkeypatch):
+        """
+        DUCKDB_MEMORY_LIMIT reaches this function from a pod manifest, where a
+        memory quantity is spelled "16Gi" — which DuckDB's parser rejects, so
+        the merge died on its first statement with the fan-out already paid for
+        (issue #217). The generator no longer emits that spelling, but the env
+        var is also set by hand during recovery, so the consumer normalises it
+        rather than trusting whoever wrote it.
+        """
+        from cng_datasets.raster.merge import merge_raster_chunks
+
+        sub_proc, chunks_dir = self._processor(raster, temp_dir, "envchunks", chunk_resolution=2)
+        for i in range(len(sub_proc.chunk_cells())):
+            sub_proc.process_chunk(i)
+
+        monkeypatch.setenv("DUCKDB_MEMORY_LIMIT", "16Gi")
+        merged_dir = os.path.join(temp_dir, "envmerged")
+        os.makedirs(merged_dir, exist_ok=True)
+        assert merge_raster_chunks(chunks_dir, merged_dir, cleanup=False) == 1
+
+        # And by the explicit argument, which the CLI exposes as --memory-limit.
+        monkeypatch.delenv("DUCKDB_MEMORY_LIMIT")
+        arg_dir = os.path.join(temp_dir, "argmerged")
+        os.makedirs(arg_dir, exist_ok=True)
+        assert merge_raster_chunks(
+            chunks_dir, arg_dir, cleanup=False, memory_limit="16Gi"
+        ) == 1
+
     @pytest.mark.timeout(120)
     def test_pruning_allows_for_children_outside_the_parent(self, raster, temp_dir):
         """
