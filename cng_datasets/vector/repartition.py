@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import duckdb
 import ibis
+from cng_datasets.duckdb_memory import to_duckdb_memory_limit
 from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
 
@@ -40,9 +41,13 @@ def repartition_by_h0(
     con = ibis.duckdb.connect()
     configure_s3_credentials(con)
     con.raw_sql('SET preserve_insertion_order=false')  # saves RAM
-    effective_limit = memory_limit or os.environ.get('DUCKDB_MEMORY_LIMIT')
-    if effective_limit:
-        print(f"Setting DuckDB memory_limit={effective_limit}")
+    requested_limit = memory_limit or os.environ.get('DUCKDB_MEMORY_LIMIT')
+    if requested_limit:
+        # DuckDB rejects the Kubernetes spelling of a memory quantity, and this
+        # value usually arrives from a manifest (issue #217).
+        effective_limit = to_duckdb_memory_limit(requested_limit)
+        suffix = "" if effective_limit == requested_limit else f" (from {requested_limit})"
+        print(f"Setting DuckDB memory_limit={effective_limit}{suffix}")
         con.raw_sql(f"SET memory_limit='{effective_limit}'")
     con.raw_sql('SET http_timeout=1200')
     con.raw_sql('SET http_retries=30')

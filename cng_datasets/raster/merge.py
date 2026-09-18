@@ -22,6 +22,7 @@ from typing import List, Optional
 import ibis
 import yaml
 
+from cng_datasets.duckdb_memory import to_duckdb_memory_limit
 from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
 
@@ -142,9 +143,14 @@ def merge_raster_chunks(
     con = ibis.duckdb.connect()
     configure_s3_credentials(con)
     con.raw_sql("SET preserve_insertion_order=false")
-    effective_limit = memory_limit or os.environ.get("DUCKDB_MEMORY_LIMIT")
-    if effective_limit:
-        print(f"Setting DuckDB memory_limit={effective_limit}")
+    requested_limit = memory_limit or os.environ.get("DUCKDB_MEMORY_LIMIT")
+    if requested_limit:
+        # Normalised because the value reaching here has usually passed through
+        # a Kubernetes manifest, and DuckDB rejects the k8s spelling of it
+        # (issue #217): "16Gi" is a parser error, "16GiB" is not.
+        effective_limit = to_duckdb_memory_limit(requested_limit)
+        suffix = "" if effective_limit == requested_limit else f" (from {requested_limit})"
+        print(f"Setting DuckDB memory_limit={effective_limit}{suffix}")
         con.raw_sql(f"SET memory_limit='{effective_limit}'")
     con.raw_sql("SET http_timeout=1200")
     con.raw_sql("SET http_retries=30")

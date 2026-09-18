@@ -1985,6 +1985,41 @@ class TestChunkResolutionGeneration:
             assert f"--expect-chunks {expected}" in mcmd
 
     @pytest.mark.timeout(60)
+    def _merge_env(self, out, name="DUCKDB_MEMORY_LIMIT"):
+        env = self._load(out / "chunky-merge.yaml")["spec"]["template"]["spec"]["containers"][0]["env"]
+        return next(e["value"] for e in env if e["name"] == name)
+
+    @pytest.mark.timeout(60)
+    def test_merge_memory_limit_is_spelled_the_way_duckdb_reads_it(self):
+        """
+        The merge pod's DUCKDB_MEMORY_LIMIT went straight to `SET memory_limit`,
+        so a Kubernetes "16Gi" was a parser error that killed the merge on its
+        first statement — after the whole fan-out had run (issue #217). DuckDB
+        itself is the assertion; a string check would not have caught the
+        original bug either, since "16Gi" looks entirely reasonable.
+        """
+        import duckdb
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2, merge_memory="16Gi")
+            limit = self._merge_env(out)
+            assert limit != "16Gi", "the k8s spelling must not reach DuckDB"
+            duckdb.connect().execute(f"SET memory_limit='{limit}'")
+
+    @pytest.mark.timeout(60)
+    def test_merge_memory_limit_leaves_the_pod_headroom(self):
+        """
+        DuckDB's limit bounds its buffer manager, not the process, so setting it
+        to the pod's whole allocation trades a parser error for an OOMKill. The
+        repartition step has always taken 85%; the merge now matches it.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2, merge_memory="16Gi")
+            resources = self._load(out / "chunky-merge.yaml")["spec"]["template"]["spec"]["containers"][0]["resources"]
+            assert resources["limits"]["memory"] == "16Gi", "pod size is unchanged"
+            assert self._merge_env(out) == "13GiB"
+
+    @pytest.mark.timeout(60)
     def test_no_merge_step_without_sub_chunking(self):
         """The default path gains nothing and must stay exactly as it was."""
         with tempfile.TemporaryDirectory() as tmpdir:

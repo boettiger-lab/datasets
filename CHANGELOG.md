@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Generated raster merge jobs no longer die on their first statement. `raster-workflow` wrote the merge pod's `DUCKDB_MEMORY_LIMIT` as a **Kubernetes** quantity (`16Gi`), and `merge-chunks` hands that straight to `SET memory_limit`, which DuckDB rejects — `Unknown unit for memory: 'gi'`; it accepts only `KiB/MiB/GiB/TiB` or `KB/MB/GB/TB`. Every chunked raster build was affected, and the failure landed **after** the whole hex fan-out had run, so the cost was a completed multi-hour build that could not be consolidated without hand-editing manifests. The generator now emits DuckDB's spelling, and `merge-chunks` and `repartition` both normalise whatever reaches them, since the env var is also set by hand during recovery. Translation is in one place (`cng_datasets/duckdb_memory.py`) and the regression gate is DuckDB itself rather than a string comparison — a string check would not have caught the original either, because `16Gi` looks entirely reasonable. The merge's DuckDB limit also drops to **85% of the pod's memory**, matching what the repartition step has always done: `memory_limit` bounds DuckDB's buffer manager, not the process, so a limit equal to the cgroup's trades a parser error for an OOMKill (#217)
+
 ## [0.6.0] - 2026-09-13
 
 ### Added
