@@ -586,9 +586,81 @@ def _ensure_vsi_path(path: str, use_public_endpoint: bool = False) -> str:
     return path
 
 
+DEFAULT_H0_GRID_PATH = "s3://public-grids/hex/h0-valid.parquet"
+
+
+def describe_h0(h0_cell: int, con) -> str:
+    """"<cell id> (h3 <string>, H3 base cell N)" — for start-up logging.
+
+    A mis-specified `--h0-subset` is otherwise invisible until the finished
+    product's extent is measured, because the positions and the H3 base cell
+    numbers occupy the same 0-121 range and a wrong value is always in it
+    (issue #213). Printing what a position actually resolved to puts the
+    mistake in the first lines of the log instead.
+    """
+    try:
+        as_str, base = con.execute(
+            f"SELECT h3_h3_to_string({int(h0_cell)}::ubigint), "
+            f"h3_get_base_cell_number({int(h0_cell)}::ubigint)"
+        ).fetchone()
+        return f"{h0_cell} (h3 {as_str}, H3 base cell {base})"
+    except duckdb.Error:
+        return str(h0_cell)
+
+
+def h0_positions_for_base_cells(base_cells: List[int],
+                                h0_grid_path: str = DEFAULT_H0_GRID_PATH,
+                                con=None) -> List[int]:
+    """Grid positions for a list of H3 **base cell numbers**.
+
+    `--h0-index` and `--h0-subset` are positions in the h0 grid's own `i`
+    column, which is an arbitrary permutation of the 122 base cells — `i = 12`
+    is base cell 9, and exactly one of the 122 positions coincides with its
+    base cell. Both numberings run 0-121, so a base-cell list passed as
+    positions is always in range, never errors, and builds a different part of
+    the world (issue #213). This is the conversion that makes the list a user
+    computed from the H3 library usable, rather than plausible-looking and
+    wrong.
+    """
+    wanted = sorted({int(b) for b in base_cells})
+    out_of_range = [b for b in wanted if not 0 <= b <= 121]
+    if out_of_range:
+        raise ValueError(
+            f"H3 base cell numbers run 0-121; got {out_of_range}."
+        )
+
+    own_con = con is None
+    if own_con:
+        con = duckdb.connect(":memory:")
+        try:
+            con.execute("LOAD h3")
+        except duckdb.Error:
+            con.execute("INSTALL h3 FROM community")
+            con.execute("LOAD h3")
+        configure_s3_credentials(con)
+    try:
+        rows = con.execute(f"""
+            SELECT h3_get_base_cell_number(h0::ubigint) AS base, i
+            FROM read_parquet('{h0_grid_path}')
+            WHERE base IN ({', '.join(str(b) for b in wanted)})
+            ORDER BY i
+        """).fetchall()
+    finally:
+        if own_con:
+            con.close()
+
+    found = {int(base) for base, _ in rows}
+    missing = [b for b in wanted if b not in found]
+    if missing:
+        raise ValueError(
+            f"H3 base cells {missing} are not in the h0 grid at {h0_grid_path}."
+        )
+    return [int(i) for _, i in rows]
+
+
 def enumerate_chunk_cells(chunk_resolution: int,
                           h0_subset: Optional[List[int]] = None,
-                          h0_grid_path: str = "s3://public-grids/hex/h0-valid.parquet",
+                          h0_grid_path: str = DEFAULT_H0_GRID_PATH,
                           con=None):
     """Ordered [(chunk_cell, h0_cell, h0_index)] — the units of work for a build.
 
@@ -2251,8 +2323,10 @@ class RasterProcessor:
 
         print(
             f"\nProcessing chunk {chunk_index} of {len(cells)} "
-            f"(res-{self.chunk_resolution} cell {chunk_cell}, h0 {h0_index})..."
+            f"(res-{self.chunk_resolution} cell {chunk_cell}, "
+            f"h0 grid position {h0_index})..."
         )
+        print(f"  h0 cell: {describe_h0(h0_cell, self.con)}")
 
         result = self._process_one_chunk(chunk_cell, h0_cell, chunk_index)
         # Recorded whether or not the chunk wrote anything. A chunk that does
@@ -2326,7 +2400,7 @@ class RasterProcessor:
         if h0_index is None:
             raise ValueError("h0_index must be specified")
 
-        print(f"\nProcessing h0 region {h0_index}...")
+        print(f"\nProcessing h0 grid position {h0_index}...")
 
         # Load h0 polygons to get the geometry using SQL with ST_AsText for WKT
         h0_result = self.con.execute(f"""
@@ -2342,7 +2416,10 @@ class RasterProcessor:
         h0_geom_wkt = h0_result['geom_wkt'].iloc[0]
         h0_cell = h0_result['h0'].iloc[0]
 
-        print(f"  h0 cell: {h0_cell}")
+        # Named, not just numbered: a position and a base cell number are
+        # indistinguishable at a glance, so this is where a wrong --h0-subset
+        # becomes visible (issue #213).
+        print(f"  h0 cell: {describe_h0(h0_cell, self.con)}")
 
         # Skip h0 cells with no overlap with the source raster — avoids
         # running exact_extract over millions of children of a raster that
@@ -2352,7 +2429,7 @@ class RasterProcessor:
         # their data actually lives (would falsely skip a seam raster). Unwrap
         # the longitudes and test the true footprint instead.
         if not self._h0_overlaps_raster(h0_geom_wkt):
-            print(f"  ℹ No overlap between source raster and h0 cell {h0_index}, skipping")
+            print(f"  ℹ No overlap between source raster and h0 grid position {h0_index}, skipping")
             return None
 
         # Dispatch by method (issue #84). exact-extract (default) does
