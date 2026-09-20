@@ -3541,3 +3541,108 @@ class TestHexWorkerDefault:
         for _ in range(3):
             cog._default_hex_workers()
         assert capsys.readouterr().out.count("No cgroup CPU quota readable") == 1
+
+
+@requires_gdal
+class TestSerialRunHonoursH0Subset:
+    """
+    `h0_subset` applies on the serial path too (issue #215).
+
+    It used to apply only to `enumerate_chunk_cells`, which
+    `process_all_h0_regions` never called -- so on this path the flag parsed,
+    validated, printed its restriction and then ran the entire grid anyway.
+    The run said `Processing h0 grid position 0 ... 121` whatever was asked
+    for. A subset flag that appears to have been accepted is the same shape of
+    defect as #213 and #218: nothing fails, and the output covers ground the
+    caller did not ask for.
+    """
+
+    # Positions deliberately not 0..n-1, so "iterated the grid" and "counted
+    # to len(grid)" cannot be confused.
+    POSITIONS = [3, 12, 20, 71, 99]
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def grid(self, temp_dir):
+        """A five-row h0 grid, so a hardcoded 122 cannot pass for the truth."""
+        import geopandas as gpd
+        from shapely.geometry import box
+        con = duckdb.connect()
+        for ext in ("spatial", "h3"):
+            try:
+                con.execute(f"LOAD {ext}")
+            except duckdb.Error:
+                con.execute(f"INSTALL {ext}" + (" FROM community" if ext == "h3" else ""))
+                con.execute(f"LOAD {ext}")
+        cells = [
+            con.execute(f"SELECT h3_latlng_to_cell({lat}, {lon}, 0)").fetchone()[0]
+            for lat, lon in [(37.7, -122.4), (40.0, -100.0), (51.5, -0.1),
+                             (-33.9, 151.2), (35.7, 139.7)]
+        ]
+        gdf = gpd.GeoDataFrame(
+            {"i": self.POSITIONS, "h0": cells,
+             "geometry": [box(-124, 36, -122, 38)] * len(cells)},
+            crs="EPSG:4326",
+        ).rename_geometry("geom")
+        path = os.path.join(temp_dir, "h0-grid.parquet")
+        gdf.to_parquet(path)
+        return path
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        path = os.path.join(temp_dir, "tiny.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 8, 8, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([-122.5, 0.01, 0, 37.75, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(np.ones((8, 8), dtype=np.int16))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _processor(self, raster, temp_dir, grid, **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        return RasterProcessor(
+            input_path=raster,
+            output_parquet_path=os.path.join(temp_dir, "out"),
+            h3_resolution=3, parent_resolutions=[0],
+            h0_grid_path=grid, value_column="v", **kwargs,
+        )
+
+    def _visited(self, proc, monkeypatch):
+        """Which positions the loop actually asks for."""
+        seen = []
+        monkeypatch.setattr(type(proc), "process_h0_region",
+                            lambda self, index: seen.append(index))
+        proc.process_all_h0_regions()
+        return seen
+
+    @pytest.mark.timeout(120)
+    def test_a_subset_is_the_only_thing_processed(self, raster, temp_dir, grid,
+                                                  monkeypatch):
+        subset = [12, 71]
+        proc = self._processor(raster, temp_dir, grid, h0_subset=subset)
+        assert self._visited(proc, monkeypatch) == subset
+
+    @pytest.mark.timeout(120)
+    def test_without_a_subset_the_whole_grid_is_processed(self, raster, temp_dir,
+                                                          grid, monkeypatch):
+        """From the grid, not from a hardcoded 122."""
+        proc = self._processor(raster, temp_dir, grid)
+        assert self._visited(proc, monkeypatch) == self.POSITIONS
+
+    @pytest.mark.timeout(120)
+    def test_sub_h0_chunking_has_no_process_everything_mode(self, raster,
+                                                            temp_dir, grid):
+        """
+        Otherwise a whole h0 is aggregated into a file named as a sub-chunk
+        part, which the CLI already refuses to let happen.
+        """
+        proc = self._processor(raster, temp_dir, grid, chunk_resolution=2)
+        with pytest.raises(ValueError, match="chunk_index"):
+            proc.process_all_h0_regions()
