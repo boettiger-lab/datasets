@@ -2937,14 +2937,48 @@ class RasterProcessor:
 
     def process_all_h0_regions(self) -> List[str]:
         """
-        Process all h0 regions (0-121) to H3-indexed parquet.
+        Process every h0 region of the grid to H3-indexed parquet, or just the
+        ones named by `h0_subset`.
+
+        `h0_subset` used to be ignored here: the loop ran the whole grid, so a
+        flag that parsed, validated and printed its restriction quietly did
+        nothing on this path, and the run reported `Processing h0 grid position
+        0 ... 121` regardless (issue #215). It applied only to
+        `enumerate_chunk_cells`, which this method never called. A subset flag
+        that appears to have been accepted is the same shape of defect as
+        #213 and #218, in a different register.
+
+        The positions come from the grid via the same enumeration the workflow
+        generator and `process_chunk` use, rather than `range(122)`, so the
+        list cannot drift from the grid it is indexing into.
 
         Returns:
             List of output parquet file paths
         """
-        output_files = []
+        if self.chunk_resolution:
+            # The CLI refuses this combination already; say the same thing to a
+            # caller reaching the library directly, rather than aggregating
+            # whole h0s into files named as sub-chunk parts.
+            raise ValueError(
+                "chunk_resolution needs a chunk_index: there is no "
+                "process-everything mode for sub-h0 chunks, which exist "
+                "precisely so each unit runs in its own pod."
+            )
 
-        for h0_index in range(122):
+        positions = [
+            index for _, _, index in enumerate_chunk_cells(
+                0,
+                h0_subset=self.h0_subset,
+                h0_grid_path=self.h0_grid_path,
+                con=self.con,
+            )
+        ]
+        if self.h0_subset:
+            print(f"Restricted to {len(positions)} of the grid's h0 positions: "
+                  f"{positions}")
+
+        output_files = []
+        for h0_index in positions:
             try:
                 output_file = self.process_h0_region(h0_index)
                 if output_file:

@@ -272,6 +272,12 @@ The list is sorted and de-duplicated, so a completion index maps to the same cel
 regenerations. Values outside 0-121 are rejected, and a subset naming all 122 is the default
 fan-out. Omit the flag for a global source.
 
+The restriction also applies to a **serial** run — `cng-datasets raster` with neither
+`--h0-index` nor `--chunk-index`, which processes the regions in one process. It used to
+apply only to the chunked fan-out, so on the serial path the flag was parsed, validated,
+echoed and then ignored, and the run worked through the whole grid anyway
+([issue #215](https://github.com/boettiger-lab/datasets/issues/215)).
+
 #### Positions are not H3 base cell numbers
 
 `--h0-index` and `--h0-subset` take **positions** — values of the `i` column in the h0 grid
