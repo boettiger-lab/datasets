@@ -122,12 +122,45 @@ cng-datasets raster --input nlcd-2021.tif ... \
 - `parent_resolutions` (list[int]): Parent resolutions for aggregation (default: [0])
 - `h0_index` (int, optional): Process specific h0 region (0-121)
 - `value_column` (str): Name for raster value column (default: "value")
-- `nodata_value` (float, optional): NoData value to exclude
+- `nodata_value` (float or comma-separated string, optional): NoData value(s) to exclude. A
+  categorical product often carries several fill codes in one band (LANDFIRE: `-9999`
+  Fill-NoData, `-1111` Fill-Not-Mapped, `32767` internal), and a GDAL band can declare only
+  one — see [Several fill codes in one band](#several-fill-codes-in-one-band).
 - `compression` (str): COG compression method (default: "zstd")
 - `blocksize` (int): COG tile size (default: 512)
 - `resampling` (str): Resampling method for COG (default: "nearest")
 - `method` (str): Raster→H3 algorithm (default: `"exact-extract"`). One of `exact-extract` or `warp-centroid` — see [Aggregation methods](#aggregation-methods).
 - `hex_resampling` (str): Reducer for aggregating source pixels into each H3 cell (default: "mean"). Valid values depend on `method`: with `exact-extract`, one of `sum`, `mean`, `mode`; with `warp-centroid`, any GDAL `resampleAlg` (`average`, `sum`, `mode`, `near`, `bilinear`, `cubic`, ...).
+
+### Several fill codes in one band
+
+exactextract honours a single declared band NoData, so extra fill codes have to be mapped
+onto the primary one before aggregation. For an **integer** source this costs nothing: the
+mapping is expressed as a VRT lookup table and applied on read, so no pixels are written.
+
+```
+Collapsing fill codes [-9999.0, -1111.0, 32767.0] → -9999.0 for hex aggregation...
+✓ Collapsed as a VRT lookup table, no raster written: /tmp/cng_collapsed_798466992877.vrt
+```
+
+This used to stage an **uncompressed copy of the whole source** instead. That copy is
+`grid pixels x bytes per pixel` — independent of the source's compression, and independent
+of the chunk the pod is working, so every pod wrote the same full-grid file. For the
+LANDFIRE CONUS grid that is 34 GB per pod against the `ephemeral-storage: 40Gi` the
+generator emits, which evicted every pod on the largest layers of a tranche (issue #209).
+An ephemeral eviction surfaces as exit 137, byte-identical to an OOM kill in
+`kubectl get pods`, so it is easy to misdiagnose as memory.
+
+A **float** source cannot use a lookup table — a table interpolates between its entries
+rather than substituting values — so it falls back to a materialised copy, which is now
+compressed with the predictor matching the band type. Sources that cannot be expressed
+exactly are refused rather than approximated.
+
+In a generated `raster-workflow` the preprocess-cog step collapses the codes once, and the
+hex pods are handed only the primary. That step is skipped when the source is already a
+single-band COG needing no clip — which is precisely when the hex pods receive the full
+list and do the work themselves, so the path above is the normal one for a well-formed
+source.
 
 ## Cloud-Optimized GeoTIFF (COG)
 
