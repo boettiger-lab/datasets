@@ -2681,3 +2681,190 @@ class TestGapfill:
         out, n = self._run_chunks(raster, temp_dir)
         with pytest.raises(RuntimeError, match="outside the expected range"):
             find_missing_chunks(out, n - 3)
+
+
+@pytest.mark.skipif(not GDAL_AVAILABLE, reason="GDAL not available")
+class TestMultiBandSelection:
+    """
+    A multi-band source can no longer be hexed without saying which band (#214).
+
+    `exact_extract` defaults to the first band, `--band` was mosaic-only, and
+    the output column is named by `--value-column` whichever band it came from.
+    So a wrong-band build is indistinguishable from a right one without
+    re-measuring against the source — which is how 384,922,346 rows of annual
+    grass cover were published and documented as perennial. The two halves of
+    the fix are tested separately: the refusal, and the band actually reaching
+    the aggregation.
+    """
+
+    H0_CELL = 577199624117288959   # res-0 cell over the San Francisco fixture
+    RES = 5
+    BAND_VALUES = [11, 22, 33, 44, 55, 66]   # the issue's own stack
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _raster(self, temp_dir, bands=6, name="stack.tif"):
+        """A raster whose every band is a distinct constant, so the band that
+        was read is readable straight off the output value."""
+        path = os.path.join(temp_dir, name)
+        width = height = 40
+        ds = gdal.GetDriverByName("GTiff").Create(path, width, height, bands, gdal.GDT_Byte)
+        ds.SetGeoTransform((-116.200, 0.0001, 0, 43.600, 0, -0.0001))
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        for b in range(1, bands + 1):
+            band = ds.GetRasterBand(b)
+            band.WriteRaster(0, 0, width, height,
+                             bytes([self.BAND_VALUES[b - 1]]) * (width * height))
+            band.SetNoDataValue(255)
+        ds.FlushCache()
+        ds = None
+        return path
+
+    def _grid(self, temp_dir):
+        import geopandas as gpd
+        from shapely.geometry import box
+        path = os.path.join(temp_dir, "h0-test.parquet")
+        gpd.GeoDataFrame(
+            {"i": [50], "h0": [self.H0_CELL], "geometry": [box(-117, 43, -116, 44)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(path)
+        return path
+
+    def _processor(self, raster, temp_dir, out_name, **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        out = os.path.join(temp_dir, out_name)
+        os.makedirs(out, exist_ok=True)
+        return RasterProcessor(
+            input_path=raster,
+            output_parquet_path=out,
+            h3_resolution=self.RES,
+            parent_resolutions=[0],
+            h0_index=50,
+            h0_grid_path=self._grid(temp_dir),
+            value_column="myvalue",
+            nodata_value=255,
+            local_cache_dir=None,
+            **kwargs,
+        ), out
+
+    @pytest.mark.timeout(120)
+    def test_hexing_a_multi_band_source_without_a_band_is_refused(self, temp_dir):
+        """The failure has to land at submission, not in the published data."""
+        raster = self._raster(temp_dir)
+        with pytest.raises(ValueError, match="6 bands"):
+            self._processor(raster, temp_dir, "nb")
+
+    @pytest.mark.timeout(120)
+    def test_the_selected_band_is_the_one_aggregated(self, temp_dir):
+        """
+        The issue's measurement, inverted: band 4 in, 44.0 out.
+
+        Every band is a distinct constant, so the value in the parquet names
+        the band that was read. Before the fix this was 11.0 — band 1 — with
+        nothing in the run, the schema or the output to say so.
+        """
+        raster = self._raster(temp_dir)
+        proc, out = self._processor(raster, temp_dir, "b4", band=4)
+        proc.process_h0_region()
+
+        con = duckdb.connect()
+        values = con.execute(
+            f"SELECT DISTINCT myvalue FROM read_parquet('{out}/h0=*/data_0.parquet')"
+        ).fetchall()
+        assert values == [(44.0,)], f"expected band 4 (44.0), got {values}"
+
+    @pytest.mark.timeout(180)
+    def test_every_band_is_reachable(self, temp_dir):
+        """Not just "not band 1": each band selects its own, across the stack."""
+        raster = self._raster(temp_dir)
+        con = duckdb.connect()
+        for band, expected in [(1, 11.0), (2, 22.0), (6, 66.0)]:
+            proc, out = self._processor(raster, temp_dir, f"each{band}", band=band)
+            proc.process_h0_region()
+            values = con.execute(
+                f"SELECT DISTINCT myvalue FROM read_parquet('{out}/h0=*/data_0.parquet')"
+            ).fetchall()
+            assert values == [(expected,)], f"band {band}: got {values}"
+
+    @pytest.mark.timeout(120)
+    def test_a_band_outside_the_stack_is_refused_by_number(self, temp_dir):
+        """Names the range rather than failing later on a missing column."""
+        raster = self._raster(temp_dir)
+        with pytest.raises(ValueError, match=r"--band 9 is out of range.*6 bands"):
+            self._processor(raster, temp_dir, "b9", band=9)
+
+    @pytest.mark.timeout(120)
+    def test_single_band_input_is_unaffected(self, temp_dir):
+        """The overwhelmingly common case must not have gained a required flag."""
+        raster = self._raster(temp_dir, bands=1, name="single.tif")
+        proc, out = self._processor(raster, temp_dir, "one")
+        proc.process_h0_region()
+        values = duckdb.connect().execute(
+            f"SELECT DISTINCT myvalue FROM read_parquet('{out}/h0=*/data_0.parquet')"
+        ).fetchall()
+        assert values == [(11.0,)]
+
+    @pytest.mark.timeout(120)
+    def test_band_one_of_a_single_band_input_is_accepted(self, temp_dir):
+        """An explicit --band 1 on a single-band source is redundant, not wrong."""
+        raster = self._raster(temp_dir, bands=1, name="single.tif")
+        proc, _ = self._processor(raster, temp_dir, "one1", band=1)
+        assert proc.band == 1
+
+    @pytest.mark.timeout(120)
+    def test_the_nodata_of_the_selected_band_survives_selection(self, temp_dir):
+        """
+        Selection is a VRT view, and a view that dropped nodata would turn fill
+        pixels into data — a quieter version of the bug being fixed.
+        """
+        from cng_datasets.raster.cog import band_subset_vrt
+
+        path = os.path.join(temp_dir, "pernodata.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 10, 10, 3, gdal.GDT_Int16)
+        ds.SetGeoTransform((-116.2, 0.0001, 0, 43.6, 0, -0.0001))
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        for b, nodata in enumerate([-9999, -1111, 32767], start=1):
+            ds.GetRasterBand(b).SetNoDataValue(nodata)
+        ds.FlushCache()
+        ds = None
+
+        vrt = gdal.Open(band_subset_vrt(path, 3))
+        assert vrt.RasterCount == 1
+        assert vrt.GetRasterBand(1).GetNoDataValue() == 32767
+
+    @pytest.mark.timeout(120)
+    def test_a_multi_band_cog_is_still_allowed(self, temp_dir):
+        """
+        The ambiguity is in hexing, not in COG creation: a multi-band COG is a
+        well-defined thing to want, so only the parquet path refuses one.
+        """
+        from cng_datasets.raster import RasterProcessor
+
+        raster = self._raster(temp_dir)
+        cog = os.path.join(temp_dir, "all-bands.tif")
+        proc = RasterProcessor(input_path=raster, output_cog_path=cog,
+                               h3_resolution=self.RES, local_cache_dir=None)
+        proc.create_cog()
+        assert gdal.Open(cog).RasterCount == 6
+
+    @pytest.mark.timeout(120)
+    def test_band_selection_reaches_the_cog_too(self, temp_dir):
+        """`--band` is no longer mosaic-only: one selection, every output."""
+        from cng_datasets.raster import RasterProcessor
+
+        raster = self._raster(temp_dir)
+        cog = os.path.join(temp_dir, "band2.tif")
+        proc = RasterProcessor(input_path=raster, output_cog_path=cog, band=2,
+                               h3_resolution=self.RES, local_cache_dir=None)
+        proc.create_cog()
+        out = gdal.Open(cog)
+        assert out.RasterCount == 1
+        assert int(out.GetRasterBand(1).ReadAsArray(0, 0, 1, 1)[0][0]) == 22

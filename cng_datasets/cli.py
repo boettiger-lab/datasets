@@ -95,7 +95,12 @@ def main():
     raster_parser.add_argument("--target-crs", default="EPSG:4326", help="Output CRS for mosaic (default: EPSG:4326)")
     raster_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in target CRS (mosaic only)")
     raster_parser.add_argument("--target-resolution", type=float, help="Output pixel size in target CRS units (mosaic only)")
-    raster_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (mosaic only)")
+    raster_parser.add_argument("--band", type=int,
+                               help="Which band of a multi-band source to use, 1-indexed. Applies "
+                                    "to the COG, the mosaic and the hex output alike — the band is "
+                                    "selected once, at the source. Required when hexing a "
+                                    "multi-band raster: without it the first band would be read "
+                                    "silently and labelled with --value-column regardless (#214).")
     raster_parser.add_argument("--local-cache-dir", default="/tmp/cng-raster-cache",
                                help="Directory to copy remote input rasters into before processing "
                                     "(default: /tmp/cng-raster-cache). Reading a remote COG via "
@@ -266,7 +271,12 @@ def main():
     raster_workflow_parser.add_argument("--cog-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for COG preprocess job pod (default: 50Gi)")
     raster_workflow_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in EPSG:4326 (multi-tile only)")
     raster_workflow_parser.add_argument("--target-resolution", type=float, help="Output pixel size in degrees (multi-tile only)")
-    raster_workflow_parser.add_argument("--band", type=int, help="Extract single band from multi-band sources, 1-indexed (multi-tile only)")
+    raster_workflow_parser.add_argument("--band", type=int,
+                                        help="Which band of a multi-band source to use, 1-indexed. "
+                                             "Giving it adds a preprocess-cog step that subsets the "
+                                             "band, so the hex job is handed a single-band COG. "
+                                             "Required for a multi-band source: the hex job refuses "
+                                             "one it cannot disambiguate (#214).")
     raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif)")
     raster_workflow_parser.add_argument("--backend", choices=["k8s", "armada", "auto"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission, 'auto' to pick armada once the chunk count exceeds the ~200-pod namespace guideline")
     raster_workflow_parser.add_argument("--chunk-resolution", type=int, default=0, metavar="N",
