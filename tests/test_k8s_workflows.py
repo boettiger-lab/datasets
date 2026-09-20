@@ -1637,6 +1637,33 @@ class TestH0Subset:
                 self._hex_job(tmpdir, h0_subset=[])
 
     @pytest.mark.timeout(5)
+    def test_the_range_check_does_not_imply_base_cells_were_validated(self):
+        """
+        The range check cannot tell a position from an H3 base cell number —
+        both run 0-121, so every base-cell list passes it. Its old wording
+        ("There are 122 H3 base cells, so each must be in 0-121") therefore
+        described the accepted range in exactly the terms that make a
+        base-cell list feel checked (#218). The wording is the only thing
+        carrying that burden, so it is pinned.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError) as err:
+                self._hex_job(tmpdir, h0_subset=[12, 122])
+            message = str(err.value)
+            assert "position" in message.lower()
+            assert "--h0-cells" in message, (
+                "the error must point at the flag that takes base cell numbers"
+            )
+
+    @pytest.mark.timeout(5)
+    def test_the_empty_subset_error_names_both_numberings(self):
+        """The other message a mis-specified subset is likely to reach."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError) as err:
+                self._hex_job(tmpdir, h0_subset=[])
+            assert "--h0-cells" in str(err.value)
+
+    @pytest.mark.timeout(5)
     def test_index_mapping_resolves_the_right_cell_in_bash(self):
         """The emitted preamble is bash — run it rather than trust the string."""
         import subprocess
