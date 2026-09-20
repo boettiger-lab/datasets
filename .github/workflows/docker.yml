@@ -8,6 +8,14 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Publish version tags (e.g. 0.7.0) as well as the ordinary ones. Use
+          this to build a versioned image for a release whose tag push failed;
+          leave blank for a plain build.
+        required: false
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -35,6 +43,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       
+      - name: Derive version tags
+        id: ver
+        if: inputs.version != ''
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must look like 0.7.0, got '$V'"
+            exit 1
+          fi
+          echo "full=$V"        >> "$GITHUB_OUTPUT"
+          echo "minor=${V%.*}"  >> "$GITHUB_OUTPUT"
+          echo "major=${V%%.*}" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
@@ -46,7 +68,11 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
+            type=sha,prefix={{branch}}-,enable=${{ github.ref_type == 'branch' }}
+            type=sha,prefix=sha-,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=${{ steps.ver.outputs.full }},enable=${{ inputs.version != '' }}
+            type=raw,value=${{ steps.ver.outputs.minor }},enable=${{ inputs.version != '' }}
+            type=raw,value=${{ steps.ver.outputs.major }},enable=${{ inputs.version != '' }}
             type=raw,value=latest,enable={{is_default_branch}}
       
       - name: Build and push Docker image
