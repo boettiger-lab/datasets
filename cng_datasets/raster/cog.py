@@ -502,6 +502,150 @@ def _fmt_gdal(value: float) -> str:
     return str(int(f)) if f.is_integer() else repr(f)
 
 
+# Integer band types whose full value range is exactly representable as the
+# doubles a VRT LUT is parsed into, so an identity entry really is the identity.
+# Int64/UInt64 are deliberately absent: past 2^53 they are not, and a LUT that
+# silently rounds is worse than no LUT at all.
+def _compression_predictor(source_path: str) -> int:
+    """2 for integer bands, 3 for float ones — GDAL rejects the wrong one.
+
+    Not a tuning detail. On a smooth float grid PREDICTOR=3 gives 8.6 MB where
+    PREDICTOR=2 gives 13.0 MB and no predictor at all gives 18.8 MB, which is
+    *larger* than the 16.8 MB uncompressed file it replaces — collapsing in
+    place rewrites tiles and leaves the originals behind as dead space. And
+    PREDICTOR=3 on an integer band is not merely worse, it is an error, which
+    would take down a run that reached the materialised path for any reason
+    other than a float source.
+    """
+    ds = gdal.Open(source_path)
+    if ds is None:
+        return 2
+    try:
+        dtype = ds.GetRasterBand(1).DataType
+    finally:
+        ds = None
+    return 3 if dtype in (gdal.GDT_Float32, gdal.GDT_Float64) else 2
+
+
+def _lut_safe_ranges():
+    ranges = {
+        gdal.GDT_Byte: (0, 255),
+        gdal.GDT_UInt16: (0, 65535),
+        gdal.GDT_Int16: (-32768, 32767),
+        gdal.GDT_UInt32: (0, 4294967295),
+        gdal.GDT_Int32: (-2147483648, 2147483647),
+    }
+    int8 = getattr(gdal, "GDT_Int8", None)   # GDAL >= 3.7
+    if int8 is not None:
+        ranges[int8] = (-128, 127)
+    return ranges
+
+
+def _fill_collapse_lut(lo: int, hi: int, fill_values: List[float], primary: float) -> str:
+    """A VRT `<LUT>` mapping every fill code to `primary` and nothing else.
+
+    A LUT interpolates linearly between the entries it is given, so identity is
+    expressed by anchoring both ends of the band's range to themselves: the
+    line through (lo, lo) and (code-1, code-1) is y = x, and is exact at every
+    integer along it. Each fill code then gets three entries — itself mapped to
+    the primary, and its two neighbours mapped to themselves — so the only
+    values the table moves are the codes, and the segments either side of a
+    code contain no integers at all.
+    """
+    codes = sorted({int(v) for v in fill_values})
+    points = {lo: lo, hi: hi}
+    for code in codes:
+        for neighbour in (code - 1, code + 1):
+            if lo <= neighbour <= hi:
+                points.setdefault(neighbour, neighbour)
+    # Second pass, so a code adjacent to another code is a code, not a
+    # neighbour: 0 and 1 together must both land on the primary.
+    for code in codes:
+        if lo <= code <= hi:
+            points[code] = int(primary)
+    return ",".join(f"{k}:{v}" for k, v in sorted(points.items()))
+
+
+def _fill_collapse_vrt(source_path: str, fill_values: List[float],
+                       primary: float, vrt_path: str):
+    """A VRT view of `source_path` with every fill code collapsed to `primary`.
+
+    Returns the path, or None when the source cannot be expressed this way and
+    the caller must materialise the collapse instead.
+
+    The materialised collapse writes `grid pixels x bytes per pixel` of
+    uncompressed raster to local disk, in every pod, independent of the chunk
+    that pod is working: 34 GB for a CONUS Int16 grid, which is what evicted
+    every pod on the two largest layers of a LANDFIRE tranche against the 40Gi
+    ephemeral limit the generator itself emits (issue #209). The mapping it
+    performs is a pure per-pixel value substitution, and GDAL can express that
+    as a lookup table on a ComplexSource — so it need not be pixels on disk at
+    all. The VRT is a few kilobytes and GDAL applies the table on read.
+
+    Only integer bands qualify. The identity anchors rely on there being no
+    representable value between a code and its neighbours, which is false for
+    floats: a float source would be silently interpolated, and quietly wrong
+    values are the one outcome worse than a large temporary file.
+    """
+    import xml.etree.ElementTree as ET
+
+    if any(float(v) != int(v) for v in fill_values) or float(primary) != int(primary):
+        return None
+
+    ranges = _lut_safe_ranges()
+    ds = gdal.Open(source_path)
+    if ds is None:
+        return None
+    try:
+        band_ranges = []
+        for b in range(1, ds.RasterCount + 1):
+            rng = ranges.get(ds.GetRasterBand(b).DataType)
+            if rng is None:
+                return None
+            if not rng[0] <= int(primary) <= rng[1]:
+                # The primary has to be storable in the band it is written
+                # into; a table that maps onto a value the type cannot hold
+                # would be clamped on read.
+                return None
+            band_ranges.append(rng)
+    finally:
+        ds = None
+    if not band_ranges:
+        return None
+
+    if gdal.Translate(vrt_path, source_path, format="VRT") is None:
+        return None
+    tree = ET.parse(vrt_path)
+    root = tree.getroot()
+    bands = root.findall("VRTRasterBand")
+    if len(bands) != len(band_ranges):
+        return None
+    for band, (lo, hi) in zip(bands, band_ranges):
+        sources = [e for e in band if e.tag in ("SimpleSource", "ComplexSource")]
+        if len(sources) != 1:
+            # Several sources per band means a mosaic; each would need its own
+            # table, and nothing in this path produces one.
+            return None
+        source = sources[0]
+        # A LUT is only honoured on a ComplexSource.
+        source.tag = "ComplexSource"
+        for nodata in source.findall("NODATA"):
+            # Dropping the source-level NODATA is what lets the table see the
+            # primary's own pixels; the band's NoDataValue below is what
+            # exactextract actually reads.
+            source.remove(nodata)
+        for existing in source.findall("LUT"):
+            source.remove(existing)
+        ET.SubElement(source, "LUT").text = _fill_collapse_lut(
+            lo, hi, fill_values, primary
+        )
+        for existing in band.findall("NoDataValue"):
+            band.remove(existing)
+        ET.SubElement(band, "NoDataValue").text = _fmt_gdal(primary)
+    tree.write(vrt_path)
+    return vrt_path
+
+
 def _collapse_fill_values(tif_path: str, fill_values: List[float], primary: float) -> None:
     """Rewrite every fill code in `tif_path` to `primary`, in place, block-wise.
 
@@ -2103,9 +2247,19 @@ class RasterProcessor:
         a /vsis3/ object) and collapsed block-wise so a continent-scale source
         never has to fit in memory.
 
+        An integer source takes the free path: the remap is expressed as a VRT
+        lookup table and no pixels are written at all. Only a float source —
+        where a lookup table would interpolate rather than substitute — falls
+        back to a materialised copy, which is compressed, because the
+        uncompressed one cost `grid pixels x bytes per pixel` on every pod's
+        ephemeral disk regardless of the chunk that pod was working (issue
+        #209).
+
         In the standard raster-workflow the COG step already collapses the fill
         codes, so the hex job is handed only the primary value and never reaches
-        this path; it covers running the hex step directly on a multi-fill source.
+        this path; it covers running the hex step directly on a multi-fill
+        source, which is what a COG source does, since it needs no preprocess
+        step to convert.
         """
         source_path = source_path or self.input_path
         # Keyed by source: with windowed reads (issue #173 lever C) each chunk
@@ -2117,16 +2271,30 @@ class RasterProcessor:
         if source_path in cache:
             return cache[source_path]
         primary = self.nodata_values[0]
-        collapsed = os.path.join(
+        stem = os.path.join(
             tempfile.gettempdir(),
-            f"cng_collapsed_{abs(hash(source_path)) % (10 ** 12)}.tif",
+            f"cng_collapsed_{abs(hash(source_path)) % (10 ** 12)}",
         )
         print(f"  Collapsing fill codes {self.nodata_values} → {primary} for hex aggregation...")
+
+        as_vrt = _fill_collapse_vrt(
+            source_path, self.nodata_values, primary, stem + ".vrt"
+        )
+        if as_vrt is not None:
+            print(f"  ✓ Collapsed as a VRT lookup table, no raster written: {as_vrt}")
+            cache[source_path] = as_vrt
+            return as_vrt
+
+        collapsed = stem + ".tif"
+        print("  ℹ No lookup table for this source, so the collapse is "
+              "materialised; this writes the whole grid to local disk")
         result = gdal.Translate(
             collapsed,
             source_path,
             format="GTiff",
-            creationOptions=["BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS"],
+            creationOptions=["BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS",
+                             "TILED=YES", "COMPRESS=ZSTD",
+                             f"PREDICTOR={_compression_predictor(source_path)}"],
         )
         if result is None:
             raise RuntimeError(

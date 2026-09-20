@@ -3248,3 +3248,200 @@ class TestEnumerationPrune:
             assert not (xmin <= lo and hi <= xmax), "fixture drifted"
 
             assert cell in {int(c) for c in proc._native_cells_for_h0(h0)}
+
+
+@requires_gdal
+class TestFillCollapseWithoutARaster:
+    """
+    The fill-code collapse writes no pixels for an integer source (issue #209).
+
+    exactextract honours one band nodata, so several fill codes (issue #108)
+    used to be remapped by staging an uncompressed copy of the source. That
+    copy is `grid pixels x bytes per pixel` -- 34 GB for a CONUS Int16 grid --
+    it is written by *every* pod regardless of the chunk that pod is working,
+    and it is what evicted every pod on the two largest layers of a LANDFIRE
+    tranche against the 40Gi ephemeral limit the generator itself emits.
+
+    The remap is a pure per-pixel value substitution, which a VRT lookup table
+    expresses exactly for integer bands: a few kilobytes, applied on read. A
+    float source cannot use one -- a table interpolates between its entries --
+    so it keeps a materialised copy, now compressed.
+    """
+
+    FILLS = [-9999.0, -1111.0, 32767.0]
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _raster(self, temp_dir, name, dtype, fills, bands=1, px=64):
+        path = os.path.join(temp_dir, name)
+        ds = gdal.GetDriverByName("GTiff").Create(path, px, px, bands, dtype)
+        ds.SetGeoTransform([-122.0, 0.01, 0, 37.64, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        np_t = {gdal.GDT_Int16: np.int16, gdal.GDT_Float32: np.float32,
+                gdal.GDT_Byte: np.uint8, gdal.GDT_Int32: np.int32}[dtype]
+        written = []
+        for b in range(1, bands + 1):
+            arr = np.full((px, px), 11 + b, dtype=np_t)
+            arr[:, 1] = np_t(22)
+            for i, f in enumerate(fills):
+                arr[i, :] = np_t(f)
+            band = ds.GetRasterBand(b)
+            band.WriteArray(arr); band.SetNoDataValue(float(fills[-1]))
+            written.append(arr)
+        ds.FlushCache(); ds = None
+        return path, written
+
+    def _expected(self, arrays, fills):
+        out = []
+        for arr in arrays:
+            want = arr.copy()
+            for f in fills[1:]:
+                want[want == arr.dtype.type(f)] = arr.dtype.type(fills[0])
+            out.append(want)
+        return out
+
+    def _read(self, path, bands):
+        ds = gdal.Open(path)
+        arrays = [ds.GetRasterBand(b).ReadAsArray() for b in range(1, bands + 1)]
+        nodata = [ds.GetRasterBand(b).GetNoDataValue() for b in range(1, bands + 1)]
+        ds = None
+        return arrays, nodata
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("name,dtype,fills,bands", [
+        ("three codes", gdal.GDT_Int16, [-9999.0, -1111.0, 32767.0], 1),
+        # Adjacent codes: 1 is both a code and the neighbour of 0, and a
+        # neighbour is written as an identity entry. The codes must win.
+        ("adjacent codes", gdal.GDT_Int16, [-9999.0, 0.0, 1.0], 1),
+        # A code at the edge of the type has no neighbour above/below to
+        # anchor identity against.
+        ("code at type max", gdal.GDT_Int16, [32767.0, 0.0], 1),
+        ("code at type min", gdal.GDT_Int16, [-32768.0, 0.0], 1),
+        ("byte", gdal.GDT_Byte, [255.0, 254.0], 1),
+        ("int32", gdal.GDT_Int32, [-9999.0, 32767.0], 1),
+        ("multi-band", gdal.GDT_Int16, [-9999.0, 32767.0], 3),
+    ])
+    def test_integer_sources_collapse_exactly_through_a_lut(
+            self, temp_dir, name, dtype, fills, bands):
+        """Every fill code moves, and nothing else does."""
+        from cng_datasets.raster.cog import _fill_collapse_vrt
+        src, arrays = self._raster(temp_dir, f"{name}.tif".replace(" ", "_"),
+                                   dtype, fills, bands)
+        vrt = _fill_collapse_vrt(src, fills, fills[0],
+                                 os.path.join(temp_dir, "c.vrt"))
+        assert vrt is not None, f"{name} should qualify for a lookup table"
+        got, nodata = self._read(vrt, bands)
+        for g, want in zip(got, self._expected(arrays, fills)):
+            assert np.array_equal(g, want), f"{name}: collapsed values differ"
+        assert all(n == fills[0] for n in nodata)
+
+    @pytest.mark.timeout(120)
+    def test_the_lut_writes_no_pixels(self, temp_dir):
+        """The whole point: kilobytes, not the grid."""
+        from cng_datasets.raster.cog import _fill_collapse_vrt
+        src, _ = self._raster(temp_dir, "big.tif", gdal.GDT_Int16, self.FILLS,
+                              px=512)
+        vrt = _fill_collapse_vrt(src, self.FILLS, self.FILLS[0],
+                                 os.path.join(temp_dir, "big.vrt"))
+        assert vrt is not None
+        assert os.path.getsize(vrt) < 8192
+        assert os.path.getsize(vrt) < os.path.getsize(src) / 10
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("why,dtype,fills,primary", [
+        # A table interpolates between entries, so a float source would have
+        # its values moved rather than substituted.
+        ("float source", gdal.GDT_Float32, [-9999.0, 32767.0], -9999.0),
+        # A code that is not an integer cannot be isolated by integer
+        # neighbours.
+        ("fractional code", gdal.GDT_Int16, [-9999.0, 0.5], -9999.0),
+        # The primary has to be storable in the band it is written into.
+        ("primary outside the band type", gdal.GDT_Byte, [0.0, 1.0], -9999.0),
+    ])
+    def test_sources_that_cannot_use_a_lut_are_refused(
+            self, temp_dir, why, dtype, fills, primary):
+        """Refused, not approximated: a quietly wrong value is the worse outcome."""
+        from cng_datasets.raster.cog import _fill_collapse_vrt
+        src, _ = self._raster(temp_dir, "x.tif", dtype, [abs(f) % 100 for f in fills])
+        assert _fill_collapse_vrt(src, fills, primary,
+                                  os.path.join(temp_dir, "x.vrt")) is None, why
+
+    @pytest.mark.timeout(300)
+    def test_a_float_source_still_collapses_exactly(self, temp_dir):
+        """The fallback has to stay correct, compressed or not."""
+        from cng_datasets.raster.cog import _collapse_fill_values
+        fills = [-9999.0, 32767.0]
+        src, arrays = self._raster(temp_dir, "f.tif", gdal.GDT_Float32, fills)
+        out = os.path.join(temp_dir, "f_collapsed.tif")
+        gdal.Translate(out, src, format="GTiff",
+                       creationOptions=["BIGTIFF=IF_SAFER", "TILED=YES",
+                                        "COMPRESS=ZSTD", "PREDICTOR=3"])
+        _collapse_fill_values(out, fills, fills[0])
+        got, nodata = self._read(out, 1)
+        assert np.array_equal(got[0], self._expected(arrays, fills)[0])
+        assert nodata[0] == fills[0]
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("dtype,expected", [
+        (gdal.GDT_Int16, 2), (gdal.GDT_Byte, 2), (gdal.GDT_Int32, 2),
+        (gdal.GDT_Float32, 3),
+    ])
+    def test_the_predictor_matches_the_band_type(self, temp_dir, dtype, expected):
+        """
+        PREDICTOR=3 on an integer band is an error, not a worse ratio.
+
+        The materialised path is reachable for an integer source whenever the
+        lookup table is refused for a reason other than float -- a band type
+        past 2^53, a primary the band cannot hold, a source GDAL declines to
+        translate -- so hardcoding the float predictor would take down exactly
+        those runs.
+        """
+        from cng_datasets.raster.cog import _compression_predictor
+        src, _ = self._raster(temp_dir, f"p{dtype}.tif", dtype, [0.0, 1.0])
+        assert _compression_predictor(src) == expected
+
+    @pytest.mark.timeout(600)
+    def test_aggregation_is_unchanged_by_the_lut(self, temp_dir, monkeypatch):
+        """
+        The gate that matters: same rows, same values, table or raster.
+
+        Runs the real aggregation twice over the same multi-fill source, once
+        through the lookup table and once through a materialised collapse.
+        """
+        from cng_datasets.raster import RasterProcessor
+        import cng_datasets.raster.cog as cog
+
+        src, _ = self._raster(temp_dir, "agg.tif", gdal.GDT_Int16, self.FILLS,
+                              px=128)
+        h0 = None
+        rows = {}
+        for use_lut in (True, False):
+            out = os.path.join(temp_dir, f"agg{int(use_lut)}")
+            os.makedirs(out, exist_ok=True)
+            proc = RasterProcessor(
+                input_path=src, output_parquet_path=out, h3_resolution=6,
+                parent_resolutions=[0], value_column="v",
+                nodata_value=",".join(str(int(f)) for f in self.FILLS),
+            )
+            with monkeypatch.context() as mp:
+                if not use_lut:
+                    # Refuse the table, so the same source takes the
+                    # materialised path instead.
+                    mp.setattr(cog, "_fill_collapse_vrt", lambda *a, **k: None)
+                if h0 is None:
+                    h0 = proc.con.execute(
+                        "SELECT h3_latlng_to_cell(37.3, -121.7, 0)"
+                    ).fetchone()[0]
+                result = proc._hex_aggregate_h0(h0)
+            assert result is not None, f"lut={use_lut} produced no output"
+            rows[use_lut] = duckdb.connect().execute(
+                f"SELECT v, h6 FROM read_parquet('{result}') ORDER BY h6"
+            ).fetchall()
+        assert rows[True] == rows[False]
+        assert rows[True], "fixture error: the aggregation produced no rows"
