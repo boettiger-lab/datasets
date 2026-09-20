@@ -181,6 +181,32 @@ This enables:
 - Parallel processing via Kubernetes
 - Independent failure handling per region
 
+### Cost follows the raster, not the cell
+
+Within a chunk, only the cells the source can actually reach are enumerated. The chunk's
+hierarchy is descended a level at a time: a subtree whose footprint misses the source —
+widened by a margin, because an H3 child can protrude past its parent — is dropped whole,
+and a subtree that lies entirely inside the source is taken whole without descending. Work
+is therefore proportional to the source's *perimeter* rather than its area.
+
+This matters most for small rasters, which previously cost exactly what a continental one
+did. A 196 x 169 pixel raster in California enumerated all 5,764,801 res-8 descendants of
+its h0 — a ~196x overshoot that made a fan-out over many small rasters impractical
+(issue #215). Each chunk now reports what it kept:
+
+```
+✓ 29,465 of 5,764,801 cells reach the source (0.5% of the chunk)
+```
+
+That figure is also the one that explains the pod's peak memory and runtime, and it is
+printed before the aggregation rather than inferred afterwards.
+
+The restriction never removes a cell the raster touches: the margin is checked against
+exhaustive enumeration of every child in the test suite, including the cells that wrap the
+antimeridian, whose true footprint is two longitude intervals rather than one. Set
+`CNG_HEX_PRUNE_CELLS=0` to enumerate every descendant instead, which is useful only for
+comparing a suspect run like for like.
+
 ### Regional rasters: restrict the fan-out with `--h0-subset` / `--h0-cells`
 
 A generated hex job runs one completion per h0 cell, 122 in all. A regional source

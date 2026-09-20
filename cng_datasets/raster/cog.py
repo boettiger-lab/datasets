@@ -542,6 +542,62 @@ def _collapse_fill_values(tif_path: str, fill_values: List[float], primary: floa
         ds = None
 
 
+def _cell_footprint(geom_wkt: str, margin_deg: float = 0.0):
+    """(lat_min, lat_max, [(lon_lo, lon_hi), ...]) for a cell polygon.
+
+    Shared by the overlap test and the enumeration prune so the two cannot
+    disagree about where a cell is — which, on the antimeridian, is the
+    difference between pruning nothing and pruning the strip that holds the
+    data (issue #88).
+
+    Cell polygons are planar lat/lon, so a cell with vertices on both sides of
+    +/-180 has a bounding box ~360 deg wide that both fails to prune anywhere
+    AND wrongly excludes the +/-180 strip where its data lives. Unwrap the
+    longitudes (negatives +360); a span > 180 deg means the cell straddles, so
+    its longitude footprint is two intervals on [-180, 180]. Latitude is never
+    wrapped, so the polygon's lat bounds are used directly.
+    """
+    from shapely import wkt as shapely_wkt
+    poly = shapely_wkt.loads(geom_wkt)
+    if poly.geom_type == "MultiPolygon":
+        xs = [x for g in poly.geoms for x, _ in g.exterior.coords]
+    else:
+        xs = [x for x, _ in poly.exterior.coords]
+    minx, miny, maxx, maxy = poly.bounds
+
+    if maxx - minx > 180:  # straddles the antimeridian
+        uxs = [x + 360.0 if x < 0 else x for x in xs]
+        umin, umax = min(uxs), max(uxs)
+        lon_intervals = [(umin, 180.0)]
+        if umax > 180.0:
+            lon_intervals.append((-180.0, umax - 360.0))
+    else:
+        lon_intervals = [(minx, maxx)]
+
+    if margin_deg:
+        return _widen_footprint(miny, maxy, lon_intervals, margin_deg)
+    return miny, maxy, lon_intervals
+
+
+def _widen_footprint(miny: float, maxy: float, lon_intervals, margin_deg: float):
+    """Widen a footprint by a margin in degrees of latitude.
+
+    Split out of `_cell_footprint` because the enumeration prune derives a
+    cell's bounds in SQL rather than from parsed WKT, and the two must widen
+    them identically or the prune and the overlap test disagree about the same
+    cell.
+    """
+    miny -= margin_deg
+    maxy += margin_deg
+    # A degree of longitude shrinks with latitude, so a margin fixed in
+    # degrees of latitude under-covers near the poles. Scale it by
+    # 1/cos(lat) at the cell's furthest-from-equator edge, capped so a
+    # near-polar cell widens to the whole globe rather than overflowing.
+    lat = min(max(abs(miny), abs(maxy)), 89.0)
+    lon_margin = min(margin_deg / max(math.cos(math.radians(lat)), 1e-6), 180.0)
+    return miny, maxy, [(lo - lon_margin, hi + lon_margin) for lo, hi in lon_intervals]
+
+
 def _h3_res_to_degrees(h3_resolution: int) -> float:
     """Approximate pixel size in degrees for a given H3 resolution.
 
@@ -1441,6 +1497,10 @@ class RasterProcessor:
             or (window_reads == "auto" and chunk_resolution > 0 and remote_source)
         )
         self._window_cache_dir = local_cache_dir
+        # Enumerate only the subtrees that reach the source (issue #215).
+        # Off via CNG_HEX_PRUNE_CELLS=0, which restores the full 7^n
+        # enumeration for a like-for-like comparison.
+        self._prune_cells = os.environ.get("CNG_HEX_PRUNE_CELLS", "1") != "0"
 
         if (local_cache_dir and not self._windowing
                 and isinstance(input_path, str)
@@ -1842,20 +1902,169 @@ class RasterProcessor:
         h3_col = f"h{self.h3_resolution}"
         import numpy as np
 
-        cells = self.con.execute(f"""
-            WITH native_cells AS (
-                SELECT UNNEST(
-                    h3_cell_to_children({h0_cell}, {self.h3_resolution})
-                ) AS cell
-            )
-            SELECT cell AS {h3_col}
-            FROM native_cells
-        """).fetchnumpy()[h3_col]
+        sql, pruned_from = self._enumeration_sql(h0_cell, h3_col)
+        cells = self.con.execute(sql).fetchnumpy()[h3_col]
+        if pruned_from is not None:
+            # The number that explains this pod's peak memory and runtime, at
+            # the point it is decided rather than afterwards (issue #215).
+            share = 100.0 * len(cells) / pruned_from if pruned_from else 0.0
+            print(f"  ✓ {len(cells):,} of {pruned_from:,} cells reach the source "
+                  f"({share:.1f}% of the chunk)")
         # fetchnumpy hands UBIGINT back as int64. Bit 63 of an H3 index is
         # reserved and always 0, so every cell id fits in an int64 and the two
         # views share a bit pattern — .view() relabels in place rather than
         # copying an array that is 2.3 GB at res 10.
         return cells.view(np.uint64)
+
+    def _enumeration_sql(self, chunk_cell: int, h3_col: str):
+        """`(sql, pruned_from)` — the query that lists one chunk's native cells.
+
+        Either every descendant of the chunk cell, or — when the source covers
+        only part of it — the descendants of the subtrees that reach the source
+        (issue #215). Both forms return the same column, so the caller and the
+        workers below it are unchanged. `pruned_from` is the chunk's full child
+        count when the prune ran, and None when it did not, so the caller can
+        report what the restriction bought.
+        """
+        full = f"""
+            WITH native_cells AS (
+                SELECT UNNEST(
+                    h3_cell_to_children({chunk_cell}, {self.h3_resolution})
+                ) AS cell
+            )
+            SELECT cell AS {h3_col}
+            FROM native_cells
+        """
+        if not self._prune_cells:
+            return full, None
+        sxmin, symin, sxmax, symax = self._src_bounds_4326
+        if (sxmin <= -180.0 and sxmax >= 180.0
+                and symin <= -90.0 and symax >= 90.0):
+            # A global source (or one whose bounds could not be computed, which
+            # falls back to global) has nothing to prune against.
+            return full, None
+
+        start = self.con.execute(
+            f"SELECT h3_get_resolution({int(chunk_cell)}::UBIGINT)"
+        ).fetchone()[0]
+        if int(start) >= self.h3_resolution:
+            # The chunk cell is already at (or below) the native resolution, so
+            # there is no hierarchy to descend and h3_cell_to_children returns
+            # the cell itself. Pruning here would mean deciding the chunk's fate
+            # twice, on the same geometry the caller has already tested.
+            return full, None
+
+        interior, leaves = self._classify_descendants(chunk_cell, int(start))
+        total = self.con.execute(
+            f"SELECT h3_cell_to_children_size({int(chunk_cell)}::UBIGINT, "
+            f"{self.h3_resolution})"
+        ).fetchone()[0]
+        if not interior and not leaves:
+            return f"SELECT NULL::UBIGINT AS {h3_col} WHERE false", int(total)
+        parts = []
+        if interior:
+            values = ",".join(f"({int(c)}::UBIGINT)" for c in interior)
+            parts.append(
+                f"SELECT UNNEST(h3_cell_to_children(cell, {self.h3_resolution})) "
+                f"AS {h3_col} FROM (VALUES {values}) t(cell)"
+            )
+        if leaves:
+            values = ",".join(f"({int(c)}::UBIGINT)" for c in leaves)
+            parts.append(f"SELECT cell AS {h3_col} FROM (VALUES {values}) t(cell)")
+        return " UNION ALL ".join(parts), int(total)
+
+    def _classify_descendants(self, chunk_cell: int, start: int):
+        """Descend the H3 hierarchy, keeping only what can reach the source.
+
+        Returns `(interior, leaves)`: cells whose every descendant is kept, and
+        individual native-resolution cells. The caller expands `interior` with
+        `h3_cell_to_children`, so nothing here is proportional to the number of
+        cells kept — only to the number examined.
+
+        At each level a cell is one of three things:
+
+        - **outside** the source, widened by the prune margin — dropped, along
+          with its whole subtree;
+        - **inside** the source outright — kept wholesale without descending,
+          which is what keeps a raster that fills its chunk from costing more
+          than it does today;
+        - **straddling** the source's edge — descended one level further.
+
+        So the work is proportional to the source's *perimeter* rather than its
+        area. The footprint tested is the one `_cell_footprint` defines — a
+        planar envelope is exactly that for any cell not straddling +/-180, and
+        the ones that do straddle are read from their rings — so the prune and
+        the overlap test cannot disagree about where a cell is.
+
+        The margin is what makes dropping safe. H3's hierarchy is only
+        approximately containing — a descendant can protrude past its parent's
+        boundary — and the protrusions compound down the levels, bounded by
+        roughly `_H3_PROTRUSION_MARGIN / (1 - 1/sqrt(7))` ~ 1.6x one level's.
+        `_H3_PRUNE_MARGIN_FACTOR` carries 2x, comfortably outside that, and the
+        gate is measured rather than argued: against exhaustive enumeration of
+        all 5,764,801 res-8 children of an h0, this drops none of the 29,055
+        cells that genuinely touch the raster, and none of the 620 straddling
+        the antimeridian (issue #215).
+
+        Containment needs no margin, only the opposite bias: taking a subtree
+        wholesale can over-include, and an extra cell yields no covered pixels
+        and is dropped by the aggregation. Under-including cannot be recovered.
+        """
+        sxmin, symin, sxmax, symax = self._src_bounds_4326
+        frontier = [int(chunk_cell)]
+        interior, leaves = [], []
+        for level in range(start + 1, self.h3_resolution + 1):
+            if not frontier:
+                break
+            values = ",".join(f"({c}::UBIGINT)" for c in frontier)
+            # Envelopes in SQL rather than shapely: at fine resolutions this
+            # loop sees tens of thousands of cells, and parsing a WKT ring per
+            # cell to recover a bounding box it already has costs more than the
+            # prune saves. A planar envelope is the whole footprint for every
+            # cell that does not straddle +/-180 — and the ones that do are
+            # re-derived from their rings below.
+            rows = self.con.execute(f"""
+                WITH f AS (SELECT * FROM (VALUES {values}) t(cell)),
+                     kids AS (SELECT UNNEST(h3_cell_to_children(cell, {level})) AS cell FROM f),
+                     env AS (SELECT cell,
+                                    ST_Envelope(ST_GeomFromText(h3_cell_to_boundary_wkt(cell))) AS e
+                             FROM kids)
+                SELECT cell, ST_XMin(e), ST_YMin(e), ST_XMax(e), ST_YMax(e) FROM env
+            """).fetchall()
+            straddlers = [r[0] for r in rows if r[3] - r[1] > 180]
+            rings = {}
+            if straddlers:
+                sv = ",".join(f"({int(c)}::UBIGINT)" for c in straddlers)
+                rings = dict(self.con.execute(
+                    f"SELECT cell, h3_cell_to_boundary_wkt(cell) "
+                    f"FROM (VALUES {sv}) t(cell)"
+                ).fetchall())
+            frontier = []
+            for cell, xmin, ymin, xmax, ymax in rows:
+                if cell in rings:
+                    ymin, ymax, lon_intervals = _cell_footprint(rings[cell])
+                else:
+                    lon_intervals = [(xmin, xmax)]
+                extent = ymax - ymin
+                margin = _H3_PRUNE_MARGIN_FACTOR * _H3_PROTRUSION_MARGIN * extent
+                wymin, wymax, wide = _widen_footprint(ymin, ymax, lon_intervals, margin)
+                if symax < wymin or symin > wymax:
+                    continue
+                if not any(not (sxmax < lo or sxmin > hi) for lo, hi in wide):
+                    continue
+                if level == self.h3_resolution:
+                    leaves.append(int(cell))
+                elif (len(lon_intervals) == 1
+                      and symin <= ymin and symax >= ymax
+                      and sxmin <= lon_intervals[0][0] and sxmax >= lon_intervals[0][1]):
+                    # Wholly inside the source: every descendant is kept. A cell
+                    # straddling +/-180 is never claimed here — its two intervals
+                    # would each have to be contained, and descending it instead
+                    # costs work rather than data.
+                    interior.append(int(cell))
+                else:
+                    frontier.append(int(cell))
+        return interior, leaves
 
     def _h0_overlaps_raster(self, h0_geom_wkt: str, margin_deg: float = 0.0) -> bool:
         """Whether the source raster's extent overlaps an h0 cell's true
@@ -1878,34 +2087,7 @@ class RasterProcessor:
         longitude footprint is two intervals on [-180, 180]. Latitude is never
         wrapped, so the polygon's lat bounds are used directly.
         """
-        from shapely import wkt as shapely_wkt
-        poly = shapely_wkt.loads(h0_geom_wkt)
-        if poly.geom_type == "MultiPolygon":
-            xs = [x for g in poly.geoms for x, _ in g.exterior.coords]
-        else:
-            xs = [x for x, _ in poly.exterior.coords]
-        minx, miny, maxx, maxy = poly.bounds
-
-        if maxx - minx > 180:  # straddles the antimeridian
-            uxs = [x + 360.0 if x < 0 else x for x in xs]
-            umin, umax = min(uxs), max(uxs)
-            lon_intervals = [(umin, 180.0)]
-            if umax > 180.0:
-                lon_intervals.append((-180.0, umax - 360.0))
-        else:
-            lon_intervals = [(minx, maxx)]
-
-        if margin_deg:
-            miny -= margin_deg
-            maxy += margin_deg
-            # A degree of longitude shrinks with latitude, so a margin fixed in
-            # degrees of latitude under-covers near the poles. Scale it by
-            # 1/cos(lat) at the cell's furthest-from-equator edge, capped so a
-            # near-polar cell widens to the whole globe rather than overflowing.
-            lat = min(max(abs(miny), abs(maxy)), 89.0)
-            lon_margin = min(margin_deg / max(math.cos(math.radians(lat)), 1e-6), 180.0)
-            lon_intervals = [(lo - lon_margin, hi + lon_margin) for lo, hi in lon_intervals]
-
+        miny, maxy, lon_intervals = _cell_footprint(h0_geom_wkt, margin_deg)
         sxmin, symin, sxmax, symax = self._src_bounds_4326  # (xmin,ymin,xmax,ymax)
         if symax < miny or symin > maxy:  # no latitude overlap
             return False
