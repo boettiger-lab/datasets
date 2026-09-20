@@ -934,6 +934,11 @@ class TestChildrenCellSelection:
         # returns zero cells at every resolution.
         h0 = 577375545977733119
         proc = RasterProcessor(input_path=tiny_raster, h3_resolution=3)
+        # This test is about *which* cells an h0 enumerates, not how many of
+        # them the raster reaches, so it asks for the unpruned list: the raster
+        # is a 5x5 square in California and this h0 is on the antimeridian, so
+        # the prune (issue #215) would correctly return none of them.
+        proc._prune_cells = False
 
         # Cell selection depends only on the h0 id (h3_cell_to_children),
         # never on the stored polygon.
@@ -1790,12 +1795,22 @@ class TestBoundariesDerivedInWorkers:
         from cng_datasets.raster import RasterProcessor
 
         proc = RasterProcessor(input_path=tiny_raster, h3_resolution=3)
+        # Unpruned, so the count below is the h0's full child set: what this
+        # test measures is bytes per cell, not which cells the raster reaches
+        # (issue #215).
+        proc._prune_cells = False
         cells = proc._native_cells_for_h0(self.H0)
 
         assert isinstance(cells, np.ndarray)
         assert cells.dtype == np.uint64
         assert cells.nbytes == 8 * len(cells)
         assert len(cells) == 7 ** 3
+
+        # The prune must not change either property, only the count.
+        proc._prune_cells = True
+        pruned = proc._native_cells_for_h0(self.H0)
+        assert pruned.dtype == np.uint64
+        assert pruned.nbytes == 8 * len(pruned)
 
     @requires_gdal
     @pytest.mark.timeout(120)
@@ -3007,3 +3022,229 @@ class TestH0PositionsAreNotBaseCells:
         from cng_datasets.raster.cog import describe_h0
 
         assert describe_h0(577199624117288959, duckdb.connect()) == "577199624117288959"
+
+
+class TestEnumerationPrune:
+    """
+    A chunk enumerates only the subtrees that reach the raster (issue #215).
+
+    `h3_cell_to_children(chunk_cell, res)` costs the same whatever the source
+    covers: 7^8 = 5,764,801 cells for a res-8 h0, whether the raster fills it
+    or is a 196x169 pixel square inside it. Measured overshoot on the raster
+    that surfaced this: ~196x, which is why a fan-out over many small rasters
+    costs the same per raster as a continental one.
+
+    The prune descends the hierarchy and drops a subtree only when the cell,
+    widened by the protrusion margin, misses the source outright. What these
+    tests guard is that descending never loses a cell the raster touches --
+    the overlap predicate itself is covered by TestOverlapSkipAntimeridian and
+    TestH3ProtrusionMargin.
+    """
+
+    # (name, h0 cell, raster bbox) -- a mid-latitude cell, the antimeridian
+    # cell whose planar polygon spans ~-175.6..+177.8, and a polar cell.
+    CASES = [
+        ("midlatitude", 577199624117288959, (-123.0, 37.0, -122.5, 37.5)),
+        # Deliberately between this h0's planar maxx (+177.85) and +180: read
+        # as one box its longitude footprint is (-175.56, 177.85), which does
+        # not reach here, so a prune that trusts the planar envelope drops
+        # every cell the raster actually covers.
+        ("antimeridian", 577375545977733119, (178.5, 30.0, 179.8, 33.0)),
+        ("polar", 576495936675512319, (-5.0, 84.0, 5.0, 86.0)),
+        # Cell 594239030690840575 (res 3, lat -89.74..-88.96) truly spans
+        # lon 4.7..180 and -180..-33.99, but its *planar* box is
+        # (-162.75, 87.67) -- so lon 120..140 is inside the cell and outside
+        # the box by 22 deg more than the prune margin covers. A descent that
+        # reads a straddling cell as one interval drops it, and with it every
+        # cell of this raster.
+        ("dateline_wrap", 580753245698260991, (120.0, -89.6, 140.0, -89.1)),
+    ]
+    RES = 3
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _raster(self, temp_dir, bbox, name="r.tif", px=32):
+        from osgeo import gdal, osr
+        xmin, ymin, xmax, ymax = bbox
+        path = os.path.join(temp_dir, name)
+        ds = gdal.GetDriverByName("GTiff").Create(path, px, px, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([xmin, (xmax - xmin) / px, 0, ymax, 0, -(ymax - ymin) / px])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:px, 0:px]
+        ds.GetRasterBand(1).WriteArray((yy * px + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _processor(self, temp_dir, bbox, name="r.tif", **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        return RasterProcessor(
+            input_path=self._raster(temp_dir, bbox, name),
+            output_parquet_path=os.path.join(temp_dir, "out_" + name),
+            h3_resolution=self.RES, parent_resolutions=[0],
+            value_column="v", **kwargs,
+        )
+
+    def _both(self, proc, h0):
+        """(pruned, full) cell id sets for one chunk cell."""
+        proc._prune_cells = True
+        pruned = set(int(c) for c in proc._native_cells_for_h0(h0))
+        proc._prune_cells = False
+        full = set(int(c) for c in proc._native_cells_for_h0(h0))
+        return pruned, full
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("name,h0,bbox", CASES, ids=[c[0] for c in CASES])
+    def test_prune_keeps_every_cell_the_raster_touches(self, temp_dir, name, h0, bbox):
+        """
+        The losslessness gate, checked exhaustively rather than sampled.
+
+        A dropped cell is the expensive failure: the job exits 0, writes its
+        partition, and covers less ground than it claims -- which no structural
+        check downstream can catch.
+        """
+        proc = self._processor(temp_dir, bbox, f"{name}.tif")
+        pruned, full = self._both(proc, h0)
+        assert pruned <= full, "the prune invented cells that are not children"
+
+        # Truth: every child whose own footprint reaches the source, tested
+        # with no margin at all, so the margin cannot mask a descent bug.
+        wkts = proc.con.execute(
+            "SELECT cell, h3_cell_to_boundary_wkt(cell) "
+            "FROM (SELECT UNNEST(?::UBIGINT[]) AS cell)",
+            [sorted(full)],
+        ).fetchall()
+        touching = {int(c) for c, wkt in wkts if proc._h0_overlaps_raster(wkt)}
+        assert touching, f"fixture error: no cell of {name} touches its raster"
+        missed = touching - pruned
+        assert not missed, f"{len(missed)} of {len(touching)} touching cells were pruned"
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    def test_a_small_raster_enumerates_far_fewer_cells(self, temp_dir):
+        """The point of the change: cost follows the raster, not the cell."""
+        proc = self._processor(temp_dir, (-123.0, 37.0, -122.5, 37.5))
+        pruned, full = self._both(proc, self.CASES[0][1])
+        assert len(full) == 7 ** self.RES
+        assert len(pruned) < len(full) / 10
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    def test_a_covering_raster_enumerates_everything(self, temp_dir):
+        """A raster that fills its cell must lose nothing to the prune."""
+        proc = self._processor(temp_dir, (-180.0, -90.0, 180.0, 90.0), "world.tif")
+        pruned, full = self._both(proc, self.CASES[0][1])
+        assert pruned == full
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    def test_prune_can_be_disabled(self, temp_dir, monkeypatch):
+        """An escape hatch, so a suspect prune can be compared like for like."""
+        monkeypatch.setenv("CNG_HEX_PRUNE_CELLS", "0")
+        proc = self._processor(temp_dir, (-123.0, 37.0, -122.5, 37.5))
+        assert proc._prune_cells is False
+        assert len(proc._native_cells_for_h0(self.CASES[0][1])) == 7 ** self.RES
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    def test_a_native_resolution_chunk_still_enumerates_itself(self, temp_dir):
+        """
+        chunk_resolution == h3_resolution leaves no hierarchy to descend.
+
+        h3_cell_to_children(cell, res(cell)) returns the cell itself, so a
+        descent that simply runs zero levels would return nothing and the
+        chunk would write no data while reporting success.
+        """
+        proc = self._processor(temp_dir, (-123.0, 37.0, -122.5, 37.5))
+        cell = proc.con.execute(
+            f"SELECT h3_cell_to_children({self.CASES[0][1]}, {self.RES})[1]"
+        ).fetchone()[0]
+        assert [int(c) for c in proc._native_cells_for_h0(cell)] == [int(cell)]
+
+    @requires_gdal
+    @pytest.mark.timeout(600)
+    def test_output_is_unchanged_by_the_prune(self, temp_dir):
+        """
+        The gate that matters: same rows, same values, pruned or not.
+
+        The cells the prune drops are exactly the ones exactextract would have
+        returned no covered pixels for, so the written parquet must not move.
+        """
+        rows = {}
+        for flag in (True, False):
+            proc = self._processor(temp_dir, (-123.0, 37.0, -122.5, 37.5),
+                                   f"eq{int(flag)}.tif")
+            proc._prune_cells = flag
+            out = proc._hex_aggregate_h0(self.CASES[0][1])
+            assert out is not None, f"prune={flag} produced no output"
+            rows[flag] = duckdb.connect().execute(
+                f"SELECT v, h{self.RES} FROM read_parquet('{out}') ORDER BY h{self.RES}"
+            ).fetchall()
+        assert rows[True] == rows[False]
+        assert rows[True], "fixture error: the aggregation produced no rows"
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    def test_cells_straddling_the_antimeridian_survive_the_prune(self, temp_dir):
+        """
+        The seam is where a planar bounding box lies (issue #88).
+
+        A cell with vertices either side of +/-180 has an envelope ~360 deg
+        wide, so its longitude footprint is two intervals rather than one. Read
+        as a single box it would be pruned against a raster that sits right
+        next to it -- the same mistake that made the old polygon polyfill
+        return zero cells for these h0s.
+        """
+        name, h0, bbox = self.CASES[1]
+        proc = self._processor(temp_dir, bbox, "seam.tif")
+        pruned, _ = self._both(proc, h0)
+
+        straddling = [
+            int(c) for c, in proc.con.execute(
+                "SELECT cell FROM (SELECT UNNEST(?::UBIGINT[]) AS cell) "
+                "WHERE ST_XMax(ST_Envelope(ST_GeomFromText(h3_cell_to_boundary_wkt(cell)))) "
+                "     - ST_XMin(ST_Envelope(ST_GeomFromText(h3_cell_to_boundary_wkt(cell)))) > 180",
+                [sorted(pruned)],
+            ).fetchall()
+        ]
+        assert straddling, (
+            "fixture error: this h0's kept cells include none that straddle "
+            "+/-180, so the case is not exercising the seam"
+        )
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    def test_a_dateline_wrapping_cell_is_kept_on_its_true_footprint(self):
+        """
+        The case where reading a straddling cell as one box loses everything.
+
+        Most straddling cells barely cross +/-180, so their planar box spans
+        nearly the globe and the prune margin covers the sliver it wrongly
+        excludes -- which is why this needs a cell picked for the purpose
+        rather than any cell on the seam. Cell 594239030690840575 wraps far
+        enough that its box excludes 86 deg of longitude it actually covers,
+        33 deg of that beyond the margin.
+        """
+        from cng_datasets.raster.cog import _cell_footprint
+        h0, cell = 580753245698260991, 594239030690840575
+        with tempfile.TemporaryDirectory() as d:
+            proc = self._processor(d, self.CASES[3][2], "wrap.tif")
+            wkt = proc.con.execute(
+                f"SELECT h3_cell_to_boundary_wkt({cell})"
+            ).fetchone()[0]
+
+            # The premise, asserted rather than assumed: the raster is inside
+            # the cell's true footprint and outside its planar box.
+            _, _, intervals = _cell_footprint(wkt)
+            xmin, _, xmax, _ = __import__("shapely.wkt", fromlist=["loads"]).loads(wkt).bounds
+            lo, hi = self.CASES[3][2][0], self.CASES[3][2][2]
+            assert any(a <= lo and hi <= b for a, b in intervals), "fixture drifted"
+            assert not (xmin <= lo and hi <= xmax), "fixture drifted"
+
+            assert cell in {int(c) for c in proc._native_cells_for_h0(h0)}
