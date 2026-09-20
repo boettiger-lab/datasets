@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-20
+
 ### Added
 - `--h0-cells` on `raster` and `raster-workflow`: the same fan-out restriction as `--h0-subset`, given as **H3 base cell numbers** rather than h0 grid positions, converted against the grid at generation time and echoed (`✓ H3 base cells [9, 19, 20, 21, 34, 36] → h0 grid positions [12, 14, 20, 50, 71, 78]`). The two flags are one restriction in two numberings, so passing both is refused rather than resolved by a precedence rule nobody would think to look up (#213)
 
@@ -213,9 +215,11 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.7.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.7.0
 [0.6.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.6.0
 [0.5.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.5.0
 [0.4.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.4.0
 [0.3.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.3.1
 [0.3.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.3.0
+[0.2.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.2.0
 [0.1.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.1.0
