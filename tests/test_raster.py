@@ -3445,3 +3445,99 @@ class TestFillCollapseWithoutARaster:
             ).fetchall()
         assert rows[True] == rows[False]
         assert rows[True], "fixture error: the aggregation produced no rows"
+
+
+class TestHexWorkerDefault:
+    """
+    How many workers to run when nobody said (issues #195, #215, #173).
+
+    Peak RSS is roughly `workers x bytes-per-cell x chunk-size`, and the worker
+    term dominates: one LANDFIRE res-10 layer peaked at 190.5 GiB and completed
+    no slice in 3h40m at 48-64 workers, and at ~37 GiB with all six slices
+    complete at 8. So the default is a memory decision, and `os.cpu_count()`
+    was the wrong answer twice -- it is the node's core count inside a pod
+    (256 workers against a `cpu: 8` limit), and it is not stable between pods
+    of the same job.
+    """
+
+    CPU_MAX = "/sys/fs/cgroup/cpu.max"
+    V1_QUOTA = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+    V1_PERIOD = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+
+    @pytest.fixture(autouse=True)
+    def _unwarn(self, monkeypatch):
+        """The warning fires once per process; each test wants its own."""
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "_CPU_QUOTA_WARNED", False)
+
+    def _cgroup(self, monkeypatch, files):
+        """Serve `files` for the cgroup paths; everything else opens normally."""
+        import builtins, io
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kwargs):
+            key = str(path)
+            if key in files:
+                if files[key] is None:
+                    raise FileNotFoundError(key)
+                return io.StringIO(files[key])
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+
+    @pytest.mark.timeout(30)
+    def test_cgroup_v2_quota_is_used(self, monkeypatch):
+        from cng_datasets.raster.cog import _default_hex_workers
+        self._cgroup(monkeypatch, {self.CPU_MAX: "800000 100000"})
+        assert _default_hex_workers() == 8
+
+    @pytest.mark.timeout(30)
+    def test_cgroup_v1_quota_is_used_when_v2_says_max(self, monkeypatch):
+        from cng_datasets.raster.cog import _default_hex_workers
+        self._cgroup(monkeypatch, {
+            self.CPU_MAX: "max 100000",
+            self.V1_QUOTA: "400000", self.V1_PERIOD: "100000",
+        })
+        assert _default_hex_workers() == 4
+
+    @pytest.mark.timeout(30)
+    def test_an_unreadable_quota_does_not_become_the_host_core_count(
+            self, monkeypatch, capsys):
+        """
+        The case that matters: `cpu.max` reads "max" inside a CPU-limited pod
+        whose /sys/fs/cgroup is the host root. The host's core count is not the
+        pod's limit, and using it oversubscribed a shared node 32x.
+        """
+        import cng_datasets.raster.cog as cog
+        self._cgroup(monkeypatch, {
+            self.CPU_MAX: "max 100000", self.V1_QUOTA: None, self.V1_PERIOD: None,
+        })
+        monkeypatch.setattr(cog.os, "cpu_count", lambda: 256)
+
+        assert cog._cgroup_cpu_count() is None, "no quota should be claimed"
+        assert cog._default_hex_workers() == 8
+
+        warning = capsys.readouterr().out
+        assert "256" in warning, "the warning should name what it declined to use"
+        assert "CNG_HEX_WORKERS" in warning, "and how to pin it"
+
+    @pytest.mark.timeout(30)
+    def test_the_fallback_never_exceeds_the_machine(self, monkeypatch):
+        """On a 2-core box, 8 workers would just be 8 ways to wait."""
+        import cng_datasets.raster.cog as cog
+        self._cgroup(monkeypatch, {
+            self.CPU_MAX: "max 100000", self.V1_QUOTA: None, self.V1_PERIOD: None,
+        })
+        monkeypatch.setattr(cog.os, "cpu_count", lambda: 2)
+        assert cog._default_hex_workers() == 2
+
+    @pytest.mark.timeout(30)
+    def test_the_warning_fires_once(self, monkeypatch, capsys):
+        """One line per pod, not one per chunk."""
+        import cng_datasets.raster.cog as cog
+        self._cgroup(monkeypatch, {
+            self.CPU_MAX: "max 100000", self.V1_QUOTA: None, self.V1_PERIOD: None,
+        })
+        for _ in range(3):
+            cog._default_hex_workers()
+        assert capsys.readouterr().out.count("No cgroup CPU quota readable") == 1

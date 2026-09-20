@@ -269,21 +269,22 @@ _WINDOW_NO_OVERLAP = "__no_overlap__"
 # Warn at most once per process that the CPU quota could not be read.
 _CPU_QUOTA_WARNED = False
 
+# Workers to run when the pod's CPU quota cannot be read. Deliberately small:
+# see _default_hex_workers for why the host's core count is the wrong answer.
+_UNKNOWN_QUOTA_HEX_WORKERS = 8
 
-def _cgroup_cpu_count() -> int:
-    """Return the cgroup CPU quota (kubernetes pod limit) or os.cpu_count() fallback.
 
-    os.cpu_count() returns the node's CPU count inside a k8s pod, which
-    over-provisions workers when the pod is limited to e.g. 8 CPU on a
-    64-core node. Read cgroup v2 cpu.max if present.
+def _cgroup_cpu_count() -> Optional[int]:
+    """The cgroup CPU quota (the pod's limit), or None if it cannot be read.
 
-    The fallback is not merely imprecise, it is non-deterministic: a container
-    whose /sys/fs/cgroup is the host root rather than its own cgroup namespace
-    reads cpu.max as "max" even though the pod *is* CPU-limited, so the worker
-    count silently becomes whatever node the pod landed on — 48 cores here, 64
-    there, from one manifest, and with it the peak RSS (issue #195). Say so
-    when it happens; generated manifests now pin CNG_HEX_WORKERS so they never
-    reach this path.
+    Separate from what we *do* about it (`_default_hex_workers`), because the
+    two are different questions: this one is a fact about the container, and
+    the answer to "how many workers" is a memory decision.
+
+    A container whose /sys/fs/cgroup is the host root rather than its own
+    cgroup namespace reads cpu.max as "max" even though the pod *is* CPU
+    limited, so there is no quota to be had — hence None rather than a guess
+    at one (issue #195).
     """
     try:
         with open("/sys/fs/cgroup/cpu.max") as f:
@@ -301,17 +302,50 @@ def _cgroup_cpu_count() -> int:
             return max(1, int(quota / period))
     except (FileNotFoundError, ValueError):
         pass
-    n_cpus = os.cpu_count() or 1
+    return None
+
+
+def _default_hex_workers() -> int:
+    """How many worker processes to run when CNG_HEX_WORKERS is not set.
+
+    The pod's CPU quota when it is readable; otherwise a small constant, NOT
+    the host's core count.
+
+    This is a memory decision wearing a CPU costume. Peak RSS is roughly
+    `workers x bytes-per-cell x chunk-size`, and the worker term dominates:
+    measured on one LANDFIRE res-10 layer, unchanged in every other respect,
+    48-64 workers peaked at 190.5 GiB and completed no slice in 3h40m, while 8
+    workers peaked at ~37 GiB and completed all six with no failures (#173).
+
+    So `os.cpu_count()` was the wrong fallback twice over. It is the *node's*
+    core count inside a pod, which on a shared 256-core node meant 256 workers
+    against a `cpu: 8` limit — a 32x oversubscription, and with it a peak the
+    manifest never asked for (#215). And it is not even stable: two pods of one
+    job reported 64 and 48 workers, so peak memory was not reproducible from
+    the manifest (#195).
+
+    The two failure modes are not symmetric. Too few workers is slower. Too
+    many is an OOM kill after hours of un-checkpointed work, on a shared node,
+    with nothing to resume from. When we do not know the pod's limit, the safe
+    answer is the one measured to finish.
+
+    Generated manifests have pinned CNG_HEX_WORKERS since #195, so this is the
+    direct-CLI and older-manifest path rather than the usual one.
+    """
+    quota = _cgroup_cpu_count()
+    if quota is not None:
+        return quota
+    workers = min(_UNKNOWN_QUOTA_HEX_WORKERS, os.cpu_count() or 1)
     global _CPU_QUOTA_WARNED
     if not _CPU_QUOTA_WARNED:
         _CPU_QUOTA_WARNED = True
         print(
-            f"  ⚠ No cgroup CPU quota readable — falling back to {n_cpus} host CPUs. "
-            "Inside a pod that is the node's core count, not the pod's limit, so "
-            "peak memory depends on which node you land on. Set CNG_HEX_WORKERS "
-            "to pin it."
+            f"  ⚠ No cgroup CPU quota readable — using {workers} workers. "
+            f"The host reports {os.cpu_count()} CPUs, but inside a pod that is "
+            "the node's core count, not the pod's limit, and peak memory "
+            "scales with workers. Set CNG_HEX_WORKERS to pin it."
         )
-    return n_cpus
+    return workers
 
 # Set GDAL to use exceptions for better error handling
 gdal.UseExceptions()
@@ -2390,7 +2424,7 @@ class RasterProcessor:
                 rast_arg = self._collapsed_aggregation_input(source_path)
 
             chunk_size = int(os.environ.get("CNG_HEX_CHUNK_SIZE", "100000"))
-            n_workers = int(os.environ.get("CNG_HEX_WORKERS", str(_cgroup_cpu_count())))
+            n_workers = int(os.environ.get("CNG_HEX_WORKERS", str(_default_hex_workers())))
             n_workers = max(1, n_workers)
 
             # Chunks are views into the uint64 id array, so nothing here is
