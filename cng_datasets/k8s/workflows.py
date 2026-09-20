@@ -265,8 +265,12 @@ def _normalize_h0_subset(h0_subset: Optional[List[int]]) -> Optional[List[int]]:
 
     Sorted and de-duplicated so the emitted ``H0S`` array is deterministic and
     the completion index maps to a stable h0 across regenerations. A subset
-    covering all 122 base cells is the default fan-out, so it collapses to None
+    covering all 122 positions is the default fan-out, so it collapses to None
     rather than emitting a redundant index mapping (issue #191).
+
+    The range check below cannot tell a position from an H3 base cell number,
+    because both numberings run 0-121 — so its wording carries the whole
+    burden of not implying that a base-cell list has been validated (#218).
     """
     if h0_subset is None:
         return None
@@ -275,14 +279,18 @@ def _normalize_h0_subset(h0_subset: Optional[List[int]]) -> Optional[List[int]]:
     if not cells:
         raise ValueError(
             "h0_subset was given but empty. Omit it to fan out over all 122 h0 "
-            "base cells, or pass the cells the source overlaps, e.g. "
-            "--h0-subset \"12,14,20,50,71,78\"."
+            "cells, or pass the grid positions the source overlaps, e.g. "
+            "--h0-subset \"12,14,20,50,71,78\" for CONUS. To give H3 base cell "
+            "numbers instead, use --h0-cells \"9,19,20,21,34,36\"."
         )
     out_of_range = [h for h in cells if not 0 <= h <= 121]
     if out_of_range:
         raise ValueError(
-            f"h0_subset contains invalid h0 index/indices {out_of_range}. "
-            "There are 122 H3 base cells, so each must be in 0-121."
+            f"h0_subset contains out-of-range h0 grid position(s) {out_of_range}. "
+            "The h0 grid has 122 rows, so each position must be in 0-121. Note "
+            "H3 base cell numbers also run 0-121 and are a different numbering "
+            "— every base-cell list passes this check (#213); pass one to "
+            "--h0-cells rather than --h0-subset."
         )
     if len(cells) == 122:
         return None
