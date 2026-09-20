@@ -324,6 +324,29 @@ from the source footprint at generation time is
 [issue #191](https://github.com/boettiger-lab/datasets/issues/191)'s option 2 and is not
 implemented — the subset is explicit.
 
+### Workers, and why the default is small
+
+The hex step aggregates in parallel worker processes. Peak memory is roughly
+`workers x bytes-per-cell x cells-per-chunk`, so the worker count is a **memory** setting
+as much as a CPU one — measured on one LANDFIRE res-10 layer, unchanged in every other
+respect:
+
+| `CNG_HEX_WORKERS` | peak RSS | outcome |
+|---:|---:|---|
+| 48–64 | 190.5 GiB | no slice completed in 3 h 40 m |
+| **8** | **~37 GiB** | all six slices complete, no failures |
+
+The default is the pod's CPU quota, read from cgroup v2 `cpu.max` or the v1 equivalent.
+When that cannot be read the default is **8**, not the host's core count: a container whose
+`/sys/fs/cgroup` is the host root reports `max` even though the pod *is* CPU limited, and
+taking the node's cores there meant 256 workers against a `cpu: 8` limit — a 32x
+oversubscription of a shared node, and a peak the manifest never asked for. It is also not
+stable, since two pods of the same job can land on nodes with different core counts.
+
+The two failure modes are not symmetric: too few workers is slower, too many is an OOM kill
+after hours of un-checkpointed work. Set `CNG_HEX_WORKERS` to pin it; generated manifests
+already do.
+
 ## Kubernetes Processing
 
 Process global rasters in parallel using Kubernetes:
