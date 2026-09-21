@@ -4165,19 +4165,198 @@ class TestExactextractWritesToDisk:
         A cell boundary is far larger than the statistic it describes, and at
         100k cells a chunk that would be the dominant term in the parts.
         """
-        from cng_datasets.raster.cog import _exact_extract_to_parquet, _boundary_wkt_for
+        from cng_datasets.raster.cog import _exact_extract_to_parquet
         monkeypatch.setenv("CNG_HEX_GDAL_WRITER", "1")
         con = duckdb.connect()
         con.execute("INSTALL h3 FROM community; LOAD h3;")
         ids = [r[0] for r in con.execute(
             "SELECT UNNEST(h3_cell_to_children(h3_latlng_to_cell(37.5, -122.2, 2), 6))"
         ).fetchall()][:200]
-        part = _exact_extract_to_parquet(
-            raster, "mean", _boundary_wkt_for(ids), temp_dir, 0)
+        # Cell ids, not (id, wkt) pairs: the worker builds its own geometry
+        # in DuckDB now.
+        part = _exact_extract_to_parquet(raster, "mean", ids, temp_dir, 0)
         assert part is not None
         columns = [r[0] for r in con.execute(
             f"SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet('{part}'))"
         ).fetchall()]
         assert columns == ["h", "value"], columns
-        assert not glob.glob(os.path.join(temp_dir, "raw-*")), \
-            "the intermediate GDAL output was left behind"
+        for pattern in ("raw-*", "cells-*"):
+            assert not glob.glob(os.path.join(temp_dir, pattern)), \
+                f"an intermediate ({pattern}) was left behind"
+
+
+@requires_gdal
+class TestChunkVecBuiltInDuckDB:
+    """
+    The worker builds its cells in DuckDB, straight to a file (issue #173).
+
+    Measured on a 100,000-cell chunk, the route this replaces cost ~201 MiB
+    per chunk per worker — 125 MiB of boundary WKT strings, 32 MiB of shapely
+    objects, 35 MiB of GeoDataFrame — about 2.1 KB per cell, and the largest
+    per-worker term left after the accumulation was moved out.
+
+    The antimeridian is the exception and keeps the tested path: a cell with
+    vertices either side of +/-180 has a planar polygon that is a ~360-degree
+    ribbon, and integrating that instead of the cell's true footprint is
+    issue #88. Those are split with shapely as before, as a second vec source.
+
+    None of this needs the Parquet driver the GDAL *writer* needs, so unlike
+    those tests these run everywhere.
+    """
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def con(self):
+        c = duckdb.connect()
+        for ext in ("spatial", "h3"):
+            try:
+                c.execute(f"LOAD {ext}")
+            except duckdb.Error:
+                c.execute(f"INSTALL {ext}" + (" FROM community" if ext == "h3" else ""))
+                c.execute(f"LOAD {ext}")
+        return c
+
+    def _raster(self, temp_dir, bbox, name="r.tif", px=256):
+        xmin, ymin, xmax, ymax = bbox
+        path = os.path.join(temp_dir, name)
+        ds = gdal.GetDriverByName("GTiff").Create(path, px, px, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([xmin, (xmax - xmin) / px, 0, ymax, 0, -(ymax - ymin) / px])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:px, 0:px]
+        ds.GetRasterBand(1).WriteArray((yy * px + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _in_memory_vec(self, ids):
+        """The construction this replaces, kept here as the reference."""
+        import geopandas as gpd
+        from shapely import wkt as shapely_wkt
+        from cng_datasets.raster.cog import _boundary_wkt_for, _split_antimeridian
+        cells = _boundary_wkt_for(ids)
+        return gpd.GeoDataFrame(
+            {
+                "_h3_str": [str(h) for h, _ in cells],
+                "geometry": [_split_antimeridian(shapely_wkt.loads(w))
+                             for _, w in cells],
+            },
+            crs="EPSG:4326",
+        )
+
+    def _extract(self, raster, vec):
+        from exactextract import exact_extract
+        out = exact_extract(rast=raster, vec=vec, ops=["mean"],
+                            include_cols=["_h3_str"], output="pandas")
+        col = [c for c in out.columns if c == "mean" or c.endswith("_mean")][0]
+        # Not itertuples(): pandas renames a leading-underscore column.
+        return dict(zip(out["_h3_str"], out[col]))
+
+    @pytest.mark.timeout(300)
+    def test_a_numpy_chunk_is_accepted(self, temp_dir, con):
+        """
+        The parent hands workers a numpy view of its cell array, never a list.
+        `not array` raises for anything longer than one element, so any guard
+        on the way in has to use len().
+        """
+        from cng_datasets.raster.cog import _chunk_vec_sources
+        ids = np.array([r[0] for r in con.execute(
+            "SELECT UNNEST(h3_cell_to_children("
+            "h3_latlng_to_cell(37.7, -122.4, 5), 7))").fetchall()],
+            dtype=np.uint64)
+        assert len(ids) > 1
+        sources, _ = _chunk_vec_sources(ids, temp_dir, 0)
+        assert len(sources) == 1
+
+    @pytest.mark.timeout(300)
+    def test_a_plain_chunk_becomes_one_file(self, temp_dir, con):
+        from cng_datasets.raster.cog import _chunk_vec_sources
+        ids = [r[0] for r in con.execute(
+            "SELECT UNNEST(h3_cell_to_children("
+            "h3_latlng_to_cell(37.7, -122.4, 4), 7))").fetchall()]
+        sources, cleanup = _chunk_vec_sources(ids, temp_dir, 0)
+        assert len(sources) == 1, "a mid-latitude chunk needs no seam source"
+        suffix, vec = sources[0]
+        assert suffix == "" and isinstance(vec, str) and vec.endswith(".fgb")
+        assert cleanup == [vec]
+
+        from osgeo import ogr
+        ds = ogr.Open(vec)
+        layer = ds.GetLayer()
+        assert layer.GetFeatureCount() == len(ids)
+        names = [layer.GetLayerDefn().GetFieldDefn(i).GetName()
+                 for i in range(layer.GetLayerDefn().GetFieldCount())]
+        assert names == ["_h3_str"], names
+        ds = None
+
+    @pytest.mark.timeout(300)
+    def test_straddling_cells_go_to_a_second_source(self, temp_dir, con):
+        """
+        The seam cells must not reach the bulk file, where they would be
+        written as their unsplit ~360-degree ribbon.
+        """
+        from cng_datasets.raster.cog import _chunk_vec_sources
+        # An antimeridian h0; some of its res-3 children wrap +/-180.
+        ids = [r[0] for r in con.execute(
+            "SELECT UNNEST(h3_cell_to_children(577375545977733119, 3))").fetchall()]
+        sources, _ = _chunk_vec_sources(ids, temp_dir, 0)
+        assert len(sources) == 2, "expected a bulk source and a seam source"
+        suffixes = [s for s, _ in sources]
+        assert suffixes == ["", "-seam"]
+
+        seam = sources[1][1]
+        assert len(seam) > 0
+        # Split, not the raw ribbon. A correctly split geometry has parts
+        # against both edges of the dateline, so its own bounds legitimately
+        # run -180..180 — it is each PART that must be narrow.
+        assert (seam.geometry.geom_type == "MultiPolygon").any()
+        for geometry in seam.geometry:
+            parts = getattr(geometry, "geoms", [geometry])
+            for part in parts:
+                minx, _, maxx, _ = part.bounds
+                assert maxx - minx <= 180, (
+                    "a seam geometry still spans the globe; it was not split"
+                )
+
+        from osgeo import ogr
+        ds = ogr.Open(sources[0][1])
+        assert ds.GetLayer().GetFeatureCount() == len(ids) - len(seam)
+        ds = None
+
+    @pytest.mark.timeout(600)
+    @pytest.mark.parametrize("name,lat,lon,res,bbox", [
+        ("midlatitude", 37.7, -122.4, 7, (-123.0, 37.0, -121.5, 38.4)),
+        # An h0 on the seam, with a raster that reaches the cells that wrap it.
+        ("antimeridian", 34.7, 169.2, 3, (176.0, 28.0, 180.0, 40.0)),
+    ])
+    def test_the_values_match_the_in_memory_construction(
+            self, temp_dir, con, name, lat, lon, res, bbox):
+        """
+        The gate: where the geometry was built must not change the numbers.
+
+        This does not need the Parquet driver, so it runs everywhere — unlike
+        the writer equivalence, which only runs in the runtime image.
+        """
+        from cng_datasets.raster.cog import _chunk_vec_sources
+        raster = self._raster(temp_dir, bbox, f"{name}.tif")
+        parent = con.execute(
+            f"SELECT h3_latlng_to_cell({lat}, {lon}, {res - 3})").fetchone()[0]
+        ids = [r[0] for r in con.execute(
+            f"SELECT UNNEST(h3_cell_to_children({parent}, {res}))").fetchall()]
+
+        reference = self._extract(raster, self._in_memory_vec(ids))
+        sources, _ = _chunk_vec_sources(ids, temp_dir, 0)
+        built = {}
+        for _, vec in sources:
+            built.update(self._extract(raster, vec))
+
+        assert set(built) == set(reference), "different cells were aggregated"
+        covered = [k for k, v in reference.items() if v == v and v is not None]
+        assert covered, "fixture error: the raster covers none of these cells"
+        for key in covered:
+            assert built[key] == pytest.approx(reference[key], rel=1e-12), key

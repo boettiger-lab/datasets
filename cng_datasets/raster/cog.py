@@ -167,11 +167,15 @@ def _worker_con():
     global _BOUNDARY_CON
     if _BOUNDARY_CON is None:
         con = duckdb.connect(':memory:')
-        try:
-            con.execute("LOAD h3")
-        except duckdb.Error:
-            con.execute("INSTALL h3 FROM community")
-            con.execute("LOAD h3")
+        # spatial as well as h3: the worker builds its own chunk's cell
+        # boundaries and writes them through GDAL, so it needs the geometry
+        # functions and the GDAL copy format (issue #173).
+        for extension, source in (("h3", " FROM community"), ("spatial", "")):
+            try:
+                con.execute(f"LOAD {extension}")
+            except duckdb.Error:
+                con.execute(f"INSTALL {extension}{source}")
+                con.execute(f"LOAD {extension}")
         # Bound it, and bound it small. This connection resolves boundaries and
         # writes one part per chunk — kilobytes of working set — but a worker
         # handles many chunks in its lifetime and DuckDB does not return its
@@ -233,16 +237,75 @@ def _exact_extract_chunk(args):
     raster_path, op_name, chunk_ids, out_dir, index = args
     if len(chunk_ids) == 0:
         return None
-    cells = _boundary_wkt_for(chunk_ids)
     if ogr_supports_parquet():
-        return _exact_extract_to_parquet(raster_path, op_name, cells, out_dir, index)
-    frame = _exact_extract_cells(raster_path, op_name, cells)
+        return _exact_extract_to_parquet(raster_path, op_name, chunk_ids,
+                                         out_dir, index)
+    frame = _exact_extract_cells(raster_path, op_name,
+                                 _boundary_wkt_for(chunk_ids))
     if frame is None or len(frame) == 0:
         return None
     return _write_chunk_part(frame, op_name, out_dir, index)
 
 
-def _exact_extract_to_parquet(raster_path, op_name, chunk_cells, out_dir, index):
+def _chunk_vec_sources(chunk_ids, out_dir, index):
+    """`(sources, cleanup)` — what to hand exactextract as its `vec`.
+
+    Builds the chunk's cell boundaries **in DuckDB, straight to a file GDAL can
+    read**, so this process never holds a geometry at all. Measured on a
+    100,000-cell chunk, the route it replaces cost ~201 MiB — 125 MiB of
+    boundary WKT strings, 32 MiB of shapely objects and 35 MiB of GeoDataFrame,
+    about 2.1 KB per cell, in every worker, for every chunk (issue #173).
+
+    The exception is the antimeridian. A cell with vertices either side of
+    +/-180 has a planar polygon that is a ~360-degree ribbon, and integrating
+    that rather than the cell's true footprint is issue #88. Splitting it into
+    a MultiPolygon is done with shapely, as it always has been, on the handful
+    of cells that need it — at resolution 8 that is ~2,300 of an h0's 5.7M, and
+    for most h0s none at all. So the bulk of the chunk takes the cheap path and
+    the hard case keeps the tested one, as two vec sources over the same ops.
+    """
+    con = _worker_con()
+    values = ",".join(f"({int(c)}::UBIGINT)" for c in chunk_ids)
+    # Deliberately a CTE rather than a temp table. A table would hold every
+    # geometry in the chunk at once, which is the cost this is here to avoid;
+    # expressed inline, DuckDB pipelines generate -> filter -> write and keeps
+    # only what is in flight. The boundary is computed twice, once per
+    # statement, which is cheap next to holding 100,000 polygons.
+    cells_cte = (f"SELECT cell, ST_GeomFromText(h3_cell_to_boundary_wkt(cell)) AS geom "
+                 f"FROM (VALUES {values}) t(cell)")
+    straddles = "ST_XMax(geom) - ST_XMin(geom) > 180"
+
+    sources, cleanup = [], []
+    vec = os.path.join(out_dir, f"cells-{index}.fgb")
+    con.execute(f"""
+        COPY (
+            WITH cells AS ({cells_cte})
+            SELECT cell::VARCHAR AS _h3_str, geom FROM cells WHERE NOT ({straddles})
+        ) TO '{vec}' (FORMAT GDAL, DRIVER 'FlatGeobuf', SRS 'EPSG:4326')
+    """)
+    if os.path.exists(vec):
+        sources.append(("", vec))
+        cleanup.append(vec)
+
+    seam = con.execute(f"""
+        WITH cells AS ({cells_cte})
+        SELECT cell, ST_AsText(geom) FROM cells WHERE {straddles}
+    """).fetchall()
+    if seam:
+        import geopandas as gpd
+        from shapely import wkt as shapely_wkt
+        sources.append(("-seam", gpd.GeoDataFrame(
+            {
+                "_h3_str": [str(cell) for cell, _ in seam],
+                "geometry": [_split_antimeridian(shapely_wkt.loads(wkt))
+                             for _, wkt in seam],
+            },
+            crs="EPSG:4326",
+        )))
+    return sources, cleanup
+
+
+def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
     """Aggregate one chunk with exactextract writing straight to disk.
 
     exactextract is C++ and can serialise its results through GDAL itself, so
@@ -256,42 +319,50 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_cells, out_dir, index)
     columns the pandas route produces, so the two paths are
     interchangeable and the parent cannot tell which ran.
     """
-    import geopandas as gpd
-    from shapely import wkt as shapely_wkt
     from exactextract import exact_extract
 
-    if not chunk_cells:
+    # len(), not truthiness: chunk_ids is a numpy view into the parent's cell
+    # array, and `not array` raises for anything longer than one element.
+    if len(chunk_ids) == 0:
         return None
     is_fractions = op_name == "fractions"
     ops = ["unique", "frac"] if is_fractions else [op_name]
 
-    # Split cells that straddle +/-180 into a MultiPolygon so exact_extract
-    # integrates their true footprint, not a 360-deg ribbon (issue #88).
-    gdf = gpd.GeoDataFrame(
-        {
-            "_h3_str": [str(h) for h, _ in chunk_cells],
-            "geometry": [_split_antimeridian(shapely_wkt.loads(wkt))
-                         for _, wkt in chunk_cells],
-        },
-        crs="EPSG:4326",
-    )
-
     os.makedirs(out_dir, exist_ok=True)
-    raw = os.path.join(out_dir, f"raw-{index}.parquet")
-    _retry_transient_reads(
-        lambda: exact_extract(
-            rast=raster_path, vec=gdf, ops=ops, include_cols=["_h3_str"],
-            output="gdal",
-            output_options={"filename": raw, "driver": "Parquet"},
-        )
-    )
-    if not os.path.exists(raw):
+    sources, cleanup = _chunk_vec_sources(chunk_ids, out_dir, index)
+    if not sources:
         return None
+
+    raws = []
+    try:
+        for suffix, vec in sources:
+            raw = os.path.join(out_dir, f"raw-{index}{suffix}.parquet")
+            _retry_transient_reads(
+                lambda vec=vec, raw=raw: exact_extract(
+                    rast=raster_path, vec=vec, ops=ops, include_cols=["_h3_str"],
+                    output="gdal",
+                    output_options={"filename": raw, "driver": "Parquet"},
+                )
+            )
+            if os.path.exists(raw):
+                raws.append(raw)
+    finally:
+        for path in cleanup:
+            if os.path.exists(path):
+                os.remove(path)
+    if not raws:
+        return None
+    def quoted(path):
+        return "'" + path.replace("'", "''") + "'"
+
+    raw = "[" + ", ".join(quoted(r) for r in raws) + "]"
 
     con = _worker_con()
     try:
+        # All sources ran the same ops, so one file's schema describes them all.
         columns = [r[0] for r in con.execute(
-            f"SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet('{raw}'))"
+            f"SELECT column_name FROM (DESCRIBE SELECT * FROM "
+            f"read_parquet({quoted(raws[0])}))"
         ).fetchall()]
         path = os.path.join(out_dir, f"part-{index}.parquet")
         if is_fractions:
@@ -302,7 +373,7 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_cells, out_dir, index)
             # used to be done with np.repeat over object arrays.
             select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
                       f'UNNEST("{ucol}") AS value, UNNEST("{fcol}") AS frac '
-                      f"FROM read_parquet('{raw}')")
+                      f"FROM read_parquet({raw})")
             # frac is the float; the class value keeps whatever type the
             # source band gave it, which is what the pandas route publishes.
             keep = _IS_A_VALUE.format(col="frac")
@@ -315,7 +386,7 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_cells, out_dir, index)
             # dataset rather than of which writer happened to be available.
             select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
                       f'CAST("{vcol}" AS DOUBLE) AS value '
-                      f"FROM read_parquet('{raw}')")
+                      f"FROM read_parquet({raw})")
             keep = _IS_A_VALUE.format(col="value")
         con.execute(
             f"COPY (SELECT * FROM ({select}) WHERE {keep}) "
@@ -325,7 +396,8 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_cells, out_dir, index)
             f"SELECT count(*) = 0 FROM read_parquet('{path}')"
         ).fetchone()[0]
     finally:
-        os.remove(raw)
+        for raw_path in raws:
+            os.remove(raw_path)
     if empty:
         os.remove(path)
         return None
@@ -2874,10 +2946,14 @@ class RasterProcessor:
         parts_glob = os.path.join(parts_dir, "part-*.parquet")
         found = sorted(glob.glob(parts_glob))
         if found != sorted(parts):
+            missing = sorted(set(parts) - set(found))
+            unexpected = sorted(set(found) - set(parts))
             raise RuntimeError(
-                f"chunk {chunk_cell}: workers reported {len(parts)} parts but "
-                f"{len(found)} are on disk at {parts_dir}. Refusing to write a "
-                f"partition from a part set that does not match the run."
+                f"chunk {chunk_cell}: the parts on disk at {parts_dir} are not "
+                f"the ones the workers reported. Refusing to write a partition "
+                f"from a part set that does not match the run.\n"
+                f"  reported but absent: {missing}\n"
+                f"  present but unreported: {unexpected}"
             )
         hex_values = (
             f"SELECT h AS {h3_col}, value AS {self.value_column}"
