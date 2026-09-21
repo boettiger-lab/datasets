@@ -4165,22 +4165,24 @@ class TestExactextractWritesToDisk:
         A cell boundary is far larger than the statistic it describes, and at
         100k cells a chunk that would be the dominant term in the parts.
         """
-        from cng_datasets.raster.cog import _exact_extract_to_parquet, _boundary_wkt_for
+        from cng_datasets.raster.cog import _exact_extract_to_parquet
         monkeypatch.setenv("CNG_HEX_GDAL_WRITER", "1")
         con = duckdb.connect()
         con.execute("INSTALL h3 FROM community; LOAD h3;")
         ids = [r[0] for r in con.execute(
             "SELECT UNNEST(h3_cell_to_children(h3_latlng_to_cell(37.5, -122.2, 2), 6))"
         ).fetchall()][:200]
-        part = _exact_extract_to_parquet(
-            raster, "mean", _boundary_wkt_for(ids), temp_dir, 0)
+        # Cell ids, not (id, wkt) pairs: the worker builds its own geometry
+        # in DuckDB now.
+        part = _exact_extract_to_parquet(raster, "mean", ids, temp_dir, 0)
         assert part is not None
         columns = [r[0] for r in con.execute(
             f"SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet('{part}'))"
         ).fetchall()]
         assert columns == ["h", "value"], columns
-        assert not glob.glob(os.path.join(temp_dir, "raw-*")), \
-            "the intermediate GDAL output was left behind"
+        for pattern in ("raw-*", "cells-*"):
+            assert not glob.glob(os.path.join(temp_dir, pattern)), \
+                f"an intermediate ({pattern}) was left behind"
 
 
 @requires_gdal
