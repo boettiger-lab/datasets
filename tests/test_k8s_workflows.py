@@ -1807,6 +1807,40 @@ class TestHexWorkerSizing:
             assert c["resources"]["requests"]["cpu"] == "4"
 
     @pytest.mark.timeout(5)
+    def test_duckdb_is_bounded_by_the_pod_not_the_host(self, monkeypatch):
+        """
+        The hex step's own DuckDB writes the partition by scanning the parts
+        its workers produced. Unset, DuckDB sizes its buffer manager from the
+        *host's* RAM — inside a pod that is neither the pod's limit nor
+        anything the manifest asked for, so the scan grows with the chunk's
+        cell count until the cgroup kills it (issue #173).
+
+        85% rather than 100% because memory_limit bounds the buffer manager,
+        not the process: a limit equal to the cgroup's trades a spill for an
+        OOMKill (issue #217). And in DuckDB's spelling, since `16Gi` is a
+        parser error there.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = self._hex_container(tmpdir, monkeypatch, hex_memory="16Gi")
+            limit = self._env(c, "DUCKDB_MEMORY_LIMIT")
+            assert limit is not None, "hex pods must bound their DuckDB"
+            assert limit.endswith("GiB"), f"k8s spelling leaked through: {limit}"
+            assert limit == "13GiB", limit
+            assert c["resources"]["limits"]["memory"] == "16Gi"
+
+    @pytest.mark.timeout(5)
+    def test_gdal_cache_is_bounded_per_worker(self, monkeypatch):
+        """
+        GDAL's block cache is per process and defaults to 5% of the *host's*
+        RAM — 12.6 GiB each on a 251 GiB node, in every worker the pod runs.
+        The preprocess-cog step has always bounded it; the hex step, which is
+        the one that runs many processes, never did (issue #173).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = self._hex_container(tmpdir, monkeypatch)
+            assert self._env(c, "GDAL_CACHEMAX") == "512"
+
+    @pytest.mark.timeout(5)
     def test_explicit_workers_override_the_cpu_default(self, monkeypatch):
         with tempfile.TemporaryDirectory() as tmpdir:
             c = self._hex_container(tmpdir, monkeypatch, hex_workers=8)

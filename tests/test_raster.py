@@ -3646,3 +3646,334 @@ class TestSerialRunHonoursH0Subset:
         proc = self._processor(raster, temp_dir, grid, chunk_resolution=2)
         with pytest.raises(ValueError, match="chunk_index"):
             proc.process_all_h0_regions()
+
+
+@requires_gdal
+class TestChunkPartsAccumulation:
+    """
+    Workers write parquet parts; the parent holds nothing (issue #173).
+
+    The rows used to come back as pandas frames, be held in a list, and be
+    `pd.concat`-ed — which allocates the result while the inputs are still
+    referenced, so the process peaked at ~2x the accumulated size at exactly
+    its largest moment. exactextract can only emit pandas, GeoJSON or an OGR
+    datasource, so a frame per chunk is unavoidable; keeping all of them was
+    not. What the existing aggregation tests cover is that the *values* did
+    not move; what these cover is the mechanism.
+    """
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        path = os.path.join(temp_dir, "r.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 64, 64, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-122.5, 0.01, 0, 37.75, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:64, 0:64]
+        ds.GetRasterBand(1).WriteArray((yy * 64 + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _processor(self, raster, temp_dir, name="out"):
+        from cng_datasets.raster import RasterProcessor
+        return RasterProcessor(
+            input_path=raster, output_parquet_path=os.path.join(temp_dir, name),
+            h3_resolution=6, parent_resolutions=[0], value_column="v",
+        )
+
+    @pytest.mark.timeout(300)
+    def test_parts_are_cleaned_up(self, raster, temp_dir):
+        """A pod that runs many chunks must not accumulate their parts."""
+        proc = self._processor(raster, temp_dir)
+        h0 = proc.con.execute(
+            "SELECT h3_latlng_to_cell(37.4, -122.2, 0)").fetchone()[0]
+        assert proc._hex_aggregate_h0(h0) is not None
+        leftover = glob.glob(os.path.join(tempfile.gettempdir(), "cng_hex_parts_*"))
+        assert leftover == [], f"parts directories left behind: {leftover}"
+
+    @pytest.mark.timeout(300)
+    def test_a_part_set_that_does_not_match_the_run_is_refused(
+            self, raster, temp_dir, monkeypatch):
+        """
+        The partition is read by glob, so it must be checked against what the
+        workers reported. A scan that silently picks up a different set of
+        files than the run produced would write a valid parquet of the wrong
+        size — the #208 failure, in a place with nothing to notice it.
+        """
+        import cng_datasets.raster.cog as cog
+        proc = self._processor(raster, temp_dir, "mismatch")
+        h0 = proc.con.execute(
+            "SELECT h3_latlng_to_cell(37.4, -122.2, 0)").fetchone()[0]
+
+        real = cog._exact_extract_chunk
+
+        def claims_an_extra_part(args):
+            written = real(args)
+            # Report a part that was never written.
+            return written if written is None else written + ".missing"
+
+        monkeypatch.setattr(cog, "_exact_extract_chunk", claims_an_extra_part)
+        with pytest.raises(RuntimeError, match="does not match the run"):
+            proc._hex_aggregate_h0(h0)
+
+
+class TestPeakMemoryReporting:
+    """
+    Every aggregation prints the model's prediction beside the real peak
+    (issue #173), so the constants are corrected by production rather than by
+    argument — they were fitted on one machine, with one reducer.
+    """
+
+    @pytest.mark.timeout(30)
+    def test_an_unbounded_cgroup_is_not_treated_as_this_workload(self, monkeypatch):
+        """
+        Outside a container, /sys/fs/cgroup is the host's own and its peak is
+        every process on the machine. Read naively it reported 73 GiB for a
+        step that used 1.5, which is worse than reporting nothing.
+        """
+        import builtins, io
+        import cng_datasets.raster.cog as cog
+        real_open = builtins.open
+        files = {"/sys/fs/cgroup/memory.max": "max",
+                 "/sys/fs/cgroup/memory.peak": str(78 * 2 ** 30),
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes": str(2 ** 63 - 1),
+                 "/sys/fs/cgroup/memory/memory.max_usage_in_bytes": str(78 * 2 ** 30)}
+
+        def fake_open(path, *a, **k):
+            if str(path) in files:
+                return io.StringIO(files[str(path)])
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        value, source = cog._peak_memory_bytes()
+        assert source != "cgroup", "an unbounded cgroup must not be quoted"
+        assert value < 78 * 2 ** 30
+
+    @pytest.mark.timeout(30)
+    def test_a_bounded_cgroup_is_used(self, monkeypatch):
+        import builtins, io
+        import cng_datasets.raster.cog as cog
+        real_open = builtins.open
+        files = {"/sys/fs/cgroup/memory.max": str(16 * 2 ** 30),
+                 "/sys/fs/cgroup/memory.peak": str(9 * 2 ** 30)}
+
+        def fake_open(path, *a, **k):
+            if str(path) in files:
+                return io.StringIO(files[str(path)])
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        value, source = cog._peak_memory_bytes()
+        assert source == "cgroup"
+        assert value == 9 * 2 ** 30
+
+    @pytest.mark.timeout(30)
+    def test_the_line_names_both_numbers(self, capsys):
+        from cng_datasets.raster.cog import _report_memory_model
+        _report_memory_model(5_358_303, 2)
+        out = capsys.readouterr().out
+        assert "5,358,303 cells" in out
+        assert "2 workers" in out
+        assert "GiB" in out
+
+
+@requires_gdal
+class TestPartitionIntegrity:
+    """
+    Invariants every written partition must satisfy, whatever path wrote it.
+
+    The hex write path now has several: cells are enumerated pruned or whole
+    (#215), fill codes collapse through a lookup table or a materialised raster
+    (#209), results accumulate through worker-written parts (#173), and the
+    unit of work may be an h0 or a sub-chunk of one. Each of those has its own
+    equivalence test against a baseline. What this adds is the properties that
+    must hold of the *output itself* -- the ones that would make a dataset
+    wrong in a way no baseline comparison catches, because the baseline would
+    be wrong the same way.
+
+    These are the checks that were run by hand against a finished LANDFIRE
+    build (`h3_cell_to_parent(h10, 8) <> h8`, duplicate cells, fill leakage)
+    after a job that succeeded, wrote its partitions and reported healthy
+    memory while carrying 42.66% fill.
+    """
+
+    RES = 6
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        """A gradient, so a cell holding the wrong value is a wrong number."""
+        path = os.path.join(temp_dir, "grad.tif")
+        px = 96
+        ds = gdal.GetDriverByName("GTiff").Create(path, px, px, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-122.6, 0.01, 0, 37.9, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:px, 0:px]
+        ds.GetRasterBand(1).WriteArray((yy * px + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    @pytest.fixture
+    def categorical(self, temp_dir):
+        """Int16 with three fill codes — the lookup-table path (#209/#108)."""
+        path = os.path.join(temp_dir, "cat.tif")
+        px = 96
+        ds = gdal.GetDriverByName("GTiff").Create(path, px, px, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([-122.6, 0.01, 0, 37.9, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        arr = np.full((px, px), 11, dtype=np.int16)
+        arr[:, ::3] = 22
+        arr[::5, :] = -9999
+        arr[1::7, :] = -1111
+        arr[2::11, :] = 32767
+        band = ds.GetRasterBand(1)
+        band.WriteArray(arr); band.SetNoDataValue(32767)
+        ds.FlushCache(); ds = None
+        return path
+
+    def _assert_partition_is_sound(self, con, path, h0_cell, parents,
+                                   is_fractions=False):
+        """Every property a partition must have to be publishable."""
+        h3_col = f"h{self.RES}"
+        rows = con.execute(f"SELECT count(*) FROM read_parquet('{path}')").fetchone()[0]
+        assert rows > 0, "fixture error: the partition is empty"
+
+        # 1. Column types, through the shipped check rather than a restatement
+        #    of it, so the test and the runtime assertion cannot drift.
+        #    h3_cell_to_parent's return type has changed between extension
+        #    releases and both are installed unpinned (#102). `h0` is exempt by
+        #    convention: it is the hive partition key, so DuckDB takes its type
+        #    from the directory string and always reads it back signed.
+        from cng_datasets.hex_checks import assert_h3_columns_unsigned
+        assert_h3_columns_unsigned(lambda sql: con.execute(sql).fetchall(), path)
+
+        # 2. No duplicate cells. The partition is assembled from many workers'
+        #    parts, so a cell counted twice is a plausible failure and an
+        #    invisible one: the file is valid and the totals are wrong.
+        key = f"{h3_col}, value" if is_fractions else h3_col
+        dupes = con.execute(f"""
+            SELECT count(*) FROM (
+                SELECT {key} FROM read_parquet('{path}')
+                GROUP BY {key} HAVING count(*) > 1
+            )
+        """).fetchone()[0]
+        unit = "(cell, class) pairs" if is_fractions else "cells"
+        assert dupes == 0, f"{dupes} duplicated {unit}"
+
+        # 3. Every cell belongs to the h0 this partition claims to be. A stray
+        #    is what the old polygon polyfill produced (#88/#89), and the
+        #    enumeration prune walks the same hierarchy.
+        strays = con.execute(f"""
+            SELECT count(*) FROM read_parquet('{path}')
+            WHERE h3_cell_to_parent({h3_col}, 0) <> {h0_cell}::UBIGINT
+        """).fetchone()[0]
+        assert strays == 0, f"{strays} cells are not children of h0 {h0_cell}"
+
+        # 4. Parent columns are the cell's actual parents, not a stale join.
+        for parent in parents:
+            if parent >= self.RES:
+                continue
+            wrong = con.execute(f"""
+                SELECT count(*) FROM read_parquet('{path}')
+                WHERE h3_cell_to_parent({h3_col}, {parent}) <> h{parent}
+            """).fetchone()[0]
+            assert wrong == 0, f"{wrong} rows disagree with h3_cell_to_parent(.., {parent})"
+
+        # 5. No nulls where a value is the point of the row.
+        value_cols = ["value", "frac"] if is_fractions else ["value"]
+        for col in value_cols:
+            nulls = con.execute(
+                f"SELECT count(*) FROM read_parquet('{path}') WHERE {col} IS NULL"
+            ).fetchone()[0]
+            assert nulls == 0, f"{nulls} null {col}"
+        return rows
+
+    def _run(self, raster, temp_dir, name, **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        parents = kwargs.pop("parent_resolutions", [5, 0])
+        proc = RasterProcessor(
+            input_path=raster, output_parquet_path=os.path.join(temp_dir, name),
+            h3_resolution=self.RES, parent_resolutions=parents,
+            value_column="value", **kwargs,
+        )
+        h0 = proc.con.execute(
+            "SELECT h3_latlng_to_cell(37.5, -122.2, 0)").fetchone()[0]
+        out = proc._hex_aggregate_h0(h0)
+        assert out is not None, f"{name} produced no partition"
+        return proc, out, h0, parents
+
+    @pytest.mark.timeout(600)
+    @pytest.mark.parametrize("reducer", ["mean", "mode"])
+    def test_a_partition_is_sound(self, raster, temp_dir, reducer):
+        proc, out, h0, parents = self._run(
+            raster, temp_dir, f"sound_{reducer}", hex_resampling=reducer)
+        self._assert_partition_is_sound(proc.con, out, h0, parents)
+
+    @pytest.mark.timeout(600)
+    def test_a_fractions_partition_is_sound(self, raster, temp_dir):
+        """Long rows: the key is (cell, class), and frac must never be null."""
+        proc, out, h0, parents = self._run(
+            raster, temp_dir, "sound_frac", hex_resampling="fractions")
+        self._assert_partition_is_sound(proc.con, out, h0, parents,
+                                        is_fractions=True)
+
+    @pytest.mark.timeout(600)
+    def test_a_collapsed_partition_is_sound_and_carries_no_fill(
+            self, categorical, temp_dir):
+        """
+        The fill codes must be absent from the output, not merely remapped.
+
+        A build that aggregated 42.66% fill as though it were data passed
+        schema validation, completion checks and memory monitoring; a single
+        value-range query is what caught it.
+        """
+        proc, out, h0, parents = self._run(
+            categorical, temp_dir, "sound_fill", hex_resampling="mode",
+            nodata_value="-9999,-1111,32767")
+        self._assert_partition_is_sound(proc.con, out, h0, parents)
+        leaked = proc.con.execute(f"""
+            SELECT count(*) FROM read_parquet('{out}')
+            WHERE value IN (-9999, -1111, 32767)
+        """).fetchone()[0]
+        assert leaked == 0, f"{leaked} cells carry a fill code as their value"
+
+    @pytest.mark.timeout(600)
+    def test_soundness_does_not_depend_on_the_enumeration_prune(
+            self, raster, temp_dir):
+        """The prune changes which cells are visited, never what is written."""
+        from cng_datasets.raster import RasterProcessor
+        outputs = {}
+        for prune in (True, False):
+            proc = RasterProcessor(
+                input_path=raster,
+                output_parquet_path=os.path.join(temp_dir, f"prune{int(prune)}"),
+                h3_resolution=self.RES, parent_resolutions=[5, 0],
+                value_column="value",
+            )
+            proc._prune_cells = prune
+            h0 = proc.con.execute(
+                "SELECT h3_latlng_to_cell(37.5, -122.2, 0)").fetchone()[0]
+            out = proc._hex_aggregate_h0(h0)
+            assert out is not None
+            self._assert_partition_is_sound(proc.con, out, h0, [5, 0])
+            outputs[prune] = proc.con.execute(
+                f"SELECT value, h{self.RES}, h5, h0 FROM read_parquet('{out}') "
+                f"ORDER BY h{self.RES}"
+            ).fetchall()
+        assert outputs[True] == outputs[False]

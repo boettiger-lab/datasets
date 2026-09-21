@@ -1670,6 +1670,23 @@ def _generate_raster_hex_job(
                 # tuned value survives regeneration (issue #195).
                 {"name": "CNG_HEX_WORKERS", "value": str(hex_workers)},
                 {"name": "CNG_HEX_CHUNK_SIZE", "value": str(hex_chunk_size)},
+                # The hex step's own DuckDB writes the partition by scanning
+                # every part its workers produced. Unset, DuckDB sizes its
+                # buffer manager from the *host's* RAM rather than the pod's
+                # limit, so that scan grows with the chunk's cell count until
+                # the cgroup kills it; bounded, it spills instead. 85% of the
+                # pod, matching the merge and repartition steps, because
+                # memory_limit bounds the buffer manager and not the process
+                # (issue #217). In DuckDB's spelling, not Kubernetes' (#217).
+                {"name": "DUCKDB_MEMORY_LIMIT", "value": _duckdb_memory_limit(hex_memory)},
+                # GDAL's block cache is per *process* and, left alone, is sized
+                # at 5% of the host's RAM — 12.6 GiB on a 251 GiB node, in every
+                # one of the pod's workers, none of which the manifest asked
+                # for. 512 MB each keeps the whole fan-out's cache under 4 GB at
+                # the default 8 workers. The preprocess-cog step has always
+                # bounded this; the hex step, which is the one that runs many
+                # processes, never did (issue #173).
+                {"name": "GDAL_CACHEMAX", "value": "512"},
             ],
             "volumeMounts": [
                 {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
