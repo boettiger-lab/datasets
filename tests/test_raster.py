@@ -4070,6 +4070,34 @@ class TestExactextractWritesToDisk:
         with pytest.raises(RuntimeError, match="no 'mode' column"):
             _exactextract_column(["_h3_str", "mean"], "mode")
 
+    @pytest.mark.timeout(60)
+    def test_the_missing_value_predicate_excludes_nan_in_duckdb(self):
+        """
+        DuckDB defines `NaN = NaN` as TRUE, so the IEEE-754 idiom for spotting
+        a NaN silently does nothing here.
+
+        exactextract's GDAL writer reports an uncovered cell as a float NaN
+        rather than a null, and this predicate is the only thing standing
+        between that and a published partition of NaN values. Pinned as a test
+        because the first fix for it used `x = x` and changed nothing at all.
+        """
+        from cng_datasets.raster.cog import _IS_A_VALUE
+        con = duckdb.connect()
+        assert con.execute("SELECT 'nan'::DOUBLE = 'nan'::DOUBLE").fetchone()[0] is True
+
+        rows = con.execute(f"""
+            SELECT v FROM (VALUES (1.5::DOUBLE), ('nan'::DOUBLE), (NULL)) t(v)
+            WHERE {_IS_A_VALUE.format(col='v')}
+        """).fetchall()
+        assert rows == [(1.5,)]
+
+        # Integer columns must pass through it rather than raise.
+        ints = con.execute(f"""
+            SELECT v FROM (VALUES (3::INTEGER), (NULL)) t(v)
+            WHERE {_IS_A_VALUE.format(col='v')}
+        """).fetchall()
+        assert ints == [(3,)]
+
     @requires_gdal
     @pytest.mark.timeout(60)
     def test_the_override_forces_the_pandas_writer(self, monkeypatch):

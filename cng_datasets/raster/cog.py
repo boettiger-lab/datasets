@@ -123,9 +123,13 @@ _BOUNDARY_CON = None
 # A cell that exactextract found no covered pixels under carries no value, and
 # the two writers say so differently: the pandas one as a null, the GDAL one as
 # a float NaN. `IS NOT NULL` alone lets the NaN through — it is a value, not a
-# null — and publishes cells whose value is NaN. `x = x` is false for NaN and
-# true for anything else, integers included (issue #173).
-_IS_A_VALUE = "{col} IS NOT NULL AND {col} = {col}"
+# null — and publishes cells whose value is NaN.
+#
+# The IEEE-754 idiom for this, `x = x`, does NOT work here: DuckDB defines
+# NaN = NaN as TRUE so that NaN has a place in a total ordering. `isnan` is the
+# test that means what it says, and it is safe on integer columns, where it
+# returns false rather than raising (issue #173).
+_IS_A_VALUE = "{col} IS NOT NULL AND NOT isnan({col})"
 
 _OGR_PARQUET = None
 
