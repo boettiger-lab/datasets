@@ -120,6 +120,13 @@ _WORKER_DUCKDB_LIMIT = os.environ.get("CNG_HEX_WORKER_DUCKDB_LIMIT", "256MiB")
 _BOUNDARY_CON = None
 
 
+# A cell that exactextract found no covered pixels under carries no value, and
+# the two writers say so differently: the pandas one as a null, the GDAL one as
+# a float NaN. `IS NOT NULL` alone lets the NaN through — it is a value, not a
+# null — and publishes cells whose value is NaN. `x = x` is false for NaN and
+# true for anything else, integers included (issue #173).
+_IS_A_VALUE = "{col} IS NOT NULL AND {col} = {col}"
+
 _OGR_PARQUET = None
 
 
@@ -292,12 +299,12 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_cells, out_dir, index)
             select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
                       f'UNNEST("{ucol}") AS value, UNNEST("{fcol}") AS frac '
                       f"FROM read_parquet('{raw}')")
-            keep = "frac IS NOT NULL"
+            keep = _IS_A_VALUE.format(col="frac")
         else:
             vcol = _exactextract_column(columns, op_name)
             select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
                       f'"{vcol}" AS value FROM read_parquet(\'{raw}\')')
-            keep = "value IS NOT NULL"
+            keep = _IS_A_VALUE.format(col="value")
         con.execute(
             f"COPY (SELECT * FROM ({select}) WHERE {keep}) "
             f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
@@ -359,7 +366,8 @@ def _write_chunk_part(frame, op_name, out_dir, index):
     try:
         cols = (f'CAST("_h3_str" AS UBIGINT) AS h, "{value_col}" AS value'
                 + (", frac" if is_fractions else ""))
-        keep = "frac IS NOT NULL" if is_fractions else f'"{value_col}" IS NOT NULL'
+        keep = _IS_A_VALUE.format(
+            col="frac" if is_fractions else '"' + value_col + '"')
         con.execute(
             f"COPY (SELECT {cols} FROM part_frame WHERE {keep}) "
             f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"

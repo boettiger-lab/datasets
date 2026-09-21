@@ -3915,13 +3915,19 @@ class TestPartitionIntegrity:
             """).fetchone()[0]
             assert wrong == 0, f"{wrong} rows disagree with h3_cell_to_parent(.., {parent})"
 
-        # 5. No nulls where a value is the point of the row.
+        # 5. No missing values where a value is the point of the row —
+        #    including NaN, which `IS NULL` does not catch. exactextract's
+        #    GDAL writer reports an uncovered cell as a float NaN rather than
+        #    a null, so a filter that tested only for nulls published cells
+        #    whose value was NaN. Found in CI, because the writer that does
+        #    that is only available in the runtime image.
         value_cols = ["value", "frac"] if is_fractions else ["value"]
         for col in value_cols:
-            nulls = con.execute(
-                f"SELECT count(*) FROM read_parquet('{path}') WHERE {col} IS NULL"
+            missing = con.execute(
+                f"SELECT count(*) FROM read_parquet('{path}') "
+                f"WHERE {col} IS NULL OR {col} <> {col}"
             ).fetchone()[0]
-            assert nulls == 0, f"{nulls} null {col}"
+            assert missing == 0, f"{missing} rows have no {col} (null or NaN)"
         return rows
 
     def _run(self, raster, temp_dir, name, **kwargs):
