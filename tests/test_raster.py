@@ -4256,6 +4256,22 @@ class TestChunkVecBuiltInDuckDB:
         return dict(zip(out["_h3_str"], out[col]))
 
     @pytest.mark.timeout(300)
+    def test_a_numpy_chunk_is_accepted(self, temp_dir, con):
+        """
+        The parent hands workers a numpy view of its cell array, never a list.
+        `not array` raises for anything longer than one element, so any guard
+        on the way in has to use len().
+        """
+        from cng_datasets.raster.cog import _chunk_vec_sources
+        ids = np.array([r[0] for r in con.execute(
+            "SELECT UNNEST(h3_cell_to_children("
+            "h3_latlng_to_cell(37.7, -122.4, 5), 7))").fetchall()],
+            dtype=np.uint64)
+        assert len(ids) > 1
+        sources, _ = _chunk_vec_sources(ids, temp_dir, 0)
+        assert len(sources) == 1
+
+    @pytest.mark.timeout(300)
     def test_a_plain_chunk_becomes_one_file(self, temp_dir, con):
         from cng_datasets.raster.cog import _chunk_vec_sources
         ids = [r[0] for r in con.execute(

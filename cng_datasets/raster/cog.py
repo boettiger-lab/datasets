@@ -321,7 +321,9 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
     """
     from exactextract import exact_extract
 
-    if not chunk_ids:
+    # len(), not truthiness: chunk_ids is a numpy view into the parent's cell
+    # array, and `not array` raises for anything longer than one element.
+    if len(chunk_ids) == 0:
         return None
     is_fractions = op_name == "fractions"
     ops = ["unique", "frac"] if is_fractions else [op_name]
