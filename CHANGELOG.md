@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-21
+
 ### Added
 - **Every published parquet records what built it.** The hex partitions, the merged `data_0.parquet`, the vector repartition output and the GeoParquet now carry `cng_datasets_version`, `built_at`, `gdal_version`, `duckdb_version` and — when the environment sets `CNG_IMAGE` — the image, in the file's own **key-value metadata** rather than a sidecar, so the stamp survives every copy, sync and re-publish: `SELECT key, value FROM parquet_kv_metadata('…/h0=*/data_0.parquet')`. Nothing recorded this before, and generated manifests pin `…/datasets:latest`, which is rebuilt on **every push to `main`** — so the code that produced a dataset was not necessarily a released version, and there was no way to find out which. That matters when a build turns out to have been wrong: the multi-band mislabel (#214) published 384,922,346 rows of one variable documented as another, and answering "which datasets came from a version with that bug" meant correlating S3 timestamps against git history, per dataset, by hand. **A dataset with no stamp predates 0.8.0** and should be checked against 0.7.0's correctness fixes (#214, and #213/#218). The library versions are there because two of this project's sharper problems were environment-dependent rather than code-dependent — a GDAL without `WarpOptions(cutlineWKT=)` (#197) and one without OGR's Parquet driver — and neither was answerable after the fact from the dataset alone. A stamp that cannot be built is omitted rather than raised, so provenance can never be the reason a dataset fails to write
 
@@ -231,6 +233,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.8.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.0
 [0.7.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.7.0
 [0.6.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.6.0
 [0.5.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.5.0
