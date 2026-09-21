@@ -214,6 +214,18 @@ This enables:
 - Parallel processing via Kubernetes
 - Independent failure handling per region
 
+### Where the results are accumulated
+
+Each worker writes its own chunk straight to a parquet part and returns the **path**; the
+final partition is one DuckDB statement over those parts. The parent therefore holds
+nothing proportional to the cell count.
+
+It used to collect every worker's rows as a pandas frame, hold them all in a list, and
+`pd.concat` them — which allocates the result while the inputs are still referenced, so the
+process peaked at roughly twice the accumulated size at exactly its largest moment.
+exactextract can only emit pandas, GeoJSON or an OGR datasource, so a frame per chunk is
+unavoidable; holding all of them was not.
+
 ### Cost follows the raster, not the cell
 
 Within a chunk, only the cells the source can actually reach are enumerated. The chunk's
@@ -352,6 +364,24 @@ stable, since two pods of the same job can land on nodes with different core cou
 The two failure modes are not symmetric: too few workers is slower, too many is an OOM kill
 after hours of un-checkpointed work. Set `CNG_HEX_WORKERS` to pin it; generated manifests
 already do.
+
+### Everything in the pod is sized from the pod
+
+Three separate things in a hex pod default to a share of the **host**, which inside a
+container is neither the pod's limit nor anything the manifest asked for:
+
+| | default | now |
+|---|---|---|
+| worker processes | `os.cpu_count()` — the node's cores | the cgroup CPU quota, else 8 |
+| DuckDB's buffer manager | 80% of host RAM | `DUCKDB_MEMORY_LIMIT`, 85% of the pod |
+| GDAL's block cache, **per worker process** | 5% of host RAM (12.6 GiB on a 251 GiB node) | `GDAL_CACHEMAX=512` MB each |
+
+The last is the one that scales with the fan-out, because the block cache is per *process*
+and a hex pod runs many. Generated manifests set all three, so a pod's memory profile
+follows from the manifest rather than from whichever node it landed on.
+
+Bounding DuckDB also changes its behaviour under pressure from *fail* to *spill*: with a
+limit it writes to `temp_directory` instead of growing until the cgroup kills it.
 
 ## Kubernetes Processing
 

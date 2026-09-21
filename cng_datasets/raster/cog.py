@@ -7,9 +7,13 @@ to H3-indexed parquet files partitioned by h0 cells.
 
 from typing import Optional, Dict, List, Union
 import os
+import glob
 import math
+import shutil
 import tempfile
 import duckdb
+
+from ..duckdb_memory import to_duckdb_memory_limit
 from osgeo import gdal, osr
 from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
@@ -106,11 +110,42 @@ def _explode_fractions(df):
     )
 
 
+# What one worker's DuckDB may hold. Small on purpose: see _worker_con.
+_WORKER_DUCKDB_LIMIT = os.environ.get("CNG_HEX_WORKER_DUCKDB_LIMIT", "256MiB")
+
 # One DuckDB connection per worker process, reused across chunks. Creating it
 # per chunk would repeat an extension load thousands of times over a large h0
 # (282M cells / CNG_HEX_CHUNK_SIZE); ProcessPoolExecutor reuses its processes,
 # so this is created at most once per worker.
 _BOUNDARY_CON = None
+
+
+def _worker_con():
+    """This process's DuckDB connection, created once and reused.
+
+    Shared with `_boundary_wkt_for` because a worker process handles many
+    chunks and creating a connection per chunk would repeat an extension load
+    thousands of times over a large h0.
+    """
+    global _BOUNDARY_CON
+    if _BOUNDARY_CON is None:
+        con = duckdb.connect(':memory:')
+        try:
+            con.execute("LOAD h3")
+        except duckdb.Error:
+            con.execute("INSTALL h3 FROM community")
+            con.execute("LOAD h3")
+        # Bound it, and bound it small. This connection resolves boundaries and
+        # writes one part per chunk — kilobytes of working set — but a worker
+        # handles many chunks in its lifetime and DuckDB does not return its
+        # buffer pool to the OS. Unbounded it sizes that pool from the host's
+        # RAM, so a worker's RSS climbs with the *total* cells it has ever
+        # processed rather than the chunk it is holding, which is a per-cell
+        # memory term hiding in a place that looks per-chunk (issue #173).
+        con.execute(f"SET memory_limit='{_WORKER_DUCKDB_LIMIT}'")
+        con.execute("SET temp_directory='/tmp'")
+        _BOUNDARY_CON = con
+    return _BOUNDARY_CON
 
 
 def _boundary_wkt_for(h3_ids):
@@ -127,18 +162,8 @@ def _boundary_wkt_for(h3_ids):
     Uses the same `h3_cell_to_boundary_wkt` as before, so the WKT — and every
     geometry and value downstream of it — is byte-for-byte what it was.
     """
-    global _BOUNDARY_CON
-    if _BOUNDARY_CON is None:
-        con = duckdb.connect(':memory:')
-        try:
-            con.execute("LOAD h3")
-        except duckdb.Error:
-            con.execute("INSTALL h3 FROM community")
-            con.execute("LOAD h3")
-        _BOUNDARY_CON = con
-
     ids = [int(h) for h in h3_ids]
-    rows = _BOUNDARY_CON.execute(
+    rows = _worker_con().execute(
         "SELECT cell, h3_cell_to_boundary_wkt(cell) "
         "FROM (SELECT UNNEST(?::UBIGINT[]) AS cell)",
         [ids],
@@ -155,12 +180,73 @@ def _exact_extract_chunk(args):
     Top-level so it pickles cleanly across processes. Receives a primitive
     array of h3 cell ids — 8 bytes each, no boundary strings, which is what
     keeps the parent's memory off the cell count (issue #173) — derives the
-    boundaries for its own chunk, and delegates to `_exact_extract_cells`.
+    boundaries for its own chunk, and returns the **path** of a parquet part
+    rather than the rows themselves.
+
+    Returning a path is what keeps the parent's memory off the cell count for
+    good. exactextract can only emit pandas, GeoJSON or an OGR datasource, so
+    a DataFrame is unavoidable here — but it is one chunk's worth, bounded by
+    CNG_HEX_CHUNK_SIZE, and it dies with this call. What used to happen next
+    was that every chunk's frame was pickled back to the parent, held in a
+    list, and then `pd.concat`-ed — which allocates the result while the
+    inputs are still referenced, so the parent's peak doubled at exactly its
+    largest moment. Measured at ~150 bytes per cell, which on a res-10 h0 is
+    ~39 GiB: essentially the whole of that job's peak.
     """
-    raster_path, op_name, chunk_ids = args
+    raster_path, op_name, chunk_ids, out_dir, index = args
     if len(chunk_ids) == 0:
         return None
-    return _exact_extract_cells(raster_path, op_name, _boundary_wkt_for(chunk_ids))
+    frame = _exact_extract_cells(raster_path, op_name, _boundary_wkt_for(chunk_ids))
+    if frame is None or len(frame) == 0:
+        return None
+    return _write_chunk_part(frame, op_name, out_dir, index)
+
+
+def _write_chunk_part(frame, op_name, out_dir, index):
+    """Write one worker's rows to a parquet part; return the path, or None.
+
+    Columns are normalised here rather than in the parent, so the parent's
+    query does not have to know which exactextract version produced them:
+    `h` (UBIGINT), `value`, and `frac` for the fractions reducer. Rows that
+    carry no value are dropped here too, so a part is only as large as the
+    data that survives.
+    """
+    is_fractions = op_name == "fractions"
+    if is_fractions:
+        value_col = "value"
+    else:
+        # Older exactextract emits "band_1_{op}"; >= 0.3 emits bare "{op}" for
+        # a single-band raster.
+        candidates = [c for c in frame.columns
+                      if c == op_name or c.endswith(f"_{op_name}")]
+        if not candidates:
+            raise RuntimeError(
+                f"exactextract returned no '{op_name}' column; "
+                f"got {list(frame.columns)}"
+            )
+        value_col = candidates[0]
+
+    con = _worker_con()
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"part-{index}.parquet")
+    con.register("part_frame", frame)
+    try:
+        cols = (f'CAST("_h3_str" AS UBIGINT) AS h, "{value_col}" AS value'
+                + (", frac" if is_fractions else ""))
+        keep = "frac IS NOT NULL" if is_fractions else f'"{value_col}" IS NOT NULL'
+        con.execute(
+            f"COPY (SELECT {cols} FROM part_frame WHERE {keep}) "
+            f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
+        )
+        empty = con.execute(
+            f"SELECT count(*) = 0 FROM read_parquet('{path}')"
+        ).fetchone()[0]
+    finally:
+        con.unregister("part_frame")
+    if empty:
+        os.remove(path)
+        return None
+    return path
 
 
 def _exact_extract_cells(raster_path, op_name, chunk_cells):
@@ -303,6 +389,80 @@ def _cgroup_cpu_count() -> Optional[int]:
     except (FileNotFoundError, ValueError):
         pass
     return None
+
+
+# Coefficients of the peak-memory model for the hex step (issue #173):
+#
+#   peak  ~=  BASE  +  PER_WORKER x concurrent workers  +  PER_CELL x cells
+#
+# They are printed against the observed peak at the end of every aggregation
+# rather than used to decide anything, so that a wrong constant is visible in
+# production logs instead of being argued about. Measured to about +/-15%.
+_MEM_MODEL_BASE_MIB = 250.0
+_MEM_MODEL_PER_WORKER_MIB = 315.0
+_MEM_MODEL_PER_CELL_BYTES = 150.0
+
+
+def _peak_memory_bytes():
+    """`(bytes, source)` for this container's peak memory, or None.
+
+    Prefers the cgroup's own high-water mark: it covers the whole process tree
+    and is exactly what an OOM kill is measured against. `ru_maxrss` is a poor
+    substitute because RUSAGE_CHILDREN reports the largest single child rather
+    than the sum of them, so it is used only to say something rather than
+    nothing, and is labelled when it is.
+
+    The cgroup figure is the *pod's* high-water mark for its whole life, not
+    this step's — a pod that localized a COG first may have peaked there.
+    """
+    for peak_path, max_path in (
+        ("/sys/fs/cgroup/memory.peak", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            with open(max_path) as f:
+                limit = f.read().strip()
+            # An unbounded cgroup is the host's own, and its high-water mark is
+            # every process on the machine — which is how this line came to
+            # report 73 GiB for a step that used 1.5. Only a bounded cgroup is
+            # measuring this workload.
+            if limit == "max" or int(limit) >= 2 ** 62:
+                continue
+            with open(peak_path) as f:
+                return int(f.read().strip()), "cgroup"
+        except (FileNotFoundError, ValueError, PermissionError, OSError):
+            continue
+    try:
+        import resource
+        usage = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                 + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+        return usage * 1024, "rusage, largest child only"
+    except (ImportError, OSError):
+        return None
+
+
+def _report_memory_model(cells: int, workers: int) -> None:
+    """Print the model's prediction beside the peak actually reached.
+
+    Every production run is then a calibration point for the constants above,
+    which is how they should have been known in the first place: the figures
+    they were fitted to came from one machine and one reducer.
+    """
+    predicted = (_MEM_MODEL_BASE_MIB
+                 + _MEM_MODEL_PER_WORKER_MIB * workers
+                 + cells * _MEM_MODEL_PER_CELL_BYTES / 2 ** 20)
+    observed = _peak_memory_bytes()
+    line = (f"  memory: model predicts {predicted / 1024:.2f} GiB "
+            f"for {cells:,} cells × {workers} workers")
+    if observed is None:
+        print(line)
+        return
+    peak_mib = observed[0] / 2 ** 20
+    line += f"; peak was {peak_mib / 1024:.2f} GiB ({observed[1]})"
+    if predicted > 0:
+        line += f", {peak_mib / predicted:.2f}x"
+    print(line)
 
 
 def _default_hex_workers() -> int:
@@ -1851,6 +2011,27 @@ class RasterProcessor:
         con.execute("SET http_retry_wait_ms=5000")
         con.execute("SET temp_directory='/tmp'")
 
+        # Bound DuckDB, and let it spill rather than compete with the workers.
+        #
+        # Unset, DuckDB sizes its buffer manager from the *host's* RAM — 80% of
+        # it — which inside a pod is neither the pod's limit nor anything the
+        # manifest asked for. The hex step's final COPY scans every part the
+        # workers wrote, so without a limit that scan buffers in proportion to
+        # the cells in the chunk and the process grows until the cgroup kills
+        # it. With a limit it spills to temp_directory instead, which is what
+        # makes the step's memory a function of the limit rather than of the
+        # data (issue #173). The merge and repartition steps have always done
+        # this; the hex step never did.
+        requested_limit = os.environ.get("DUCKDB_MEMORY_LIMIT")
+        if requested_limit:
+            # Normalised because the value reaching here has usually passed
+            # through a Kubernetes manifest, and DuckDB rejects the k8s
+            # spelling of it (issue #217): "16Gi" is a parser error.
+            effective = to_duckdb_memory_limit(requested_limit)
+            suffix = "" if effective == requested_limit else f" (from {requested_limit})"
+            print(f"  Setting DuckDB memory_limit={effective}{suffix}")
+            con.execute(f"SET memory_limit='{effective}'")
+
         # Configure S3 credentials
         configure_s3_credentials(con)
 
@@ -2358,7 +2539,6 @@ class RasterProcessor:
         """
         import rasterio
         from concurrent.futures import ProcessPoolExecutor
-        import pandas as pd
 
         h3_col = f"h{self.h3_resolution}"
         # chunk_cell is the unit of work and defines which native cells are
@@ -2436,58 +2616,77 @@ class RasterProcessor:
             chunks = [cells_arr[i:i + chunk_size]
                       for i in range(0, len(cells_arr), chunk_size)]
 
-            args_iter = [(rast_arg, self.hex_resampling, c) for c in chunks]
+            parts_dir = os.path.join(
+                tempfile.gettempdir(), f"cng_hex_parts_{chunk_cell}_{os.getpid()}"
+            )
+            args_iter = [(rast_arg, self.hex_resampling, c, parts_dir, i)
+                         for i, c in enumerate(chunks)]
             print(
                 f"  exact_extract: {sum(len(c) for c in chunks)} cells in "
                 f"{len(chunks)} chunks (size {chunk_size}) × {n_workers} workers"
             )
 
+            # Workers return paths, not rows. The parent therefore holds
+            # nothing proportional to the cell count, and DuckDB reads the
+            # parts as one scan — streaming, and bounded by its own memory
+            # limit rather than by what fits in this process (issue #173).
+            # Only as many workers as there are chunks ever run at once, and
+            # the model below is in terms of what actually ran.
+            workers_used = min(n_workers, len(chunks))
             if n_workers == 1 or len(chunks) == 1:
-                chunk_results = [_exact_extract_chunk(a) for a in args_iter]
+                parts = [_exact_extract_chunk(a) for a in args_iter]
             else:
                 with ProcessPoolExecutor(max_workers=n_workers) as ex:
-                    chunk_results = list(ex.map(_exact_extract_chunk, args_iter))
+                    parts = list(ex.map(_exact_extract_chunk, args_iter))
 
-            chunk_results = [r for r in chunk_results if r is not None and len(r) > 0]
-            if not chunk_results:
+            parts = [p for p in parts if p]
+            if not parts:
                 print(f"  ℹ chunk {chunk_cell}: no cells produced values (all chunks empty)")
                 return None
-            results = pd.concat(chunk_results, ignore_index=True)
+
+            output_path = self._write_partition(
+                parts, parts_dir, chunk_cell, h0_cell, h3_col,
+                is_fractions, nodata_codes,
+            )
         finally:
             if vrt_path is not None and os.path.exists(vrt_path):
                 os.remove(vrt_path)
+            # Always, not only on the way out of the COPY: a chunk whose
+            # workers all found nothing returns before writing anything, and
+            # an exception anywhere above leaves the parts behind too. A pod
+            # processes many chunks, so a leak here accumulates.
+            if parts_dir is not None:
+                shutil.rmtree(parts_dir, ignore_errors=True)
 
-        results[h3_col] = results["_h3_str"].astype("uint64")
-        results = results.drop(columns=["_h3_str"])
-
-        if is_fractions:
-            # Worker already returned long (value, frac) rows; just rename the
-            # class column and drop any rows that carry no coverage fraction.
-            results = results.rename(columns={"value": self.value_column})
-            results = results[results["frac"].notna()]
-        else:
-            # exactextract column naming: older versions emit "band_1_{op}",
-            # newer versions (>=0.3) emit just "{op}" for single-band rasters.
-            op_col = [
-                c for c in results.columns
-                if c == self.hex_resampling or c.endswith(f"_{self.hex_resampling}")
-            ]
-            if not op_col:
-                raise RuntimeError(
-                    f"exactextract returned no '{self.hex_resampling}' column; "
-                    f"got {list(results.columns)}"
-                )
-            results = results.rename(columns={op_col[0]: self.value_column})
-            # Drop cells that produced no covered pixels (all-nodata under cell).
-            results = results[results[self.value_column].notna()]
-
-        if len(results) == 0:
+        if output_path is None:
             print(f"  ℹ chunk {chunk_cell}: no cells produced values (all nodata)")
             return None
 
-        # Write to DuckDB to add parent columns and emit parquet.
-        self.con.register("hex_values", results)
+        # Fail fast if the h3 extension emitted signed BIGINT parents (issue #102):
+        # the native cell column is UBIGINT, but h3_cell_to_parent's return type
+        # depends on the (unpinned) extension version. Assert per-partition since
+        # each h0 region is written by an independent job.
+        assert_h3_columns_unsigned(
+            lambda sql: self.con.execute(sql).fetchall(), output_path
+        )
 
+        written = self.con.execute(
+            f"SELECT count(*) FROM read_parquet('{output_path}')"
+        ).fetchone()[0]
+        unit = "class rows" if is_fractions else "cells"
+        print(f"  ✓ Wrote: {output_path} ({written} {unit})")
+        _report_memory_model(len(cells_arr), workers_used)
+        return output_path
+
+    def _write_partition(self, parts, parts_dir, chunk_cell, h0_cell, h3_col,
+                         is_fractions, nodata_codes):
+        """One DuckDB statement from the workers' parts to the partition.
+
+        Returns the path written, or None when every row was filtered out.
+        Nothing here is materialised in this process: the parts are a parquet
+        scan and the output is a COPY, so the parent's memory is a function of
+        DuckDB's limit rather than of the chunk's cell count (issue #173).
+        """
         parent_exprs = []
         for parent_res in sorted(self.parent_resolutions):
             if parent_res < self.h3_resolution:
@@ -2499,6 +2698,30 @@ class RasterProcessor:
 
         output_path = self._chunk_output_path(chunk_cell, h0_cell)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # The parts, renamed into the caller's vocabulary. Everything below is
+        # one DuckDB statement over a parquet scan, so no result set is
+        # materialised in this process at any point.
+        #
+        # Read by glob, but checked against the paths the workers actually
+        # reported: a scan that silently picks up a different set of files than
+        # the run produced is the failure this project has paid for most often
+        # (issue #208), and here it would be invisible — the output would be a
+        # valid parquet of the wrong size.
+        #
+        parts_glob = os.path.join(parts_dir, "part-*.parquet")
+        found = sorted(glob.glob(parts_glob))
+        if found != sorted(parts):
+            raise RuntimeError(
+                f"chunk {chunk_cell}: workers reported {len(parts)} parts but "
+                f"{len(found)} are on disk at {parts_dir}. Refusing to write a "
+                f"partition from a part set that does not match the run."
+            )
+        hex_values = (
+            f"SELECT h AS {h3_col}, value AS {self.value_column}"
+            + (", frac" if is_fractions else "")
+            + f" FROM read_parquet('{parts_glob}')"
+        )
 
         if is_fractions:
             # Keep nodata rows only for cells that also hold a real class, so the
@@ -2517,6 +2740,7 @@ class RasterProcessor:
                 )
             copy_sql = f"""
                 COPY (
+                    WITH hex_values AS ({hex_values})
                     SELECT {select_cols}
                     FROM hex_values
                     {where_sql}
@@ -2525,23 +2749,23 @@ class RasterProcessor:
         else:
             copy_sql = f"""
                 COPY (
+                    WITH hex_values AS ({hex_values})
                     SELECT {self.value_column}, {h3_col}{parent_sql}
                     FROM hex_values
                 ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
             """
         self.con.execute(copy_sql)
-        self.con.unregister("hex_values")
 
-        # Fail fast if the h3 extension emitted signed BIGINT parents (issue #102):
-        # the native cell column is UBIGINT, but h3_cell_to_parent's return type
-        # depends on the (unpinned) extension version. Assert per-partition since
-        # each h0 region is written by an independent job.
-        assert_h3_columns_unsigned(
-            lambda sql: self.con.execute(sql).fetchall(), output_path
-        )
-
-        unit = "class rows" if is_fractions else "cells"
-        print(f"  ✓ Wrote: {output_path} ({len(results)} {unit})")
+        # Counted from the file rather than from a frame we no longer hold;
+        # parquet keeps the row count in its footer, so this reads no data.
+        written = self.con.execute(
+            f"SELECT count(*) FROM read_parquet('{output_path}')"
+        ).fetchone()[0]
+        if written == 0:
+            # Every row was filtered out — an all-nodata chunk. Leave no empty
+            # partition behind for the merge to find.
+            os.remove(output_path)
+            return None
         return output_path
 
     def chunk_cells(self):

@@ -3646,3 +3646,139 @@ class TestSerialRunHonoursH0Subset:
         proc = self._processor(raster, temp_dir, grid, chunk_resolution=2)
         with pytest.raises(ValueError, match="chunk_index"):
             proc.process_all_h0_regions()
+
+
+@requires_gdal
+class TestChunkPartsAccumulation:
+    """
+    Workers write parquet parts; the parent holds nothing (issue #173).
+
+    The rows used to come back as pandas frames, be held in a list, and be
+    `pd.concat`-ed — which allocates the result while the inputs are still
+    referenced, so the process peaked at ~2x the accumulated size at exactly
+    its largest moment. exactextract can only emit pandas, GeoJSON or an OGR
+    datasource, so a frame per chunk is unavoidable; keeping all of them was
+    not. What the existing aggregation tests cover is that the *values* did
+    not move; what these cover is the mechanism.
+    """
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        path = os.path.join(temp_dir, "r.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 64, 64, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-122.5, 0.01, 0, 37.75, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:64, 0:64]
+        ds.GetRasterBand(1).WriteArray((yy * 64 + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _processor(self, raster, temp_dir, name="out"):
+        from cng_datasets.raster import RasterProcessor
+        return RasterProcessor(
+            input_path=raster, output_parquet_path=os.path.join(temp_dir, name),
+            h3_resolution=6, parent_resolutions=[0], value_column="v",
+        )
+
+    @pytest.mark.timeout(300)
+    def test_parts_are_cleaned_up(self, raster, temp_dir):
+        """A pod that runs many chunks must not accumulate their parts."""
+        proc = self._processor(raster, temp_dir)
+        h0 = proc.con.execute(
+            "SELECT h3_latlng_to_cell(37.4, -122.2, 0)").fetchone()[0]
+        assert proc._hex_aggregate_h0(h0) is not None
+        leftover = glob.glob(os.path.join(tempfile.gettempdir(), "cng_hex_parts_*"))
+        assert leftover == [], f"parts directories left behind: {leftover}"
+
+    @pytest.mark.timeout(300)
+    def test_a_part_set_that_does_not_match_the_run_is_refused(
+            self, raster, temp_dir, monkeypatch):
+        """
+        The partition is read by glob, so it must be checked against what the
+        workers reported. A scan that silently picks up a different set of
+        files than the run produced would write a valid parquet of the wrong
+        size — the #208 failure, in a place with nothing to notice it.
+        """
+        import cng_datasets.raster.cog as cog
+        proc = self._processor(raster, temp_dir, "mismatch")
+        h0 = proc.con.execute(
+            "SELECT h3_latlng_to_cell(37.4, -122.2, 0)").fetchone()[0]
+
+        real = cog._exact_extract_chunk
+
+        def claims_an_extra_part(args):
+            written = real(args)
+            # Report a part that was never written.
+            return written if written is None else written + ".missing"
+
+        monkeypatch.setattr(cog, "_exact_extract_chunk", claims_an_extra_part)
+        with pytest.raises(RuntimeError, match="does not match the run"):
+            proc._hex_aggregate_h0(h0)
+
+
+class TestPeakMemoryReporting:
+    """
+    Every aggregation prints the model's prediction beside the real peak
+    (issue #173), so the constants are corrected by production rather than by
+    argument — they were fitted on one machine, with one reducer.
+    """
+
+    @pytest.mark.timeout(30)
+    def test_an_unbounded_cgroup_is_not_treated_as_this_workload(self, monkeypatch):
+        """
+        Outside a container, /sys/fs/cgroup is the host's own and its peak is
+        every process on the machine. Read naively it reported 73 GiB for a
+        step that used 1.5, which is worse than reporting nothing.
+        """
+        import builtins, io
+        import cng_datasets.raster.cog as cog
+        real_open = builtins.open
+        files = {"/sys/fs/cgroup/memory.max": "max",
+                 "/sys/fs/cgroup/memory.peak": str(78 * 2 ** 30),
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes": str(2 ** 63 - 1),
+                 "/sys/fs/cgroup/memory/memory.max_usage_in_bytes": str(78 * 2 ** 30)}
+
+        def fake_open(path, *a, **k):
+            if str(path) in files:
+                return io.StringIO(files[str(path)])
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        value, source = cog._peak_memory_bytes()
+        assert source != "cgroup", "an unbounded cgroup must not be quoted"
+        assert value < 78 * 2 ** 30
+
+    @pytest.mark.timeout(30)
+    def test_a_bounded_cgroup_is_used(self, monkeypatch):
+        import builtins, io
+        import cng_datasets.raster.cog as cog
+        real_open = builtins.open
+        files = {"/sys/fs/cgroup/memory.max": str(16 * 2 ** 30),
+                 "/sys/fs/cgroup/memory.peak": str(9 * 2 ** 30)}
+
+        def fake_open(path, *a, **k):
+            if str(path) in files:
+                return io.StringIO(files[str(path)])
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        value, source = cog._peak_memory_bytes()
+        assert source == "cgroup"
+        assert value == 9 * 2 ** 30
+
+    @pytest.mark.timeout(30)
+    def test_the_line_names_both_numbers(self, capsys):
+        from cng_datasets.raster.cog import _report_memory_model
+        _report_memory_model(5_358_303, 2)
+        out = capsys.readouterr().out
+        assert "5,358,303 cells" in out
+        assert "2 workers" in out
+        assert "GiB" in out
