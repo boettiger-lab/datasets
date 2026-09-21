@@ -120,6 +120,32 @@ _WORKER_DUCKDB_LIMIT = os.environ.get("CNG_HEX_WORKER_DUCKDB_LIMIT", "256MiB")
 _BOUNDARY_CON = None
 
 
+_OGR_PARQUET = None
+
+
+def ogr_supports_parquet() -> bool:
+    """Whether this GDAL build can write Parquet through OGR.
+
+    Feature-detected, never assumed from the local environment. The runtime
+    image is `ghcr.io/osgeo/gdal:ubuntu-full-latest`, which ships the Arrow and
+    Parquet drivers; a distribution GDAL usually does not. Assuming either way
+    is how the `cutlineWKT` gap reached a release (issue #197) — a path that
+    worked in CI and raised TypeError on a developer's machine.
+    """
+    global _OGR_PARQUET
+    if os.environ.get("CNG_HEX_GDAL_WRITER") == "0":
+        # An escape hatch, so the two paths can be compared like for like and
+        # a suspect result can be reproduced on the older route.
+        return False
+    if _OGR_PARQUET is None:
+        try:
+            from osgeo import ogr
+            _OGR_PARQUET = ogr.GetDriverByName("Parquet") is not None
+        except Exception:
+            _OGR_PARQUET = False
+    return _OGR_PARQUET
+
+
 def _worker_con():
     """This process's DuckDB connection, created once and reused.
 
@@ -196,10 +222,110 @@ def _exact_extract_chunk(args):
     raster_path, op_name, chunk_ids, out_dir, index = args
     if len(chunk_ids) == 0:
         return None
-    frame = _exact_extract_cells(raster_path, op_name, _boundary_wkt_for(chunk_ids))
+    cells = _boundary_wkt_for(chunk_ids)
+    if ogr_supports_parquet():
+        return _exact_extract_to_parquet(raster_path, op_name, cells, out_dir, index)
+    frame = _exact_extract_cells(raster_path, op_name, cells)
     if frame is None or len(frame) == 0:
         return None
     return _write_chunk_part(frame, op_name, out_dir, index)
+
+
+def _exact_extract_to_parquet(raster_path, op_name, chunk_cells, out_dir, index):
+    """Aggregate one chunk with exactextract writing straight to disk.
+
+    exactextract is C++ and can serialise its results through GDAL itself, so
+    the rows never have to become a pandas DataFrame in this process at all.
+    `include_geom` is False, so what lands on disk is the requested statistics
+    and the cell id — no boundary polygons, which at 100k cells a chunk would
+    dwarf the values they describe.
+
+    DuckDB then normalises that file into the part the parent expects, in one
+    streaming statement: the same `h`, `value` and (for fractions) `frac`
+    columns the pandas route produces, so the two paths are
+    interchangeable and the parent cannot tell which ran.
+    """
+    import geopandas as gpd
+    from shapely import wkt as shapely_wkt
+    from exactextract import exact_extract
+
+    if not chunk_cells:
+        return None
+    is_fractions = op_name == "fractions"
+    ops = ["unique", "frac"] if is_fractions else [op_name]
+
+    # Split cells that straddle +/-180 into a MultiPolygon so exact_extract
+    # integrates their true footprint, not a 360-deg ribbon (issue #88).
+    gdf = gpd.GeoDataFrame(
+        {
+            "_h3_str": [str(h) for h, _ in chunk_cells],
+            "geometry": [_split_antimeridian(shapely_wkt.loads(wkt))
+                         for _, wkt in chunk_cells],
+        },
+        crs="EPSG:4326",
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+    raw = os.path.join(out_dir, f"raw-{index}.parquet")
+    _retry_transient_reads(
+        lambda: exact_extract(
+            rast=raster_path, vec=gdf, ops=ops, include_cols=["_h3_str"],
+            output="gdal",
+            output_options={"filename": raw, "driver": "Parquet"},
+        )
+    )
+    if not os.path.exists(raw):
+        return None
+
+    con = _worker_con()
+    try:
+        columns = [r[0] for r in con.execute(
+            f"SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet('{raw}'))"
+        ).fetchall()]
+        path = os.path.join(out_dir, f"part-{index}.parquet")
+        if is_fractions:
+            ucol = _exactextract_column(columns, "unique")
+            fcol = _exactextract_column(columns, "frac")
+            # The two lists are parallel per cell, and DuckDB unnests several
+            # lists in one projection positionally — which is the explode that
+            # used to be done with np.repeat over object arrays.
+            select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
+                      f'UNNEST("{ucol}") AS value, UNNEST("{fcol}") AS frac '
+                      f"FROM read_parquet('{raw}')")
+            keep = "frac IS NOT NULL"
+        else:
+            vcol = _exactextract_column(columns, op_name)
+            select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
+                      f'"{vcol}" AS value FROM read_parquet(\'{raw}\')')
+            keep = "value IS NOT NULL"
+        con.execute(
+            f"COPY (SELECT * FROM ({select}) WHERE {keep}) "
+            f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
+        )
+        empty = con.execute(
+            f"SELECT count(*) = 0 FROM read_parquet('{path}')"
+        ).fetchone()[0]
+    finally:
+        os.remove(raw)
+    if empty:
+        os.remove(path)
+        return None
+    return path
+
+
+def _exactextract_column(columns, op_name):
+    """The column exactextract used for *op_name* in this version's naming.
+
+    Older releases emit `band_1_{op}`; >= 0.3 emits a bare `{op}` for a
+    single-band raster. Resolved from the file's own schema rather than
+    assumed, since the raster may be multi-band on other paths.
+    """
+    for column in columns:
+        if column == op_name or column.endswith(f"_{op_name}"):
+            return column
+    raise RuntimeError(
+        f"exactextract wrote no '{op_name}' column; got {columns}"
+    )
 
 
 def _write_chunk_part(frame, op_name, out_dir, index):
@@ -262,12 +388,8 @@ def _exact_extract_cells(raster_path, op_name, chunk_cells):
     every other reducer maps to a single exactextract op and returns one row
     per cell.
 
-    Retries transient TIFF/HTTP read failures up to a few times — Ceph S3
-    occasionally returns truncated tile reads under heavy concurrent load,
-    and the partial read becomes a hard RuntimeError that would otherwise
-    kill the whole pool.
+    Retries transient TIFF/HTTP read failures via `_retry_transient_reads`.
     """
-    import time
     import geopandas as gpd
     from shapely import wkt as shapely_wkt
     from exactextract import exact_extract
@@ -290,25 +412,41 @@ def _exact_extract_cells(raster_path, op_name, chunk_cells):
         crs="EPSG:4326",
     )
 
-    max_attempts = 6
+    def run():
+        result = exact_extract(
+            rast=raster_path,
+            vec=gdf,
+            ops=ops,
+            output="pandas",
+            include_cols=["_h3_str"],
+        )
+        if not is_fractions:
+            return result
+        # exactextract column naming: bare "unique"/"frac" for single-band
+        # rasters, "band_1_unique"/… on older versions or multi-band.
+        ucol = _exactextract_column(list(result.columns), "unique")
+        fcol = _exactextract_column(list(result.columns), "frac")
+        result = result.rename(columns={ucol: "unique", fcol: "frac"})
+        return _explode_fractions(result)
+
+    return _retry_transient_reads(run)
+
+
+def _retry_transient_reads(call, max_attempts: int = 6):
+    """Run *call*, retrying the read failures that are worth retrying.
+
+    Ceph S3 occasionally returns a truncated tile read under heavy concurrent
+    load, and GDAL surfaces that as a hard RuntimeError — which, in a worker,
+    would take down the whole pool for a fault that succeeds on the next
+    attempt. Shared by both aggregation paths so they cannot acquire different
+    ideas about what is transient.
+    """
+    import time
+
     last_exc = None
     for attempt in range(max_attempts):
         try:
-            result = exact_extract(
-                rast=raster_path,
-                vec=gdf,
-                ops=ops,
-                output="pandas",
-                include_cols=["_h3_str"],
-            )
-            if not is_fractions:
-                return result
-            # exactextract column naming: bare "unique"/"frac" for single-band
-            # rasters, "band_1_unique"/… on older versions or multi-band.
-            ucol = [c for c in result.columns if c == "unique" or c.endswith("_unique")][0]
-            fcol = [c for c in result.columns if c == "frac" or c.endswith("_frac")][0]
-            result = result.rename(columns={ucol: "unique", fcol: "frac"})
-            return _explode_fractions(result)
+            return call()
         except RuntimeError as exc:
             msg = str(exc)
             msg_lower = msg.lower()

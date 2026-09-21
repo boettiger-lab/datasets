@@ -58,6 +58,26 @@ requires_cutline_wkt = pytest.mark.skipif(
 )
 
 
+def _ogr_parquet_available():
+    """Whether OGR can write Parquet, which decides which writer the hex
+    workers use. Present in the runtime image (osgeo/gdal:ubuntu-full-latest)
+    and absent from most distribution GDALs, so these two environments
+    exercise the two paths between them (issue #173)."""
+    if not GDAL_AVAILABLE:
+        return False
+    try:
+        from osgeo import ogr
+        return ogr.GetDriverByName("Parquet") is not None
+    except Exception:
+        return False
+
+
+requires_ogr_parquet = pytest.mark.skipif(
+    not _ogr_parquet_available(),
+    reason="OGR lacks the Parquet driver; exactextract writes via pandas here"
+)
+
+
 @requires_gdal_array
 class TestRasterProcessor:
     """Test the RasterProcessor class with small synthetic rasters."""
@@ -3977,3 +3997,122 @@ class TestPartitionIntegrity:
                 f"ORDER BY h{self.RES}"
             ).fetchall()
         assert outputs[True] == outputs[False]
+
+
+class TestExactextractWritesToDisk:
+    """
+    exactextract serialises through GDAL rather than through pandas (#173).
+
+    exactextract is C++ and can write its results through GDAL itself, so a
+    chunk's rows need never become a Python object in the worker at all. The
+    pandas writer remains the fallback for a GDAL without the Parquet driver,
+    which is most distribution builds — including the one these tests usually
+    run on locally. The runtime image has it, so CI exercises the other side.
+
+    `include_geom` is False, so what reaches disk is the statistics and the
+    cell id; writing the cell boundaries would dwarf the values they describe.
+    """
+
+    RES = 6
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        path = os.path.join(temp_dir, "grad.tif")
+        px = 96
+        ds = gdal.GetDriverByName("GTiff").Create(path, px, px, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-122.6, 0.01, 0, 37.9, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:px, 0:px]
+        ds.GetRasterBand(1).WriteArray((yy * px + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _rows(self, raster, temp_dir, name, reducer, monkeypatch, gdal_writer):
+        from cng_datasets.raster import RasterProcessor
+        monkeypatch.setenv("CNG_HEX_GDAL_WRITER", "1" if gdal_writer else "0")
+        proc = RasterProcessor(
+            input_path=raster, output_parquet_path=os.path.join(temp_dir, name),
+            h3_resolution=self.RES, parent_resolutions=[0], value_column="value",
+            hex_resampling=reducer,
+        )
+        h0 = proc.con.execute(
+            "SELECT h3_latlng_to_cell(37.5, -122.2, 0)").fetchone()[0]
+        out = proc._hex_aggregate_h0(h0)
+        assert out is not None, f"{name} produced no partition"
+        cols = "value, frac, h6" if reducer == "fractions" else "value, h6"
+        order = "h6, value" if reducer == "fractions" else "h6"
+        return proc.con.execute(
+            f"SELECT {cols} FROM read_parquet('{out}') ORDER BY {order}"
+        ).fetchall()
+
+    @requires_gdal
+    @pytest.mark.timeout(60)
+    def test_the_column_lookup_handles_both_naming_conventions(self):
+        """`band_1_mean` on older exactextract, bare `mean` since 0.3."""
+        from cng_datasets.raster.cog import _exactextract_column
+        assert _exactextract_column(["_h3_str", "mean"], "mean") == "mean"
+        assert _exactextract_column(
+            ["_h3_str", "band_1_mean"], "mean") == "band_1_mean"
+        with pytest.raises(RuntimeError, match="no 'mode' column"):
+            _exactextract_column(["_h3_str", "mean"], "mode")
+
+    @requires_gdal
+    @pytest.mark.timeout(60)
+    def test_the_override_forces_the_pandas_writer(self, monkeypatch):
+        from cng_datasets.raster.cog import ogr_supports_parquet
+        monkeypatch.setenv("CNG_HEX_GDAL_WRITER", "0")
+        assert ogr_supports_parquet() is False
+
+    @requires_gdal
+    @requires_ogr_parquet
+    @pytest.mark.timeout(900)
+    @pytest.mark.parametrize("reducer", ["mean", "mode", "fractions"])
+    def test_both_writers_produce_the_same_rows(self, raster, temp_dir,
+                                                monkeypatch, reducer):
+        """
+        The gate: which writer ran must not be visible in the output.
+
+        Includes `fractions`, where the two routes differ most — the pandas
+        one explodes exactextract's parallel `unique`/`frac` arrays with
+        np.repeat, and the GDAL one writes them as list columns and lets
+        DuckDB UNNEST them.
+        """
+        via_gdal = self._rows(raster, temp_dir, f"g_{reducer}", reducer,
+                              monkeypatch, gdal_writer=True)
+        via_pandas = self._rows(raster, temp_dir, f"p_{reducer}", reducer,
+                                monkeypatch, gdal_writer=False)
+        assert via_gdal, "fixture error: no rows"
+        assert via_gdal == via_pandas
+
+    @requires_gdal
+    @requires_ogr_parquet
+    @pytest.mark.timeout(900)
+    def test_no_geometry_reaches_disk(self, raster, temp_dir, monkeypatch):
+        """
+        A cell boundary is far larger than the statistic it describes, and at
+        100k cells a chunk that would be the dominant term in the parts.
+        """
+        from cng_datasets.raster.cog import _exact_extract_to_parquet, _boundary_wkt_for
+        monkeypatch.setenv("CNG_HEX_GDAL_WRITER", "1")
+        con = duckdb.connect()
+        con.execute("INSTALL h3 FROM community; LOAD h3;")
+        ids = [r[0] for r in con.execute(
+            "SELECT UNNEST(h3_cell_to_children(h3_latlng_to_cell(37.5, -122.2, 2), 6))"
+        ).fetchall()][:200]
+        part = _exact_extract_to_parquet(
+            raster, "mean", _boundary_wkt_for(ids), temp_dir, 0)
+        assert part is not None
+        columns = [r[0] for r in con.execute(
+            f"SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet('{part}'))"
+        ).fetchall()]
+        assert columns == ["h", "value"], columns
+        assert not glob.glob(os.path.join(temp_dir, "raw-*")), \
+            "the intermediate GDAL output was left behind"
