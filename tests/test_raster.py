@@ -3782,3 +3782,198 @@ class TestPeakMemoryReporting:
         assert "5,358,303 cells" in out
         assert "2 workers" in out
         assert "GiB" in out
+
+
+@requires_gdal
+class TestPartitionIntegrity:
+    """
+    Invariants every written partition must satisfy, whatever path wrote it.
+
+    The hex write path now has several: cells are enumerated pruned or whole
+    (#215), fill codes collapse through a lookup table or a materialised raster
+    (#209), results accumulate through worker-written parts (#173), and the
+    unit of work may be an h0 or a sub-chunk of one. Each of those has its own
+    equivalence test against a baseline. What this adds is the properties that
+    must hold of the *output itself* -- the ones that would make a dataset
+    wrong in a way no baseline comparison catches, because the baseline would
+    be wrong the same way.
+
+    These are the checks that were run by hand against a finished LANDFIRE
+    build (`h3_cell_to_parent(h10, 8) <> h8`, duplicate cells, fill leakage)
+    after a job that succeeded, wrote its partitions and reported healthy
+    memory while carrying 42.66% fill.
+    """
+
+    RES = 6
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.fixture
+    def raster(self, temp_dir):
+        """A gradient, so a cell holding the wrong value is a wrong number."""
+        path = os.path.join(temp_dir, "grad.tif")
+        px = 96
+        ds = gdal.GetDriverByName("GTiff").Create(path, px, px, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-122.6, 0.01, 0, 37.9, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        yy, xx = np.mgrid[0:px, 0:px]
+        ds.GetRasterBand(1).WriteArray((yy * px + xx).astype("float32"))
+        ds.FlushCache(); ds = None
+        return path
+
+    @pytest.fixture
+    def categorical(self, temp_dir):
+        """Int16 with three fill codes — the lookup-table path (#209/#108)."""
+        path = os.path.join(temp_dir, "cat.tif")
+        px = 96
+        ds = gdal.GetDriverByName("GTiff").Create(path, px, px, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform([-122.6, 0.01, 0, 37.9, 0, -0.01])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+        arr = np.full((px, px), 11, dtype=np.int16)
+        arr[:, ::3] = 22
+        arr[::5, :] = -9999
+        arr[1::7, :] = -1111
+        arr[2::11, :] = 32767
+        band = ds.GetRasterBand(1)
+        band.WriteArray(arr); band.SetNoDataValue(32767)
+        ds.FlushCache(); ds = None
+        return path
+
+    def _assert_partition_is_sound(self, con, path, h0_cell, parents,
+                                   is_fractions=False):
+        """Every property a partition must have to be publishable."""
+        h3_col = f"h{self.RES}"
+        rows = con.execute(f"SELECT count(*) FROM read_parquet('{path}')").fetchone()[0]
+        assert rows > 0, "fixture error: the partition is empty"
+
+        # 1. Column types, through the shipped check rather than a restatement
+        #    of it, so the test and the runtime assertion cannot drift.
+        #    h3_cell_to_parent's return type has changed between extension
+        #    releases and both are installed unpinned (#102). `h0` is exempt by
+        #    convention: it is the hive partition key, so DuckDB takes its type
+        #    from the directory string and always reads it back signed.
+        from cng_datasets.hex_checks import assert_h3_columns_unsigned
+        assert_h3_columns_unsigned(lambda sql: con.execute(sql).fetchall(), path)
+
+        # 2. No duplicate cells. The partition is assembled from many workers'
+        #    parts, so a cell counted twice is a plausible failure and an
+        #    invisible one: the file is valid and the totals are wrong.
+        key = f"{h3_col}, value" if is_fractions else h3_col
+        dupes = con.execute(f"""
+            SELECT count(*) FROM (
+                SELECT {key} FROM read_parquet('{path}')
+                GROUP BY {key} HAVING count(*) > 1
+            )
+        """).fetchone()[0]
+        unit = "(cell, class) pairs" if is_fractions else "cells"
+        assert dupes == 0, f"{dupes} duplicated {unit}"
+
+        # 3. Every cell belongs to the h0 this partition claims to be. A stray
+        #    is what the old polygon polyfill produced (#88/#89), and the
+        #    enumeration prune walks the same hierarchy.
+        strays = con.execute(f"""
+            SELECT count(*) FROM read_parquet('{path}')
+            WHERE h3_cell_to_parent({h3_col}, 0) <> {h0_cell}::UBIGINT
+        """).fetchone()[0]
+        assert strays == 0, f"{strays} cells are not children of h0 {h0_cell}"
+
+        # 4. Parent columns are the cell's actual parents, not a stale join.
+        for parent in parents:
+            if parent >= self.RES:
+                continue
+            wrong = con.execute(f"""
+                SELECT count(*) FROM read_parquet('{path}')
+                WHERE h3_cell_to_parent({h3_col}, {parent}) <> h{parent}
+            """).fetchone()[0]
+            assert wrong == 0, f"{wrong} rows disagree with h3_cell_to_parent(.., {parent})"
+
+        # 5. No nulls where a value is the point of the row.
+        value_cols = ["value", "frac"] if is_fractions else ["value"]
+        for col in value_cols:
+            nulls = con.execute(
+                f"SELECT count(*) FROM read_parquet('{path}') WHERE {col} IS NULL"
+            ).fetchone()[0]
+            assert nulls == 0, f"{nulls} null {col}"
+        return rows
+
+    def _run(self, raster, temp_dir, name, **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        parents = kwargs.pop("parent_resolutions", [5, 0])
+        proc = RasterProcessor(
+            input_path=raster, output_parquet_path=os.path.join(temp_dir, name),
+            h3_resolution=self.RES, parent_resolutions=parents,
+            value_column="value", **kwargs,
+        )
+        h0 = proc.con.execute(
+            "SELECT h3_latlng_to_cell(37.5, -122.2, 0)").fetchone()[0]
+        out = proc._hex_aggregate_h0(h0)
+        assert out is not None, f"{name} produced no partition"
+        return proc, out, h0, parents
+
+    @pytest.mark.timeout(600)
+    @pytest.mark.parametrize("reducer", ["mean", "mode"])
+    def test_a_partition_is_sound(self, raster, temp_dir, reducer):
+        proc, out, h0, parents = self._run(
+            raster, temp_dir, f"sound_{reducer}", hex_resampling=reducer)
+        self._assert_partition_is_sound(proc.con, out, h0, parents)
+
+    @pytest.mark.timeout(600)
+    def test_a_fractions_partition_is_sound(self, raster, temp_dir):
+        """Long rows: the key is (cell, class), and frac must never be null."""
+        proc, out, h0, parents = self._run(
+            raster, temp_dir, "sound_frac", hex_resampling="fractions")
+        self._assert_partition_is_sound(proc.con, out, h0, parents,
+                                        is_fractions=True)
+
+    @pytest.mark.timeout(600)
+    def test_a_collapsed_partition_is_sound_and_carries_no_fill(
+            self, categorical, temp_dir):
+        """
+        The fill codes must be absent from the output, not merely remapped.
+
+        A build that aggregated 42.66% fill as though it were data passed
+        schema validation, completion checks and memory monitoring; a single
+        value-range query is what caught it.
+        """
+        proc, out, h0, parents = self._run(
+            categorical, temp_dir, "sound_fill", hex_resampling="mode",
+            nodata_value="-9999,-1111,32767")
+        self._assert_partition_is_sound(proc.con, out, h0, parents)
+        leaked = proc.con.execute(f"""
+            SELECT count(*) FROM read_parquet('{out}')
+            WHERE value IN (-9999, -1111, 32767)
+        """).fetchone()[0]
+        assert leaked == 0, f"{leaked} cells carry a fill code as their value"
+
+    @pytest.mark.timeout(600)
+    def test_soundness_does_not_depend_on_the_enumeration_prune(
+            self, raster, temp_dir):
+        """The prune changes which cells are visited, never what is written."""
+        from cng_datasets.raster import RasterProcessor
+        outputs = {}
+        for prune in (True, False):
+            proc = RasterProcessor(
+                input_path=raster,
+                output_parquet_path=os.path.join(temp_dir, f"prune{int(prune)}"),
+                h3_resolution=self.RES, parent_resolutions=[5, 0],
+                value_column="value",
+            )
+            proc._prune_cells = prune
+            h0 = proc.con.execute(
+                "SELECT h3_latlng_to_cell(37.5, -122.2, 0)").fetchone()[0]
+            out = proc._hex_aggregate_h0(h0)
+            assert out is not None
+            self._assert_partition_is_sound(proc.con, out, h0, [5, 0])
+            outputs[prune] = proc.con.execute(
+                f"SELECT value, h{self.RES}, h5, h0 FROM read_parquet('{out}') "
+                f"ORDER BY h{self.RES}"
+            ).fetchall()
+        assert outputs[True] == outputs[False]
