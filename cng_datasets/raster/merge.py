@@ -19,6 +19,8 @@ import shutil
 import subprocess
 from typing import List, Optional
 
+from ..provenance import kv_metadata_sql
+
 import ibis
 import yaml
 
@@ -205,7 +207,7 @@ def merge_raster_chunks(
             f"COPY (SELECT * EXCLUDE (h0) FROM "
             f"read_parquet('{chunks_dir.rstrip('/')}/h0={h0}/part-*.parquet', "
             f"hive_partitioning=true)) "
-            f"TO '{local_file}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+            f"TO '{local_file}' (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
         )
 
         if rclone_output:

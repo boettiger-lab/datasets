@@ -14,6 +14,7 @@ import tempfile
 import duckdb
 
 from ..duckdb_memory import to_duckdb_memory_limit
+from ..provenance import kv_metadata_sql
 from osgeo import gdal, osr
 from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
@@ -2932,6 +2933,8 @@ class RasterProcessor:
 
         output_path = self._chunk_output_path(chunk_cell, h0_cell)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        # What built this, recorded in the partition itself (provenance.py).
+        stamp = kv_metadata_sql()
 
         # The parts, renamed into the caller's vocabulary. Everything below is
         # one DuckDB statement over a parquet scan, so no result set is
@@ -2982,7 +2985,7 @@ class RasterProcessor:
                     SELECT {select_cols}
                     FROM hex_values
                     {where_sql}
-                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
+                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd'{stamp})
             """
         else:
             copy_sql = f"""
@@ -2990,7 +2993,7 @@ class RasterProcessor:
                     WITH hex_values AS ({hex_values})
                     SELECT {self.value_column}, {h3_col}{parent_sql}
                     FROM hex_values
-                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
+                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd'{stamp})
             """
         self.con.execute(copy_sql)
 
@@ -3377,6 +3380,7 @@ class RasterProcessor:
 
             output_path = self._chunk_output_path(chunk_cell, h0_cell)
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            stamp = kv_metadata_sql()
 
             self.con.execute(f"""
                 COPY (
@@ -3386,7 +3390,7 @@ class RasterProcessor:
                         {parent_sql}
                     FROM xyz_table
                     {where_clause}
-                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
+                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd'{stamp})
             """)
 
             print(f"  ✓ Wrote: {output_path} (warp-centroid; one row per warped pixel)")

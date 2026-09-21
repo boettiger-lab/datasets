@@ -3928,6 +3928,19 @@ class TestPartitionIntegrity:
                 f"WHERE {col} IS NULL OR {col} <> {col}"
             ).fetchone()[0]
             assert missing == 0, f"{missing} rows have no {col} (null or NaN)"
+
+        # 6. It records what built it. Without this, "which datasets came from
+        #    a version with that bug" is answerable only by correlating S3
+        #    timestamps against git history, for every dataset, by hand.
+        from cng_datasets import __version__
+        stamp = dict(con.execute(
+            f"SELECT key, value FROM parquet_kv_metadata('{path}')"
+        ).fetchall())
+        stamp = {k.decode() if isinstance(k, bytes) else k:
+                 v.decode() if isinstance(v, bytes) else v
+                 for k, v in stamp.items()}
+        assert stamp.get("cng_datasets_version") == __version__, stamp
+        assert "built_at" in stamp, stamp
         return rows
 
     def _run(self, raster, temp_dir, name, **kwargs):
@@ -4360,3 +4373,65 @@ class TestChunkVecBuiltInDuckDB:
         assert covered, "fixture error: the raster covers none of these cells"
         for key in covered:
             assert built[key] == pytest.approx(reference[key], rel=1e-12), key
+
+
+class TestBuildProvenance:
+    """
+    Every published parquet records what built it (issue #173 follow-up).
+
+    Nothing used to. Generated manifests pin `…/datasets:latest`, rebuilt on
+    every push to `main`, so the version that ran was not even a released one —
+    it was whatever `main` happened to be when the pod pulled the image. When a
+    build turns out to have been wrong, as in the multi-band mislabel (#214)
+    that published 384,922,346 rows of one variable documented as another, that
+    leaves no way to ask which datasets are affected.
+
+    The stamp lives in the parquet's own key-value metadata rather than a
+    sidecar, so it survives every copy and re-publish.
+    """
+
+    @pytest.mark.timeout(30)
+    def test_the_stamp_names_the_version(self):
+        from cng_datasets import __version__
+        from cng_datasets.provenance import build_metadata
+        meta = build_metadata()
+        assert meta["cng_datasets_version"] == __version__
+        assert meta["built_at"].endswith("Z")
+        # The library versions are here because two of this project's sharper
+        # bugs were environment-dependent, not code-dependent.
+        assert "duckdb_version" in meta
+
+    @pytest.mark.timeout(30)
+    def test_the_image_is_recorded_when_known(self, monkeypatch):
+        from cng_datasets.provenance import build_metadata
+        assert "image" not in build_metadata()
+        monkeypatch.setenv("CNG_IMAGE", "ghcr.io/boettiger-lab/datasets:0.8.0")
+        assert build_metadata()["image"] == "ghcr.io/boettiger-lab/datasets:0.8.0"
+
+    @pytest.mark.timeout(30)
+    def test_the_sql_fragment_survives_a_quote(self, monkeypatch):
+        """A value with an apostrophe must not end the SQL string early."""
+        from cng_datasets.provenance import kv_metadata_sql
+        monkeypatch.setenv("CNG_IMAGE", "it's/an/image")
+        fragment = kv_metadata_sql()
+        assert "it''s/an/image" in fragment
+        con = duckdb.connect()
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.parquet")
+            con.execute(f"COPY (SELECT 1 AS a) TO '{out}' "
+                        f"(FORMAT PARQUET{fragment})")
+            stamp = dict(con.execute(
+                f"SELECT key, value FROM parquet_kv_metadata('{out}')"
+            ).fetchall())
+            stamp = {k.decode() if isinstance(k, bytes) else k:
+                     v.decode() if isinstance(v, bytes) else v
+                     for k, v in stamp.items()}
+            assert stamp["image"] == "it's/an/image"
+
+    @pytest.mark.timeout(30)
+    def test_a_failed_stamp_never_stops_a_write(self, monkeypatch):
+        """Provenance is worth having, not worth failing a build over."""
+        import cng_datasets.provenance as provenance
+        monkeypatch.setattr(provenance, "build_metadata",
+                            lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert provenance.kv_metadata_sql() == ""

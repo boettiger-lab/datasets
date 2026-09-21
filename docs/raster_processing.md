@@ -388,6 +388,39 @@ follows from the manifest rather than from whichever node it landed on.
 Bounding DuckDB also changes its behaviour under pressure from *fail* to *spill*: with a
 limit it writes to `temp_directory` instead of growing until the cgroup kills it.
 
+### What built this dataset
+
+Every published parquet — the hex partitions, the merged `data_0.parquet`, the vector
+repartition output and the GeoParquet — records the version that produced it, in the
+file's own key-value metadata rather than a sidecar, so it survives copies and syncs:
+
+```sql
+SELECT key, value
+FROM parquet_kv_metadata('s3://bucket/dataset/hex/h0=*/data_0.parquet');
+-- cng_datasets_version  0.8.0
+-- built_at              2026-09-21T23:06:45Z
+-- gdal_version          3.13.0
+-- duckdb_version        1.5.4
+-- image                 ghcr.io/boettiger-lab/datasets:0.8.0
+```
+
+`image` appears when the environment sets `CNG_IMAGE`; its absence means a local run.
+
+This exists because generated manifests pin `ghcr.io/boettiger-lab/datasets:latest`,
+which is rebuilt on **every push to `main`** — so the code that ran was not necessarily a
+released version, and nothing recorded which. When a build turns out to have been wrong,
+as with the multi-band mislabel in
+[#214](https://github.com/boettiger-lab/datasets/issues/214), the question "which datasets
+are affected?" otherwise has no answer but correlating S3 timestamps against git history.
+
+**A dataset with no stamp predates 0.8.0** and should be checked against the correctness
+fixes in 0.7.0 — the multi-band read (#214) and the h0 position/base-cell confusion
+(#213, #218).
+
+The library versions are recorded because two of this project's sharper problems were
+environment-dependent rather than code-dependent: a GDAL without
+`WarpOptions(cutlineWKT=)` (#197), and one without OGR's Parquet driver.
+
 ## Kubernetes Processing
 
 Process global rasters in parallel using Kubernetes:

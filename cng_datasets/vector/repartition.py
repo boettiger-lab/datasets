@@ -13,6 +13,7 @@ import ibis
 from cng_datasets.duckdb_memory import to_duckdb_memory_limit
 from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
+from ..provenance import kv_metadata_sql
 
 
 def repartition_by_h0(
@@ -222,7 +223,7 @@ def repartition_by_h0(
         con.raw_sql(
             f"COPY (SELECT * FROM ({join_sql.format(h0=h0)})"
             f" ORDER BY \"{chunk_id_col}\") TO '{local_file}'"
-            f" (FORMAT PARQUET, COMPRESSION ZSTD)"
+            f" (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
         )
 
         if rclone_output:

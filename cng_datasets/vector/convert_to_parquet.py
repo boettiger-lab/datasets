@@ -23,6 +23,7 @@ import duckdb
 import geopandas as gpd
 from urllib.request import urlretrieve
 from urllib.parse import urlparse
+from ..provenance import kv_metadata_sql
 
 
 # Curved geometry types that DuckDB's WKB parser cannot handle
@@ -1270,7 +1271,7 @@ def write_with_duckdb(query: str, output_path: str,
             (FORMAT PARQUET,
              COMPRESSION {compression},
              ROW_GROUP_SIZE {row_group_size},
-             ROW_GROUP_SIZE_BYTES '{row_group_bytes}')
+             ROW_GROUP_SIZE_BYTES '{row_group_bytes}'{kv_metadata_sql()})
         """).fetchone()
         rows_written = int(written[0]) if written else 0
 
