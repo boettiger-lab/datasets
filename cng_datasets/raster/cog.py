@@ -373,7 +373,7 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
             # used to be done with np.repeat over object arrays.
             select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
                       f'UNNEST("{ucol}") AS value, UNNEST("{fcol}") AS frac '
-                      f"FROM read_parquet('{raw}')")
+                      f"FROM read_parquet({raw})")
             # frac is the float; the class value keeps whatever type the
             # source band gave it, which is what the pandas route publishes.
             keep = _IS_A_VALUE.format(col="frac")
@@ -396,8 +396,8 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
             f"SELECT count(*) = 0 FROM read_parquet('{path}')"
         ).fetchone()[0]
     finally:
-        for path in raws:
-            os.remove(path)
+        for raw_path in raws:
+            os.remove(raw_path)
     if empty:
         os.remove(path)
         return None
@@ -2946,10 +2946,14 @@ class RasterProcessor:
         parts_glob = os.path.join(parts_dir, "part-*.parquet")
         found = sorted(glob.glob(parts_glob))
         if found != sorted(parts):
+            missing = sorted(set(parts) - set(found))
+            unexpected = sorted(set(found) - set(parts))
             raise RuntimeError(
-                f"chunk {chunk_cell}: workers reported {len(parts)} parts but "
-                f"{len(found)} are on disk at {parts_dir}. Refusing to write a "
-                f"partition from a part set that does not match the run."
+                f"chunk {chunk_cell}: the parts on disk at {parts_dir} are not "
+                f"the ones the workers reported. Refusing to write a partition "
+                f"from a part set that does not match the run.\n"
+                f"  reported but absent: {missing}\n"
+                f"  present but unreported: {unexpected}"
             )
         hex_values = (
             f"SELECT h AS {h3_col}, value AS {self.value_column}"
