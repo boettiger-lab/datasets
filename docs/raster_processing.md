@@ -223,8 +223,13 @@ nothing proportional to the cell count.
 It used to collect every worker's rows as a pandas frame, hold them all in a list, and
 `pd.concat` them — which allocates the result while the inputs are still referenced, so the
 process peaked at roughly twice the accumulated size at exactly its largest moment.
-exactextract can only emit pandas, GeoJSON or an OGR datasource, so a frame per chunk is
-unavoidable; holding all of them was not.
+
+Nor does a frame have to be built in the first place. exactextract is C++ and can serialise
+through GDAL, so where OGR can write Parquet the worker has it write the file directly and
+DuckDB normalises that into the part. The runtime image ships that driver; most
+distribution GDALs do not, so the pandas writer remains the fallback and which one runs is
+**feature-detected**. `CNG_HEX_GDAL_WRITER=0` forces the fallback, and the two are asserted
+to produce identical rows.
 
 ### Cost follows the raster, not the cell
 
