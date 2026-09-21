@@ -4127,6 +4127,37 @@ class TestExactextractWritesToDisk:
         assert via_gdal == via_pandas
 
     @requires_gdal
+    @pytest.mark.timeout(900)
+    @pytest.mark.parametrize("reducer,expected", [
+        ("mean", "DOUBLE"), ("mode", "DOUBLE"),
+    ])
+    def test_the_published_value_type_is_declared_not_inferred(
+            self, raster, temp_dir, monkeypatch, reducer, expected):
+        """
+        The schema must be a property of the dataset, not of which writer was
+        available. OGR types the column from its own driver rules — `mode`
+        arrives as VARCHAR — while the pandas route has always published
+        DOUBLE for every single-value reducer.
+        """
+        from cng_datasets.raster import RasterProcessor
+        monkeypatch.delenv("CNG_HEX_GDAL_WRITER", raising=False)
+        proc = RasterProcessor(
+            input_path=raster,
+            output_parquet_path=os.path.join(temp_dir, f"typed_{reducer}"),
+            h3_resolution=self.RES, parent_resolutions=[0],
+            value_column="value", hex_resampling=reducer,
+        )
+        h0 = proc.con.execute(
+            "SELECT h3_latlng_to_cell(37.5, -122.2, 0)").fetchone()[0]
+        out = proc._hex_aggregate_h0(h0)
+        assert out is not None
+        types = dict(proc.con.execute(
+            f"SELECT column_name, column_type FROM "
+            f"(DESCRIBE SELECT * FROM read_parquet('{out}'))"
+        ).fetchall())
+        assert types["value"] == expected, types
+
+    @requires_gdal
     @requires_ogr_parquet
     @pytest.mark.timeout(900)
     def test_no_geometry_reaches_disk(self, raster, temp_dir, monkeypatch):

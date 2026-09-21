@@ -303,11 +303,19 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_cells, out_dir, index)
             select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
                       f'UNNEST("{ucol}") AS value, UNNEST("{fcol}") AS frac '
                       f"FROM read_parquet('{raw}')")
+            # frac is the float; the class value keeps whatever type the
+            # source band gave it, which is what the pandas route publishes.
             keep = _IS_A_VALUE.format(col="frac")
         else:
             vcol = _exactextract_column(columns, op_name)
+            # Declared, not inferred. OGR types this column from the driver's
+            # own schema rules -- `mode` arrives as VARCHAR -- while the pandas
+            # route has always published DOUBLE for every single-value reducer.
+            # Casting here is what keeps the published schema a property of the
+            # dataset rather than of which writer happened to be available.
             select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
-                      f'"{vcol}" AS value FROM read_parquet(\'{raw}\')')
+                      f'CAST("{vcol}" AS DOUBLE) AS value '
+                      f"FROM read_parquet('{raw}')")
             keep = _IS_A_VALUE.format(col="value")
         con.execute(
             f"COPY (SELECT * FROM ({select}) WHERE {keep}) "
@@ -368,7 +376,11 @@ def _write_chunk_part(frame, op_name, out_dir, index):
     path = os.path.join(out_dir, f"part-{index}.parquet")
     con.register("part_frame", frame)
     try:
-        cols = (f'CAST("_h3_str" AS UBIGINT) AS h, "{value_col}" AS value'
+        # Same declared schema as the GDAL route: DOUBLE for a single-value
+        # reducer, the source's own type for a fractions class code.
+        value_expr = (f'"{value_col}"' if is_fractions
+                      else f'CAST("{value_col}" AS DOUBLE)')
+        cols = (f'CAST("_h3_str" AS UBIGINT) AS h, {value_expr} AS value'
                 + (", frac" if is_fractions else ""))
         keep = _IS_A_VALUE.format(
             col="frac" if is_fractions else '"' + value_col + '"')
