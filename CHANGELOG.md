@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The image ships 7-Zip** (#245). ArcGIS map, project and layer packages (`.mpk`, `.ppkx`, `.lpkx`), which USGS ScienceBase uses for data releases, are 7z archives around a file geodatabase. GDAL, `/vsizip/` and Python's `zipfile` can't open them. `7z` is now on PATH in `ghcr.io/boettiger-lab/datasets`, so stage jobs no longer need an `apt-get install` at runtime, which fails when the pod can't reach the apt mirrors.
+
 ### Fixed
 - **Raster hex no longer crashes on an all-nodata h0 when writing to S3** (#238). With `--hex-resampling fractions` and `--nodata`, an h0 that overlaps the raster but contains only nodata filters every row out, and the partition that had just been written was then deleted with `os.remove()` — which cannot delete an `s3://` object. Every such index in a 122-completion Job failed with exit 1 and left a 0-row partition behind. The row count is now checked before anything is written, so an empty chunk writes nothing and returns cleanly, whether the output is local or remote.
 - **`--hex-resampling sum` no longer writes a `0.0` row for every cell without data** (#232). Empty cells were dropped by testing the value for NaN. That works for `mean`, `max`, `min` and `mode`, but an empty `sum` is `0.0`, so it was never dropped. One CONUS build wrote 2.5 billion rows, 95% of them zero, for totals that were still correct. Cells are now kept only when they cover at least one valid pixel (exactextract's `count` > 0), for every single-value reducer. Cells over pixels that genuinely measure zero are still written. **`sum` layers built before this fix have correct totals but many extra zero rows, and are worth rebuilding.**

@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     rclone \
     curl \
     unzip \
+    7zip \
     make \
     g++ \
     libsqlite3-dev \
