@@ -8,15 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-28
+
 ### Added
 - **The image ships 7-Zip** (#245). ArcGIS map, project and layer packages (`.mpk`, `.ppkx`, `.lpkx`), which USGS ScienceBase uses for data releases, are 7z archives around a file geodatabase. GDAL, `/vsizip/` and Python's `zipfile` can't open them. `7z` is now on PATH in `ghcr.io/boettiger-lab/datasets`, so stage jobs no longer need an `apt-get install` at runtime, which fails when the pod can't reach the apt mirrors.
+
+### Changed
+- **`--window-reads auto` now windows any remote source, including at the default `--chunk-resolution 0`** (#209). Previously only sub-h0 chunking windowed, so each pod in the default 122-pod fan-out copied the whole COG to local disk: 4.1 GB per pod for LANDFIRE CONUS, now the largest use of ephemeral storage in the hex step since #226 removed the fill-collapse intermediate. Each h0 pod now reads only its own window, plus the H3 protrusion margin. Windows are now written with ZSTD compression and the band's predictor, so a large window can't take more disk than the compressed COG it replaces. `--window-reads never` restores whole-file localization. The output is identical.
 
 ### Fixed
 - **Raster hex no longer crashes on an all-nodata h0 when writing to S3** (#238). With `--hex-resampling fractions` and `--nodata`, an h0 that overlaps the raster but contains only nodata filters every row out, and the partition that had just been written was then deleted with `os.remove()` — which cannot delete an `s3://` object. Every such index in a 122-completion Job failed with exit 1 and left a 0-row partition behind. The row count is now checked before anything is written, so an empty chunk writes nothing and returns cleanly, whether the output is local or remote.
 - **`--hex-resampling sum` no longer writes a `0.0` row for every cell without data** (#232). Empty cells were dropped by testing the value for NaN. That works for `mean`, `max`, `min` and `mode`, but an empty `sum` is `0.0`, so it was never dropped. One CONUS build wrote 2.5 billion rows, 95% of them zero, for totals that were still correct. Cells are now kept only when they cover at least one valid pixel (exactextract's `count` > 0), for every single-value reducer. Cells over pixels that genuinely measure zero are still written. **`sum` layers built before this fix have correct totals but many extra zero rows, and are worth rebuilding.**
-
-### Changed
-- **`--window-reads auto` now windows any remote source, including at the default `--chunk-resolution 0`** (#209). Previously only sub-h0 chunking windowed, so each pod in the default 122-pod fan-out copied the whole COG to local disk: 4.1 GB per pod for LANDFIRE CONUS, now the largest use of ephemeral storage in the hex step since #226 removed the fill-collapse intermediate. Each h0 pod now reads only its own window, plus the H3 protrusion margin. Windows are now written with ZSTD compression and the band's predictor, so a large window can't take more disk than the compressed COG it replaces. `--window-reads never` restores whole-file localization. The output is identical.
 
 ## [0.8.2] - 2026-09-28
 
@@ -257,6 +259,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.8.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.3
 [0.8.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.2
 [0.8.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.1
 [0.8.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.0
