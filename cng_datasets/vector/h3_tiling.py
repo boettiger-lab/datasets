@@ -12,13 +12,22 @@ import os
 from cng_datasets.storage.s3 import configure_s3_credentials
 
 
-# Average H3 edge lengths in km (from h3geo.org/docs/core-library/restable)
-_H3_EDGE_KM = {
-    0: 1281.256011, 1: 483.0568391, 2: 182.5129565, 3: 68.97922179,
-    4: 26.07175968, 5: 9.854090990, 6: 3.724532667, 7: 1.406475763,
-    8: 0.531414010, 9: 0.200786148, 10: 0.075863783, 11: 0.028663897,
-    12: 0.010830188, 13: 0.004092010, 14: 0.001546100, 15: 0.000584169,
-}
+# Line geometries are polyfilled as the H3 cells they *intersect* (issue #239).
+# h3_polygon_wkt_to_cells only accepts polygons, so a line is first given a
+# negligible buffer (~1 cm; 2% of an edge even at res 15) purely to make it a
+# polygon, then filled with the 'overlap' containment mode, which returns every
+# cell whose boundary meets the polygon. Because the sliver contains the line,
+# every cell the line passes through is included, at any latitude and whatever
+# the local cell size. A coarse ring of quadrant segments is enough for a
+# sliver this thin and keeps the buffered vertex count (and polyfill time) low.
+#
+# The old approach — buffer by one average edge length *in degrees*, then
+# center-containment — lost cells two ways: a degree of longitude is only
+# cos(lat) x 111 km, so the east-west buffer shrank with latitude (half an edge
+# at 60N); and H3 cell size varies ~2x over the globe, so even an exact
+# edge-length buffer misses cells larger than average.
+_LINE_BUFFER_DEG = 1e-7
+_LINE_BUFFER_QUAD_SEGS = 1
 
 # Pass 1 writes each feature's H3 cells as a single list value. DuckDB/Arrow
 # cannot hold one list value larger than 2^31-1 bytes — i.e. ~268M UBIGINT
@@ -182,30 +191,6 @@ def _transmeridian_split_sql(carry_cols: str, source: str) -> str:
     '''
 
 
-def _h3_edge_length_degrees(resolution: int) -> float:
-    """Return the H3 edge length in degrees for a given resolution.
-
-    Uses the equatorial approximation (1 deg ~ 111.32 km) which
-    slightly over-buffers at higher latitudes — the safe direction
-    for a spatial index.
-    """
-    return _H3_EDGE_KM[resolution] / 111.32
-
-
-def _buffer_case_sql(native_res_col: str) -> str:
-    """Build a SQL CASE mapping a per-row native H3 resolution column to the line
-    buffer width in degrees (H3 edge length at that resolution).
-
-    Used only on the variable-resolution path (issue #98), where the buffer for a
-    line feature must track that feature's native_res rather than a fixed zoom.
-    """
-    whens = " ".join(
-        f"WHEN {res} THEN {_h3_edge_length_degrees(res)}" for res in sorted(_H3_EDGE_KM)
-    )
-    # Fall back to the finest resolution's edge length if native_res is unexpected.
-    return f"CASE {native_res_col} {whens} ELSE {_h3_edge_length_degrees(max(_H3_EDGE_KM))} END"
-
-
 def identify_id_column(
     con: duckdb.DuckDBPyConnection,
     table_name: str,
@@ -338,29 +323,37 @@ def geom_to_h3_cells(
             "resolutions may map to the same cell. Document this in the STAC metadata."
         )
 
-    # For line geometries, buffer to a thin polygon so h3_polygon_wkt_to_cells
-    # can identify every H3 cell the line passes through.  Buffer width = H3
-    # edge length in degrees (equatorial approximation; slightly over-buffers
-    # at higher latitudes, which is the safe direction for a spatial index).
-    buffer_deg = _h3_edge_length_degrees(zoom)
+    # Line geometries become a ~1 cm sliver polygon and are filled with 'overlap'
+    # containment so every cell the line passes through is kept (issue #239; see
+    # _LINE_BUFFER_DEG). `_is_line` carries that choice past the buffer, transmeridian
+    # split and ST_Dump, after which the geometry type alone no longer tells.
+    line_buffer = f"{_LINE_BUFFER_DEG}, {_LINE_BUFFER_QUAD_SEGS}"
+    is_line = "ST_GeometryType({g}) IN ('LINESTRING', 'MULTILINESTRING')"
+
+    def polyfill(res: str) -> str:
+        return f"""CASE
+                       WHEN ST_GeometryType(geom) = 'POINT'
+                       THEN [h3_latlng_to_cell(ST_Y(geom), ST_X(geom), {res})]
+                       WHEN _is_line
+                       THEN h3_polygon_wkt_to_cells_experimental(
+                                ST_AsText(ST_Force2D(geom)), {res}, 'overlap')
+                       ELSE h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), {res})
+                   END"""
 
     if line_count > 0:
         print(
             f"  Line geometries detected ({line_count} features). "
-            f"Buffering by {buffer_deg:.6f} deg (~H3 edge length at res {zoom}) "
-            f"before H3 polyfill to ensure continuous cell coverage."
+            f"Indexing every H3 cell at res {zoom} that each line passes through."
         )
 
     # Variable-resolution (issue #98): when resolution_by_area is provided, each
     # feature is hexed at the native resolution its planar ST_Area maps to, a
     # per-feature `native_res` column is emitted, and the H3 functions take that
     # column (not a literal zoom) as the resolution argument — DuckDB's H3
-    # bindings accept a per-row resolution expression. The buffer width for line
-    # geometries likewise tracks each feature's native_res. Otherwise the
+    # bindings accept a per-row resolution expression. Otherwise the
     # original single-`zoom` path below is used unchanged.
     if resolution_by_area is not None:
         native_res_case = _native_res_case_sql(resolution_by_area, geom_col)
-        buffer_case = _buffer_case_sql("native_res")
         return f'''
         WITH tbase AS (
             SELECT {col_list},
@@ -370,28 +363,25 @@ def geom_to_h3_cells(
         ),
         t0 AS (
             SELECT {col_list}, native_res,
+                   {is_line.format(g='_geom_orig')} AS _is_line,
                    CASE
-                       WHEN ST_GeometryType(_geom_orig) IN ('LINESTRING', 'MULTILINESTRING')
-                       THEN ST_Multi(ST_Buffer(ST_Force2D(_geom_orig), {buffer_case}))
+                       WHEN {is_line.format(g='_geom_orig')}
+                       THEN ST_Multi(ST_Buffer(ST_Force2D(_geom_orig), {line_buffer}))
                        WHEN ST_GeometryType(_geom_orig) = 'POLYGON'
                        THEN ST_Multi(_geom_orig)
                        ELSE _geom_orig
                    END AS geom
             FROM tbase
         ),
-        tsplit AS ({_transmeridian_split_sql(f'{col_list}, native_res', 't0')}),
+        tsplit AS ({_transmeridian_split_sql(f'{col_list}, native_res, _is_line', 't0')}),
         t1 AS (
-            SELECT {col_list}, native_res,
+            SELECT {col_list}, native_res, _is_line,
                    UNNEST(ST_Dump(geom)).geom AS geom
             FROM tsplit
         ),
         t2 AS (
             SELECT {col_list}, native_res, geom,
-                   CASE
-                       WHEN ST_GeometryType(geom) = 'POINT'
-                       THEN [h3_latlng_to_cell(ST_Y(geom), ST_X(geom), native_res)]
-                       ELSE h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), native_res)
-                   END AS h3id
+                   {polyfill('native_res')} AS h3id
             FROM t1
         )
         SELECT {col_list}, native_res,
@@ -409,7 +399,7 @@ def geom_to_h3_cells(
 
     # Convert to multi-polygons and unnest, then generate H3 cells
     # The geometry is already GEOMETRY type in DuckDB spatial extension
-    # Line geometries are buffered into polygons before polyfill.
+    # Line geometries are buffered into sliver polygons before polyfill.
     #
     # Any polygon smaller than one H3 cell at this resolution contains no cell
     # centre, so h3_polygon_wkt_to_cells returns an empty array and the feature
@@ -424,29 +414,26 @@ def geom_to_h3_cells(
     sql = f'''
         WITH t0 AS (
             SELECT {col_list},
+                   {is_line.format(g=geom_col)} AS _is_line,
                    CASE
-                       WHEN ST_GeometryType({geom_col}) IN ('LINESTRING', 'MULTILINESTRING')
-                       THEN ST_Multi(ST_Buffer(ST_Force2D({geom_col}), {buffer_deg}))
+                       WHEN {is_line.format(g=geom_col)}
+                       THEN ST_Multi(ST_Buffer(ST_Force2D({geom_col}), {line_buffer}))
                        WHEN ST_GeometryType({geom_col}) = 'POLYGON'
                        THEN ST_Multi({geom_col})
                        ELSE {geom_col}
                    END AS geom
             FROM {table_name}
         ),
-        tsplit AS ({_transmeridian_split_sql(col_list, 't0')}),
+        tsplit AS ({_transmeridian_split_sql(f'{col_list}, _is_line', 't0')}),
         t1 AS (
-            SELECT {col_list},
+            SELECT {col_list}, _is_line,
                    UNNEST(ST_Dump(geom)).geom AS geom
             FROM tsplit
         ),
         t2 AS (
             SELECT {col_list},
                    geom,
-                   CASE
-                       WHEN ST_GeometryType(geom) = 'POINT'
-                       THEN [h3_latlng_to_cell(ST_Y(geom), ST_X(geom), {zoom})]
-                       ELSE h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), {zoom})
-                   END AS h3id
+                   {polyfill(str(zoom))} AS h3id
             FROM t1
         )
         SELECT {col_list},
