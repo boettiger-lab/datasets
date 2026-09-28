@@ -1032,7 +1032,7 @@ class TestOverlapSkipAntimeridian:
             h0_grid_path=self._grid(temp_dir, self.WRAP_WKT),
         )
         called = []
-        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0: called.append(h0))
+        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0, **k: called.append(h0))
         result = proc.process_h0_region(0)
         assert result is None
         assert called == [], "antimeridian h0 should be skipped for a far raster"
@@ -1049,7 +1049,7 @@ class TestOverlapSkipAntimeridian:
             h0_grid_path=self._grid(temp_dir, self.WRAP_WKT),
         )
         called = []
-        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0: called.append(h0))
+        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0, **k: called.append(h0))
         proc.process_h0_region(0)
         assert called, "antimeridian h0 overlapping the seam must be processed"
 
