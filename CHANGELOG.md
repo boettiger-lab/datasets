@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Polygons crossing ±180° are no longer filled the long way round the globe** (#241). Any feature whose planar longitude bbox spanned more than 180° was cut into 90° longitude bands (the #145 fix for circumpolar features), and that included narrow features that merely cross the antimeridian. For those, the pieces covered the wrong-way ~359° region: a ~150 km² box at 180°E/52°N hexed to 54,521 res-7 cells around the globe instead of 28. Large crossers hit the #167 fail-fast error; smaller ones wrote those cells without any error. Crossers are now identified by their vertex longitudes (a gap of more than 180°) and left to H3, which fills them the short way. Circumpolar features are still split. The size guard, `--resolution-by-area` binning and the sub-cell fallback point also use the short-way extent. This also fixes single-part lines that jump across 180°. **Datasets with features crossing ±180° should be rebuilt.**
+
 ## [0.8.1] - 2026-09-28
 
 ### Fixed

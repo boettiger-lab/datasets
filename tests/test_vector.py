@@ -1015,11 +1015,15 @@ class TestOversizedFeatureGuard:
 
 
 class TestAntimeridianCrossingFeature:
-    """Issue #167: a polygon whose ring crosses the antimeridian (lon bbox span
-    > 180°) polyfills its full planar cartesian span — a near-global cell set —
-    and hangs Pass 1 for hours. ST_Area_Spheroid sees only the geodesic
-    short-way strip (small, or NaN), so the #107 oversized guard misses it. The
-    guard now estimates such features from planar area and fails fast."""
+    """A polygon whose ring crosses the antimeridian has a > 180-deg planar
+    longitude bbox, like a circumpolar band, but must not be band-split: H3
+    already polyfills it the short way, while the split pieces covered the
+    wrong-way ~359-deg region and the fill wrapped the globe (issue #241;
+    before that it hung Pass 1, issue #167). The oversized-feature guard
+    estimates such features by their short-way extent."""
+
+    # 2 x 6 deg box straddling 180 at 51-57N.
+    _CROSSER = 'POLYGON((179 51,-179 51,-179 57,179 57,179 51))'
 
     def _processor(self, tmpdir, wkt, resolution=10):
         con = setup_duckdb_connection()
@@ -1036,24 +1040,87 @@ class TestAntimeridianCrossingFeature:
             h3_resolution=resolution, parent_resolutions=[0], chunk_size=10,
         )
 
+    @staticmethod
+    def _cells(con, wkt, res, rba=None):
+        con.execute(f"CREATE OR REPLACE TABLE t AS SELECT 1 AS id, ST_GeomFromText('{wkt}') AS geom")
+        sql = geom_to_h3_cells(con, "t", zoom=res, resolution_by_area=rba)
+        return {r[0] for r in con.execute(
+            f"SELECT DISTINCT UNNEST(h3id) FROM ({sql})").fetchall()}
+
     @pytest.mark.timeout(30)
-    def test_crossing_ring_fails_fast_instead_of_hanging(self):
-        """A single ring spanning ~358° of longitude must raise immediately
-        (planar-area estimate) rather than enumerate billions of cells."""
+    def test_crossing_ring_polyfills_the_short_way(self):
+        """The crosser yields exactly H3's own short-way fill, not a band
+        wrapping the globe (issue #241)."""
+        con = setup_duckdb_connection()
+        got = self._cells(con, self._CROSSER, 6)
+        expected = set(con.execute(
+            f"SELECT h3_polygon_wkt_to_cells('{self._CROSSER}', 6)").fetchone()[0])
+        assert len(expected) > 1000
+        assert got == expected
+        con.close()
+
+    @pytest.mark.timeout(30)
+    def test_crossing_ring_variable_resolution(self):
+        """The --resolution-by-area path leaves crossers to H3 too (issue #241)."""
+        con = setup_duckdb_connection()
+        got = self._cells(con, self._CROSSER, 8, rba=parse_resolution_by_area("100:6,3"))
+        expected = set(con.execute(
+            f"SELECT h3_polygon_wkt_to_cells('{self._CROSSER}', 6)").fetchone()[0])
+        assert got == expected
+        con.close()
+
+    @pytest.mark.timeout(30)
+    def test_sub_cell_crosser_falls_back_near_the_dateline(self):
+        """A crosser smaller than a cell gets one cell at the feature, not at the
+        planar wrong-way band's ST_PointOnSurface near 0 deg (issues #104, #241)."""
+        con = setup_duckdb_connection()
+        got = self._cells(con, 'POLYGON((179.99 52,-179.99 52,-179.99 52.01,179.99 52.01,179.99 52))', 4)
+        assert len(got) == 1
+        lng = con.execute(f"SELECT h3_cell_to_lng({next(iter(got))})").fetchone()[0]
+        assert abs(lng) > 178
+        con.close()
+
+    @pytest.mark.timeout(30)
+    def test_line_crossing_the_dateline(self):
+        """A single planar line that jumps across 180 is indexed along its short
+        way; its sliver buffer is a crosser too (issues #239, #241)."""
+        con = setup_duckdb_connection()
+        got = self._cells(con, 'LINESTRING(179.95 52, -179.95 52.02)', 8)
+        assert 5 < len(got) < 20
+        lngs = [r[0] for r in con.execute(
+            f"SELECT h3_cell_to_lng(c) FROM (SELECT UNNEST({sorted(got)}::UBIGINT[]) c)").fetchall()]
+        assert all(abs(x) > 179.5 for x in lngs)
+        con.close()
+
+    @pytest.mark.timeout(30)
+    def test_huge_crosser_still_fails_fast(self):
+        """A crosser genuinely too large for one cell array at this resolution is
+        still refused up front, by its short-way size (issue #167)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             processor = self._processor(
-                tmpdir, 'POLYGON((179 51,-179 51,-179 57,179 57,179 51))',
-                resolution=10,
+                tmpdir, 'POLYGON((160 50,-150 50,-150 66,160 66,160 50))', resolution=12,
             )
             with pytest.raises(RuntimeError, match=r"too large to hex"):
                 processor._process_pass1(0)
-            # And the message must point at the antimeridian, not just "big".
-            try:
-                processor._process_pass1(0)
-            except RuntimeError as e:
-                assert 'antimeridian' in str(e)
-                assert '#167' in str(e)
             processor.con.close()
+
+    @pytest.mark.timeout(30)
+    def test_crossing_ring_is_estimated_short_way(self):
+        """The guard sizes the crosser by its ~2-deg short-way extent, so a fill
+        of a few million cells is not rejected as a near-global one (issue #241)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor = self._processor(tmpdir, self._CROSSER, resolution=10)
+            processor.max_cells_per_feature = 20_000_000
+            con = processor.con
+            con.execute(
+                f"CREATE OR REPLACE VIEW chunk_table AS SELECT 1 AS _cng_fid, "
+                f"ST_GeomFromText('{self._CROSSER}') AS geom"
+            )
+            processor._assert_no_oversized_feature("_cng_fid", 0)  # must not raise
+            processor.max_cells_per_feature = 1_000_000
+            with pytest.raises(RuntimeError, match=r"too large to hex"):
+                processor._assert_no_oversized_feature("_cng_fid", 0)
+            con.close()
 
     @pytest.mark.timeout(60)
     def test_clean_island_multipolygon_still_passes(self):
