@@ -8,9 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-28
+
 ### Fixed
 - **Polygons crossing ±180° are no longer filled the long way round the globe** (#241). Any feature whose planar longitude bbox spanned more than 180° was cut into 90° longitude bands (the #145 fix for circumpolar features), and that included narrow features that merely cross the antimeridian. For those, the pieces covered the wrong-way ~359° region: a ~150 km² box at 180°E/52°N hexed to 54,521 res-7 cells around the globe instead of 28. Large crossers hit the #167 fail-fast error; smaller ones wrote those cells without any error. Crossers are now identified by their vertex longitudes (a gap of more than 180°) and left to H3, which fills them the short way. Circumpolar features are still split. The size guard, `--resolution-by-area` binning and the sub-cell fallback point also use the short-way extent. This also fixes single-part lines that jump across 180°. **Datasets with features crossing ±180° should be rebuilt.**
 - **`workflow` fails on a source it can't read instead of inventing a feature count** (#235). When counting failed (a 404, a typo in the bucket name, missing credentials), the generator assumed `max_completions × 1000` features, exited 0 and wrote a complete, plausible-looking 200-way hex fan-out. For a small source that made each chunk up to 200× larger than a real count would. It also suggested a `--chunk-size` flag that `workflow` doesn't accept. It now exits non-zero before writing anything, with an error naming the source and the cause. For a source that is right but can't be counted from where you generate (for example, not uploaded yet), pass `--expect-features N`: the hex job is then sized from that count, which the convert step already enforces at runtime.
+
+### Documentation
+- **AGENTS.md: verify tool changes in cluster Jobs, never on the dev pod** (#246). New section *Verifying Changes to the Tool*: reproduce an issue's MRE on the released image before writing code, then test the branch in a short Job that clones it inside the image. It includes a copy-paste manifest. A new *What NOT To Do* bullet rules out building environments or running tests, MREs or the CLI on the shared dev pod.
 
 ## [0.8.1] - 2026-09-28
 
@@ -242,6 +247,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.8.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.2
 [0.8.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.1
 [0.8.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.0
 [0.7.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.7.0
