@@ -100,9 +100,9 @@ def main():
     raster_parser.add_argument("--window-reads", choices=["auto", "always", "never"], default="auto",
                                help="Read only this chunk's window of the source COG instead of "
                                     "localizing the whole file. 'auto' (default) windows whenever "
-                                    "--chunk-resolution > 0. Full localization is a per-pod cost, so "
-                                    "total transfer scales with the fan-out — fine across 122 h0 "
-                                    "pods, ruinous across the thousands sub-h0 chunking creates.")
+                                    "the source is remote. Full localization is a per-pod cost, so "
+                                    "total transfer and ephemeral disk scale with the fan-out rather "
+                                    "than with the data (#209).")
     raster_parser.add_argument("--h0-subset", type=str, default=None, metavar="POSITIONS",
                                help="Restrict the chunk list to descendants of these h0 grid "
                                     "**positions**, e.g. '12,14,20,50,71,78' for CONUS, so a "
