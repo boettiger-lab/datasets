@@ -131,10 +131,12 @@ def _native_res_case_sql(bins: List[Tuple[Optional[float], int]], geom_expr: str
     """Build a SQL CASE expression mapping a geometry's planar area to its native
     H3 resolution, given parsed ``--resolution-by-area`` bins.
 
-    The catch-all (``threshold is None``) becomes the ELSE branch.
+    The catch-all (``threshold is None``) becomes the ELSE branch. An
+    antimeridian crosser is binned by its short-way area (issue #241).
     """
+    area = _planar_area_deg2_sql(geom_expr)
     whens = [
-        f"WHEN ST_Area({geom_expr}) <= {threshold} THEN {res}"
+        f"WHEN {area} <= {threshold} THEN {res}"
         for threshold, res in bins
         if threshold is not None
     ]
@@ -152,12 +154,96 @@ def _native_res_case_sql(bins: List[Tuple[Optional[float], int]], geom_expr: str
 # strips tile the whole -180..180 range with margin to spare.
 _TRANSMERIDIAN_MAX_SPAN_DEG = 180
 _TRANSMERIDIAN_BANDS = [(-180, -90), (-90, 0), (0, 90), (90, 180)]
+#
+# A wide planar bbox alone does NOT mean the feature is circumpolar, though. A
+# feature that merely *crosses* the antimeridian (an Aleutian island, a North
+# Pacific RFMO area) also has a ~359-deg planar bbox, but there H3's own
+# transmeridian handling is correct, and band-splitting is harmful: the pieces
+# cover the wrong-way ~359-deg region, so the fill wraps the globe (issue #241).
+# See _dateline_crosser_sql for how the two are told apart.
 
 # Square of the equatorial metres-per-degree, for converting a planar ST_Area
 # (deg²) to an approximate area in m². Over-estimates away from the equator
 # (longitude degrees shrink with latitude), which is the safe direction for the
 # oversized-feature guard below.
 _DEG2_TO_M2 = 111_320.0 ** 2
+
+
+def _lon_gap_sql(geom_expr: str) -> str:
+    """SQL for the vertex-free longitude gap that spans the prime meridian.
+
+    For longitudes in [-180, 180], any gap wider than 180 deg must contain 0:
+    if the gap is (a, b) with b - a > 180 and -180 <= a < b <= 180, then
+    a < b - 180 <= 0 and b > a + 180 >= 0. So min(lon >= 0) - max(lon < 0) is
+    the only gap that can exceed 180, and it needs only list aggregates. NULL
+    when every vertex is on one side of 0.
+
+    Vertices exactly on +-180 are ignored. Read the short way (as H3 does), an
+    edge between -180 and 180 has zero length, so they are no evidence of a
+    crossing. They are how a full circumpolar band is usually written, e.g.
+    POLYGON((-180 -78, 180 -78, 180 -50, -180 -50, -180 -78)), whose remaining
+    vertex set is empty (NULL gap), so it is still band-split.
+    """
+    lons = f"list_transform(ST_Dump(ST_Points({geom_expr})), s -> ST_X(s.geom))"
+    return (
+        f"(list_min(list_filter({lons}, x -> x >= 0 AND x < 180)) "
+        f"- list_max(list_filter({lons}, x -> x < 0 AND x > -180)))"
+    )
+
+
+def _dateline_crosser_sql(geom_expr: str) -> str:
+    """SQL predicate: is this a narrow antimeridian *crosser* rather than a
+    genuinely circumpolar feature? Never NULL.
+
+    Both have a > 180-deg planar longitude bbox, so the bbox cannot separate
+    them; the vertex distribution can. A crosser's vertices cluster near +-180
+    and leave a gap wider than 180 deg the long way round (see _lon_gap_sql); a
+    circumpolar band's vertices span all longitudes and leave no such gap.
+
+    Checked against ``public-high-seas/rfmo/rfb`` (the #145 layer): CCAMLR, IWC,
+    ACAP and CCSBT are circumpolar and still split; IPHC (288-deg gap) and APFIC
+    (237-deg gap) are crossers and left to H3. The vertex list is built only for
+    rows already wider than the span threshold, since DuckDB evaluates a CASE
+    branch on just the rows that select it.
+    """
+    return f"""COALESCE(
+        CASE WHEN ST_XMax({geom_expr}) - ST_XMin({geom_expr}) > {_TRANSMERIDIAN_MAX_SPAN_DEG}
+             THEN {_lon_gap_sql(geom_expr)} > {_TRANSMERIDIAN_MAX_SPAN_DEG}
+             ELSE FALSE
+        END, FALSE)"""
+
+
+def _planar_area_deg2_sql(geom_expr: str) -> str:
+    """SQL for a feature's planar area in deg², measured the short way round
+    for an antimeridian crosser.
+
+    Planar ``ST_Area`` of a crossing ring is the wrong-way region, orders of
+    magnitude too large. A multipolygon whose parts sit either side of the
+    dateline without crossing it is a crosser too, but there ``ST_Area`` is
+    exact. So a crosser takes the lesser of ``ST_Area`` and its short-way bbox
+    (360 - gap deg wide), which bounds its true planar area from above.
+    """
+    short_way_bbox = (
+        f"(360 - {_lon_gap_sql(geom_expr)}) * (ST_YMax({geom_expr}) - ST_YMin({geom_expr}))"
+    )
+    return (
+        f"(CASE WHEN {_dateline_crosser_sql(geom_expr)} "
+        f"THEN LEAST(ST_Area({geom_expr}), {short_way_bbox}) "
+        f"ELSE ST_Area({geom_expr}) END)"
+    )
+
+
+def _representative_point_sql(geom_expr: str) -> str:
+    """SQL for a point on the feature, for the sub-cell fallback (issue #104).
+
+    ST_PointOnSurface reads an antimeridian crosser planarly, as the wrong-way
+    band, and lands far from the feature; use one of its own vertices instead.
+    """
+    return (
+        f"(CASE WHEN {_dateline_crosser_sql(geom_expr)} "
+        f"THEN ST_Dump(ST_Points({geom_expr}))[1].geom "
+        f"ELSE ST_PointOnSurface({geom_expr}) END)"
+    )
 
 
 def _transmeridian_split_sql(carry_cols: str, source: str) -> str:
@@ -170,6 +256,10 @@ def _transmeridian_split_sql(carry_cols: str, source: str) -> str:
     GEOMETRYCOLLECTION, which the existing ST_Dump step already splits into single
     geometries before polyfill.
 
+    Antimeridian crossers are not split but pass through unchanged, because H3
+    polyfills them correctly and the split does not (issue #241; see
+    _dateline_crosser_sql). NULL geometries are dropped, as before.
+
     Args:
         carry_cols: comma-separated non-geometry columns to propagate (e.g. the id
             column, plus ``native_res`` in variable-resolution mode).
@@ -179,15 +269,19 @@ def _transmeridian_split_sql(carry_cols: str, source: str) -> str:
         f"(ST_GeomFromText('POLYGON(({lo} -90, {hi} -90, {hi} 90, {lo} 90, {lo} -90))'))"
         for lo, hi in _TRANSMERIDIAN_BANDS
     )
+    needs_split = (
+        f"ST_XMax(geom) - ST_XMin(geom) > {_TRANSMERIDIAN_MAX_SPAN_DEG} "
+        f"AND NOT {_dateline_crosser_sql('geom')}"
+    )
     return f'''
             SELECT {carry_cols}, geom
             FROM {source}
-            WHERE ST_XMax(geom) - ST_XMin(geom) <= {_TRANSMERIDIAN_MAX_SPAN_DEG}
+            WHERE NOT ({needs_split})
             UNION ALL
             SELECT {carry_cols}, ST_Intersection(s.geom, _bands.band) AS geom
-            FROM {source} AS s, (VALUES {bands}) AS _bands(band)
-            WHERE ST_XMax(s.geom) - ST_XMin(s.geom) > {_TRANSMERIDIAN_MAX_SPAN_DEG}
-              AND ST_Intersects(s.geom, _bands.band)
+            FROM (SELECT {carry_cols}, geom FROM {source} WHERE {needs_split}) AS s,
+                 (VALUES {bands}) AS _bands(band)
+            WHERE ST_Intersects(s.geom, _bands.band)
     '''
 
 
@@ -389,8 +483,8 @@ def geom_to_h3_cells(
                    WHEN h3id IS NOT NULL AND len(h3id) > 0 THEN h3id
                    WHEN ST_YMin(geom) >= -90 AND ST_YMax(geom) <= 90
                    THEN [h3_latlng_to_cell(
-                            ST_Y(ST_PointOnSurface(geom)),
-                            ST_X(ST_PointOnSurface(geom)),
+                            ST_Y({_representative_point_sql('geom')}),
+                            ST_X({_representative_point_sql('geom')}),
                             native_res)]
                    ELSE h3id
                END AS h3id
@@ -441,8 +535,8 @@ def geom_to_h3_cells(
                    WHEN h3id IS NOT NULL AND len(h3id) > 0 THEN h3id
                    WHEN ST_YMin(geom) >= -90 AND ST_YMax(geom) <= 90
                    THEN [h3_latlng_to_cell(
-                            ST_Y(ST_PointOnSurface(geom)),
-                            ST_X(ST_PointOnSurface(geom)),
+                            ST_Y({_representative_point_sql('geom')}),
+                            ST_X({_representative_point_sql('geom')}),
                             {zoom})]
                    ELSE h3id
                END AS h3id
@@ -618,27 +712,28 @@ class H3VectorProcessor:
         converts an otherwise-fatal C++ page-size assertion in the Pass-1 COPY
         into an actionable error.
 
-        Area is measured geodesically (``ST_Area_Spheroid``) for the common case,
-        but PLANARLY for antimeridian-crossing features — those whose longitude
-        bbox spans more than 180° (issue #167). ``h3_polygon_wkt_to_cells``
-        polyfills the planar WKT, so a narrow strip that crosses ±180° reads as a
-        near-hemisphere cartesian fill and enumerates billions of cells, hanging
-        Pass 1 for hours. ``ST_Area_Spheroid`` measures the geodesic (short-way)
-        region instead — small, or even NaN for such a polygon — so it slips past
-        the guard. Estimating these features from planar area (what the polyfill
-        actually walks) catches the explosion up front; a clean multipolygon of
-        islands either side of the dateline has small planar area and still passes.
+        Area is measured geodesically (``ST_Area_Spheroid``) for the common case.
+        Features whose longitude bbox spans more than 180 deg need a planar
+        estimate instead, because ``ST_Area_Spheroid`` returns NaN for them (or a
+        figure unrelated to what the polyfill walks), and DuckDB orders NaN above
+        every number:
+
+        - Circumpolar features are band-split and polyfilled planarly, so their
+          planar area is what the fill walks (#145, #167).
+        - Antimeridian crossers are polyfilled the short way round by H3 (#241).
+          They are measured by their short-way planar area
+          (``_planar_area_deg2_sql``), not the wrong-way region.
 
         In variable-resolution mode (issue #98) the estimate uses each feature's
         own native resolution — large features map to a coarser resolution and far
         fewer cells, the per-feature back-off that complements this guardrail — and
         the reported resolution is the worst offender's native res.
         """
-        # Planar area (deg² → m²) for antimeridian-crossing features, geodesic
-        # area otherwise. See the docstring for why the choice matters (#167).
+        # Geodesic area normally; planar (short-way for antimeridian crossers)
+        # for >180-deg features. See the docstring for why (#167, #241).
         area_expr = (
             f"CASE WHEN ST_XMax(geom) - ST_XMin(geom) > {_TRANSMERIDIAN_MAX_SPAN_DEG} "
-            f"THEN ST_Area(geom) * {_DEG2_TO_M2} "
+            f"THEN {_planar_area_deg2_sql('geom')} * {_DEG2_TO_M2} "
             f"ELSE ST_Area_Spheroid(geom) END"
         )
         if self.resolution_by_area is not None:
@@ -660,8 +755,7 @@ class H3VectorProcessor:
                 "{id_col}" AS fid,
                 {area_expr} AS area_m2,
                 {est_cells_expr} AS est_cells,
-                {res_select},
-                ST_XMax(geom) - ST_XMin(geom) AS lon_span
+                {res_select}
             FROM chunk_table
             WHERE ST_GeometryType(geom) NOT IN ('POINT', 'MULTIPOINT')
             ORDER BY est_cells DESC
@@ -670,23 +764,13 @@ class H3VectorProcessor:
 
         if worst is None or worst[2] is None:
             return
-        fid, area_m2, est_cells, native_res, lon_span = worst
+        fid, area_m2, est_cells, native_res = worst
         if est_cells > self.max_cells_per_feature:
-            antimeridian_note = ""
-            if lon_span is not None and lon_span > _TRANSMERIDIAN_MAX_SPAN_DEG:
-                antimeridian_note = (
-                    f" Its longitude bbox spans {lon_span:.1f}°, so it crosses the "
-                    f"antimeridian (±180°): the planar H3 polyfill would enumerate "
-                    f"the whole span (a near-global cell set) and hang (issue #167). "
-                    f"Split the feature at ±180° upstream, or drop it from the hex "
-                    f"input if it is a dateline artifact."
-                )
             raise RuntimeError(
                 f"Chunk {chunk_id}: feature {id_col}={fid} is too large to hex at "
                 f"resolution {native_res} — estimated {int(est_cells):,} H3 "
                 f"cells ({area_m2 / 1e6:,.0f} km²) would exceed the per-feature "
-                f"cell-array limit ({self.max_cells_per_feature:,})."
-                f"{antimeridian_note} A single "
+                f"cell-array limit ({self.max_cells_per_feature:,}). A single "
                 f"feature's cells are written as one array value, which cannot "
                 f"exceed the ~268M-element (2GB) Arrow/parquet-page ceiling. "
                 f"Hex this feature at a coarser resolution (see #98 for adaptive "
