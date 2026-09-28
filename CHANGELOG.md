@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-28
+
 ### Fixed
 - **Line hex no longer drops cells the line passes through** (#239). Lines were buffered by one average H3 edge length *in degrees* and polyfilled by center containment. A degree of longitude is only `cos(lat) × 111 km`, so the east–west buffer shrank with latitude (half an edge at 60°), and H3 cells vary ~2× in size, so even at the equator cells larger than average fell outside it. On the 4.0M-segment global coastline build at res 8, 14–17% of segment start-point cells were missing at 45–75° latitude. Lines are now given a ~1 cm sliver buffer and polyfilled with H3's `overlap` containment, which yields exactly the cells the line intersects, at any latitude and on both the fixed- and variable-resolution paths. Output for lines changes: no missed cells, and no longer the extra cells whose centers merely lay within an edge of the line. Polygon and point hexing are unchanged. **Line datasets hexed before this fix should be rebuilt.**
 
@@ -236,6 +238,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.8.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.1
 [0.8.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.0
 [0.7.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.7.0
 [0.6.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.6.0
