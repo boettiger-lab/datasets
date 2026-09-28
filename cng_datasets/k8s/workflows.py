@@ -877,7 +877,7 @@ def generate_dataset_workflow(
         h3_resolution = _DEFAULT_H3_RESOLUTION.get(geom_type, 10)
         print(f"  Detected geometry type: {geom_type} — using H3 resolution {h3_resolution}")
         if geom_type == 'line':
-            print("  Line geometries will be buffered before H3 polyfill for continuous cell coverage.")
+            print("  Line geometries will be indexed by every H3 cell they pass through.")
 
     # Set defaults for parent resolutions if not provided
     if parent_resolutions is None:

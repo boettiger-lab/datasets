@@ -414,7 +414,7 @@ class TestH3Functions:
 
 
 class TestLineGeometryH3:
-    """Test H3 cell generation for LineString geometries via buffer."""
+    """Test H3 cell generation for LineString geometries (sliver buffer + overlap polyfill)."""
 
     @pytest.mark.timeout(10)
     def test_linestring_produces_h3_cells(self):
@@ -547,6 +547,89 @@ class TestLineGeometryH3:
         ids_with_cells = set(result['id'].tolist())
         assert 1 in ids_with_cells, "Polygon should produce H3 cells"
         assert 2 in ids_with_cells, "LineString should produce H3 cells"
+        con.close()
+
+    # A USGS Ecological Coastal Units segment at 59.3N (issue #239). The old
+    # degree-width buffer + center containment dropped 880e2d7817fffff, the cell
+    # holding the line's first vertex.
+    _ISSUE_239_COORDS = [
+        (-69.74939742099997, 59.31287451400004),
+        (-69.74804911099994, 59.31264979500003),
+        (-69.74236448199997, 59.314070953000055),
+        (-69.74114115399993, 59.31398560500003),
+    ]
+
+    @staticmethod
+    def _cells_on_line(con, coords, res):
+        """Cells of points spaced every ~1/50 edge along the line: the cells it
+        passes through, to within that sampling."""
+        step = con.execute(
+            f"SELECT h3_get_hexagon_edge_length_avg({res}, 'km') / 111.32 / 50"
+        ).fetchone()[0]
+        pts = []
+        for (x0, y0), (x1, y1) in zip(coords, coords[1:]):
+            n = max(1, int(max(abs(x1 - x0), abs(y1 - y0)) / step))
+            pts += [(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n) for i in range(n + 1)]
+        values = ", ".join(f"({y}, {x})" for x, y in pts)
+        return {
+            r[0] for r in con.execute(
+                f"SELECT DISTINCT h3_latlng_to_cell(lat, lng, {res}) "
+                f"FROM (VALUES {values}) t(lat, lng)"
+            ).fetchall()
+        }
+
+    @staticmethod
+    def _wkt(coords):
+        return "LINESTRING(" + ", ".join(f"{x} {y}" for x, y in coords) + ")"
+
+    @pytest.mark.timeout(10)
+    def test_issue_239_mre_keeps_vertex_cell(self):
+        """Every cell holding a vertex of the line is indexed (issue #239)."""
+        con = setup_duckdb_connection()
+        con.execute(f"CREATE TABLE t AS SELECT 1 AS id, "
+                    f"ST_GeomFromText('{self._wkt(self._ISSUE_239_COORDS)}') AS geom")
+        sql = geom_to_h3_cells(con, "t", zoom=8)
+        got = {r[0] for r in con.execute(
+            f"SELECT DISTINCT h3_h3_to_string(UNNEST(h3id)) FROM ({sql})").fetchall()}
+        assert '880e2d7817fffff' in got
+        con.close()
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize("lat", [0.0, 30.0, 45.0, 60.0, 75.0, 85.0])
+    def test_line_covers_every_cell_it_passes_through(self, lat):
+        """No cell the line crosses is dropped, at any latitude (issue #239).
+
+        The old buffer was one edge in *degrees*, so its east-west ground width
+        shrank by cos(lat); an east-west zigzag at high latitude lost most of the
+        cells it clipped.
+        """
+        con = setup_duckdb_connection()
+        edge_deg = 0.531414010 / 111.32
+        coords = [(-100.0 + i * 2 * edge_deg, lat + (i % 2) * 0.3 * edge_deg)
+                  for i in range(12)]
+        con.execute(f"CREATE TABLE t AS SELECT 1 AS id, "
+                    f"ST_GeomFromText('{self._wkt(coords)}') AS geom")
+        sql = geom_to_h3_cells(con, "t", zoom=8)
+        got = {r[0] for r in con.execute(
+            f"SELECT DISTINCT UNNEST(h3id) FROM ({sql})").fetchall()}
+        expected = self._cells_on_line(con, coords, 8)
+        assert expected - got == set()
+        # The sliver buffer adds no lateral swath: only cells the line touches.
+        assert len(got) <= len(expected) + 2
+        con.close()
+
+    @pytest.mark.timeout(10)
+    def test_line_coverage_variable_resolution(self):
+        """The --resolution-by-area path polyfills lines the same way (issue #239)."""
+        con = setup_duckdb_connection()
+        con.execute(f"CREATE TABLE t AS SELECT 1 AS id, "
+                    f"ST_GeomFromText('{self._wkt(self._ISSUE_239_COORDS)}') AS geom")
+        sql = geom_to_h3_cells(
+            con, "t", zoom=8, resolution_by_area=parse_resolution_by_area("12:8,6")
+        )
+        got = {r[0] for r in con.execute(
+            f"SELECT DISTINCT UNNEST(h3id) FROM ({sql})").fetchall()}
+        assert self._cells_on_line(con, self._ISSUE_239_COORDS, 8) - got == set()
         con.close()
 
 
