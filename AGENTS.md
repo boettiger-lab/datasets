@@ -204,6 +204,49 @@ kubectl get jobs | grep <name>
 - **Do not modify `cng_datasets/` source code** unless fixing a bug in the tool itself. User workflows only touch `catalog/` and generated YAML.
 - **Do not hardcode S3 endpoints or credentials.** The generated jobs handle S3 configuration (internal endpoints, secrets) automatically.
 - **Do not exceed 200 completions per job.** This is a hard limit to avoid overwhelming the cluster's etcd.
+- **Do not build environments or run tests, MREs or the CLI on the dev pod.** That includes `uv venv`, `pip install -e .`, `pytest` and `cng-datasets workflow`. The dev pod is shared and small, and installing the package there has crashed it. Reading code, `git`, `gh` and `kubectl` are fine locally; everything that executes the tool goes in a cluster Job (next section).
+
+## Verifying Changes to the Tool
+
+When fixing a bug in `cng_datasets/`:
+
+1. **Reproduce first.** Run the issue's MRE against the released image (`ghcr.io/boettiger-lab/datasets:<version>`) *before* writing code. Issues filed against old versions are often already fixed.
+2. **Test the branch on the cluster.** Push the branch, then run a short Job on the image that clones it, installs it over the image's copy, and runs the MRE and the relevant tests:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-<issue>
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 10800
+  template:
+    spec:
+      priorityClassName: opportunistic   # short, interruptible check
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: ghcr.io/boettiger-lab/datasets:latest
+          command: ["bash", "-c"]
+          args:
+            - |
+              git clone -q --depth 1 -b <branch> https://github.com/boettiger-lab/datasets.git /src && cd /src
+              pip install -q -e ".[dev]"
+              python -m pytest tests/test_<area>.py -q -p no:cacheprovider
+          resources:
+            requests: {cpu: "2", memory: "4Gi"}
+            limits: {cpu: "2", memory: "4Gi"}
+```
+
+```bash
+kubectl -n geo-workflows apply -f verify.yaml
+kubectl -n geo-workflows wait --for=condition=complete job/verify-<issue> --timeout=900s
+kubectl -n geo-workflows logs job/verify-<issue>
+kubectl -n geo-workflows delete job verify-<issue>
+```
+
+CI (`test` + `lint`) runs the full suite in the same image on every PR, so it is the final gate. The Job is for getting the answer before you open the PR.
 
 ## Reference: Complete PAD-US Example
 
