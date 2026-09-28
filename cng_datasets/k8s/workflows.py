@@ -507,6 +507,46 @@ def _count_source_features(source_urls: Union[str, List[str]], layer: str = None
     return total_count
 
 
+def _resolve_feature_count(
+    source_urls: List[str], layer: Optional[str], expect_features: Optional[int]
+) -> int:
+    """Feature count to size the hex job by, or a ValueError if there is none.
+
+    Counts the source. If it can't be read, falls back to ``expect_features``
+    (``--expect-features``) when the caller gave one: that count is known
+    independently and the convert step enforces it at runtime, so a job sized
+    by it cannot quietly be wrong. Otherwise it raises.
+
+    It used to fall back to a made-up ``max_completions * 1000`` features, exit
+    0 and write a complete 200-way fan-out for a source that 404s. For a small
+    source that made each chunk up to 200x larger than a real count would, and
+    the warning suggested a ``--chunk-size`` flag that ``workflow`` does not
+    accept (issue #235).
+    """
+    if len(source_urls) > 1:
+        print(f"Counting features in {len(source_urls)} sources...")
+    else:
+        print(f"Counting features in {source_urls[0]}...")
+    try:
+        return _count_source_features(source_urls, layer=layer)
+    except Exception as e:
+        if expect_features is not None:
+            print(
+                f"  Warning: could not count features ({e}); sizing the hex job "
+                f"from --expect-features {int(expect_features):,} instead."
+            )
+            return int(expect_features)
+        sources = ", ".join(source_urls)
+        raise ValueError(
+            f"Could not count features in {sources} ({e}). The hex job is sized "
+            f"from the feature count, so no workflow was written. Check that the "
+            f"URL is correct and readable from here (a 404, a typo in the bucket "
+            f"name or missing credentials all look like this). If the source is "
+            f"right but can't be read from this machine, or isn't uploaded yet, "
+            f"pass --expect-features N with its known feature count."
+        ) from e
+
+
 def _count_single_source(source_url: str, layer: str = None) -> int:
     """
     Count features in a single source file.
@@ -814,7 +854,8 @@ def generate_dataset_workflow(
         expect_features: Row count the convert step must produce, known
             independently by the caller. The step exits non-zero on a mismatch,
             so a silently truncated source fails the workflow rather than
-            flowing into the hex and PMTiles steps (issue #186).
+            flowing into the hex and PMTiles steps (issue #186). Also sizes the
+            hex job when the source can't be counted from here (issue #235).
         armada_priority_class: Armada priority class for the `armada` backend —
             a literal name ("armada-default") or a shorthand ("default",
             "preemptible", "high"). Defaults to non-preemptible, since a
@@ -852,7 +893,6 @@ def generate_dataset_workflow(
 
     manager = K8sJobManager(namespace=namespace, image=image)
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
 
     # Sanitize dataset name for Kubernetes (replace underscores, slashes with hyphens)
     k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
@@ -861,6 +901,18 @@ def generate_dataset_workflow(
     # Normalize source_urls to list
     if isinstance(source_urls, str):
         source_urls = [source_urls]
+
+    # Count features to size the hex fan-out. This runs before any manifest is
+    # written: when the source can't be read, the workflow must fail rather than
+    # emit a plausible-looking fan-out sized for a made-up count (issue #235).
+    total_rows = _resolve_feature_count(source_urls, layer, expect_features)
+    chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
+    print(f"  Total features: {total_rows:,}")
+    print(f"  Chunk size: {chunk_size:,}")
+    print(f"  Completions: {completions}")
+    print(f"  Parallelism: {parallelism}")
+
+    output_path.mkdir(parents=True, exist_ok=True)
 
     # Variable-resolution mode (issue #98): the hex job receives the
     # --resolution-by-area spec instead of a single --h3-resolution. Derive the
@@ -891,27 +943,6 @@ def generate_dataset_workflow(
 
     # Generate pmtiles job (uses converted parquet, not source)
     _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config, h3_resolution=h3_resolution, max_zoom=pmtiles_max_zoom)
-
-    # Count features in source file(s) and calculate chunking parameters
-    if len(source_urls) > 1:
-        print(f"Counting features in {len(source_urls)} sources...")
-    else:
-        print(f"Counting features in {source_urls[0]}...")
-    try:
-        total_rows = _count_source_features(source_urls, layer=layer)
-        chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
-        print(f"  Total features: {total_rows:,}")
-        print(f"  Chunk size: {chunk_size:,}")
-        print(f"  Completions: {completions}")
-        print(f"  Parallelism: {parallelism}")
-    except Exception as e:
-        # Fall back to default values if counting fails (e.g., in tests or if file doesn't exist yet)
-        print(f"  Warning: Could not count features ({e}). Using conservative chunking parameters.")
-        total_rows = max_completions * 1000  # Conservative: covers up to max_completions*1000 features
-        chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
-        print(f"  Warning: feature count unknown — defaults cover at most {total_rows:,} features (chunk_size={chunk_size}).")
-        print("  If your dataset is larger, set --chunk-size manually.")
-        print(f"  Using defaults: chunk_size={chunk_size}, completions={completions}, parallelism={parallelism}")
 
     print(f"  H3 resolution: {h3_resolution}")
     print(f"  Parent resolutions: {parent_resolutions}")
