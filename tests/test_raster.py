@@ -1032,7 +1032,7 @@ class TestOverlapSkipAntimeridian:
             h0_grid_path=self._grid(temp_dir, self.WRAP_WKT),
         )
         called = []
-        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0: called.append(h0))
+        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0, **k: called.append(h0))
         result = proc.process_h0_region(0)
         assert result is None
         assert called == [], "antimeridian h0 should be skipped for a far raster"
@@ -1049,7 +1049,7 @@ class TestOverlapSkipAntimeridian:
             h0_grid_path=self._grid(temp_dir, self.WRAP_WKT),
         )
         called = []
-        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0: called.append(h0))
+        monkeypatch.setattr(proc, "_hex_aggregate_h0", lambda h0, **k: called.append(h0))
         proc.process_h0_region(0)
         assert called, "antimeridian h0 overlapping the seam must be processed"
 
@@ -2361,10 +2361,46 @@ class TestWindowedCogReads:
         assert forced._windowing is True
 
     @pytest.mark.timeout(120)
-    def test_auto_is_off_without_sub_chunking(self, raster, temp_dir):
-        """At h0 granularity the whole-file copy is still the right trade."""
+    def test_auto_follows_the_source_not_the_chunk_resolution(self, raster, temp_dir):
+        """
+        Whole-file localization is a per-pod cost at h0 granularity too.
+
+        'auto' used to window only when chunk_resolution > 0, so the default
+        122-pod fan-out copied the whole COG into every pod (issue #209). The
+        decision now depends only on whether the source is remote, so a local
+        source is left alone at any chunk resolution.
+        """
         proc, _ = self._processor(raster, temp_dir, "auto-h0")
         assert proc._windowing is False
+
+    @pytest.mark.timeout(300)
+    def test_h0_path_windows_and_matches_unwindowed(self, raster, temp_dir, monkeypatch):
+        """At chunk_resolution 0 the window is actually used, and changes nothing."""
+        plain, plain_out = self._processor(raster, temp_dir, "h0-plain",
+                                           window_reads="never")
+        windowed, win_out = self._processor(raster, temp_dir, "h0-win",
+                                            window_reads="always")
+        windows = []
+        real = windowed._windowed_source_for
+
+        def spy(*a, **k):
+            path = real(*a, **k)
+            windows.append(path)
+            return path
+        monkeypatch.setattr(windowed, "_windowed_source_for", spy)
+
+        plain.process_chunk(0)
+        windowed.process_chunk(0)
+        assert windows and isinstance(windows[0], str), (
+            "the h0 path never windowed the source")
+
+        con = duckdb.connect()
+        query = (f"SELECT v, h{self.RES} FROM read_parquet('{{}}/h0=*/data_0.parquet') "
+                 f"ORDER BY h{self.RES}")
+        a = con.execute(query.format(plain_out)).fetchall()
+        b = con.execute(query.format(win_out)).fetchall()
+        assert a, "unwindowed run produced nothing"
+        assert b == a, "windowed read changed the values"
 
     @pytest.mark.timeout(60)
     def test_invalid_mode_is_rejected(self, raster, temp_dir):
@@ -4435,3 +4471,102 @@ class TestBuildProvenance:
         monkeypatch.setattr(provenance, "build_metadata",
                             lambda: (_ for _ in ()).throw(RuntimeError("boom")))
         assert provenance.kv_metadata_sql() == ""
+
+
+@requires_gdal
+class TestEmptyCells:
+    """
+    A cell with no valid pixels under it is not a row (issues #232, #238).
+
+    `sum` of an empty cell is 0.0, not NaN, so a value test cannot tell it from
+    a cell that measures zero; the fractions reducer can filter a chunk down to
+    nothing, and the resulting empty partition must never be written — on an
+    s3:// output there is no os.remove to take it back.
+    """
+
+    H0_CELL = 577199624117288959
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _grid(self, temp_dir):
+        import geopandas as gpd
+        from shapely.geometry import box
+        g = gpd.GeoDataFrame(
+            {"i": [0], "h0": [self.H0_CELL], "geometry": [box(-124, 36, -118, 40)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom")
+        path = os.path.join(temp_dir, "h0-test.parquet")
+        g.to_parquet(path)
+        return path
+
+    def _raster(self, temp_dir, arr, nodata, dtype):
+        from osgeo import gdal, osr
+        ny, nx = arr.shape
+        path = os.path.join(temp_dir, f"src-{dtype}.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, nx, ny, 1, dtype)
+        ds.SetGeoTransform([-120.0, 0.01, 0, 38.1, 0, -0.01])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        band.WriteArray(arr)
+        band.SetNoDataValue(nodata)
+        ds = None
+        return path
+
+    def _processor(self, raster, temp_dir, name, **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        out = os.path.join(temp_dir, name)
+        return RasterProcessor(
+            input_path=raster, output_parquet_path=out, h3_resolution=7,
+            parent_resolutions=[0], h0_grid_path=self._grid(temp_dir),
+            value_column="v", **kwargs,
+        )
+
+    @pytest.mark.timeout(180)
+    def test_sum_drops_uncovered_cells_and_keeps_genuine_zeros(self, temp_dir):
+        """The #232 MRE, plus a block of real zeros that must survive."""
+        from osgeo import gdal
+        arr = np.full((10, 10), -9999.0, dtype="float32")
+        arr[1:3, 1:3] = 1.0   # mass 4.0
+        arr[7:9, 7:9] = 0.0   # measured zero, not missing
+        raster = self._raster(temp_dir, arr, -9999, gdal.GDT_Float32)
+
+        rows = {}
+        for op in ("mean", "sum"):
+            out = self._processor(raster, temp_dir, op, hex_resampling=op,
+                                  nodata_value=-9999).process_h0_region(0)
+            assert out is not None
+            rows[op] = dict(duckdb.sql(
+                f"SELECT h7, v FROM read_parquet('{out}')").fetchall())
+
+        # mean drops empty cells by NaN; sum must drop exactly the same ones.
+        assert set(rows["sum"]) == set(rows["mean"])
+        assert sum(rows["sum"].values()) == pytest.approx(4.0, rel=1e-6)
+        assert any(v == 0.0 for v in rows["sum"].values()), (
+            "cells over genuine zero pixels were dropped with the empty ones")
+
+    @pytest.mark.timeout(180)
+    def test_all_nodata_fractions_chunk_writes_nothing_to_a_remote_output(
+            self, temp_dir, monkeypatch):
+        """The #238 MRE's shape, without a bucket: nothing may reach the output."""
+        from osgeo import gdal
+        arr = np.full((10, 10), 255, dtype="uint8")
+        raster = self._raster(temp_dir, arr, 255, gdal.GDT_Byte)
+        proc = self._processor(raster, temp_dir, "frac", hex_resampling="fractions",
+                               nodata_value=255)
+        remote = "s3://no-such-bucket-cng/mre/h0=577199624117288959/data_0.parquet"
+        monkeypatch.setattr(proc, "_chunk_output_path", lambda *a, **k: remote)
+        real_makedirs = os.makedirs
+
+        def makedirs(path, *a, **k):
+            if str(path).startswith("s3:"):
+                pytest.fail("created a local directory for an s3:// output")
+            return real_makedirs(path, *a, **k)
+        monkeypatch.setattr(os, "makedirs", makedirs)
+
+        assert proc.process_h0_region(0) is None

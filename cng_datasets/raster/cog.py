@@ -132,6 +132,26 @@ _BOUNDARY_CON = None
 # returns false rather than raising (issue #173).
 _IS_A_VALUE = "{col} IS NOT NULL AND NOT isnan({col})"
 
+# Coverage, not value, decides whether a cell has data (issue #232). An empty
+# `mean`/`max`/`min` is NaN and falls to _IS_A_VALUE, but an empty `sum` is 0.0,
+# indistinguishable from a cell that measures zero. exactextract's `count` is
+# the coverage-weighted number of valid pixels, so it is > 0 exactly when the
+# cell covers at least one non-nodata pixel, whatever the reducer returns.
+_COVERAGE_OP = "count"
+_HAS_COVERAGE = "{col} > 0"
+
+
+def _is_remote_path(path) -> bool:
+    """Whether *path* is an object-store or HTTP URL rather than a local file."""
+    return isinstance(path, str) and path.startswith(("s3://", "http://", "https://"))
+
+
+def _extract_ops(op_name):
+    """The exactextract ops a reducer needs: its own, plus coverage."""
+    if op_name == "fractions":
+        return ["unique", "frac"]
+    return [op_name, _COVERAGE_OP]
+
 _OGR_PARQUET = None
 
 
@@ -327,7 +347,7 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
     if len(chunk_ids) == 0:
         return None
     is_fractions = op_name == "fractions"
-    ops = ["unique", "frac"] if is_fractions else [op_name]
+    ops = _extract_ops(op_name)
 
     os.makedirs(out_dir, exist_ok=True)
     sources, cleanup = _chunk_vec_sources(chunk_ids, out_dir, index)
@@ -385,9 +405,12 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
             # route has always published DOUBLE for every single-value reducer.
             # Casting here is what keeps the published schema a property of the
             # dataset rather than of which writer happened to be available.
+            # Filtered on coverage, not value: an empty sum is 0.0 (#232).
+            ccol = _exactextract_column(columns, _COVERAGE_OP)
+            has_coverage = _HAS_COVERAGE.format(col=f'"{ccol}"')
             select = (f'SELECT CAST("_h3_str" AS UBIGINT) AS h, '
                       f'CAST("{vcol}" AS DOUBLE) AS value '
-                      f"FROM read_parquet({raw})")
+                      f"FROM read_parquet({raw}) WHERE {has_coverage}")
             keep = _IS_A_VALUE.format(col="value")
         con.execute(
             f"COPY (SELECT * FROM ({select}) WHERE {keep}) "
@@ -457,6 +480,9 @@ def _write_chunk_part(frame, op_name, out_dir, index):
                 + (", frac" if is_fractions else ""))
         keep = _IS_A_VALUE.format(
             col="frac" if is_fractions else '"' + value_col + '"')
+        if not is_fractions:
+            count_col = _exactextract_column(list(frame.columns), _COVERAGE_OP)
+            keep += " AND " + _HAS_COVERAGE.format(col=f'"{count_col}"')
         con.execute(
             f"COPY (SELECT {cols} FROM part_frame WHERE {keep}) "
             f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
@@ -495,7 +521,7 @@ def _exact_extract_cells(raster_path, op_name, chunk_cells):
         return None
 
     is_fractions = op_name == "fractions"
-    ops = ["unique", "frac"] if is_fractions else [op_name]
+    ops = _extract_ops(op_name)
 
     # Split cells that straddle +/-180 into a MultiPolygon so exact_extract
     # integrates their true footprint, not a 360-deg ribbon (issue #88).
@@ -1946,12 +1972,12 @@ class RasterProcessor:
                 h0_index; either may be given.
             window_reads: Whether a chunk reads only its own window of the
                 source COG instead of localizing the whole file. "auto"
-                (default) windows whenever chunk_resolution > 0, "always" and
-                "never" force it. Full localization costs one whole-file copy
-                per pod, which is tolerable across 122 h0 pods and ruinous
-                across the thousands of pods sub-h0 chunking creates — the
-                transfer scales with the fan-out, not with the data (issue
-                #173, lever C).
+                (default) windows whenever the source is remote, at any chunk
+                resolution; "always" and "never" force it. Full localization
+                costs one whole-file copy per pod, so transfer and ephemeral
+                disk scale with the fan-out rather than with the data — already
+                wasteful across 122 h0 pods (issue #209), ruinous across the
+                thousands sub-h0 chunking creates (issue #173, lever C).
             h0_subset: Restrict the chunk list to descendants of these h0 base
                 cell indices, so a regional source never enumerates chunks it
                 cannot overlap (issue #191, applied at chunk granularity).
@@ -2060,14 +2086,10 @@ class RasterProcessor:
         # "auto" also requires the source to be remote — a window over a local
         # file transfers nothing and buys nothing, it just decodes and re-encodes
         # the region, so the honest default is to leave a local read alone.
-        remote_source = isinstance(input_path, str) and (
-            input_path.startswith("s3://")
-            or input_path.startswith("http://")
-            or input_path.startswith("https://")
-        )
+        remote_source = _is_remote_path(input_path)
         self._windowing = (
             window_reads == "always"
-            or (window_reads == "auto" and chunk_resolution > 0 and remote_source)
+            or (window_reads == "auto" and remote_source)
         )
         self._window_cache_dir = local_cache_dir
         # Enumerate only the subtrees that reach the source (issue #215).
@@ -2075,11 +2097,7 @@ class RasterProcessor:
         # enumeration for a like-for-like comparison.
         self._prune_cells = os.environ.get("CNG_HEX_PRUNE_CELLS", "1") != "0"
 
-        if (local_cache_dir and not self._windowing
-                and isinstance(input_path, str)
-                and (input_path.startswith("s3://")
-                     or input_path.startswith("http://")
-                     or input_path.startswith("https://"))):
+        if local_cache_dir and not self._windowing and remote_source:
             input_path = _localize_input(input_path, local_cache_dir)
 
         # Use /vsis3/ so reads honor AWS_S3_ENDPOINT — inside the cluster this
@@ -2932,7 +2950,6 @@ class RasterProcessor:
         parent_sql = ", " + ", ".join(parent_exprs) if parent_exprs else ""
 
         output_path = self._chunk_output_path(chunk_cell, h0_cell)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         # What built this, recorded in the partition itself (provenance.py).
         stamp = kv_metadata_sql()
 
@@ -2979,34 +2996,33 @@ class RasterProcessor:
                     f"SELECT {h3_col} FROM hex_values "
                     f"WHERE {self.value_column} NOT IN ({codes}))"
                 )
-            copy_sql = f"""
-                COPY (
-                    WITH hex_values AS ({hex_values})
-                    SELECT {select_cols}
-                    FROM hex_values
-                    {where_sql}
-                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd'{stamp})
+            rows_sql = f"""
+                WITH hex_values AS ({hex_values})
+                SELECT {select_cols}
+                FROM hex_values
+                {where_sql}
             """
         else:
-            copy_sql = f"""
-                COPY (
-                    WITH hex_values AS ({hex_values})
-                    SELECT {self.value_column}, {h3_col}{parent_sql}
-                    FROM hex_values
-                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION 'zstd'{stamp})
+            rows_sql = f"""
+                WITH hex_values AS ({hex_values})
+                SELECT {self.value_column}, {h3_col}{parent_sql}
+                FROM hex_values
             """
-        self.con.execute(copy_sql)
 
-        # Counted from the file rather than from a frame we no longer hold;
-        # parquet keeps the row count in its footer, so this reads no data.
-        written = self.con.execute(
-            f"SELECT count(*) FROM read_parquet('{output_path}')"
-        ).fetchone()[0]
-        if written == 0:
-            # Every row was filtered out — an all-nodata chunk. Leave no empty
-            # partition behind for the merge to find.
-            os.remove(output_path)
+        # Counted before writing, not after. An all-nodata chunk filters every
+        # row out, and a 0-row partition must not be left for the merge to
+        # find — but the output is usually s3://, where there is no os.remove
+        # to take it back (issue #238). The parts are local, so this scan is
+        # cheap next to the COPY it may save.
+        if self.con.execute(f"SELECT count(*) FROM ({rows_sql})").fetchone()[0] == 0:
             return None
+
+        if not _is_remote_path(output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        self.con.execute(
+            f"COPY ({rows_sql}) TO '{output_path}' "
+            f"(FORMAT PARQUET, COMPRESSION 'zstd'{stamp})"
+        )
         return output_path
 
     def chunk_cells(self):
@@ -3041,7 +3057,7 @@ class RasterProcessor:
                                  h0_cell: int, result: Optional[str]) -> None:
         """Write this chunk's completion marker."""
         path = self._chunk_manifest_path(chunk_index)
-        if not path.startswith("s3://"):
+        if not _is_remote_path(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
         self.con.execute(f"""
             COPY (
@@ -3108,8 +3124,11 @@ class RasterProcessor:
                 format="GTiff",
                 projWin=[wxmin, wymax, wxmax, wymin],
                 projWinSRS="EPSG:4326",
+                # Compressed: at h0 size an uncompressed window can be larger
+                # than the whole compressed COG it replaces (issue #209).
                 creationOptions=["TILED=YES", "BIGTIFF=IF_SAFER",
-                                 "NUM_THREADS=ALL_CPUS"],
+                                 "NUM_THREADS=ALL_CPUS", "COMPRESS=ZSTD",
+                                 f"PREDICTOR={_compression_predictor(self.input_path)}"],
                 noData=None,
             )
         except RuntimeError as e:
@@ -3211,6 +3230,14 @@ class RasterProcessor:
             # it reads only what it needs without a separate window.
             return self._hex_warp_centroid_h0(geom_wkt, chunk_cell, chunk_index, h0_cell=h0_cell)
 
+        return self._aggregate_chunk(chunk_cell, h0_cell, geom_wkt, window_margin)
+
+    def _aggregate_chunk(self, chunk_cell: int, h0_cell: int, geom_wkt: str,
+                         window_margin: float) -> Optional[str]:
+        """exact-extract one chunk, through its own window of the source when
+        windowing is on. Shared by the h0 and sub-h0 paths, so the default
+        fan-out gets the same bounded read as a sub-chunked one (issue #209).
+        """
         source_path = None
         if self._windowing:
             source_path = self._windowed_source_for(geom_wkt, window_margin, chunk_cell)
@@ -3286,7 +3313,17 @@ class RasterProcessor:
         # warp-centroid is the opt-in gdal.Warp -> XYZ -> centroid fallback.
         if self.method == "warp-centroid":
             return self._hex_warp_centroid_h0(h0_geom_wkt, h0_cell, h0_index)
-        return self._hex_aggregate_h0(h0_cell)
+        # The window follows the H3 cell's own boundary, not the grid's stored
+        # polygon, since that is what the native cells are enumerated from.
+        geom_wkt = self.con.execute(
+            f"SELECT h3_cell_to_boundary_wkt({int(h0_cell)})"
+        ).fetchone()[0]
+        from shapely import wkt as _shapely_wkt
+        _, cminy, _, cmaxy = _shapely_wkt.loads(geom_wkt).bounds
+        return self._aggregate_chunk(
+            int(h0_cell), int(h0_cell), geom_wkt,
+            _H3_PROTRUSION_MARGIN * (cmaxy - cminy),
+        )
 
     def _hex_warp_centroid_h0(
         self, h0_geom_wkt: str, chunk_cell: int, h0_index: int,
@@ -3379,7 +3416,8 @@ class RasterProcessor:
                 where_clause = ""
 
             output_path = self._chunk_output_path(chunk_cell, h0_cell)
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            if not _is_remote_path(output_path):
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
             stamp = kv_metadata_sql()
 
             self.con.execute(f"""
