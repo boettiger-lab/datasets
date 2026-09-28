@@ -635,31 +635,53 @@ class TestEdgeCases:
             assert "single.shp" in command_str
 
     @pytest.mark.timeout(10)
-    def test_feature_count_fallback_uses_conservative_chunk_size(self, mocker):
-        """When feature counting fails, chunk_size should be large enough to cover large datasets."""
+    def test_uncountable_source_fails_without_writing_a_workflow(self, mocker):
+        """A source that can't be counted is an error, not a made-up 200-way
+        fan-out (issue #235), and nothing is written."""
         mocker.patch(
             'cng_datasets.k8s.workflows._count_source_features',
-            side_effect=Exception("ogrinfo timed out after 30 seconds")
+            side_effect=Exception("ogrinfo returned non-zero exit status 1"),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "wf"
+            with pytest.raises(ValueError) as exc:
+                generate_dataset_workflow(
+                    dataset_name="fallback-test",
+                    source_urls="https://example.com/missing.gdb",
+                    bucket="test-bucket",
+                    output_dir=str(out),
+                    max_completions=200,
+                )
+            msg = str(exc.value)
+            assert "missing.gdb" in msg
+            assert "--expect-features" in msg
+            # The old warning advertised a flag `workflow` does not accept.
+            assert "--chunk-size" not in msg
+            assert not out.exists() or not any(out.iterdir())
+
+    @pytest.mark.timeout(10)
+    def test_uncountable_source_sized_by_expect_features(self, mocker):
+        """With --expect-features, an uncountable source is sized by that
+        count rather than rejected (issue #235)."""
+        mocker.patch(
+            'cng_datasets.k8s.workflows._count_source_features',
+            side_effect=Exception("ogrinfo returned non-zero exit status 1"),
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             generate_dataset_workflow(
                 dataset_name="fallback-test",
-                source_urls="https://example.com/large.gdb",
+                source_urls="https://example.com/not-uploaded-yet.gdb",
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 max_completions=200,
+                expect_features=847,
             )
-
-            hex_file = Path(tmpdir) / "fallback-test-hex.yaml"
-            with open(hex_file) as f:
+            with open(Path(tmpdir) / "fallback-test-hex.yaml") as f:
                 job = yaml.safe_load(f)
-
-            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
-            # With max_completions=200, fallback total_rows=200*1000=200000,
-            # so chunk_size=ceil(200000/200)=1000 — not the old silently-small 50.
-            assert "--chunk-size 50" not in command_str
-            assert "--chunk-size 1000" in command_str
+            # 847 features is one chunk (the 1000-feature floor), not 200.
+            assert job["spec"]["completions"] == 1
 
 
 class TestRasterWorkflowGeneration:

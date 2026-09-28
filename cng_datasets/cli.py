@@ -251,7 +251,10 @@ def main():
                                       "independently (e.g. from the source service's own "
                                       "count). The step exits non-zero on a mismatch, so a "
                                       "silently truncated source fails the workflow instead "
-                                      "of flowing into the hex and PMTiles steps")
+                                      "of flowing into the hex and PMTiles steps. Also sizes the "
+                                      "hex job when the source can't be counted from here "
+                                      "(e.g. not uploaded yet); without it, an uncountable "
+                                      "source is an error")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     workflow_parser.add_argument("--armada-queue", default=None, metavar="QUEUE", help="Armada queue when --backend armada/auto. Defaults to --namespace: NRP maps queues one-to-one onto namespaces, but they are separate fields in a job set, so set this to submit to a queue that is not named after the namespace the pods land in.")
     workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
