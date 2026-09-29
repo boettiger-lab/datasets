@@ -1810,13 +1810,16 @@ class TestRepartitionCompletenessGuard:
             chunks_dir = f"{tmpdir}/chunks"
             self._hex_chunks(src, chunks_dir, chunk_ids=[0], chunk_size=5)
 
-            with pytest.raises(RuntimeError, match=r"incomplete: 5 of 10"):
+            with pytest.raises(RuntimeError, match=r"incomplete: 5 of 10") as exc:
                 repartition_by_h0(
                     chunks_dir=chunks_dir,
                     output_dir=f"{tmpdir}/output",
                     source_parquet=src,
                     cleanup=False,
                 )
+            # A failed hex index is the likeliest cause, so it is named first (#258).
+            msg = str(exc.value)
+            assert msg.index("failedIndexes") < msg.index("#170")
 
     @pytest.mark.timeout(30)
     def test_complete_hex_output_passes(self):

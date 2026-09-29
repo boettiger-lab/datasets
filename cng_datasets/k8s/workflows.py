@@ -1836,7 +1836,7 @@ echo "Step 1: Preprocessing COG mosaic..."
 kubectl apply -f /yamls/{dataset_name}-preprocess-cog.yaml -n {namespace}
 
 echo "Waiting for preprocess-cog (may take 30-60 min for large tile sets)..."
-kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-preprocess-cog -n {namespace}
+wait_job {dataset_name}-preprocess-cog {namespace} 7200
 """
         hex_step_num = "2"
         cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-preprocess-cog {dataset_name}-hex {dataset_name}-workflow"
@@ -1851,7 +1851,7 @@ kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-preproc
 # Step {int(hex_step_num) + 1}: Merge sub-h0 chunks into one file per h0 partition
 echo "Step {int(hex_step_num) + 1}: Merging hex chunks..."
 kubectl apply -f /yamls/{dataset_name}-merge.yaml -n {namespace}
-kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-merge -n {namespace}
+wait_job {dataset_name}-merge {namespace} 7200
 """
         cleanup_jobs = cleanup_jobs.replace(
             f"{dataset_name}-workflow", f"{dataset_name}-merge {dataset_name}-workflow"
@@ -1874,18 +1874,18 @@ kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-merge -
                         "image": "bitnami/kubectl:latest",
                         "command": ["bash", "-c"],
                         "args": [f"""set -e
-
+{_WAIT_JOB_SH}
 echo "Starting {dataset_name} raster workflow..."
 
 # Step 0: Setup bucket
 echo "Step 0: Setting up bucket..."
 kubectl apply -f /yamls/{dataset_name}-setup-bucket.yaml -n {namespace}
-kubectl wait --for=condition=complete --timeout=600s job/{dataset_name}-setup-bucket -n {namespace}
+wait_job {dataset_name}-setup-bucket {namespace} 600
 {preprocess_steps}
 # Step {hex_step_num}: H3 hexagonal tiling
 echo "Step {hex_step_num}: H3 hexagonal tiling..."
 kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
-kubectl wait --for=condition=complete --timeout=7200s job/{dataset_name}-hex -n {namespace}
+wait_job {dataset_name}-hex {namespace} 7200
 {merge_steps}
 echo "✓ Workflow complete!"
 echo "Clean up with:"
@@ -2378,6 +2378,37 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
         yaml.dump(configmap, f, default_flow_style=False)
 
 
+# Shell for the orchestrator Jobs: wait for a step's Job and stop at once if it
+# fails. `kubectl wait --for=condition=complete` never returns for a Job that
+# has *failed*, so a dead step used to hold the orchestrator for its whole
+# timeout — 48 h for the vector hex step — looking Running throughout (#258).
+# Spliced into the scripts as a value, since its jsonpath braces would
+# otherwise be read as f-string fields.
+_WAIT_JOB_SH = """
+wait_job() {
+  local job="$1" ns="$2" timeout="$3" waited=0 state
+  echo "Waiting for $job (up to ${timeout}s)..."
+  while :; do
+    state=$(kubectl get job "$job" -n "$ns" -o jsonpath='{.status.conditions[?(@.status=="True")].type}')
+    case " $state " in
+      *" Complete "*) echo "✓ $job complete"; return 0 ;;
+      *" Failed "*)
+        echo "✗ $job failed, so the workflow stops here:"
+        kubectl get job "$job" -n "$ns" -o jsonpath='{range .status.conditions[*]}  {.type}: {.reason} {.message}{"\\n"}{end}'
+        echo "  Inspect it with: kubectl logs job/$job -n $ns"
+        exit 1 ;;
+    esac
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "✗ $job did not finish within ${timeout}s"
+      exit 1
+    fi
+    sleep 30
+    waited=$((waited + 30))
+  done
+}
+"""
+
+
 def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir):
     """Generate K8s Job that orchestrates the workflow using a ConfigMap.
 
@@ -2409,7 +2440,7 @@ def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir):
                         "command": ["bash", "-c"],
                         "args": [f"""
 set -e
-
+{_WAIT_JOB_SH}
 echo "Starting {dataset_name} workflow..."
 
 # Step 0: Setup bucket with public access and CORS
@@ -2417,14 +2448,14 @@ echo "Step 0: Setting up bucket..."
 kubectl apply -f /yamls/{dataset_name}-setup-bucket.yaml -n {namespace}
 
 echo "Waiting for bucket setup to complete..."
-kubectl wait --for=condition=complete --timeout=600s job/{dataset_name}-setup-bucket -n {namespace}
+wait_job {dataset_name}-setup-bucket {namespace} 600
 
 # Step 1: Convert to optimized GeoParquet (needed by both pmtiles and hex jobs)
 echo "Step 1: Converting to optimized GeoParquet..."
 kubectl apply -f /yamls/{dataset_name}-convert.yaml -n {namespace}
 
 echo "Waiting for GeoParquet conversion to complete..."
-kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-convert -n {namespace}
+wait_job {dataset_name}-convert {namespace} 3600
 
 # Step 2: Run pmtiles and hex tiling in parallel (both use the converted geoparquet)
 echo "Step 2: H3 hexagonal tiling and PMTiles generation (parallel)..."
@@ -2433,13 +2464,13 @@ kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
 
 echo "Waiting for hex tiling to complete (PMTiles continues in background)..."
 echo "Timeout set to 48 hours (172800s)..."
-kubectl wait --for=condition=complete --timeout=172800s job/{dataset_name}-hex -n {namespace}
+wait_job {dataset_name}-hex {namespace} 172800
 
 echo "Step 3: Repartitioning by h0..."
 kubectl apply -f /yamls/{dataset_name}-repartition.yaml -n {namespace}
 
 echo "Waiting for repartition to complete..."
-kubectl wait --for=condition=complete --timeout=3600s job/{dataset_name}-repartition -n {namespace}
+wait_job {dataset_name}-repartition {namespace} 3600
 
 echo "✓ Workflow complete!"
 echo "Note: PMTiles job may still be running in the background"
