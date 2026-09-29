@@ -2074,3 +2074,105 @@ class TestFeatureCountReporting:
         source = self._gpkg(tmp_path, "full", 6)
         cp.convert_to_parquet(source, "s3://bucket/out.parquet", expect_features=6)
         assert len(uploads) == 1
+
+
+class TestArchiveLayerSelection:
+    """Issue #216: --layer on a multi-source archive, and sources that cannot
+    be merged. DuckDB's ST_Read segfaults when asked for a layer its source
+    does not have, so every one of these must be refused *before* ST_Read."""
+
+    @staticmethod
+    def _zip(tmpdir, py_extra_column=False):
+        import zipfile
+        import geopandas as gpd
+        from shapely.geometry import Point, box
+        data = Path(tmpdir) / "data"
+        data.mkdir()
+        gpd.GeoDataFrame({"name": ["a", "b"]}, geometry=[Point(0, 0), Point(1, 1)],
+                         crs=4326).to_file(data / "reefs_pt.shp")
+        cols = {"name": ["c"], "area": [1.0]} if py_extra_column else {"name": ["c"]}
+        gpd.GeoDataFrame(cols, geometry=[box(0, 0, 1, 1)], crs=4326).to_file(data / "reefs_py.shp")
+        path = Path(tmpdir) / "reefs.zip"
+        with zipfile.ZipFile(path, "w") as z:
+            for f in data.iterdir():
+                z.write(f, f"data/{f.name}")
+        return str(path)
+
+    @staticmethod
+    def _rows(path):
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        geom = next(r[0] for r in con.execute(f"DESCRIBE SELECT * FROM '{path}'").fetchall()
+                    if str(r[1]).upper().startswith("GEOMETRY"))
+        return con.execute(
+            f'SELECT name, ST_GeometryType("{geom}")::VARCHAR FROM \'{path}\' ORDER BY name'
+        ).fetchall()
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("layer, expected", [
+        ("reefs_pt", [("a", "POINT"), ("b", "POINT")]),
+        ("reefs_py", [("c", "POLYGON")]),
+    ])
+    def test_layer_selects_only_its_source(self, layer, expected):
+        """The MRE: this segfaulted for both layers."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._zip(tmpdir)
+            out = f"{tmpdir}/out.parquet"
+            convert_to_parquet(source_url=src, destination=out, layer=layer, progress=False)
+            assert self._rows(out) == expected
+
+    @pytest.mark.timeout(60)
+    def test_a_layer_in_no_source_is_a_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._zip(tmpdir)
+            with pytest.raises(ValueError, match=r"'reefs_typo' is not in any source.*reefs_pt"):
+                convert_to_parquet(source_url=src, destination=f"{tmpdir}/o.parquet",
+                                   layer="reefs_typo", progress=False)
+
+    @pytest.mark.timeout(60)
+    def test_mixed_geometry_archive_without_layer_is_refused(self):
+        """Same columns, so DuckDB would happily union a point and a polygon
+        layer into one table; refuse and point at --layer."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._zip(tmpdir)
+            with pytest.raises(ValueError, match=r"(?s)mixed geometry types.*--layer"):
+                convert_to_parquet(source_url=src, destination=f"{tmpdir}/o.parquet",
+                                   progress=False)
+
+    @pytest.mark.timeout(60)
+    def test_differing_columns_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import geopandas as gpd
+            from shapely.geometry import box
+            a, b = f"{tmpdir}/a.gpkg", f"{tmpdir}/b.gpkg"
+            gpd.GeoDataFrame({"x": [1], "y": ["p"]}, geometry=[box(0, 0, 1, 1)], crs=4326).to_file(a)
+            gpd.GeoDataFrame({"y": ["q"], "x": [2]}, geometry=[box(1, 1, 2, 2)], crs=4326).to_file(b)
+            # Same count, different order: a positional UNION ALL would
+            # silently put x's values under y and vice versa.
+            with pytest.raises(ValueError, match="different columns"):
+                convert_to_parquet(source_url=[a, b], destination=f"{tmpdir}/o.parquet",
+                                   progress=False)
+
+    @pytest.mark.timeout(60)
+    def test_a_missing_layer_on_a_single_source_is_a_clear_error(self):
+        """Not an archive at all: a --layer typo segfaulted here too."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import geopandas as gpd
+            from shapely.geometry import box
+            src = f"{tmpdir}/x.gpkg"
+            gpd.GeoDataFrame({"n": [1]}, geometry=[box(0, 0, 1, 1)], crs=4326).to_file(src, layer="real")
+            with pytest.raises(ValueError, match=r"'nope' is not in .*Available layers: real"):
+                convert_to_parquet(source_url=src, destination=f"{tmpdir}/o.parquet",
+                                   layer="nope", progress=False)
+
+    @pytest.mark.timeout(60)
+    def test_compatible_sources_still_merge(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import geopandas as gpd
+            from shapely.geometry import box
+            a, b = f"{tmpdir}/a.gpkg", f"{tmpdir}/b.gpkg"
+            for path, name in ((a, "p"), (b, "q")):
+                gpd.GeoDataFrame({"name": [name]}, geometry=[box(0, 0, 1, 1)], crs=4326).to_file(path)
+            out = f"{tmpdir}/o.parquet"
+            convert_to_parquet(source_url=[a, b], destination=out, progress=False)
+            assert [r[0] for r in self._rows(out)] == ["p", "q"]

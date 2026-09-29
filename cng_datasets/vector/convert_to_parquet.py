@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import zipfile
+import re
 from typing import NamedTuple, Optional, Tuple, List, Union
 import duckdb
 import geopandas as gpd
@@ -390,6 +391,97 @@ def download_and_extract(url: str, extract_to: str, verbose: bool = False) -> No
 
     except Exception as e:
         raise RuntimeError(f"Failed to download/extract zip: {e}")
+
+
+# Geometry families that can share one GeoParquet column. A layer whose type
+# GDAL cannot pin down ("Unknown", "Geometry") is compatible with anything.
+_GEOMETRY_FAMILIES = {
+    "point": "point", "multipoint": "point",
+    "linestring": "line", "multilinestring": "line",
+    "polygon": "polygon", "multipolygon": "polygon",
+}
+
+
+def _source_layers(source: str) -> Optional[List[str]]:
+    """Layer names GDAL sees in *source*, or None if it cannot be listed."""
+    try:
+        import pyogrio
+        return [str(row[0]) for row in pyogrio.list_layers(source)]
+    except Exception:
+        return None
+
+
+def select_sources_for_layer(sources: List[str], layer: str) -> List[str]:
+    """The sources in *sources* that actually contain *layer* (issue #216).
+
+    `--layer` on an archive used to reach every source in it, and DuckDB's
+    ST_Read segfaults when asked for a layer its source does not have — so a
+    zip of a point and a polygon shapefile crashed whichever layer was asked
+    for. A source whose layers cannot be listed is kept, and left to ST_Read.
+    """
+    keep, available = [], {}
+    for src in sources:
+        layers = _source_layers(src)
+        if layers is None or layer in layers:
+            keep.append(src)
+        else:
+            available[os.path.basename(src.rstrip("/"))] = layers
+    if not keep:
+        listing = "; ".join(f"{name}: {', '.join(ls) or '(none)'}"
+                            for name, ls in available.items())
+        raise ValueError(f"--layer {layer!r} is not in any source. Available layers: {listing}")
+    return keep
+
+
+def require_layer(source: str, layer: str) -> None:
+    """Refuse a layer the source does not have, rather than crash on it.
+
+    DuckDB's ST_Read segfaults on a missing layer (issue #216) — a typo in
+    `--layer` would otherwise kill the process with no traceback at all.
+    """
+    layers = _source_layers(source)
+    if layers is not None and layer not in layers:
+        raise ValueError(
+            f"--layer {layer!r} is not in {source}. Available layers: "
+            f"{', '.join(layers) or '(none)'}")
+
+
+def check_union_compatible(sources: List[str], layer: Optional[str] = None) -> None:
+    """Refuse to UNION sources that cannot share one table (issue #216).
+
+    The union is positional, so sources must agree on their columns, in order,
+    and on geometry family. A mismatch in column count is already a DuckDB
+    error, but equal counts with different columns would silently put values
+    under the wrong names, and a point layer unioned with a polygon layer is
+    never what a single-layer dataset means.
+    """
+    import pyogrio
+
+    described = []
+    for src in sources:
+        try:
+            info = pyogrio.read_info(src, layer=layer)
+        except Exception:
+            return  # cannot describe it; leave the union to DuckDB
+        gtype = str(info.get("geometry_type") or "").lower().replace(" ", "")
+        # "Polygon Z", "MultiLineString M", "Point ZM", "3D Polygon": the family
+        # is what matters, not the dimensionality.
+        family = _GEOMETRY_FAMILIES.get(re.sub(r"^(3d|2\.5d)|(zm|z|m|25d)$", "", gtype))
+        fields = [str(f) for f in info.get("fields", [])]
+        described.append((os.path.basename(src.rstrip("/")), family, fields, info.get("geometry_type")))
+
+    families = {d[1] for d in described if d[1] is not None}
+    schemas = {tuple(d[2]) for d in described}
+    if len(families) <= 1 and len(schemas) <= 1:
+        return
+    lines = "\n".join(f"    {name}: {gtype}, columns {fields}"
+                      for name, _, fields, gtype in described)
+    problem = ("mixed geometry types" if len(families) > 1
+               else "different columns")
+    raise ValueError(
+        f"Cannot merge these {len(sources)} sources into one table ({problem}):\n"
+        f"{lines}\n"
+        f"  Pick one with --layer <name>, or convert each separately.")
 
 
 def find_vector_sources(directory: str) -> List[str]:
@@ -1552,6 +1644,30 @@ def convert_to_parquet(
                 source_urls[0] = to_gdal_readable(source_urls[0])
             source_inputs = source_urls[0]
             representative_source = source_urls[0]
+
+        # Step 0b: Narrow to the requested layer and refuse unions that cannot
+        # work, before anything calls ST_Read — which segfaults on a layer its
+        # source does not have (issue #216).
+        if isinstance(source_inputs, list):
+            if layer and not is_zip:
+                # Sources named explicitly: each must have the layer. Dropping
+                # one the caller listed would be a silent change of input.
+                for src in source_inputs:
+                    require_layer(src, layer)
+            elif layer:
+                # An archive's contents were not chosen by the caller, so
+                # narrow them to the sources that hold the layer.
+                chosen = select_sources_for_layer(source_inputs, layer)
+                if len(chosen) < len(source_inputs):
+                    names = ", ".join(os.path.basename(c.rstrip("/")) for c in chosen)
+                    print(f"  --layer {layer}: using {len(chosen)} of "
+                          f"{len(source_inputs)} source(s): {names}")
+                source_inputs = chosen
+                representative_source = chosen[0]
+            if len(source_inputs) > 1:
+                check_union_compatible(source_inputs, layer)
+        elif layer:
+            require_layer(source_inputs, layer)
 
         # Step 1: Detect source CRS and geometry column
         print("  Detecting source CRS...")

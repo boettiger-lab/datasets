@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`--layer` on a multi-source zip selects that source, and a missing layer is an error instead of a segfault** (#216). DuckDB's `ST_Read` segfaults (SIGSEGV, no traceback) when asked for a layer its source doesn't contain. It does this on shapefiles and GeoPackages alike (DuckDB 1.5.4). `--layer` on an archive was passed to *every* source in it, so a zip with a point and a polygon shapefile crashed whichever layer was asked for. That covers the published UNEP-WCMC coral reef release. A `--layer` typo on a single source crashed the same way. Now:
+  - `--layer` narrows an archive to the sources that hold the layer.
+  - An explicitly listed source that lacks the layer, or a layer found nowhere, raises an error naming the available layers.
+  - Sources that can't share one table are refused before they're merged, with a message pointing at `--layer`. That means different geometry types, or different columns: the merge is positional, so equal column counts in a different order used to put values under the wrong names without an error.
+
 ## [0.9.0] - 2026-09-29
 
 ### Added
