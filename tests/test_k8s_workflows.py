@@ -2788,7 +2788,8 @@ class TestOrchestratorStopsOnFailedStep:
         import re
         assert "condition=complete" not in script
         assert "wait_job() {" in script and '*" Failed "*)' in script
-        applied = re.findall(r"kubectl apply -f /yamls/(\S+)\.yaml", script)
+        # A planned hex Job is applied through `kubectl patch --local -f` (#124).
+        applied = re.findall(r"kubectl (?:apply|patch --local) -f /yamls/(\S+)\.yaml", script)
         waited = re.findall(r"^wait_job (\S+) ", script, flags=re.M)
         assert applied and set(waited) == set(applied) - set(background)
         for step in steps:
@@ -2803,7 +2804,7 @@ class TestOrchestratorStopsOnFailedStep:
                                       bucket="b", output_dir=tmpdir, h3_resolution=8)
             script = self._script(tmpdir)
         # pmtiles is deliberately left running in the background.
-        self._check(script, ["setup-bucket", "convert", "hex", "repartition"],
+        self._check(script, ["setup-bucket", "convert", "plan", "hex", "repartition"],
                     background=["vec-ds-pmtiles"])
         assert "wait_job vec-ds-hex geo-workflows 172800" in script
 
