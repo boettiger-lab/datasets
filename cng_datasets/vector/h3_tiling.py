@@ -233,6 +233,20 @@ def _planar_area_deg2_sql(geom_expr: str) -> str:
     )
 
 
+def _spheroid_area_m2_sql(geom_expr: str) -> str:
+    """Geodesic area in m² of a (lon, lat) geometry.
+
+    DuckDB's ``ST_Area_Spheroid`` reads its input as (latitude, longitude),
+    while every geometry here is (lon, lat) (convert writes it that way with
+    ``always_xy``). Unflipped, a feature beyond ±90° longitude has an
+    out-of-range "latitude" and measures NaN, and one inside it is measured
+    with its axes swapped. NaN sorts above every number in DuckDB, so a single
+    such feature also hid the chunk's true worst feature from the #107 guard
+    (issue #253).
+    """
+    return f"ST_Area_Spheroid(ST_FlipCoordinates({geom_expr}))"
+
+
 def _representative_point_sql(geom_expr: str) -> str:
     """SQL for a point on the feature, for the sub-cell fallback (issue #104).
 
@@ -712,7 +726,8 @@ class H3VectorProcessor:
         converts an otherwise-fatal C++ page-size assertion in the Pass-1 COPY
         into an actionable error.
 
-        Area is measured geodesically (``ST_Area_Spheroid``) for the common case.
+        Area is measured geodesically (``ST_Area_Spheroid``, on flipped axes —
+        see ``_spheroid_area_m2_sql``) for the common case.
         Features whose longitude bbox spans more than 180 deg need a planar
         estimate instead, because ``ST_Area_Spheroid`` returns NaN for them (or a
         figure unrelated to what the polyfill walks), and DuckDB orders NaN above
@@ -734,7 +749,7 @@ class H3VectorProcessor:
         area_expr = (
             f"CASE WHEN ST_XMax(geom) - ST_XMin(geom) > {_TRANSMERIDIAN_MAX_SPAN_DEG} "
             f"THEN {_planar_area_deg2_sql('geom')} * {_DEG2_TO_M2} "
-            f"ELSE ST_Area_Spheroid(geom) END"
+            f"ELSE {_spheroid_area_m2_sql('geom')} END"
         )
         if self.resolution_by_area is not None:
             native_res_case = _native_res_case_sql(self.resolution_by_area, "geom")

@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The oversized-feature guard works everywhere, not just between 90°W and 90°E** (#253). The #107 guard measures each feature with DuckDB's `ST_Area_Spheroid`, which reads coordinates as (latitude, longitude), while every geometry here is (longitude, latitude). Any feature beyond ±90° longitude measured `NaN`. Because `NaN` sorts above every number, one such feature also hid the chunk's real worst feature, so the guard was off for any chunk touching the Americas west of the Mississippi, East Asia or Australia. There, an oversized feature hit the raw C++ page-size assertion again instead of the guard's clear error. On the published ecoregions layers, 404 of 847 and 4,007 of 5,896 features measured `NaN`. Areas are now computed on flipped axes and match a known answer at any longitude. Output data was never affected; only the guard.
+
 ### Added
 - **`workflow --chunk-size N` sets the number of features per hex chunk** (#237). The generator never went below 1000 features per chunk, and no flag could change that, so any vector dataset under 1000 features got a single hex pod however large its polygons were. Hex memory follows the H3 cells of the features in a chunk, not how many features there are, so a small-count, large-feature layer is exactly the case that needs small chunks. The 847-feature ecoregions layer at res 8 now generates the 170 × 5 fan-out that production runs from a hand-tuned manifest. The default is unchanged. If the requested size would need more than `--max-completions` chunks, it is still raised to fit, and the generator now says so instead of overriding an explicit memory decision without a word. This is a manual control; sizing chunks automatically from feature size is #124.
 
