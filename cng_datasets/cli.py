@@ -226,6 +226,12 @@ def main():
     workflow_parser.add_argument("--hex-memory", type=str, default="8Gi", help="Memory per hex job pod (default: 8Gi)")
     workflow_parser.add_argument("--max-parallelism", type=int, default=50, help="Maximum parallel hex jobs (default: 50)")
     workflow_parser.add_argument("--max-completions", type=int, default=200, help="Maximum hex job completions (default: 200, increase to reduce chunk size/memory)")
+    workflow_parser.add_argument("--chunk-size", type=int, default=None, metavar="N",
+                                 help="Features per hex chunk (default 1000). Lower it for a dataset of few "
+                                      "but very large features (ecoregions, countries, basins): hex memory "
+                                      "follows the H3 cells of the features in a chunk, not their count, so "
+                                      "847 continent-scale polygons need small chunks, not one pod (#237). "
+                                      "Raised, with a warning, if it would exceed --max-completions.")
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
     workflow_parser.add_argument("--simplify-tolerance", type=float, default=None, help="Simplify geometry to this tolerance in target-CRS units (degrees for EPSG:4326; e.g. 0.0001 ~ 10m) during the convert step. Right-sizes high-vertex sources for tiling/hex (issue #132).")
@@ -608,6 +614,7 @@ def _dispatch(args):
             hex_memory=args.hex_memory,
             max_parallelism=args.max_parallelism,
             max_completions=args.max_completions,
+            chunk_size=args.chunk_size,
             hex_retries=args.hex_retries,
             max_failed_indexes=args.max_failed_indexes,
             intermediate_chunk_size=args.intermediate_chunk_size,

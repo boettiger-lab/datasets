@@ -383,3 +383,31 @@ class TestHexSizingFlags:
         captured = self._captured(tmp_path)
         for key in ("hex_workers", "hex_cpu", "hex_chunk_size"):
             assert key not in captured
+
+
+class TestWorkflowChunkSize:
+    """--chunk-size must reach the vector workflow generator (issue #237)."""
+
+    def _captured(self, tmp_path, *extra):
+        captured = {}
+        test_args = [
+            "cng-datasets", "workflow",
+            "--dataset", "cli-chunk",
+            "--source-url", "https://example.com/ecoregions.gdb",
+            "--bucket", "test-bucket",
+            "--output-dir", str(tmp_path),
+            *extra,
+        ]
+        with patch("cng_datasets.k8s.generate_dataset_workflow",
+                   lambda **kwargs: captured.update(kwargs)):
+            with patch.object(sys, 'argv', test_args):
+                main()
+        return captured
+
+    @pytest.mark.timeout(10)
+    def test_flag_reaches_the_generator(self, tmp_path):
+        assert self._captured(tmp_path, "--chunk-size", "5")["chunk_size"] == 5
+
+    @pytest.mark.timeout(10)
+    def test_omitting_it_keeps_the_default(self, tmp_path):
+        assert self._captured(tmp_path)["chunk_size"] is None

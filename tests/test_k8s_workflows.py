@@ -497,6 +497,78 @@ class TestCalculateChunking:
             assert chunk_size * completions >= n, f"n={n} not fully covered"
 
 
+class TestChunkSizeOverride:
+    """Issue #237: the 1000-feature target was unreachable from `workflow`, so a
+    dataset of few but enormous features always ran as a single hex pod."""
+
+    ECOREGIONS = 847  # the issue's source; production runs it at 5 per chunk
+
+    def _generate(self, mocker, tmpdir, features, **kwargs):
+        mocker.patch('cng_datasets.k8s.workflows._count_source_features',
+                     return_value=features)
+        generate_dataset_workflow(
+            dataset_name="ecoregion",
+            source_urls="https://example.com/ecoregions.gdb",
+            bucket="test-bucket",
+            output_dir=tmpdir,
+            h3_resolution=8,
+            **kwargs,
+        )
+        with open(Path(tmpdir) / "ecoregion-hex.yaml") as f:
+            return yaml.safe_load(f)
+
+    @staticmethod
+    def _hex_command(job):
+        return str(job["spec"]["template"]["spec"]["containers"][0])
+
+    def test_target_is_honoured_below_the_default(self):
+        from cng_datasets.k8s.workflows import _calculate_chunking
+        assert _calculate_chunking(847, max_completions=200,
+                                   target_chunk_size=5) == (5, 170, 50)
+
+    @pytest.mark.timeout(10)
+    def test_small_count_large_feature_dataset_fans_out(self, mocker, capsys):
+        """The #237 MRE: 170 completions of 5, as the hand-tuned manifest runs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._generate(mocker, tmpdir, self.ECOREGIONS, chunk_size=5)
+        assert job["spec"]["completions"] == 170
+        assert job["spec"]["parallelism"] == 50
+        assert "--chunk-size 5 " in self._hex_command(job)
+        assert "⚠" not in capsys.readouterr().out
+
+    @pytest.mark.timeout(10)
+    def test_default_is_unchanged(self, mocker):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._generate(mocker, tmpdir, self.ECOREGIONS)
+        assert job["spec"]["completions"] == 1
+        assert "--chunk-size 1000 " in self._hex_command(job)
+
+    @pytest.mark.timeout(10)
+    def test_raising_an_explicit_size_is_reported(self, mocker, capsys):
+        """max_completions still wins, but an explicit memory decision is not
+        overridden silently."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._generate(mocker, tmpdir, 10_000, chunk_size=5,
+                                 max_completions=200)
+        assert job["spec"]["completions"] == 200
+        assert "--chunk-size 50 " in self._hex_command(job)
+        out = capsys.readouterr().out
+        assert "--chunk-size 5 would need 2,000 completions" in out
+        assert "raised to 50" in out
+
+    @pytest.mark.timeout(10)
+    def test_nonpositive_size_is_refused_before_counting(self, mocker):
+        count = mocker.patch('cng_datasets.k8s.workflows._count_source_features')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="chunk_size"):
+                generate_dataset_workflow(
+                    dataset_name="ecoregion",
+                    source_urls="https://example.com/ecoregions.gdb",
+                    bucket="test-bucket", output_dir=tmpdir, chunk_size=0,
+                )
+        count.assert_not_called()
+
+
 class TestSimplifyToleranceWiring:
     """Issue #132: --simplify-tolerance reaches the generated convert job command."""
 
@@ -656,7 +728,8 @@ class TestEdgeCases:
             msg = str(exc.value)
             assert "missing.gdb" in msg
             assert "--expect-features" in msg
-            # The old warning advertised a flag `workflow` does not accept.
+            # The old warning advertised --chunk-size as the remedy, which it
+            # is not for a source that can't be read (#237 added the flag later).
             assert "--chunk-size" not in msg
             assert not out.exists() or not any(out.iterdir())
 
