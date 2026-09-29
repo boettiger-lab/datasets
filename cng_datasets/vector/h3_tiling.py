@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Tuple
 import duckdb
 import os
 from cng_datasets.storage.s3 import configure_s3_credentials
+from cng_datasets.duckdb_memory import to_duckdb_memory_limit
 
 
 # Line geometries are polyfilled as the H3 cells they *intersect* (issue #239).
@@ -599,6 +600,20 @@ def setup_duckdb_connection(
 
     # Enable large buffer size for complex geometries
     con.execute("SET arrow_large_buffer_size=true")
+
+    # Bound DuckDB to the pod (issue #255). Unset, its buffer manager is sized
+    # at 80% of the RAM it can see, which inside a pod is the *node's*: an 8Gi
+    # hex pod on a 250 GiB node believes it has ~200 GiB, never spills, and is
+    # OOM-killed by the cgroup instead. The generator sets this to 85% of the
+    # pod's limit, as it does for the raster hex and repartition steps (#227).
+    requested_limit = os.environ.get("DUCKDB_MEMORY_LIMIT")
+    if requested_limit:
+        # Normalised: the value usually comes through a Kubernetes manifest,
+        # and DuckDB rejects the k8s spelling ("8Gi") outright (issue #217).
+        effective = to_duckdb_memory_limit(requested_limit)
+        suffix = "" if effective == requested_limit else f" (from {requested_limit})"
+        print(f"  Setting DuckDB memory_limit={effective}{suffix}")
+        con.execute(f"SET memory_limit='{effective}'")
 
     return con
 
