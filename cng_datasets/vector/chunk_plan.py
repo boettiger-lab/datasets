@@ -47,6 +47,16 @@ DEFAULT_CELLS_PER_CHUNK = 5_000_000
 # The fixed rule's features per chunk (#144), which the plan never exceeds.
 DEFAULT_MAX_FEATURES_PER_CHUNK = 1000
 
+# A hex pod's peak memory, as a function of its chunk's estimated cells.
+# Measured 2026-09-29 on EPA L3 ecoregions at res 10: 97 pods of a planned
+# build, peak read from the cgroup's memory.peak, least-squares fit (residual
+# SD 0.71 GiB; vertex complexity is the rest). At the default budget this is
+# ~2.4 GiB, far inside the default 8Gi, so the budget is set by balancing
+# runtime rather than memory — memory binds only on single features larger than
+# the budget, which is what the warning below is for (#124).
+PEAK_BASE_BYTES = int(0.74 * 2**30)
+PEAK_BYTES_PER_CELL = 354
+
 # Where Kubernetes reads a container's termination message. The plan reports
 # its chunk count here so the workflow can size the hex Job to it.
 TERMINATION_LOG = "/dev/termination-log"
@@ -169,6 +179,11 @@ def plan_chunks(cells: Sequence[float], cells_budget: float = DEFAULT_CELLS_PER_
     )
 
 
+def predicted_peak_bytes(est_cells: float) -> float:
+    """A hex pod's predicted peak memory for a chunk of *est_cells*."""
+    return PEAK_BASE_BYTES + PEAK_BYTES_PER_CELL * est_cells
+
+
 def _connect() -> duckdb.DuckDBPyConnection:
     con = setup_duckdb_connection()
     configure_s3_credentials(con)
@@ -229,7 +244,8 @@ def read_plan_chunk(con: duckdb.DuckDBPyConnection, plan_url: str,
     return (Chunk(*row) if row else None), n
 
 
-def report(plan: ChunkPlan, max_chunks: Optional[int]) -> List[str]:
+def report(plan: ChunkPlan, max_chunks: Optional[int],
+           hex_memory_bytes: Optional[float] = None) -> List[str]:
     """Human-readable summary lines, including anything that was raised."""
     sizes = [c.est_cells for c in plan.chunks]
     mean = (sum(sizes) / len(sizes)) if sizes else 0.0
@@ -252,6 +268,21 @@ def report(plan: ChunkPlan, max_chunks: Optional[int]) -> List[str]:
         lines.append(
             f"  ℹ {plan.oversized:,} feature(s) exceed the budget on their own; "
             f"each is a chunk by itself, the finest split possible.")
+    if hex_memory_bytes:
+        # 90%: the fit's residual SD is ~0.7 GiB, so a prediction at the
+        # limit is roughly a coin flip.
+        risky = [c for c in plan.chunks
+                 if predicted_peak_bytes(c.est_cells) > 0.9 * hex_memory_bytes]
+        if risky:
+            worst = max(risky, key=lambda c: c.est_cells)
+            lines.append(
+                f"  ⚠ {len(risky):,} chunk(s) are predicted to peak near or over the "
+                f"{hex_memory_bytes / 2**30:.0f} GiB hex memory limit; the largest, "
+                f"chunk {worst.chunk_id} (rows {worst.row_offset:,}+{worst.row_count:,}, "
+                f"~{worst.est_cells:,.0f} cells), at "
+                f"~{predicted_peak_bytes(worst.est_cells) / 2**30:.1f} GiB. A chunk "
+                f"cannot be split below one feature: raise --hex-memory, or hex "
+                f"the largest features coarser (--resolution-by-area).")
     return lines
 
 
@@ -260,7 +291,8 @@ def run_plan(input_url: str, output_url: str, h3_resolution: int = 10,
              cells_per_chunk: float = DEFAULT_CELLS_PER_CHUNK,
              max_chunks: Optional[int] = None,
              max_features: Optional[int] = None,
-             termination_log: Optional[str] = TERMINATION_LOG) -> ChunkPlan:
+             termination_log: Optional[str] = TERMINATION_LOG,
+             hex_memory_bytes: Optional[float] = None) -> ChunkPlan:
     """Estimate, cut and write the plan; report the chunk count to Kubernetes."""
     con = _connect()
     try:
@@ -270,7 +302,7 @@ def run_plan(input_url: str, output_url: str, h3_resolution: int = 10,
             raise ValueError(f"{input_url} has no rows to plan")
         plan = plan_chunks(cells, cells_per_chunk, max_chunks=max_chunks,
                            max_features=max_features)
-        for line in report(plan, max_chunks):
+        for line in report(plan, max_chunks, hex_memory_bytes):
             print(line)
         write_plan(con, plan, output_url)
         print(f"  ✓ Wrote plan: {output_url}")
@@ -290,5 +322,6 @@ def run_plan(input_url: str, output_url: str, h3_resolution: int = 10,
 __all__ = [
     "DEFAULT_CELLS_PER_CHUNK", "DEFAULT_MAX_FEATURES_PER_CHUNK", "Chunk", "ChunkPlan",
     "cut_chunks", "plan_chunks", "feature_cells_sql", "estimate_row_cells",
+    "predicted_peak_bytes", "PEAK_BASE_BYTES", "PEAK_BYTES_PER_CELL",
     "write_plan", "read_plan_chunk", "run_plan",
 ]

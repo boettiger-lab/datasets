@@ -610,6 +610,7 @@ class TestPlannedHexWorkflow:
         assert "--output s3://test-bucket/eco/regions/_hex_plan.parquet" in cmd
         assert "--resolution 8" in cmd and "--cells-per-chunk 2000000" in cmd
         assert "--max-chunks 200" in cmd
+        assert "--hex-memory 8Gi" in cmd
         assert container["terminationMessagePolicy"] == "File"
         assert "priorityClassName" not in plan["spec"]["template"]["spec"]
         hex_cmd = str(hex_job["spec"]["template"]["spec"]["containers"][0]["command"])

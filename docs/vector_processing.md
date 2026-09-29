@@ -125,6 +125,12 @@ On three published layers the largest fixed-count chunk was 2.2–2.4× the mean
 5 M-cell budget gave 1.0–1.2× (#124). Pass `--chunk-size N` to `workflow` for fixed
 chunks instead.
 
+Measured on a real 107-chunk build, a hex pod peaks at about **0.74 GiB + 354 bytes per
+estimated cell**, so the default budget needs about 2.4 GiB. Memory binds only on a *single*
+feature larger than the budget. The plan lists any chunk predicted to peak near the
+`--hex-memory` limit. For those, raise `--hex-memory` or hex the largest features at a
+coarser resolution with `--resolution-by-area`.
+
 ## Memory Optimization
 
 If you encounter Out-Of-Memory errors:

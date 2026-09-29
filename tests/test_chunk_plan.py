@@ -8,7 +8,11 @@ import duckdb
 import pytest
 
 from cng_datasets.vector.chunk_plan import (
+    PEAK_BASE_BYTES,
+    PEAK_BYTES_PER_CELL,
     cut_chunks,
+    predicted_peak_bytes,
+    report,
     feature_cells_sql,
     plan_chunks,
     read_plan_chunk,
@@ -208,3 +212,30 @@ class TestRunPlan:
         with pytest.raises(RuntimeError, match="re-run the plan step"):
             proc.process_chunk(0)
         proc.con.close()
+
+
+class TestMemoryModel:
+    """The peak-memory model is a measurement; pin it (#124, #173's pattern)."""
+
+    GiB = 2**30
+
+    def test_constants_reproduce_the_measurement(self):
+        """EPA L3 at res 10, 2026-09-29: 5.4 M cells peaked at 2.67 GiB and
+        13.2 M at 7.40 GiB (the high-complexity outlier); the fit has to sit
+        between the typical case and that outlier."""
+        assert PEAK_BASE_BYTES == pytest.approx(0.74 * self.GiB, rel=0.01)
+        assert PEAK_BYTES_PER_CELL == 354
+        assert predicted_peak_bytes(5_399_736) / self.GiB == pytest.approx(2.52, abs=0.05)
+        assert predicted_peak_bytes(13_213_435) < 7.40 * self.GiB
+
+    def test_default_budget_is_far_inside_the_default_pod(self):
+        from cng_datasets.vector.chunk_plan import DEFAULT_CELLS_PER_CHUNK
+        assert predicted_peak_bytes(DEFAULT_CELLS_PER_CHUNK) < 0.4 * 8 * self.GiB
+
+    def test_a_single_feature_too_big_for_the_pod_is_reported(self):
+        plan = plan_chunks([100] * 10 + [24_000_000] + [100] * 10, cells_budget=5e6)
+        lines = "\n".join(report(plan, None, hex_memory_bytes=8 * self.GiB))
+        assert "predicted to peak near or over the 8 GiB" in lines
+        assert "chunk 1 (rows 10+1" in lines
+        quiet = "\n".join(report(plan, None, hex_memory_bytes=32 * self.GiB))
+        assert "predicted to peak" not in quiet
