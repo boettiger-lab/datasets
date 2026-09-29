@@ -987,6 +987,59 @@ class TestOversizedFeatureGuard:
                 processor._process_pass1(0)
             processor.con.close()
 
+    def _guard_processor(self, tmpdir, features):
+        src = f"{tmpdir}/polys.parquet"
+        con = setup_duckdb_connection()
+        rows = " UNION ALL ".join(
+            f"SELECT {fid} AS _cng_fid, ST_GeomFromText('{wkt}') AS geom"
+            for fid, wkt in features)
+        con.execute(f"COPY ({rows}) TO '{src}' (FORMAT PARQUET)")
+        con.close()
+        processor = H3VectorProcessor(
+            input_url=src, output_url=f"{tmpdir}/out",
+            h3_resolution=8, parent_resolutions=[0], chunk_size=500,
+        )
+        processor.max_cells_per_feature = 50_000  # below a 2deg box's ~67k
+        return processor
+
+    @pytest.mark.timeout(30)
+    def test_guard_fires_east_of_90_degrees(self):
+        """ST_Area_Spheroid reads (lat, lon); unflipped, lon 100 is an invalid
+        latitude and the area is NaN, which never exceeds the limit (#253)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor = self._guard_processor(tmpdir, [
+                (1, "POLYGON((100 0,102 0,102 2,100 2,100 0))"),
+            ])
+            with pytest.raises(RuntimeError, match=r"_cng_fid=1 is too large"):
+                processor._process_pass1(0)
+            processor.con.close()
+
+    @pytest.mark.timeout(30)
+    def test_one_far_east_feature_does_not_hide_the_worst_one(self):
+        """NaN sorts above every number, so an unflipped far-east feature used
+        to be picked as the chunk's worst and disable the guard for all of it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor = self._guard_processor(tmpdir, [
+                (1, "POLYGON((0 0,2 0,2 2,0 2,0 0))"),  # the oversized one
+                (2, "POLYGON((120 10,120.01 10,120.01 10.01,120 10.01,120 10))"),
+            ])
+            with pytest.raises(RuntimeError, match=r"_cng_fid=1 is too large"):
+                processor._process_pass1(0)
+            processor.con.close()
+
+    @pytest.mark.timeout(30)
+    def test_spheroid_area_matches_a_known_answer(self):
+        """A 1x1 degree box at the equator is 12,308 km2 at any longitude."""
+        from cng_datasets.vector.h3_tiling import _spheroid_area_m2_sql
+        con = setup_duckdb_connection()
+        for lon in (10, 100, -150):
+            box = (f"ST_GeomFromText('POLYGON(({lon} 0,{lon + 1} 0,"
+                   f"{lon + 1} 1,{lon} 1,{lon} 0))')")
+            km2 = con.execute(
+                f"SELECT {_spheroid_area_m2_sql(box)} / 1e6").fetchone()[0]
+            assert km2 == pytest.approx(12_308, rel=1e-3), f"lon {lon}: {km2}"
+        con.close()
+
     @pytest.mark.timeout(30)
     def test_normal_features_pass_under_default_threshold(self):
         with tempfile.TemporaryDirectory() as tmpdir:
