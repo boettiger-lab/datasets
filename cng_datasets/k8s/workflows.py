@@ -787,6 +787,7 @@ def generate_dataset_workflow(
     max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
     max_parallelism: int = 50,
     max_completions: int = 200,
+    chunk_size: Optional[int] = None,
     intermediate_chunk_size: int = 10,
     row_group_size: int = 100000,
     simplify_tolerance: Optional[float] = None,
@@ -862,6 +863,11 @@ def generate_dataset_workflow(
             preempted Armada job is not rescheduled and the k8s Job-level retry
             settings do not survive conversion (issue #183). Ignored when
             backend is "k8s".
+        chunk_size: Features per hex chunk (default 1000). Lower it for a
+            dataset with few but very large features, whose peak memory is set
+            by the cells of the largest features in a chunk rather than by the
+            feature count (issue #237). Still raised if needed to keep the
+            fan-out within ``max_completions``, and that is reported.
         intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM (default: 10)
         source_url: (Deprecated) Use source_urls instead. Kept for backwards compatibility.
     """
@@ -902,13 +908,28 @@ def generate_dataset_workflow(
     if isinstance(source_urls, str):
         source_urls = [source_urls]
 
+    requested_chunk_size = chunk_size
+    if requested_chunk_size is not None and int(requested_chunk_size) < 1:
+        raise ValueError(f"chunk_size must be at least 1, got {requested_chunk_size}")
     # Count features to size the hex fan-out. This runs before any manifest is
     # written: when the source can't be read, the workflow must fail rather than
     # emit a plausible-looking fan-out sized for a made-up count (issue #235).
     total_rows = _resolve_feature_count(source_urls, layer, expect_features)
-    chunk_size, completions, parallelism = _calculate_chunking(total_rows, max_completions=max_completions, max_parallelism=max_parallelism)
+    chunk_size, completions, parallelism = _calculate_chunking(
+        total_rows, max_completions=max_completions, max_parallelism=max_parallelism,
+        target_chunk_size=(_DEFAULT_TARGET_CHUNK_SIZE if requested_chunk_size is None
+                           else int(requested_chunk_size)),
+    )
     print(f"  Total features: {total_rows:,}")
     print(f"  Chunk size: {chunk_size:,}")
+    if requested_chunk_size is not None and chunk_size > requested_chunk_size:
+        # A size asked for explicitly is a memory decision; overriding it
+        # quietly would hand back the OOM it was chosen to avoid.
+        print(f"  ⚠ --chunk-size {requested_chunk_size:,} would need "
+              f"{math.ceil(total_rows / requested_chunk_size):,} completions, so it was "
+              f"raised to {chunk_size:,} to stay within --max-completions "
+              f"{max_completions}. Raise --max-completions to keep the smaller chunks "
+              f"(past ~200, use --backend armada).")
     print(f"  Completions: {completions}")
     print(f"  Parallelism: {parallelism}")
 
@@ -966,6 +987,8 @@ def generate_dataset_workflow(
     gen_command = (f"cng-datasets workflow --dataset {dataset_name} "
                    f"{source_urls_str} --bucket {bucket} "
                    f"{res_flag} --parent-resolutions \"{parent_res_str}\"")
+    if requested_chunk_size is not None:
+        gen_command += f" --chunk-size {requested_chunk_size}"
 
     # Generate ConfigMap YAML from job files
     _generate_configmap(k8s_name, namespace, output_path, gen_command)

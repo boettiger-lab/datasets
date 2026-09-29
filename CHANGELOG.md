@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`workflow --chunk-size N` sets the number of features per hex chunk** (#237). The generator never went below 1000 features per chunk, and no flag could change that, so any vector dataset under 1000 features got a single hex pod however large its polygons were. Hex memory follows the H3 cells of the features in a chunk, not how many features there are, so a small-count, large-feature layer is exactly the case that needs small chunks. The 847-feature ecoregions layer at res 8 now generates the 170 × 5 fan-out that production runs from a hand-tuned manifest. The default is unchanged. If the requested size would need more than `--max-completions` chunks, it is still raised to fit, and the generator now says so instead of overriding an explicit memory decision without a word. This is a manual control; sizing chunks automatically from feature size is #124.
+
 ## [0.8.3] - 2026-09-28
 
 ### Added

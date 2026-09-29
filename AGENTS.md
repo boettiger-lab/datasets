@@ -105,6 +105,7 @@ rclone copy catalog/<dataset>/stac/stac-collection.json nrp:<bucket>/
 | `--max-completions` | 200 | Keep at 200 for datasets > 50K features |
 | `--max-parallelism` | 50 | Reduce if cluster is already busy |
 | `--parent-resolutions` | "9,8,0" | Almost never change this |
+| `--chunk-size` | 1000 | Lower (e.g. 5) for few but very large features — ecoregions, countries, basins — which otherwise run as one hex pod |
 | `--intermediate-chunk-size` | auto | Decrease if hex pods OOM during unnest step |
 
 `raster-workflow` additionally takes:
