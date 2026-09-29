@@ -2135,7 +2135,7 @@ class TestArchiveLayerSelection:
         layer into one table; refuse and point at --layer."""
         with tempfile.TemporaryDirectory() as tmpdir:
             src = self._zip(tmpdir)
-            with pytest.raises(ValueError, match=r"mixed geometry types.*--layer"):
+            with pytest.raises(ValueError, match=r"(?s)mixed geometry types.*--layer"):
                 convert_to_parquet(source_url=src, destination=f"{tmpdir}/o.parquet",
                                    progress=False)
 
