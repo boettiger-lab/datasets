@@ -70,6 +70,28 @@ def main():
     vector_parser.add_argument("--chunk-id", type=int, help="Process specific chunk")
     vector_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
     vector_parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
+    vector_parser.add_argument("--plan", default=None, metavar="URL",
+                               help="Chunk plan from `vector-plan` (#124): chunk K is the plan's row "
+                                    "range K instead of a fixed --chunk-size slice. An index past "
+                                    "the end of the plan exits cleanly.")
+
+    # Cells-per-chunk planning for the vector hex fan-out (issue #124)
+    plan_parser = subparsers.add_parser(
+        "vector-plan",
+        help="Cut a GeoParquet into hex chunks by estimated H3 cells (#124)")
+    plan_parser.add_argument("--input", required=True, help="GeoParquet the hex pods will read")
+    plan_parser.add_argument("--output", required=True, help="Where to write the plan parquet")
+    plan_res_group = plan_parser.add_mutually_exclusive_group()
+    plan_res_group.add_argument("--resolution", type=int, default=10, help="H3 resolution")
+    plan_res_group.add_argument("--resolution-by-area", type=str, default=None,
+                                help="Same spec as `vector --resolution-by-area`")
+    plan_parser.add_argument("--cells-per-chunk", type=float, default=None, metavar="N",
+                             help="Estimated H3 cells per chunk (default 5,000,000)")
+    plan_parser.add_argument("--max-chunks", type=int, default=None, metavar="N",
+                             help="Upper bound on chunks: the hex Job's completions. The budget "
+                                  "is raised, with a warning, to fit.")
+    plan_parser.add_argument("--max-features-per-chunk", type=int, default=None, metavar="N",
+                             help="Feature cap per chunk (default 1000, raised to fit --max-chunks)")
 
 
     # Raster processing command
@@ -231,7 +253,13 @@ def main():
                                       "but very large features (ecoregions, countries, basins): hex memory "
                                       "follows the H3 cells of the features in a chunk, not their count, so "
                                       "847 continent-scale polygons need small chunks, not one pod (#237). "
-                                      "Raised, with a warning, if it would exceed --max-completions.")
+                                      "Raised, with a warning, if it would exceed --max-completions. Giving "
+                                      "it turns off cells-per-chunk planning.")
+    workflow_parser.add_argument("--cells-per-chunk", type=float, default=None, metavar="N",
+                                 help="Estimated H3 cells per hex chunk (default 5,000,000). A plan step "
+                                      "after convert cuts the GeoParquet at this budget, never exceeding "
+                                      "the default features per chunk, and the hex Job is sized to the "
+                                      "plan (#124). Mutually exclusive with --chunk-size.")
     workflow_parser.add_argument("--intermediate-chunk-size", type=int, default=10, help="Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM")
     workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
     workflow_parser.add_argument("--simplify-tolerance", type=float, default=None, help="Simplify geometry to this tolerance in target-CRS units (degrees for EPSG:4326; e.g. 0.0001 ~ 10m) during the convert step. Right-sizes high-vertex sources for tiling/hex (issue #132).")
@@ -447,6 +475,22 @@ def _dispatch(args):
             intermediate_chunk_size=args.intermediate_chunk_size,
             id_column=args.id_column,
             resolution_by_area=resolution_by_area,
+            plan_url=args.plan,
+        )
+
+    elif args.command == "vector-plan":
+        from .vector.chunk_plan import run_plan, DEFAULT_CELLS_PER_CHUNK
+        from .vector.h3_tiling import parse_resolution_by_area
+        run_plan(
+            input_url=args.input,
+            output_url=args.output,
+            h3_resolution=args.resolution,
+            resolution_by_area=(parse_resolution_by_area(args.resolution_by_area)
+                                if args.resolution_by_area else None),
+            cells_per_chunk=(args.cells_per_chunk if args.cells_per_chunk is not None
+                             else DEFAULT_CELLS_PER_CHUNK),
+            max_chunks=args.max_chunks,
+            max_features=args.max_features_per_chunk,
         )
 
     elif args.command == "raster":
@@ -615,6 +659,7 @@ def _dispatch(args):
             max_parallelism=args.max_parallelism,
             max_completions=args.max_completions,
             chunk_size=args.chunk_size,
+            cells_per_chunk=args.cells_per_chunk,
             hex_retries=args.hex_retries,
             max_failed_indexes=args.max_failed_indexes,
             intermediate_chunk_size=args.intermediate_chunk_size,
