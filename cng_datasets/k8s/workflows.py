@@ -1063,8 +1063,10 @@ def generate_dataset_workflow(
         print(f"\nFiles created in {output_dir}:")
         print(f"  - {k8s_name}-setup-bucket.yaml")
         print(f"  - {k8s_name}-convert.yaml")
+        if planned:
+            print(f"  - {k8s_name}-plan.yaml")
         print(f"  - {k8s_name}-pmtiles.yaml")
-        print(f"  - {k8s_name}-hex.yaml")
+        print(f"  - {k8s_name}-hex.yaml" + (" (upper bound; the workflow sizes it to the plan)" if planned else ""))
         print(f"  - {k8s_name}-repartition.yaml")
         print("  - workflow-rbac.yaml (generic, reusable)")
         print("  - configmap.yaml (job configs)")
