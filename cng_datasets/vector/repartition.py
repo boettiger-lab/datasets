@@ -174,14 +174,17 @@ def repartition_by_h0(
                 raise RuntimeError(
                     f"Hex output is incomplete: {hexed_features:,} of "
                     f"{source_features:,} source features{geom_note} were hexed "
-                    f"({missing:,} missing). The k8s hex Job covers only "
-                    f"`max-completions × chunk-size` features, so a source larger "
-                    f"than that cap is silently truncated (issue #170). Re-run the "
-                    f"hex step with a larger --max-completions (or --chunk-size) so "
-                    f"that max-completions × chunk-size >= {source_features:,}. If "
-                    f"the shortfall is instead genuinely-degenerate geometry that "
-                    f"produces 0 H3 cells, set CNG_SKIP_COMPLETENESS_CHECK=1 to "
-                    f"proceed. Chunks left in place at '{chunks_dir}' for inspection."
+                    f"({missing:,} missing). Likely causes, most likely first:\n"
+                    f"  1. A hex index failed or never ran: check the hex Job's "
+                    f"failedIndexes (`kubectl get job <name>-hex -o "
+                    f"jsonpath='{{.status.failedIndexes}}'`) and re-run those "
+                    f"indexes (#258).\n"
+                    f"  2. The fan-out was too small for the source: completions × "
+                    f"chunk size < {source_features:,} (issue #170). Re-run the hex "
+                    f"step with a larger --max-completions.\n"
+                    f"  3. Genuinely degenerate geometry that produces 0 H3 cells: "
+                    f"set CNG_SKIP_COMPLETENESS_CHECK=1 to proceed.\n"
+                    f"Chunks left in place at '{chunks_dir}' for inspection."
                 )
     else:
         print('No source parquet provided, proceeding without attribute join')

@@ -2676,3 +2676,44 @@ class TestResourceNorms:
         """
         from cng_datasets.k8s.workflows import K8S_CHUNK_COUNT_GUIDELINE
         assert K8S_CHUNK_COUNT_GUIDELINE == self.MAX_PODS
+
+
+class TestOrchestratorStopsOnFailedStep:
+    """Issue #258: `kubectl wait --for=condition=complete` never returns for a
+    Failed Job, so a dead step held the orchestrator for its whole timeout."""
+
+    @staticmethod
+    def _script(tmpdir):
+        wf = yaml.safe_load((Path(tmpdir) / "workflow.yaml").read_text())
+        return wf["spec"]["template"]["spec"]["containers"][0]["args"][0]
+
+    def _check(self, script, steps, background=()):
+        import re
+        assert "condition=complete" not in script
+        assert "wait_job() {" in script and '*" Failed "*)' in script
+        applied = re.findall(r"kubectl apply -f /yamls/(\S+)\.yaml", script)
+        waited = re.findall(r"^wait_job (\S+) ", script, flags=re.M)
+        assert applied and set(waited) == set(applied) - set(background)
+        for step in steps:
+            assert any(step in w for w in waited), step
+
+    @pytest.mark.timeout(10)
+    def test_vector_orchestrator(self, mocker):
+        mocker.patch('cng_datasets.k8s.workflows._count_source_features',
+                     return_value=5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(dataset_name="v", source_urls="https://example.com/x.gdb",
+                                      bucket="b", output_dir=tmpdir, h3_resolution=8)
+            script = self._script(tmpdir)
+        # pmtiles is deliberately left running in the background.
+        self._check(script, ["setup-bucket", "convert", "hex", "repartition"],
+                    background=["v-pmtiles"])
+        assert "wait_job v-hex geo-workflows 172800" in script
+
+    @pytest.mark.timeout(10)
+    def test_raster_orchestrator(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(dataset_name="r", source_urls="https://example.com/x.tif",
+                                     bucket="b", output_dir=tmpdir)
+            script = self._script(tmpdir)
+        self._check(script, ["setup-bucket", "hex"])
