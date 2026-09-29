@@ -2101,3 +2101,45 @@ class TestResolutionByArea:
             byarea.con.close()
 
 
+
+
+class TestVectorDuckDBMemoryLimit:
+    """Issue #255: vector hex pods bound DuckDB to the pod, not the node."""
+
+    @pytest.mark.timeout(30)
+    def test_connection_honours_a_kubernetes_spelled_limit(self, monkeypatch):
+        monkeypatch.setenv("DUCKDB_MEMORY_LIMIT", "2Gi")  # the k8s spelling
+        con = setup_duckdb_connection()
+        got = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        con.execute("SET memory_limit='2GiB'")
+        want = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        con.close()
+        assert got == want
+
+    @pytest.mark.timeout(30)
+    def test_unset_leaves_duckdb_default(self, monkeypatch):
+        monkeypatch.delenv("DUCKDB_MEMORY_LIMIT", raising=False)
+        con = setup_duckdb_connection()
+        default = duckdb.connect().execute(
+            "SELECT current_setting('memory_limit')").fetchone()[0]
+        got = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        con.close()
+        assert got == default
+
+    @pytest.mark.timeout(10)
+    def test_hex_job_emits_85_percent_of_the_pod(self, mocker):
+        import yaml
+        from pathlib import Path
+        from cng_datasets.k8s.workflows import generate_dataset_workflow
+        mocker.patch('cng_datasets.k8s.workflows._count_source_features',
+                     return_value=5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="mem", source_urls="https://example.com/x.gdb",
+                bucket="b", output_dir=tmpdir, h3_resolution=8, hex_memory="16Gi",
+            )
+            job = yaml.safe_load((Path(tmpdir) / "mem-hex.yaml").read_text())
+        c = job["spec"]["template"]["spec"]["containers"][0]
+        env = {e["name"]: e.get("value") for e in c["env"]}
+        assert env["DUCKDB_MEMORY_LIMIT"] == "13GiB"
+        assert c["resources"]["limits"]["memory"] == "16Gi"

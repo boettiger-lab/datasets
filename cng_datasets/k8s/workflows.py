@@ -2196,7 +2196,11 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
             "env": _s3_env_vars(config) + [
                 {"name": "TMPDIR", "value": "/tmp"},
                 {"name": "BUCKET", "value": bucket},
-                {"name": "DATASET", "value": dataset_name}
+                {"name": "DATASET", "value": dataset_name},
+                # Bound DuckDB to the pod rather than the node, so a large
+                # feature spills to /tmp instead of being OOM-killed (#255).
+                # 85%, as for the raster hex step (#227); DuckDB's spelling (#217).
+                {"name": "DUCKDB_MEMORY_LIMIT", "value": _duckdb_memory_limit(hex_memory)},
             ],
             "command": ["bash", "-c", command_str],
             "resources": {
