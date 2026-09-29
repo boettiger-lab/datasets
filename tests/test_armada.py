@@ -375,6 +375,7 @@ class TestConvertWorkflowToArmada:
         # Pin the feature count so this exercises multi-completion expansion
         # independently of the fixture's actual size and of the chunk-sizing
         # policy (issue #144): 5000 features / 1000-per-chunk target -> 5 chunks.
+        # Fixed chunks, since a planned hex Job (#124) carries an upper bound.
         import cng_datasets.k8s.workflows as wf
         monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -384,6 +385,7 @@ class TestConvertWorkflowToArmada:
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 h3_resolution=10,  # skip network geometry-type detection
+                chunk_size=1000,
             )
 
             convert_workflow_to_armada(

@@ -3,7 +3,6 @@ Tests for cells-per-chunk planning of the vector hex fan-out (issue #124).
 """
 
 import os
-import tempfile
 
 import duckdb
 import pytest
@@ -166,6 +165,7 @@ class TestRunPlan:
         assert len(plan.chunks) > 1
 
         def hex_rows(out, **kwargs):
+            os.makedirs(out, exist_ok=True)
             proc = H3VectorProcessor(input_url=nofid, output_url=out, h3_resolution=7,
                                      parent_resolutions=[0], **kwargs)
             proc.process_all_chunks()

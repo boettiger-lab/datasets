@@ -553,6 +553,32 @@ class TestChunkSizeOverride:
                                cells_per_chunk=1e6)
 
 
+    @pytest.mark.timeout(10)
+    def test_raising_an_explicit_size_is_reported(self, mocker, capsys):
+        """max_completions still wins, but an explicit memory decision is not
+        overridden silently."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._generate(mocker, tmpdir, 10_000, chunk_size=5,
+                                 max_completions=200)
+        assert job["spec"]["completions"] == 200
+        assert "--chunk-size 50 " in self._hex_command(job)
+        out = capsys.readouterr().out
+        assert "--chunk-size 5 would need 2,000 completions" in out
+        assert "raised to 50" in out
+
+    @pytest.mark.timeout(10)
+    def test_nonpositive_size_is_refused_before_counting(self, mocker):
+        count = mocker.patch('cng_datasets.k8s.workflows._count_source_features')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="chunk_size"):
+                generate_dataset_workflow(
+                    dataset_name="ecoregion",
+                    source_urls="https://example.com/ecoregions.gdb",
+                    bucket="test-bucket", output_dir=tmpdir, chunk_size=0,
+                )
+        count.assert_not_called()
+
+
 class TestPlannedHexWorkflow:
     """Issue #124: by default a plan step sizes hex chunks by estimated cells."""
 
@@ -637,31 +663,6 @@ class TestPlannedHexWorkflow:
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(ValueError, match="cells_per_chunk"):
                 self._generate(mocker, tmpdir, cells_per_chunk=0)
-
-    @pytest.mark.timeout(10)
-    def test_raising_an_explicit_size_is_reported(self, mocker, capsys):
-        """max_completions still wins, but an explicit memory decision is not
-        overridden silently."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            job = self._generate(mocker, tmpdir, 10_000, chunk_size=5,
-                                 max_completions=200)
-        assert job["spec"]["completions"] == 200
-        assert "--chunk-size 50 " in self._hex_command(job)
-        out = capsys.readouterr().out
-        assert "--chunk-size 5 would need 2,000 completions" in out
-        assert "raised to 50" in out
-
-    @pytest.mark.timeout(10)
-    def test_nonpositive_size_is_refused_before_counting(self, mocker):
-        count = mocker.patch('cng_datasets.k8s.workflows._count_source_features')
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="chunk_size"):
-                generate_dataset_workflow(
-                    dataset_name="ecoregion",
-                    source_urls="https://example.com/ecoregions.gdb",
-                    bucket="test-bucket", output_dir=tmpdir, chunk_size=0,
-                )
-        count.assert_not_called()
 
 
 class TestSimplifyToleranceWiring:
@@ -1671,6 +1672,7 @@ class TestStepManifestNamespace:
             expected = {
                 "ns-vector-setup-bucket.yaml",
                 "ns-vector-convert.yaml",
+                "ns-vector-plan.yaml",     # the #124 chunk plan
                 "ns-vector-pmtiles.yaml",
                 "ns-vector-hex.yaml",
                 "ns-vector-repartition.yaml",
