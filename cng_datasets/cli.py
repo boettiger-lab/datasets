@@ -92,9 +92,6 @@ def main():
                                   "is raised, with a warning, to fit.")
     plan_parser.add_argument("--max-features-per-chunk", type=int, default=None, metavar="N",
                              help="Feature cap per chunk (default 1000, raised to fit --max-chunks)")
-    plan_parser.add_argument("--hex-memory", default=None, metavar="QUANTITY",
-                             help="The hex pods' memory limit (e.g. 8Gi). Chunks predicted to peak "
-                                  "near it are reported, since a single feature cannot be split.")
 
 
     # Raster processing command
@@ -483,7 +480,6 @@ def _dispatch(args):
 
     elif args.command == "vector-plan":
         from .vector.chunk_plan import run_plan, DEFAULT_CELLS_PER_CHUNK
-        from .k8s.workflows import _parse_memory_to_bytes
         from .vector.h3_tiling import parse_resolution_by_area
         run_plan(
             input_url=args.input,
@@ -495,8 +491,6 @@ def _dispatch(args):
                              else DEFAULT_CELLS_PER_CHUNK),
             max_chunks=args.max_chunks,
             max_features=args.max_features_per_chunk,
-            hex_memory_bytes=(_parse_memory_to_bytes(args.hex_memory)
-                              if args.hex_memory else None),
         )
 
     elif args.command == "raster":

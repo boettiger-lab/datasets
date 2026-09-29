@@ -1001,8 +1001,7 @@ def generate_dataset_workflow(
         _generate_plan_job(manager, k8s_name, bucket, output_path, plan_url,
                            h3_resolution, resolution_by_area, cells_per_chunk,
                            max_chunks=completions, memory=hex_memory,
-                           s3_dataset=dataset_name, config=config,
-                           hex_memory=hex_memory)
+                           s3_dataset=dataset_name, config=config)
 
     # Generate hex tiling job
     _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config, resolution_by_area=resolution_by_area, hex_retries=hex_retries, max_failed_indexes=max_failed_indexes, plan_url=plan_url)
@@ -2196,7 +2195,7 @@ def _hex_plan_url(bucket: str, s3_dataset: str) -> str:
 def _generate_plan_job(manager, dataset_name, bucket, output_path, plan_url,
                        h3_resolution, resolution_by_area, cells_per_chunk,
                        max_chunks, memory="8Gi", s3_dataset=None,
-                       config: ClusterConfig = None, hex_memory="8Gi"):
+                       config: ClusterConfig = None):
     """Generate the job that cuts the GeoParquet into hex chunks by cells (#124).
 
     It runs after convert, reads every geometry once, writes the plan, and
@@ -2213,8 +2212,7 @@ def _generate_plan_job(manager, dataset_name, bucket, output_path, plan_url,
         "set -e\n"
         f"cng-datasets vector-plan --input s3://{bucket}/{s3_dataset}.parquet "
         f"--output {plan_url} {res_flag} "
-        f"--cells-per-chunk {cells_per_chunk:.0f} --max-chunks {max_chunks} "
-        f"--hex-memory {hex_memory}"
+        f"--cells-per-chunk {cells_per_chunk:.0f} --max-chunks {max_chunks}"
     )
     pod_spec = {
         "restartPolicy": "Never",
