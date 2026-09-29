@@ -174,10 +174,10 @@ class TestWorkflowGeneration:
                 job = yaml.safe_load(f)
                 
             assert job["metadata"]["name"] == "test-ds-hex"
-            # 5-feature fixture -> chunk_size floored at 1000 -> 1 chunk (#144),
-            # not 5 tiny one-feature pods.
-            assert job["spec"]["completions"] == 1
-            assert job["spec"]["parallelism"] == 1
+            # Planned by cells (#124): the Job carries an upper bound of one
+            # chunk per row, and the workflow patches it down to the plan.
+            assert job["spec"]["completions"] == 5
+            assert job["spec"]["parallelism"] == 5
             assert job["spec"]["completionMode"] == "Indexed"
     
     @pytest.mark.timeout(30)
@@ -230,9 +230,9 @@ class TestWorkflowGeneration:
                 job = yaml.safe_load(f)
                 
             assert job["metadata"]["name"] == "mappinginequality-hex"
-            # 5-feature fixture -> chunk_size floored at 1000 -> 1 chunk (#144).
-            assert job["spec"]["completions"] == 1
-            assert job["spec"]["parallelism"] == 1
+            # Upper bound of one chunk per row; the plan sets the real count (#124).
+            assert job["spec"]["completions"] == 5
+            assert job["spec"]["parallelism"] == 5
             assert job["spec"]["completionMode"] == "Indexed"
 
             # Check chunk-size is set correctly
@@ -537,11 +537,21 @@ class TestChunkSizeOverride:
         assert "⚠" not in capsys.readouterr().out
 
     @pytest.mark.timeout(10)
-    def test_default_is_unchanged(self, mocker):
+    def test_an_explicit_size_turns_planning_off(self, mocker):
         with tempfile.TemporaryDirectory() as tmpdir:
-            job = self._generate(mocker, tmpdir, self.ECOREGIONS)
-        assert job["spec"]["completions"] == 1
-        assert "--chunk-size 1000 " in self._hex_command(job)
+            job = self._generate(mocker, tmpdir, self.ECOREGIONS, chunk_size=5)
+            assert not (Path(tmpdir) / "ecoregion-plan.yaml").exists()
+            workflow = (Path(tmpdir) / "workflow.yaml").read_text()
+        assert "--plan" not in self._hex_command(job)
+        assert "ecoregion-plan" not in workflow
+
+    @pytest.mark.timeout(10)
+    def test_size_and_budget_are_alternatives(self, mocker):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="alternatives"):
+                self._generate(mocker, tmpdir, self.ECOREGIONS, chunk_size=5,
+                               cells_per_chunk=1e6)
+
 
     @pytest.mark.timeout(10)
     def test_raising_an_explicit_size_is_reported(self, mocker, capsys):
@@ -567,6 +577,92 @@ class TestChunkSizeOverride:
                     bucket="test-bucket", output_dir=tmpdir, chunk_size=0,
                 )
         count.assert_not_called()
+
+
+class TestPlannedHexWorkflow:
+    """Issue #124: by default a plan step sizes hex chunks by estimated cells."""
+
+    def _generate(self, mocker, tmpdir, features=847, **kwargs):
+        mocker.patch('cng_datasets.k8s.workflows._count_source_features',
+                     return_value=features)
+        generate_dataset_workflow(
+            dataset_name="eco/regions",
+            source_urls="https://example.com/ecoregions.gdb",
+            bucket="test-bucket",
+            output_dir=tmpdir,
+            h3_resolution=8,
+            **kwargs,
+        )
+        out = Path(tmpdir)
+        return {name: out / f"eco-regions-{name}.yaml"
+                for name in ("plan", "hex", "convert")} | {"workflow": out / "workflow.yaml"}
+
+    @pytest.mark.timeout(10)
+    def test_plan_job_reads_the_geoparquet_and_writes_outside_chunks(self, mocker):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = self._generate(mocker, tmpdir, cells_per_chunk=2e6)
+            plan = yaml.safe_load(files["plan"].read_text())
+            hex_job = yaml.safe_load(files["hex"].read_text())
+        container = plan["spec"]["template"]["spec"]["containers"][0]
+        cmd = container["command"][-1]
+        assert "cng-datasets vector-plan --input s3://test-bucket/eco/regions.parquet" in cmd
+        # Not under chunks/: repartition reads chunks/*.parquet as hex output.
+        assert "--output s3://test-bucket/eco/regions/_hex_plan.parquet" in cmd
+        assert "--resolution 8" in cmd and "--cells-per-chunk 2000000" in cmd
+        assert "--max-chunks 200" in cmd
+        assert container["terminationMessagePolicy"] == "File"
+        assert "priorityClassName" not in plan["spec"]["template"]["spec"]
+        hex_cmd = str(hex_job["spec"]["template"]["spec"]["containers"][0]["command"])
+        assert "--plan s3://test-bucket/eco/regions/_hex_plan.parquet" in hex_cmd
+
+    @pytest.mark.timeout(10)
+    def test_hex_job_is_an_upper_bound_the_workflow_resizes(self, mocker):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = self._generate(mocker, tmpdir, max_parallelism=30)
+            hex_job = yaml.safe_load(files["hex"].read_text())
+            workflow = yaml.safe_load(files["workflow"].read_text())
+            configmap = (Path(tmpdir) / "configmap.yaml").read_text() \
+                if (Path(tmpdir) / "configmap.yaml").exists() else ""
+        assert hex_job["spec"]["completions"] == 200
+        script = workflow["spec"]["template"]["spec"]["containers"][0]["args"][0]
+        # convert -> plan -> hex, and the hex Job is patched to the plan.
+        assert script.index("eco-regions-convert.yaml") < script.index("eco-regions-plan.yaml") \
+            < script.index("eco-regions-hex.yaml")
+        assert "terminated.message" in script
+        assert "kubectl patch --local -f /yamls/eco-regions-hex.yaml" in script
+        assert "CHUNKS < 30 ? CHUNKS : 30" in script
+        assert "refusing to guess" in script
+        if configmap:
+            assert "eco-regions-plan.yaml" in configmap
+
+    @pytest.mark.timeout(10)
+    def test_upper_bound_never_exceeds_the_row_count(self, mocker):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = self._generate(mocker, tmpdir, features=12)
+            hex_job = yaml.safe_load(files["hex"].read_text())
+            plan = yaml.safe_load(files["plan"].read_text())
+        assert hex_job["spec"]["completions"] == 12
+        assert "--max-chunks 12" in plan["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+
+    @pytest.mark.timeout(10)
+    def test_resolution_by_area_reaches_the_plan(self, mocker):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mocker.patch('cng_datasets.k8s.workflows._count_source_features',
+                         return_value=100)
+            generate_dataset_workflow(
+                dataset_name="byarea", source_urls="https://example.com/x.gdb",
+                bucket="b", output_dir=tmpdir,
+                resolution_by_area="12:8,600:6,5", parent_resolutions=[7, 6, 5, 4, 0],
+            )
+            cmd = yaml.safe_load((Path(tmpdir) / "byarea-plan.yaml").read_text())[
+                "spec"]["template"]["spec"]["containers"][0]["command"][-1]
+        assert '--resolution-by-area "12:8,600:6,5"' in cmd
+
+    @pytest.mark.timeout(10)
+    def test_nonpositive_budget_is_refused(self, mocker):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="cells_per_chunk"):
+                self._generate(mocker, tmpdir, cells_per_chunk=0)
 
 
 class TestSimplifyToleranceWiring:
@@ -749,12 +845,12 @@ class TestEdgeCases:
                 bucket="test-bucket",
                 output_dir=tmpdir,
                 max_completions=200,
-                expect_features=847,
+                expect_features=50,
             )
             with open(Path(tmpdir) / "fallback-test-hex.yaml") as f:
                 job = yaml.safe_load(f)
-            # 847 features is one chunk (the 1000-feature floor), not 200.
-            assert job["spec"]["completions"] == 1
+            # Bounded by the expected 50 rows, not by max_completions.
+            assert job["spec"]["completions"] == 50
 
 
 class TestRasterWorkflowGeneration:
@@ -1576,6 +1672,7 @@ class TestStepManifestNamespace:
             expected = {
                 "ns-vector-setup-bucket.yaml",
                 "ns-vector-convert.yaml",
+                "ns-vector-plan.yaml",     # the #124 chunk plan
                 "ns-vector-pmtiles.yaml",
                 "ns-vector-hex.yaml",
                 "ns-vector-repartition.yaml",
@@ -2691,7 +2788,8 @@ class TestOrchestratorStopsOnFailedStep:
         import re
         assert "condition=complete" not in script
         assert "wait_job() {" in script and '*" Failed "*)' in script
-        applied = re.findall(r"kubectl apply -f /yamls/(\S+)\.yaml", script)
+        # A planned hex Job is applied through `kubectl patch --local -f` (#124).
+        applied = re.findall(r"kubectl (?:apply|patch --local) -f /yamls/(\S+)\.yaml", script)
         waited = re.findall(r"^wait_job (\S+) ", script, flags=re.M)
         assert applied and set(waited) == set(applied) - set(background)
         for step in steps:
@@ -2706,7 +2804,7 @@ class TestOrchestratorStopsOnFailedStep:
                                       bucket="b", output_dir=tmpdir, h3_resolution=8)
             script = self._script(tmpdir)
         # pmtiles is deliberately left running in the background.
-        self._check(script, ["setup-bucket", "convert", "hex", "repartition"],
+        self._check(script, ["setup-bucket", "convert", "plan", "hex", "repartition"],
                     background=["vec-ds-pmtiles"])
         assert "wait_job vec-ds-hex geo-workflows 172800" in script
 

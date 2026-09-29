@@ -788,6 +788,7 @@ def generate_dataset_workflow(
     max_parallelism: int = 50,
     max_completions: int = 200,
     chunk_size: Optional[int] = None,
+    cells_per_chunk: Optional[float] = None,
     intermediate_chunk_size: int = 10,
     row_group_size: int = 100000,
     simplify_tolerance: Optional[float] = None,
@@ -867,7 +868,13 @@ def generate_dataset_workflow(
             dataset with few but very large features, whose peak memory is set
             by the cells of the largest features in a chunk rather than by the
             feature count (issue #237). Still raised if needed to keep the
-            fan-out within ``max_completions``, and that is reported.
+            fan-out within ``max_completions``, and that is reported. Giving
+            it turns off cells-per-chunk planning.
+        cells_per_chunk: Estimated H3 cells per hex chunk (default
+            ``DEFAULT_CELLS_PER_CHUNK``). Unless chunk_size is given, a plan
+            step after convert cuts the GeoParquet into contiguous row ranges
+            at this budget (never more than the fixed rule's features per
+            chunk), and the workflow sizes the hex Job to the plan (#124).
         intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM (default: 10)
         source_url: (Deprecated) Use source_urls instead. Kept for backwards compatibility.
     """
@@ -911,6 +918,17 @@ def generate_dataset_workflow(
     requested_chunk_size = chunk_size
     if requested_chunk_size is not None and int(requested_chunk_size) < 1:
         raise ValueError(f"chunk_size must be at least 1, got {requested_chunk_size}")
+    if requested_chunk_size is not None and cells_per_chunk is not None:
+        raise ValueError(
+            "chunk_size and cells_per_chunk are alternatives: chunk_size fixes the "
+            "features per chunk, cells_per_chunk sizes chunks by estimated cells. "
+            "Give one.")
+    if cells_per_chunk is not None and cells_per_chunk <= 0:
+        raise ValueError(f"cells_per_chunk must be positive, got {cells_per_chunk}")
+    planned = requested_chunk_size is None
+    if planned and cells_per_chunk is None:
+        from ..vector.chunk_plan import DEFAULT_CELLS_PER_CHUNK
+        cells_per_chunk = DEFAULT_CELLS_PER_CHUNK
     # Count features to size the hex fan-out. This runs before any manifest is
     # written: when the source can't be read, the workflow must fail rather than
     # emit a plausible-looking fan-out sized for a made-up count (issue #235).
@@ -930,7 +948,16 @@ def generate_dataset_workflow(
               f"raised to {chunk_size:,} to stay within --max-completions "
               f"{max_completions}. Raise --max-completions to keep the smaller chunks "
               f"(past ~200, use --backend armada).")
-    print(f"  Completions: {completions}")
+    if planned:
+        # The plan decides the real chunk count after convert; the Job carries
+        # an upper bound so it is valid as written, and the workflow patches
+        # it down to the plan (#124). No more chunks than rows.
+        completions = max(1, min(max_completions, total_rows))
+        parallelism = min(max_parallelism, completions)
+        print(f"  Hex chunks: planned after convert at ~{cells_per_chunk:,.0f} "
+              f"estimated cells each (at most {chunk_size:,} features), up to "
+              f"{completions} completions")
+    print(f"  Completions: {completions}{' (upper bound)' if planned else ''}")
     print(f"  Parallelism: {parallelism}")
 
     output_path.mkdir(parents=True, exist_ok=True)
@@ -968,8 +995,16 @@ def generate_dataset_workflow(
     print(f"  H3 resolution: {h3_resolution}")
     print(f"  Parent resolutions: {parent_resolutions}")
 
+    plan_url = None
+    if planned:
+        plan_url = _hex_plan_url(bucket, dataset_name)
+        _generate_plan_job(manager, k8s_name, bucket, output_path, plan_url,
+                           h3_resolution, resolution_by_area, cells_per_chunk,
+                           max_chunks=completions, memory=hex_memory,
+                           s3_dataset=dataset_name, config=config)
+
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config, resolution_by_area=resolution_by_area, hex_retries=hex_retries, max_failed_indexes=max_failed_indexes)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config, resolution_by_area=resolution_by_area, hex_retries=hex_retries, max_failed_indexes=max_failed_indexes, plan_url=plan_url)
 
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory, config=config)
@@ -989,12 +1024,15 @@ def generate_dataset_workflow(
                    f"{res_flag} --parent-resolutions \"{parent_res_str}\"")
     if requested_chunk_size is not None:
         gen_command += f" --chunk-size {requested_chunk_size}"
+    else:
+        gen_command += f" --cells-per-chunk {cells_per_chunk:.0f}"
 
     # Generate ConfigMap YAML from job files
     _generate_configmap(k8s_name, namespace, output_path, gen_command)
 
     # Generate Argo workflow with ConfigMap-based approach
-    _generate_argo_workflow(k8s_name, namespace, output_path, output_dir)
+    _generate_argo_workflow(k8s_name, namespace, output_path, output_dir,
+                            planned=planned, max_parallelism=max_parallelism)
 
     if backend == "armada":
         armada_files = convert_workflow_to_armada(
@@ -1014,7 +1052,7 @@ def generate_dataset_workflow(
         for f in armada_files:
             print(f"  - {Path(f).name}")
         print("\nTo run (submit each step in order):")
-        steps = ["setup-bucket", "convert", "pmtiles", "hex", "repartition"]
+        steps = ["setup-bucket", "convert", "plan", "pmtiles", "hex", "repartition"]
         for step in steps:
             armada_file = output_path / f"armada-{k8s_name}-{step}.yaml"
             if armada_file.exists():
@@ -1025,8 +1063,10 @@ def generate_dataset_workflow(
         print(f"\nFiles created in {output_dir}:")
         print(f"  - {k8s_name}-setup-bucket.yaml")
         print(f"  - {k8s_name}-convert.yaml")
+        if planned:
+            print(f"  - {k8s_name}-plan.yaml")
         print(f"  - {k8s_name}-pmtiles.yaml")
-        print(f"  - {k8s_name}-hex.yaml")
+        print(f"  - {k8s_name}-hex.yaml" + (" (upper bound; the workflow sizes it to the plan)" if planned else ""))
         print(f"  - {k8s_name}-repartition.yaml")
         print("  - workflow-rbac.yaml (generic, reusable)")
         print("  - configmap.yaml (job configs)")
@@ -2146,7 +2186,69 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-pmtiles.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None, resolution_by_area=None, hex_retries: int = DEFAULT_HEX_RETRIES, max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES):
+def _hex_plan_url(bucket: str, s3_dataset: str) -> str:
+    """Where the #124 chunk plan lives. Outside `chunks/`, whose `*.parquet`
+    glob repartition reads as hex output."""
+    return f"s3://{bucket}/{s3_dataset}/_hex_plan.parquet"
+
+
+def _generate_plan_job(manager, dataset_name, bucket, output_path, plan_url,
+                       h3_resolution, resolution_by_area, cells_per_chunk,
+                       max_chunks, memory="8Gi", s3_dataset=None,
+                       config: ClusterConfig = None):
+    """Generate the job that cuts the GeoParquet into hex chunks by cells (#124).
+
+    It runs after convert, reads every geometry once, writes the plan, and
+    reports its chunk count as the container's termination message — which is
+    how the workflow sizes the hex Job to it without an S3 client of its own.
+    """
+    if config is None:
+        config = ClusterConfig()
+    s3_dataset = s3_dataset or dataset_name
+    res_flag = (f'--resolution-by-area "{resolution_by_area}"'
+                if resolution_by_area is not None
+                else f"--resolution {h3_resolution}")
+    plan_cmd = (
+        "set -e\n"
+        f"cng-datasets vector-plan --input s3://{bucket}/{s3_dataset}.parquet "
+        f"--output {plan_url} {res_flag} "
+        f"--cells-per-chunk {cells_per_chunk:.0f} --max-chunks {max_chunks}"
+    )
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "plan-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config) + [{"name": "BUCKET", "value": bucket}],
+            "command": ["bash", "-c", plan_cmd],
+            "terminationMessagePolicy": "File",
+            "resources": {
+                "requests": {"cpu": "2", "memory": memory},
+                "limits": {"cpu": "2", "memory": memory}
+            }
+        }],
+    }
+    _apply_scheduling(pod_spec, config)
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": _job_metadata(manager, f"{dataset_name}-plan"),
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 1,
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-plan"}},
+                "spec": pod_spec,
+            }
+        }
+    }
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-plan.yaml"))
+
+
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None, resolution_by_area=None, hex_retries: int = DEFAULT_HEX_RETRIES, max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES, plan_url: Optional[str] = None):
     """Generate H3 hex tiling job.
 
     Args:
@@ -2184,6 +2286,8 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
     ]
     if id_column:
         cmd_parts[-1] += f" --id-column {id_column}"
+    if plan_url:
+        cmd_parts[-1] += f" --plan {plan_url}"
 
     command_str = "\n".join(cmd_parts)
 
@@ -2342,7 +2446,7 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     import yaml
 
     # Read all job YAML files
-    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-convert.yaml", f"{dataset_name}-pmtiles.yaml", f"{dataset_name}-hex.yaml", f"{dataset_name}-repartition.yaml"]
+    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-convert.yaml", f"{dataset_name}-plan.yaml", f"{dataset_name}-pmtiles.yaml", f"{dataset_name}-hex.yaml", f"{dataset_name}-repartition.yaml"]
     data = {}
 
     for job_file in job_files:
@@ -2409,7 +2513,8 @@ wait_job() {
 """
 
 
-def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir):
+def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir,
+                            planned: bool = False, max_parallelism: int = 50):
     """Generate K8s Job that orchestrates the workflow using a ConfigMap.
 
     Args:
@@ -2417,10 +2522,36 @@ def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir):
         namespace: Kubernetes namespace
         output_path: Path object where YAML files are written
         output_dir: String path to YAML directory for kubectl create configmap command
+        planned: Run the #124 plan step and size the hex Job from its chunk
+            count, rather than applying the hex Job as generated.
+        max_parallelism: Cap on the hex Job's parallelism when it is resized.
     """
     import yaml
 
     configmap_name = f"{dataset_name}-yamls"
+
+    if planned:
+        # The plan pod reports "chunks=N" as its termination message (#124).
+        # The hex Job was generated with an upper bound; patch it to the plan
+        # locally, from the ConfigMap copy, before it is ever created.
+        hex_apply = f"""echo "Planning hex chunks by estimated cells..."
+kubectl apply -f /yamls/{dataset_name}-plan.yaml -n {namespace}
+wait_job {dataset_name}-plan {namespace} 7200
+MSG=$(kubectl get pods -n {namespace} -l job-name={dataset_name}-plan \\
+  -o jsonpath='{{.items[*].status.containerStatuses[0].state.terminated.message}}')
+CHUNKS=$(echo "$MSG" | tr ' ' '\\n' | sed -n 's/^chunks=\\([0-9][0-9]*\\)$/\\1/p' | tail -1)
+if [ -z "$CHUNKS" ] || [ "$CHUNKS" -lt 1 ]; then
+  echo "The plan step reported no chunk count (termination message: '$MSG'); refusing to guess."
+  exit 1
+fi
+PAR=$(( CHUNKS < {max_parallelism} ? CHUNKS : {max_parallelism} ))
+echo "Plan: $CHUNKS hex chunks; parallelism $PAR"
+kubectl patch --local -f /yamls/{dataset_name}-hex.yaml --type merge \\
+  -p "{{\\"spec\\":{{\\"completions\\":$CHUNKS,\\"parallelism\\":$PAR}}}}" -o yaml \\
+  | kubectl apply -n {namespace} -f -
+"""
+    else:
+        hex_apply = f"kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}\n"
 
     workflow_job = {
         "apiVersion": "batch/v1",
@@ -2460,8 +2591,7 @@ wait_job {dataset_name}-convert {namespace} 3600
 # Step 2: Run pmtiles and hex tiling in parallel (both use the converted geoparquet)
 echo "Step 2: H3 hexagonal tiling and PMTiles generation (parallel)..."
 kubectl apply -f /yamls/{dataset_name}-pmtiles.yaml -n {namespace}
-kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
-
+{hex_apply}
 echo "Waiting for hex tiling to complete (PMTiles continues in background)..."
 echo "Timeout set to 48 hours (172800s)..."
 wait_job {dataset_name}-hex {namespace} 172800
@@ -2476,7 +2606,7 @@ echo "✓ Workflow complete!"
 echo "Note: PMTiles job may still be running in the background"
 echo ""
 echo "Clean up with:"
-echo "  kubectl delete jobs {dataset_name}-setup-bucket {dataset_name}-convert {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace}"
+echo "  kubectl delete jobs {dataset_name}-setup-bucket {dataset_name}-convert{' ' + dataset_name + '-plan' if planned else ''} {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace} --ignore-not-found"
 echo "  kubectl delete configmap {configmap_name} -n {namespace}"
 """],
                         "resources": {

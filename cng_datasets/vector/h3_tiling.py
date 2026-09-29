@@ -248,6 +248,40 @@ def _spheroid_area_m2_sql(geom_expr: str) -> str:
     return f"ST_Area_Spheroid(ST_FlipCoordinates({geom_expr}))"
 
 
+def _feature_area_m2_sql(geom_expr: str) -> str:
+    """Area in m² that the polyfill of *geom_expr* walks.
+
+    Geodesic normally; planar (the short way for antimeridian crossers) for a
+    feature spanning more than 180 degrees of longitude, whose spheroid area is
+    NaN or unrelated to what the fill covers (#167, #241).
+    """
+    return (
+        f"CASE WHEN ST_XMax({geom_expr}) - ST_XMin({geom_expr}) > {_TRANSMERIDIAN_MAX_SPAN_DEG} "
+        f"THEN {_planar_area_deg2_sql(geom_expr)} * {_DEG2_TO_M2} "
+        f"ELSE {_spheroid_area_m2_sql(geom_expr)} END"
+    )
+
+
+def _native_res_sql(geom_expr: str, h3_resolution: int,
+                    resolution_by_area: Optional[List[Tuple[Optional[float], int]]]) -> str:
+    """The resolution *geom_expr* is hexed at: fixed, or by area (#98)."""
+    if resolution_by_area is not None:
+        return _native_res_case_sql(resolution_by_area, geom_expr)
+    return str(int(h3_resolution))
+
+
+def _polygon_cells_sql(geom_expr: str, h3_resolution: int,
+                       resolution_by_area: Optional[List[Tuple[Optional[float], int]]]) -> str:
+    """Estimated H3 cells in the polyfill of a polygon: area / average hex area.
+
+    The estimate undercounts the true polyfill by ~1.3x (see
+    _DEFAULT_MAX_CELLS_PER_FEATURE); it is shared by the #107 guard and the
+    #124 chunk planner so the two cannot disagree about a feature's size.
+    """
+    res = _native_res_sql(geom_expr, h3_resolution, resolution_by_area)
+    return f"({_feature_area_m2_sql(geom_expr)}) / h3_get_hexagon_area_avg({res}, 'm^2')"
+
+
 def _representative_point_sql(geom_expr: str) -> str:
     """SQL for a point on the feature, for the sub-cell fallback (issue #104).
 
@@ -561,6 +595,42 @@ def geom_to_h3_cells(
     return sql
 
 
+def find_geometry_column(con: duckdb.DuckDBPyConnection, table_name: str) -> str:
+    """Find the geometry column in the table.
+
+    Resolves the geometry column by DuckDB *type* first: a column whose type
+    is GEOMETRY is the geometry, regardless of its name. This keeps an
+    unrelated attribute column that merely happens to be named
+    ``GEOMETRY``/``SHAPE``/``GEOM`` (e.g. a DOUBLE carried over from a source
+    DBF, issue #171) from shadowing the real geometry column and aborting the
+    hex job with an ``ST_GeometryType(DOUBLE)`` binder error. Name matching is
+    used only as a fallback when no GEOMETRY-typed column exists (e.g. WKB
+    stored as BLOB).
+    """
+    schema = con.execute(f"DESCRIBE {table_name}").fetchall()
+    # DESCRIBE rows are (column_name, column_type, ...). Geometry columns are
+    # reported as GEOMETRY (optionally with a CRS annotation, e.g.
+    # "GEOMETRY('OGC:CRS84')"), so match on the type prefix.
+    geom_typed = [
+        row[0] for row in schema if str(row[1]).upper().startswith('GEOMETRY')
+    ]
+    if geom_typed:
+        # If several geometry-typed columns exist, prefer conventional names;
+        # otherwise take the first geometry-typed column.
+        by_upper = {col.upper(): col for col in geom_typed}
+        for name in ['GEOM', 'GEOMETRY', 'SHAPE']:
+            if name in by_upper:
+                return by_upper[name]
+        return geom_typed[0]
+
+    # Fallback: no GEOMETRY-typed column (e.g. WKB blobs) — match by name.
+    columns = [row[0] for row in schema]
+    for col in columns:
+        if col.upper() in ['SHAPE', 'GEOMETRY', 'GEOM']:
+            return col
+    raise ValueError(f"No geometry column found. Available columns: {columns}")
+
+
 def setup_duckdb_connection(
     extensions: Optional[List[str]] = None,
     http_retries: int = 20,
@@ -638,6 +708,7 @@ class H3VectorProcessor:
         resolution_by_area: Optional[List[Tuple[Optional[float], int]]] = None,
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
+        plan_url: Optional[str] = None,
     ):
         """
         Initialize the H3 vector processor.
@@ -658,6 +729,10 @@ class H3VectorProcessor:
                 columns NULL in coarser tiers) plus a native_res column.
             read_credentials: Dict with AWS credentials for reading (key, secret, region, endpoint)
             write_credentials: Dict with AWS credentials for writing (key, secret, region, endpoint)
+            plan_url: Optional chunk plan from `cng-datasets vector-plan` (issue
+                #124). When set, chunk K is the plan's row range K rather than
+                rows [K * chunk_size, (K + 1) * chunk_size), and chunk_size is
+                not used to select rows.
         """
         self.input_url = input_url
         self.output_url = output_url
@@ -683,6 +758,7 @@ class H3VectorProcessor:
         self.chunk_size = chunk_size
         self.intermediate_chunk_size = intermediate_chunk_size
         self.id_column = id_column
+        self.plan_url = plan_url
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
         self.max_cells_per_feature = int(
@@ -697,39 +773,8 @@ class H3VectorProcessor:
         configure_s3_credentials(self.con)
 
     def _find_geometry_column(self, table_name: str) -> str:
-        """Find the geometry column in the table.
-
-        Resolves the geometry column by DuckDB *type* first: a column whose type
-        is GEOMETRY is the geometry, regardless of its name. This keeps an
-        unrelated attribute column that merely happens to be named
-        ``GEOMETRY``/``SHAPE``/``GEOM`` (e.g. a DOUBLE carried over from a source
-        DBF, issue #171) from shadowing the real geometry column and aborting the
-        hex job with an ``ST_GeometryType(DOUBLE)`` binder error. Name matching is
-        used only as a fallback when no GEOMETRY-typed column exists (e.g. WKB
-        stored as BLOB).
-        """
-        schema = self.con.execute(f"DESCRIBE {table_name}").fetchall()
-        # DESCRIBE rows are (column_name, column_type, ...). Geometry columns are
-        # reported as GEOMETRY (optionally with a CRS annotation, e.g.
-        # "GEOMETRY('OGC:CRS84')"), so match on the type prefix.
-        geom_typed = [
-            row[0] for row in schema if str(row[1]).upper().startswith('GEOMETRY')
-        ]
-        if geom_typed:
-            # If several geometry-typed columns exist, prefer conventional names;
-            # otherwise take the first geometry-typed column.
-            by_upper = {col.upper(): col for col in geom_typed}
-            for name in ['GEOM', 'GEOMETRY', 'SHAPE']:
-                if name in by_upper:
-                    return by_upper[name]
-            return geom_typed[0]
-
-        # Fallback: no GEOMETRY-typed column (e.g. WKB blobs) — match by name.
-        columns = [row[0] for row in schema]
-        for col in columns:
-            if col.upper() in ['SHAPE', 'GEOMETRY', 'GEOM']:
-                return col
-        raise ValueError(f"No geometry column found. Available columns: {columns}")
+        """The geometry column of *table_name*; see `find_geometry_column`."""
+        return find_geometry_column(self.con, table_name)
 
     def _assert_no_oversized_feature(self, id_col: str, chunk_id: int) -> None:
         """Fail fast if any feature in `chunk_table` would produce an H3 cell
@@ -759,26 +804,10 @@ class H3VectorProcessor:
         fewer cells, the per-feature back-off that complements this guardrail — and
         the reported resolution is the worst offender's native res.
         """
-        # Geodesic area normally; planar (short-way for antimeridian crossers)
-        # for >180-deg features. See the docstring for why (#167, #241).
-        area_expr = (
-            f"CASE WHEN ST_XMax(geom) - ST_XMin(geom) > {_TRANSMERIDIAN_MAX_SPAN_DEG} "
-            f"THEN {_planar_area_deg2_sql('geom')} * {_DEG2_TO_M2} "
-            f"ELSE {_spheroid_area_m2_sql('geom')} END"
-        )
-        if self.resolution_by_area is not None:
-            native_res_case = _native_res_case_sql(self.resolution_by_area, "geom")
-            est_cells_expr = (
-                f"({area_expr}) / "
-                f"h3_get_hexagon_area_avg({native_res_case}, 'm^2')"
-            )
-            res_select = f"{native_res_case} AS native_res"
-        else:
-            avg_hex_m2 = self.con.execute(
-                f"SELECT h3_get_hexagon_area_avg({self.h3_resolution}, 'm^2')"
-            ).fetchone()[0]
-            est_cells_expr = f"({area_expr}) / {avg_hex_m2}"
-            res_select = f"{self.h3_resolution} AS native_res"
+        area_expr = _feature_area_m2_sql("geom")
+        est_cells_expr = _polygon_cells_sql(
+            "geom", self.h3_resolution, self.resolution_by_area)
+        res_select = f"{_native_res_sql('geom', self.h3_resolution, self.resolution_by_area)} AS native_res"
 
         worst = self.con.execute(f"""
             SELECT
@@ -843,6 +872,25 @@ class H3VectorProcessor:
 
         return output_file
 
+    def _chunk_rows(self, chunk_id: int) -> Tuple[int, Optional[int]]:
+        """(row offset, row count) for *chunk_id*; count None = nothing to do.
+
+        Without a plan, chunks are fixed-size slices. With one (issue #124),
+        they are the plan's ranges, and an index past its end is a surplus pod
+        — the hex Job was generated with an upper bound on the chunk count —
+        which exits cleanly rather than failing its Job index.
+        """
+        if self.plan_url is None:
+            return chunk_id * self.chunk_size, self.chunk_size
+        from .chunk_plan import read_plan_chunk
+        chunk, n = read_plan_chunk(self.con, self.plan_url, chunk_id)
+        if chunk is None:
+            print(f"Chunk {chunk_id} is past the plan's {n:,} chunks; nothing to do")
+            return 0, None
+        print(f"Chunk {chunk_id} of {n:,}: rows {chunk.row_offset:,}+{chunk.row_count:,}, "
+              f"~{chunk.est_cells:,.0f} estimated cells")
+        return chunk.row_offset, chunk.row_count
+
     def _process_pass1(
         self,
         chunk_id: int,
@@ -851,18 +899,29 @@ class H3VectorProcessor:
         Pass 1: Convert geometries to H3 cell arrays without unnesting.
         Writes intermediate parquet with arrays to disk.
         """
-        offset = chunk_id * self.chunk_size
+        offset, limit = self._chunk_rows(chunk_id)
+        if limit is None:
+            return None
 
         self.con.execute(f"""
             CREATE OR REPLACE VIEW source_table AS
             SELECT * FROM read_parquet('{self.input_url}')
-            LIMIT {self.chunk_size} OFFSET {offset}
+            LIMIT {limit} OFFSET {offset}
         """)
 
         chunk_rows = self.con.execute("SELECT COUNT(*) FROM source_table").fetchone()[0]
         if chunk_rows == 0:
             print(f"Chunk {chunk_id} is empty (offset {offset:,} beyond data)")
             return None
+        if self.plan_url is not None and chunk_rows != limit:
+            # The plan was cut from this file; a short range means the file
+            # changed under it, and hexing the remainder would silently drop
+            # rows at a chunk boundary.
+            raise RuntimeError(
+                f"Chunk {chunk_id}: the plan says {limit:,} rows from offset "
+                f"{offset:,}, but {self.input_url} has only {chunk_rows:,} there. "
+                f"The GeoParquet has changed since {self.plan_url} was written; "
+                f"re-run the plan step.")
 
         print(f"\nPass 1 - Chunk {chunk_id} ({chunk_rows:,} rows): Converting geometries to H3 arrays...")
 
@@ -1171,7 +1230,11 @@ class H3VectorProcessor:
             f"SELECT COUNT(*) FROM read_parquet('{self.input_url}')"
         ).fetchone()[0]
 
-        num_chunks = (total_rows + self.chunk_size - 1) // self.chunk_size
+        if self.plan_url is not None:
+            from .chunk_plan import read_plan_chunk
+            _, num_chunks = read_plan_chunk(self.con, self.plan_url, 0)
+        else:
+            num_chunks = (total_rows + self.chunk_size - 1) // self.chunk_size
 
         print(f"Processing {total_rows} rows in {num_chunks} chunks...")
 

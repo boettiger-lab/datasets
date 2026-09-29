@@ -411,3 +411,9 @@ class TestWorkflowChunkSize:
     @pytest.mark.timeout(10)
     def test_omitting_it_keeps_the_default(self, tmp_path):
         assert self._captured(tmp_path)["chunk_size"] is None
+
+    @pytest.mark.timeout(10)
+    def test_cells_per_chunk_reaches_the_generator(self, tmp_path):
+        captured = self._captured(tmp_path, "--cells-per-chunk", "2e6")
+        assert captured["cells_per_chunk"] == 2e6
+        assert self._captured(tmp_path)["cells_per_chunk"] is None

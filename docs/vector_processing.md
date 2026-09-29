@@ -99,6 +99,32 @@ job = manager.generate_chunked_job(
 manager.save_job_yaml(job, "tiling-job.yaml")
 ```
 
+## Chunk Planning
+
+A hex pod's memory and runtime follow the H3 cells of its features, not how many
+features it has, and per-feature cell counts are extremely skewed. On IUCN ranges at
+res 6 the median feature is 345 cells and the largest is 2.5 M. So `cng-datasets
+workflow` does not cut the hex fan-out at a fixed number of features. A **plan** step
+runs after convert:
+
+```bash
+cng-datasets vector-plan --input s3://bucket/data.parquet \
+    --output s3://bucket/data/_hex_plan.parquet --resolution 8 \
+    --cells-per-chunk 5000000 --max-chunks 200
+```
+
+It estimates each row's cells (area / hex area for polygons, length / edge for lines,
+one per point) and cuts the file into contiguous row ranges. A new chunk starts when
+*either* the cells budget or 1000 features would be exceeded, so chunks are never larger
+than the fixed rule would make them; heavy features are only split further. A feature
+larger than the budget gets a chunk of its own. If the budget would need more than
+`--max-chunks` chunks, it is raised to fit and the log says so. Hex pods run with
+`--plan <url>`, and pod K processes range K.
+
+On three published layers the largest fixed-count chunk was 2.2–2.4× the mean, while a
+5 M-cell budget gave 1.0–1.2× (#124). Pass `--chunk-size N` to `workflow` for fixed
+chunks instead.
+
 ## Memory Optimization
 
 If you encounter Out-Of-Memory errors:

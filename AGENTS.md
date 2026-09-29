@@ -72,13 +72,14 @@ kubectl apply -f catalog/<dataset>/k8s/<name>/<name>-setup-bucket.yaml \
               -f catalog/<dataset>/k8s/<name>/workflow.yaml
 ```
 
-The workflow orchestrator handles the rest: setup-bucket → convert → pmtiles + hex (parallel) → repartition.
+The workflow orchestrator handles the rest: setup-bucket → convert → plan → pmtiles + hex (parallel) → repartition. The plan step cuts the GeoParquet into hex chunks by estimated H3 cells, and the orchestrator sizes the hex Job to it. The hex YAML as generated holds only an upper bound, so apply it through `workflow.yaml` rather than by hand.
 
 ### Step 4: Monitor
 
 ```bash
 kubectl get jobs | grep <name>       # Job status
 kubectl logs job/<name>-convert      # Check conversion
+kubectl logs job/<name>-plan         # Hex chunk plan: chunk count, largest chunk, any raised budget
 kubectl logs job/<name>-workflow     # Orchestrator log
 ```
 
@@ -105,7 +106,8 @@ rclone copy catalog/<dataset>/stac/stac-collection.json nrp:<bucket>/
 | `--max-completions` | 200 | Keep at 200 for datasets > 50K features |
 | `--max-parallelism` | 50 | Reduce if cluster is already busy |
 | `--parent-resolutions` | "9,8,0" | Almost never change this |
-| `--chunk-size` | 1000 | Lower (e.g. 5) for few but very large features — ecoregions, countries, basins — which otherwise run as one hex pod |
+| `--cells-per-chunk` | 5,000,000 | Hex chunks are planned by estimated H3 cells. Lower it if hex pods OOM or straggle; raise it if there are too many tiny pods |
+| `--chunk-size` | (planned) | A fixed number of features per chunk instead of a plan. Mutually exclusive with `--cells-per-chunk` |
 | `--intermediate-chunk-size` | auto | Decrease if hex pods OOM during unnest step |
 
 `raster-workflow` additionally takes:
