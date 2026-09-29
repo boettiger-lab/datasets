@@ -2702,18 +2702,18 @@ class TestOrchestratorStopsOnFailedStep:
         mocker.patch('cng_datasets.k8s.workflows._count_source_features',
                      return_value=5000)
         with tempfile.TemporaryDirectory() as tmpdir:
-            generate_dataset_workflow(dataset_name="v", source_urls="https://example.com/x.gdb",
+            generate_dataset_workflow(dataset_name="vec-ds", source_urls="https://example.com/x.gdb",
                                       bucket="b", output_dir=tmpdir, h3_resolution=8)
             script = self._script(tmpdir)
         # pmtiles is deliberately left running in the background.
         self._check(script, ["setup-bucket", "convert", "hex", "repartition"],
-                    background=["v-pmtiles"])
-        assert "wait_job v-hex geo-workflows 172800" in script
+                    background=["vec-ds-pmtiles"])
+        assert "wait_job vec-ds-hex geo-workflows 172800" in script
 
     @pytest.mark.timeout(10)
     def test_raster_orchestrator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            generate_raster_workflow(dataset_name="r", source_urls="https://example.com/x.tif",
+            generate_raster_workflow(dataset_name="ras-ds", source_urls="https://example.com/x.tif",
                                      bucket="b", output_dir=tmpdir)
             script = self._script(tmpdir)
         self._check(script, ["setup-bucket", "hex"])
