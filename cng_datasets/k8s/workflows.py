@@ -1659,27 +1659,11 @@ cng-datasets merge-chunks \\
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-merge.yaml"))
 
 
-def _generate_raster_hex_job(
-    manager, dataset_name, source_url, bucket, output_path, git_repo,
-    h3_resolution, parent_resolutions, value_column, nodata_value,
-    hex_memory, max_parallelism, hex_storage="20Gi",
-    hex_resampling: str = "mean", config: ClusterConfig = None,
-    s3_dataset=None, h0_subset: Optional[List[int]] = None,
-    hex_workers: Optional[int] = None,
-    hex_chunk_size: int = DEFAULT_HEX_CHUNK_SIZE,
-    hex_cpu: str = DEFAULT_HEX_CPU,
-    chunk_resolution: int = 0,
-    chunk_count: Optional[int] = None,
-    hex_retries: int = DEFAULT_HEX_RETRIES,
-    max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
-):
-    """Generate raster H3 hex tiling job."""
-    if config is None:
-        config = ClusterConfig()
-    hex_cpu = str(hex_cpu).strip()
-    hex_workers = _resolve_hex_workers(hex_workers, hex_cpu)
-    hex_chunk_size = _validate_hex_chunk_size(hex_chunk_size)
-
+def _hex_fanout(bucket: str, s3_dataset: str, chunk_resolution: int,
+                chunk_count: Optional[int], h0_subset: Optional[List[int]]):
+    """(completions, shell preamble, chunk selector flags, output URL) for an
+    indexed hex Job. Shared by the raster and mdim hex jobs (#181), so both
+    fan out over the same chunk list and write where `merge-chunks` reads."""
     # One completion per unit of work: the chunk list at chunk_resolution, or
     # the h0 fan-out as before. Emitting fewer than the chunk list holds would
     # drop whole chunks with a clean exit, so this number and the list a pod
@@ -1693,8 +1677,6 @@ def _generate_raster_hex_job(
     # dataset_name is the k8s name, with '/' flattened to '-' so it is a legal
     # object name. S3 paths want the original hierarchical name, as the vector
     # generators already do for their own jobs (issue #189).
-    s3_dataset = s3_dataset or dataset_name
-    parent_res_str = ','.join(map(str, parent_resolutions))
 
     # One completion per h0 cell the build actually needs. Without a subset
     # every raster fans out over all 122 base cells, so a regional source
@@ -1724,7 +1706,6 @@ def _generate_raster_hex_job(
             "fi\n\n"
         )
 
-    # Build command
     if chunk_resolution:
         # Sub-h0 chunks are staged outside the published tree and merged back by
         # the merge step, so a reader globbing hex/ mid-build never sees parts.
@@ -1735,68 +1716,29 @@ def _generate_raster_hex_job(
     else:
         out_url = f"s3://{bucket}/{s3_dataset}/hex/"
         selector = f"--h0-index {h0_index}"
-    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet {out_url} {selector} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
-    nodata_cli = _nodata_cli_value(nodata_value)
-    if nodata_cli is not None:
-        cng_cmd += f' --nodata "{nodata_cli}"'
+    return completions, h0_preamble, selector, out_url
 
-    # PROJ database selection is handled deterministically inside the CLI
-    # (cog._configure_proj picks the highest-version proj.db, MINOR>=7). A bash
-    # `find ... | head -1` here would be non-deterministic and could export a
-    # stale PROJ_DATA — see issue #91.
-    command_str = f"""set -e
 
-{h0_preamble}{cng_cmd}"""
-
-    pod_spec = {
-        "restartPolicy": "Never",
-        "containers": [{
-            "name": "hex-task",
-            "image": "ghcr.io/boettiger-lab/datasets:latest",
-            "imagePullPolicy": "Always",
-            "env": _s3_env_vars(config) + [
-                {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
-                {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
-                {"name": "BUCKET", "value": bucket},
-                # Peak RSS of a hex pod is roughly workers x chunk size x bytes
-                # per cell. Both are pinned here, never left to the runtime, so
-                # the manifest alone determines the pod's memory profile and a
-                # tuned value survives regeneration (issue #195).
-                {"name": "CNG_HEX_WORKERS", "value": str(hex_workers)},
-                {"name": "CNG_HEX_CHUNK_SIZE", "value": str(hex_chunk_size)},
-                # The hex step's own DuckDB writes the partition by scanning
-                # every part its workers produced. Unset, DuckDB sizes its
-                # buffer manager from the *host's* RAM rather than the pod's
-                # limit, so that scan grows with the chunk's cell count until
-                # the cgroup kills it; bounded, it spills instead. 85% of the
-                # pod, matching the merge and repartition steps, because
-                # memory_limit bounds the buffer manager and not the process
-                # (issue #217). In DuckDB's spelling, not Kubernetes' (#217).
-                {"name": "DUCKDB_MEMORY_LIMIT", "value": _duckdb_memory_limit(hex_memory)},
-                # GDAL's block cache is per *process* and, left alone, is sized
-                # at 5% of the host's RAM — 12.6 GiB on a 251 GiB node, in every
-                # one of the pod's workers, none of which the manifest asked
-                # for. 512 MB each keeps the whole fan-out's cache under 4 GB at
-                # the default 8 workers. The preprocess-cog step has always
-                # bounded this; the hex step, which is the one that runs many
-                # processes, never did (issue #173).
-                {"name": "GDAL_CACHEMAX", "value": "512"},
-            ],
-            "volumeMounts": [
-                {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
-            ],
-            "command": ["bash", "-c", command_str],
-            "resources": {
-                "requests": {"cpu": hex_cpu, "memory": hex_memory, "ephemeral-storage": hex_storage},
-                "limits": {"cpu": hex_cpu, "memory": hex_memory, "ephemeral-storage": hex_storage}
-            }
-        }],
-        "volumes": [
-            {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
-        ]
+def _indexed_hex_job_spec(manager, dataset_name, command_str, env, resources,
+                          completions, max_parallelism, hex_retries, max_failed_indexes,
+                          config: ClusterConfig, volumes=None, volume_mounts=None):
+    """The indexed hex Job around *command_str*: retries per index, preemption
+    ignored, parallelism capped at the completions (#201)."""
+    container = {
+        "name": "hex-task",
+        "image": "ghcr.io/boettiger-lab/datasets:latest",
+        "imagePullPolicy": "Always",
+        "env": env,
+        "command": ["bash", "-c", command_str],
+        "resources": resources,
     }
+    if volume_mounts:
+        container["volumeMounts"] = volume_mounts
+    pod_spec = {"restartPolicy": "Never", "containers": [container]}
+    if volumes:
+        pod_spec["volumes"] = volumes
     _apply_scheduling(pod_spec, config)
-    job_spec = {
+    return {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": _job_metadata(manager, f"{dataset_name}-hex"),
@@ -1820,6 +1762,84 @@ def _generate_raster_hex_job(
             }
         }
     }
+
+
+def _generate_raster_hex_job(
+    manager, dataset_name, source_url, bucket, output_path, git_repo,
+    h3_resolution, parent_resolutions, value_column, nodata_value,
+    hex_memory, max_parallelism, hex_storage="20Gi",
+    hex_resampling: str = "mean", config: ClusterConfig = None,
+    s3_dataset=None, h0_subset: Optional[List[int]] = None,
+    hex_workers: Optional[int] = None,
+    hex_chunk_size: int = DEFAULT_HEX_CHUNK_SIZE,
+    hex_cpu: str = DEFAULT_HEX_CPU,
+    chunk_resolution: int = 0,
+    chunk_count: Optional[int] = None,
+    hex_retries: int = DEFAULT_HEX_RETRIES,
+    max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
+):
+    """Generate raster H3 hex tiling job."""
+    if config is None:
+        config = ClusterConfig()
+    hex_cpu = str(hex_cpu).strip()
+    hex_workers = _resolve_hex_workers(hex_workers, hex_cpu)
+    hex_chunk_size = _validate_hex_chunk_size(hex_chunk_size)
+
+    s3_dataset = s3_dataset or dataset_name
+    parent_res_str = ','.join(map(str, parent_resolutions))
+    completions, h0_preamble, selector, out_url = _hex_fanout(
+        bucket, s3_dataset, chunk_resolution, chunk_count, h0_subset)
+    cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet {out_url} {selector} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
+    nodata_cli = _nodata_cli_value(nodata_value)
+    if nodata_cli is not None:
+        cng_cmd += f' --nodata "{nodata_cli}"'
+
+    # PROJ database selection is handled deterministically inside the CLI
+    # (cog._configure_proj picks the highest-version proj.db, MINOR>=7). A bash
+    # `find ... | head -1` here would be non-deterministic and could export a
+    # stale PROJ_DATA — see issue #91.
+    command_str = f"""set -e
+
+{h0_preamble}{cng_cmd}"""
+
+    env = _s3_env_vars(config) + [
+        {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
+        {"name": "PYTHONPATH", "value": "/usr/lib/python3/dist-packages"},
+        {"name": "BUCKET", "value": bucket},
+        # Peak RSS of a hex pod is roughly workers x chunk size x bytes
+        # per cell. Both are pinned here, never left to the runtime, so
+        # the manifest alone determines the pod's memory profile and a
+        # tuned value survives regeneration (issue #195).
+        {"name": "CNG_HEX_WORKERS", "value": str(hex_workers)},
+        {"name": "CNG_HEX_CHUNK_SIZE", "value": str(hex_chunk_size)},
+        # The hex step's own DuckDB writes the partition by scanning
+        # every part its workers produced. Unset, DuckDB sizes its
+        # buffer manager from the *host's* RAM rather than the pod's
+        # limit, so that scan grows with the chunk's cell count until
+        # the cgroup kills it; bounded, it spills instead. 85% of the
+        # pod, matching the merge and repartition steps, because
+        # memory_limit bounds the buffer manager and not the process
+        # (issue #217). In DuckDB's spelling, not Kubernetes' (#217).
+        {"name": "DUCKDB_MEMORY_LIMIT", "value": _duckdb_memory_limit(hex_memory)},
+        # GDAL's block cache is per *process* and, left alone, is sized
+        # at 5% of the host's RAM — 12.6 GiB on a 251 GiB node, in every
+        # one of the pod's workers, none of which the manifest asked
+        # for. 512 MB each keeps the whole fan-out's cache under 4 GB at
+        # the default 8 workers. The preprocess-cog step has always
+        # bounded this; the hex step, which is the one that runs many
+        # processes, never did (issue #173).
+        {"name": "GDAL_CACHEMAX", "value": "512"},
+    ]
+    resources = {
+        "requests": {"cpu": hex_cpu, "memory": hex_memory, "ephemeral-storage": hex_storage},
+        "limits": {"cpu": hex_cpu, "memory": hex_memory, "ephemeral-storage": hex_storage}
+    }
+    job_spec = _indexed_hex_job_spec(
+        manager, dataset_name, command_str, env, resources, completions,
+        max_parallelism, hex_retries, max_failed_indexes, config,
+        volumes=[{"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}],
+        volume_mounts=[{"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}],
+    )
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-hex.yaml"))
 
 
