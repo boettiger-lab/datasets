@@ -94,6 +94,39 @@ def main():
                              help="Feature cap per chunk (default 1000, raised to fit --max-chunks)")
 
 
+    # N-D cube (time, lat, lon) processing (issue #181)
+    mdim_parser = subparsers.add_parser(
+        "mdim", help="Hex a (time, lat, lon) cube (zarr, netCDF, ...) into H3 partitions")
+    mdim_parser.add_argument("--input", dest="inputs", action="append", required=True,
+                             metavar="PATH",
+                             help="GDAL multidimensional source, e.g. 'ZARR:\"/vsicurl/https://…\"' "
+                                  "or a netCDF path. Repeat for one time series split across files "
+                                  "(e.g. a file per year), in time order.")
+    mdim_parser.add_argument("--variable", dest="variables", action="append", required=True,
+                             metavar="NAME", help="Array to hex. Repeatable; all must share the grid.")
+    mdim_parser.add_argument("--output-parquet", required=True, help="Output hex directory")
+    mdim_parser.add_argument("--resolution", type=int, required=True, help="H3 resolution")
+    mdim_parser.add_argument("--parent-resolutions", type=str, default="0",
+                             help="Comma-separated parent resolutions (default '0')")
+    mdim_parser.add_argument("--h0-index", type=int, default=None,
+                             help="h0 grid position to process (same as --chunk-index at --chunk-resolution 0)")
+    mdim_parser.add_argument("--chunk-resolution", type=int, default=0)
+    mdim_parser.add_argument("--chunk-index", type=int, default=None)
+    mdim_parser.add_argument("--h0-subset", type=str, default=None, metavar="POSITIONS",
+                             help="Restrict the chunk list to these h0 grid positions. " + POS_NOTE)
+    mdim_parser.add_argument("--h0-cells", type=str, default=None, metavar="BASE_CELLS",
+                             help="The same restriction as --h0-subset, given as H3 base cell numbers.")
+    mdim_parser.add_argument("--hex-resampling", default="mean", choices=["mean", "min", "max"],
+                             help="Reducer over pixels in a cell and over the --time-agg window. "
+                                  "'sum' is refused: mdim placement is not area-weighted.")
+    mdim_parser.add_argument("--time-agg", default="none", choices=["none", "month", "year"])
+    mdim_parser.add_argument("--time-start", default=None, metavar="YYYY-MM-DD")
+    mdim_parser.add_argument("--time-end", default=None, metavar="YYYY-MM-DD")
+    mdim_parser.add_argument("--placement", default="auto", choices=["auto", "aggregate", "sample"],
+                             help="aggregate: pixel centres into cells (pixels finer than cells); "
+                                  "sample: cell centres read their pixel (pixels coarser). "
+                                  "auto picks by comparing pixel and cell area.")
+
     # Raster processing command
     raster_parser = subparsers.add_parser("raster", help="Process raster datasets")
     raster_parser.add_argument("--input", required=True, action="append", dest="inputs",
@@ -492,6 +525,29 @@ def _dispatch(args):
             max_chunks=args.max_chunks,
             max_features=args.max_features_per_chunk,
         )
+
+    elif args.command == "mdim":
+        from .mdim import MdimProcessor
+        if args.h0_index is not None and args.chunk_index is not None:
+            raise SystemExit("give --h0-index or --chunk-index, not both")
+        index = args.chunk_index if args.chunk_index is not None else args.h0_index
+        if index is None:
+            raise SystemExit("--h0-index or --chunk-index is required")
+        processor = MdimProcessor(
+            inputs=args.inputs,
+            variables=args.variables,
+            output_parquet_path=args.output_parquet,
+            h3_resolution=args.resolution,
+            parent_resolutions=[int(x) for x in args.parent_resolutions.split(",") if x.strip()],
+            chunk_resolution=args.chunk_resolution,
+            h0_subset=_resolve_h0_subset(args),
+            hex_resampling=args.hex_resampling,
+            time_agg=args.time_agg,
+            time_start=args.time_start,
+            time_end=args.time_end,
+            placement=args.placement,
+        )
+        processor.process_chunk(index)
 
     elif args.command == "raster":
         from .raster import RasterProcessor, create_mosaic_cog
