@@ -347,3 +347,105 @@ class TestTimeAndOptions:
         wrote = duckdb.sql(f"SELECT bool_or(wrote_data), count(*) FROM "
                            f"read_parquet('{tmp_path}/o/_manifest/*.parquet')").fetchone()
         assert wrote == (False, 7)
+
+
+# -- workflow generator --------------------------------------------------------
+
+class TestMdimWorkflow:
+    """`mdim-workflow`: setup-bucket -> hex (mdim per chunk) -> merge (#181)."""
+
+    @pytest.fixture
+    def cube(self, tmp_path):
+        lat, lon = grid(4, 4, 0.25)
+        path = make_cube(str(tmp_path / "src.zarr"), "Zarr", lat, lon, [0, 1],
+                         data={"tas": field(lat, lon, 2)})
+        return f'ZARR:"{path}"'
+
+    @staticmethod
+    def _load(path):
+        import yaml
+        with open(path) as f:
+            return yaml.safe_load(f)
+
+    def _hex_cmd(self, out):
+        job = self._load(out / "cube-loca-hex.yaml")
+        return job, job["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+
+    @pytest.mark.timeout(60)
+    def test_generates_the_pipeline(self, tmp_path, cube):
+        from cng_datasets.k8s import generate_mdim_workflow
+        out = tmp_path / "wf"
+        generate_mdim_workflow("cube/loca", [cube], ["tas"], "b", output_dir=str(out),
+                               h3_resolution=5, h0_subset=[50], time_agg="year")
+        names = sorted(p.name for p in out.iterdir())
+        assert {"cube-loca-setup-bucket.yaml", "cube-loca-hex.yaml", "workflow.yaml",
+                "configmap.yaml", "workflow-rbac.yaml"} <= set(names)
+        assert "cube-loca-merge.yaml" not in names
+        job, cmd = self._hex_cmd(out)
+        assert job["spec"]["completions"] == 1 and "H0S=(50)" in cmd
+        assert "s3://b/cube/loca/hex/" in cmd                 # hierarchical S3 path
+        assert "--time-agg year" in cmd and "--resolution 5" in cmd
+        env = {e["name"]: e.get("value") for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
+        assert env["DUCKDB_MEMORY_LIMIT"] == "13GiB"           # 85% of 16Gi (#255)
+        script = self._load(out / "workflow.yaml")["spec"]["template"]["spec"]["containers"][0]["args"][0]
+        assert "wait_job cube-loca-hex" in script and "condition=complete" not in script
+
+    @pytest.mark.timeout(60)
+    def test_the_pod_command_parses_through_the_cli(self, tmp_path, cube):
+        """The flags the generator writes must be the flags `mdim` accepts."""
+        import shlex
+        import sys
+        from unittest.mock import patch
+        from cng_datasets.cli import main
+        from cng_datasets.k8s import generate_mdim_workflow
+        out = tmp_path / "wf"
+        generate_mdim_workflow("cube/loca", [cube, cube], ["tas"], "b", output_dir=str(out),
+                               h3_resolution=5, time_start="2000-01-01", placement="sample")
+        _, cmd = self._hex_cmd(out)
+        line = cmd.split("cng-datasets mdim", 1)[1].replace("\\\n", " ")
+        argv = ["cng-datasets", "mdim"] + shlex.split(line.replace("${JOB_COMPLETION_INDEX}", "7"))
+        captured = {}
+
+        class Fake:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def process_chunk(self, index):
+                captured["index"] = index
+
+        with patch("cng_datasets.mdim.MdimProcessor", Fake), patch.object(sys, "argv", argv):
+            main()
+        assert captured["inputs"] == [cube, cube]               # quoting survived
+        assert captured["variables"] == ["tas"]
+        assert captured["index"] == 7 and captured["h3_resolution"] == 5
+        assert captured["time_start"] == "2000-01-01" and captured["placement"] == "sample"
+        assert captured["output_parquet_path"] == "s3://b/cube/loca/hex/"
+
+    @pytest.mark.timeout(60)
+    def test_sub_chunks_add_a_merge_step(self, tmp_path, cube, monkeypatch):
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "enumerate_chunk_cells",
+                            lambda res, h0_subset=None, **k: [(i, H0, 50) for i in range(7)])
+        from cng_datasets.k8s import generate_mdim_workflow
+        out = tmp_path / "wf"
+        generate_mdim_workflow("cube/loca", [cube], ["tas"], "b", output_dir=str(out),
+                               h3_resolution=5, chunk_resolution=1, h0_subset=[50])
+        job, cmd = self._hex_cmd(out)
+        assert job["spec"]["completions"] == 7
+        assert "--chunk-resolution 1 --chunk-index ${JOB_COMPLETION_INDEX}" in cmd
+        assert "s3://b/cube/loca/hex-chunks/" in cmd
+        merge = self._load(out / "cube-loca-merge.yaml")
+        assert "--expect-chunks 7" in merge["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+
+    @pytest.mark.timeout(60)
+    def test_bad_requests_fail_before_writing(self, tmp_path, cube):
+        from cng_datasets.k8s import generate_mdim_workflow
+        for kwargs, match in (({"variables": ["nope"]}, "not in"),
+                              ({"hex_resampling": "sum"}, "area-weighted")):
+            out = tmp_path / f"wf-{match[:3]}"
+            args = dict(dataset_name="cube/loca", inputs=[cube], variables=["tas"], bucket="b",
+                        output_dir=str(out), h3_resolution=5)
+            args.update(kwargs)
+            with pytest.raises(ValueError, match=match):
+                generate_mdim_workflow(**args)
+            assert not out.exists() or not any(out.iterdir())

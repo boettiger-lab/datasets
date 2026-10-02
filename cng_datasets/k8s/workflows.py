@@ -1087,6 +1087,38 @@ def generate_dataset_workflow(
         print(f"  kubectl delete -f {output_dir}/configmap.yaml")
 
 
+def _count_chunks(chunk_resolution: int, h0_subset: Optional[List[int]]) -> Optional[int]:
+    """The number of chunks a fan-out has at *chunk_resolution*, or None at 0.
+
+    Bounded before it is enumerated, and enumerated by the same function a pod
+    indexes into, so the Job and the chunk list cannot disagree (issue #173).
+    Shared by the raster and mdim generators (#181).
+    """
+    if not chunk_resolution:
+        return None
+    # Bound the fan-out *before* enumerating it: 7 children per level is an
+    # upper bound (pentagons have six), so this over-estimates in the safe
+    # direction and costs nothing.
+    upper_bound = (len(h0_subset) if h0_subset else 122) * 7 ** chunk_resolution
+    if upper_bound > MAX_CHUNK_COUNT:
+        raise ValueError(
+            f"chunk-resolution {chunk_resolution} would fan out to as many as "
+            f"{upper_bound:,} chunks, past the {MAX_CHUNK_COUNT:,} ceiling. Each "
+            f"chunk is a pod that schedules, pulls the image and reads the source, "
+            f"so this trades a memory problem for a scheduling one — and "
+            f"enumerating a list that size would hang generation itself. Use a "
+            f"coarser --chunk-resolution, or narrow the build with --h0-subset."
+        )
+    from cng_datasets.raster.cog import enumerate_chunk_cells
+    chunk_count = len(enumerate_chunk_cells(chunk_resolution, h0_subset=h0_subset))
+    if chunk_count == 0:
+        raise ValueError(
+            f"No chunks at chunk-resolution {chunk_resolution} for h0 subset "
+            f"{h0_subset}. Check --h0-subset."
+        )
+    return chunk_count
+
+
 def generate_raster_workflow(
     dataset_name: str,
     source_urls: Union[str, List[str]],
@@ -1286,28 +1318,7 @@ def generate_raster_workflow(
     # The fan-out and the list a pod indexes into come from one enumeration, so
     # they cannot disagree — a Job narrower than the chunk list would drop whole
     # chunks with a clean exit (issue #173).
-    chunk_count = None
-    if chunk_resolution:
-        # Bound the fan-out *before* enumerating it: 7 children per level is an
-        # upper bound (pentagons have six), so this over-estimates in the safe
-        # direction and costs nothing.
-        upper_bound = (len(h0_subset) if h0_subset else 122) * 7 ** chunk_resolution
-        if upper_bound > MAX_CHUNK_COUNT:
-            raise ValueError(
-                f"chunk-resolution {chunk_resolution} would fan out to as many as "
-                f"{upper_bound:,} chunks, past the {MAX_CHUNK_COUNT:,} ceiling. Each "
-                f"chunk is a pod that schedules, pulls the image and reads the source, "
-                f"so this trades a memory problem for a scheduling one — and "
-                f"enumerating a list that size would hang generation itself. Use a "
-                f"coarser --chunk-resolution, or narrow the build with --h0-subset."
-            )
-        from cng_datasets.raster.cog import enumerate_chunk_cells
-        chunk_count = len(enumerate_chunk_cells(chunk_resolution, h0_subset=h0_subset))
-        if chunk_count == 0:
-            raise ValueError(
-                f"No chunks at chunk-resolution {chunk_resolution} for h0 subset "
-                f"{h0_subset}. Check --h0-subset."
-            )
+    chunk_count = _count_chunks(chunk_resolution, h0_subset)
     # Decide whether a preprocess-cog step is needed
     needs_preprocess = len(source_urls) > 1 or target_extent is not None or band is not None
 
@@ -1570,6 +1581,175 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
         },
     }
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-preprocess-cog.yaml"))
+
+
+def generate_mdim_workflow(
+    dataset_name: str,
+    inputs: Union[str, List[str]],
+    variables: Union[str, List[str]],
+    bucket: str,
+    output_dir: str = ".",
+    namespace: Optional[str] = None,
+    image: str = "ghcr.io/boettiger-lab/datasets:latest",
+    h3_resolution: int = 6,
+    parent_resolutions: Optional[List[int]] = None,
+    hex_resampling: str = "mean",
+    time_agg: str = "none",
+    time_start: Optional[str] = None,
+    time_end: Optional[str] = None,
+    placement: str = "auto",
+    hex_memory: str = "16Gi",
+    hex_cpu: str = "4",
+    hex_storage: str = "10Gi",
+    max_parallelism: int = 50,
+    h0_subset: Optional[List[int]] = None,
+    chunk_resolution: int = 0,
+    hex_retries: int = DEFAULT_HEX_RETRIES,
+    max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
+    merge_memory: str = "16Gi",
+    merge_storage: str = "50Gi",
+    validate_source: bool = True,
+    backend: str = "k8s",
+    armada_priority_class: Optional[str] = None,
+    armada_queue: Optional[str] = None,
+    profile: Optional[str] = None,
+    s3_endpoint: Optional[str] = None,
+    s3_public_endpoint: Optional[str] = None,
+    s3_secret_name: Optional[str] = None,
+    rclone_secret_name: Optional[str] = None,
+    rclone_remote: Optional[str] = None,
+    priority_class: Optional[str] = None,
+    node_affinity: Optional[str] = None,
+):
+    """Generate the fan-out for a (time, lat, lon) cube (issue #181).
+
+    setup-bucket -> hex (one `cng-datasets mdim` pod per chunk) -> merge (when
+    chunk_resolution > 0). The same chunk list, output layout, merge step and
+    orchestrator as `raster-workflow`, so the two products are interchangeable
+    downstream.
+
+    validate_source opens the *first* input at generation time, so a wrong
+    variable, an unsupported calendar or an empty time window fails here rather
+    than in every pod. Only the first: a NEX-GDDP series is 86 remote files, and
+    opening each would make generation take minutes.
+    """
+    import shlex
+
+    if isinstance(inputs, str):
+        inputs = [inputs]
+    if isinstance(variables, str):
+        variables = [variables]
+    if not inputs or not variables:
+        raise ValueError("at least one input and one variable are required")
+    from cng_datasets.mdim.processor import (
+        VALID_PLACEMENTS, VALID_REDUCERS, VALID_TIME_AGG)
+    if hex_resampling == "sum":
+        raise ValueError("--hex-resampling sum is refused for mdim: placement is not "
+                         "area-weighted. Use a 2-D COG and raster-workflow instead.")
+    if hex_resampling not in VALID_REDUCERS:
+        raise ValueError(f"hex_resampling must be one of {VALID_REDUCERS}")
+    if time_agg not in VALID_TIME_AGG:
+        raise ValueError(f"time_agg must be one of {VALID_TIME_AGG}")
+    if placement not in VALID_PLACEMENTS:
+        raise ValueError(f"placement must be one of {VALID_PLACEMENTS}")
+    if not 0 <= chunk_resolution <= h3_resolution:
+        raise ValueError(f"chunk_resolution must be between 0 and {h3_resolution}")
+
+    config = cluster_config_from_args(
+        profile=profile, s3_endpoint=s3_endpoint, s3_public_endpoint=s3_public_endpoint,
+        s3_secret_name=s3_secret_name, rclone_secret_name=rclone_secret_name,
+        rclone_remote=rclone_remote, priority_class=priority_class,
+        node_affinity=node_affinity, armada_queue=armada_queue,
+    )
+    namespace = namespace or config.namespace
+    armada_queue = config.armada_queue or namespace
+    manager = K8sJobManager(namespace=namespace, image=image)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
+    _validate_k8s_name(k8s_name, dataset_name)
+    parent_resolutions = parent_resolutions if parent_resolutions is not None else [0]
+    h0_subset = _normalize_h0_subset(h0_subset)
+
+    if validate_source:
+        from cng_datasets.mdim.reader import CubeSource
+        src = CubeSource(inputs[:1], variables)
+        dy, dx = src.pixel_deg
+        t = src.time
+        print(f"  Source: {len(src.lat)}x{len(src.lon)} grid, {dy:g}x{dx:g} deg pixels, "
+              f"calendar {t.calendar}, first file {t.year[0]}-{t.month[0]:02d}-{t.day[0]:02d} "
+              f"to {t.year[-1]}-{t.month[-1]:02d}-{t.day[-1]:02d}")
+        if time_agg == "none" and t.dates is None:
+            raise ValueError(f"calendar {t.calendar!r} needs --time-agg month or year")
+
+    chunk_count = _count_chunks(chunk_resolution, h0_subset)
+    _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, None, config)
+
+    completions, h0_preamble, selector, out_url = _hex_fanout(
+        bucket, dataset_name, chunk_resolution, chunk_count, h0_subset)
+    flags = [f"--input {shlex.quote(i)}" for i in inputs]
+    flags += [f"--variable {shlex.quote(v)}" for v in variables]
+    flags += [f"--output-parquet {out_url}", selector,
+              f"--resolution {h3_resolution}",
+              f"--parent-resolutions {','.join(map(str, parent_resolutions))}",
+              f"--hex-resampling {hex_resampling}", f"--time-agg {time_agg}",
+              f"--placement {placement}"]
+    if time_start:
+        flags.append(f"--time-start {time_start}")
+    if time_end:
+        flags.append(f"--time-end {time_end}")
+    command_str = "set -e\n\n" + h0_preamble + "cng-datasets mdim \\\n  " + " \\\n  ".join(flags)
+    env = _s3_env_vars(config) + [
+        {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
+        {"name": "BUCKET", "value": bucket},
+        # Bound DuckDB to the pod (#227, #255) and GDAL's block cache, which
+        # holds decoded chunks between slab reads.
+        {"name": "DUCKDB_MEMORY_LIMIT", "value": _duckdb_memory_limit(hex_memory)},
+        {"name": "GDAL_CACHEMAX", "value": "1024"},
+        {"name": "GDAL_HTTP_MAX_RETRY", "value": "5"},
+        {"name": "GDAL_HTTP_RETRY_DELAY", "value": "2"},
+    ]
+    resources = {
+        "requests": {"cpu": str(hex_cpu), "memory": hex_memory, "ephemeral-storage": hex_storage},
+        "limits": {"cpu": str(hex_cpu), "memory": hex_memory, "ephemeral-storage": hex_storage},
+    }
+    job_spec = _indexed_hex_job_spec(
+        manager, k8s_name, command_str, env, resources, completions,
+        max_parallelism, hex_retries, max_failed_indexes, config)
+    manager.save_job_yaml(job_spec, str(output_path / f"{k8s_name}-hex.yaml"))
+
+    if chunk_resolution:
+        _generate_raster_merge_job(
+            manager, k8s_name, bucket, output_path, s3_dataset=dataset_name,
+            merge_memory=merge_memory, merge_storage=merge_storage, config=config,
+            expect_chunks=chunk_count,
+        )
+    _generate_workflow_rbac(namespace, output_path)
+    gen_command = (f"cng-datasets mdim-workflow --dataset {dataset_name} "
+                   + " ".join(f"--input {shlex.quote(i)}" for i in inputs) + " "
+                   + " ".join(f"--variable {shlex.quote(v)}" for v in variables)
+                   + f" --bucket {bucket} --h3-resolution {h3_resolution}")
+    _generate_raster_configmap(k8s_name, namespace, output_path, gen_command,
+                               needs_preprocess=False, needs_merge=bool(chunk_resolution))
+    _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir,
+                                   needs_preprocess=False, needs_merge=bool(chunk_resolution))
+
+    if backend == "auto":
+        backend = "armada" if (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE else "k8s"
+    print(f"\n✓ Generated mdim workflow for {dataset_name}: {completions} hex completions"
+          + (f" (res-{chunk_resolution} chunks)" if chunk_resolution else "")
+          + f", {len(inputs)} input(s), variables {', '.join(variables)}")
+    if backend == "armada":
+        files = convert_workflow_to_armada(
+            k8s_yaml_dir=str(output_path), dataset_name=k8s_name,
+            queue=armada_queue, priority_class=armada_priority_class)
+        print("Armada files:", ", ".join(Path(f).name for f in files))
+    elif (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE:
+        print(f"  ⚠ {chunk_count} chunks exceeds the ~{K8S_CHUNK_COUNT_GUIDELINE}-pod "
+              f"guideline; consider --backend auto")
+    print("To run:")
+    print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml  # one-time")
+    print(f"  kubectl apply -f {output_dir}/configmap.yaml -f {output_dir}/workflow.yaml")
 
 
 def _generate_raster_merge_job(

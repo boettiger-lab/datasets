@@ -61,5 +61,23 @@ and `360_day`.
 
 - Variables must be exactly (time, lat, lon) on a 1-D lat/lon grid. Depth,
   ensemble and other axes aren't supported yet.
-- Each call processes one chunk; the generated fan-out (`mdim-workflow`) is
-  next (#181).
+
+## Fan-out on the cluster
+
+`cng-datasets mdim-workflow` generates the same pipeline shape as
+`raster-workflow`: setup-bucket → hex (one `mdim` pod per chunk) → merge (when
+`--chunk-resolution` > 0). The orchestrator stops as soon as a step fails.
+
+```bash
+cng-datasets mdim-workflow --dataset climate/nex-gddp-tas \
+  $(for y in $(seq 2015 2100); do echo --input /vsicurl/https://nex-gddp-cmip6.s3.us-west-2.amazonaws.com/NEX-GDDP-CMIP6/ACCESS-CM2/ssp245/r1i1p1f1/tas/tas_day_ACCESS-CM2_ssp245_r1i1p1f1_gn_${y}_v2.0.nc; done) \
+  --variable tas --bucket public-climate --h3-resolution 5 --time-agg year \
+  --h0-cells 9,19,20,21,34,36 --output-dir catalog/climate/k8s/nex-gddp-tas
+kubectl apply -f catalog/climate/k8s/nex-gddp-tas/configmap.yaml \
+              -f catalog/climate/k8s/nex-gddp-tas/workflow.yaml
+```
+
+Generation opens the first input, so a wrong variable, an unsupported calendar
+or an empty time window fails before anything is applied. Read public
+object-store sources through `/vsicurl/https://…`, not `s3://`: inside the
+cluster, `s3://` resolves to the NRP Ceph endpoint, not AWS.
