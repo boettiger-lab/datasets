@@ -4,6 +4,7 @@ from .jobs import K8sJobManager, generate_job_yaml, submit_job
 from .workflows import (
     generate_dataset_workflow,
     generate_raster_workflow,
+    generate_mdim_workflow,
     generate_sync_job,
     ClusterConfig,
     load_profile,
@@ -18,7 +19,7 @@ from .armada import (
 
 __all__ = [
     "K8sJobManager", "generate_job_yaml", "submit_job",
-    "generate_dataset_workflow", "generate_raster_workflow", "generate_sync_job",
+    "generate_dataset_workflow", "generate_raster_workflow", "generate_mdim_workflow", "generate_sync_job",
     "ClusterConfig", "load_profile", "cluster_config_from_args",
     "k8s_job_to_armada", "k8s_indexed_job_to_armada",
     "convert_workflow_to_armada", "save_armada_yaml",
