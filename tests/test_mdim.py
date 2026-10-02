@@ -36,7 +36,10 @@ def make_cube(path, driver, lat, lon, time_vals, units="days since 2000-01-01",
         d = rg.CreateDimension(name, types[name] if typed_dims else None, None, len(vals))
         v = rg.CreateMDArray(name, [d], gdal.ExtendedDataType.Create(gdal.GDT_Float64))
         v.Write(np.asarray(vals, dtype=np.float64))
-        d.SetIndexingVariable(v)
+        try:
+            d.SetIndexingVariable(v)
+        except RuntimeError:
+            pass  # netCDF: a variable named after its dimension is its coordinate
         dims[name] = (d, v)
     tvar = dims["time"][1]
     tvar.SetUnit(units)
