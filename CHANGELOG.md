@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cng-datasets mdim`: hex a (time, lat, lon) cube without per-slice COGs** (#181). Reads zarr, netCDF, or anything else GDAL's multidimensional API opens, using chunk-aligned slab reads. A series split across files (e.g. NEX-GDDP's one netCDF per year) can be passed as several `--input`s. DuckDB does the H3 indexing, the reduction and the write.
+  - **Several `--variable`s** become columns, and time stays a column instead of a fan-out.
+  - **`--time-agg none|month|year`**, plus `--time-start`/`--time-end`. CF time is decoded on the Gregorian, `noleap`, `all_leap` and `360_day` calendars.
+  - **Placement** is `aggregate` (pixel centres into cells) when pixels are finer than cells, or `sample` (cell centres read their pixel) when they are coarser. Neither is area-weighted, so `sum` is refused.
+  - **Output** uses the same `hex/h0=*` layout, chunking and completion markers as `raster`. The chunk listing, footprints, output paths and markers now live in `cng_datasets/h3_chunks.py`, shared by both.
+  - **Why GDAL:** the DuckDB `zarr` extension (v0.1.1) scanned whole stores rather than pruning chunks. On the LOCA2 store, a 1-day, 1° query read 483 MiB without finishing, where GDAL moved one 72 MiB chunk. NEX-GDDP netCDF reads in place over `/vsicurl/`.
+  - **Not yet:** the generated fan-out (`mdim-workflow`) follows separately.
+
 ### Fixed
 - **`--layer` on a multi-source zip selects that source, and a missing layer is an error instead of a segfault** (#216). DuckDB's `ST_Read` segfaults (SIGSEGV, no traceback) when asked for a layer its source doesn't contain. It does this on shapefiles and GeoPackages alike (DuckDB 1.5.4). `--layer` on an archive was passed to *every* source in it, so a zip with a point and a polygon shapefile crashed whichever layer was asked for. That covers the published UNEP-WCMC coral reef release. A `--layer` typo on a single source crashed the same way. Now:
   - `--layer` narrows an archive to the sources that hold the layer.

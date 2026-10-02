@@ -11,6 +11,7 @@ A Python toolkit for processing large geospatial datasets into cloud-native form
    quickstart
    vector_processing
    raster_processing
+   mdim_processing
    kubernetes_workflows
    configuration
 
