@@ -83,7 +83,10 @@ def _open_array(path: str, variable: str):
         raise ValueError(f"GDAL could not open {path} as a multidimensional dataset")
     rg = ds.GetRootGroup()
     full = variable if variable.startswith("/") else "/" + variable
-    arr = rg.OpenMDArrayFromFullname(full)
+    try:
+        arr = rg.OpenMDArrayFromFullname(full)
+    except RuntimeError:
+        arr = None
     if arr is None:
         names = rg.GetMDArrayNames() or []
         raise ValueError(f"variable {variable!r} is not in {path}; arrays: {names}")

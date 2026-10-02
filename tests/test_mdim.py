@@ -35,6 +35,9 @@ def make_cube(path, driver, lat, lon, time_vals, units="days since 2000-01-01",
     for name, vals in (("time", time_vals), ("lat", lat), ("lon", lon)):
         d = rg.CreateDimension(name, types[name] if typed_dims else None, None, len(vals))
         v = rg.CreateMDArray(name, [d], gdal.ExtendedDataType.Create(gdal.GDT_Float64))
+        # Zarr skips writing a chunk that equals its fill value, which would
+        # read back a coordinate of 0 as missing; NaN cannot collide.
+        v.SetNoDataValueDouble(float("nan"))
         v.Write(np.asarray(vals, dtype=np.float64))
         try:
             d.SetIndexingVariable(v)
@@ -129,6 +132,10 @@ class TestCFTime:
     def test_ambiguous_or_malformed_units_are_refused(self, units):
         with pytest.raises(ValueError):
             parse_units(units)
+
+    def test_missing_time_values_are_refused(self):
+        with pytest.raises(ValueError, match="missing value"):
+            decode_cf_time([0, np.nan], "days since 2000-01-01", "standard")
 
     def test_julian_and_pre_1582_standard_are_refused(self):
         with pytest.raises(ValueError, match="unsupported CF calendar"):

@@ -94,6 +94,9 @@ def decode_cf_time(values, units: str, calendar: Optional[str] = None) -> Decode
     cal = (calendar or "standard").strip().lower()
     unit_seconds, ref, ref_secs = parse_units(units)
     offsets = np.asarray(values, dtype=np.float64) * unit_seconds
+    if not np.all(np.isfinite(offsets)):
+        # A NaN offset would decode to NaT and then to a nonsense DATE.
+        raise ValueError(f"time coordinate has {int((~np.isfinite(offsets)).sum())} missing value(s)")
 
     if cal in GREGORIAN:
         y, m, d = ref
