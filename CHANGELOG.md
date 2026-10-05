@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-05
+
 ### Added
 - **`mdim-workflow` can fan out over time, and does so automatically when one chunk spans the whole grid** (#267). Splitting over space makes every pod fetch every chunk of such a source. NEX-GDDP-CMIP6 stores one global day per chunk, so a global 122-pod run would move about **2.6 TB per series instead of ~21 GB**. With `--fan-out time` (chosen by `auto` from the first input's chunk shape), each pod processes one input file, or a slice of a single input, across every h0, reading each chunk once. It writes `part-t{unit}-*.parquet` into each h0 partition, and the existing `merge-chunks` step concatenates them.
   - Slices of a single input are cut only between `--time-agg` keys. A pod whose input starts or ends mid-month or mid-year refuses to run, since concatenation would duplicate that key.
@@ -295,6 +297,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.11.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.0
 [0.10.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.10.0
 [0.9.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.9.0
 [0.8.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.3
