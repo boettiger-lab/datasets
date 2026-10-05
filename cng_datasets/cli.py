@@ -127,6 +127,40 @@ def main():
                                   "sample: cell centres read their pixel (pixels coarser). "
                                   "auto picks by comparing pixel and cell area.")
 
+    mdim_wf = subparsers.add_parser(
+        "mdim-workflow", help="Generate the k8s fan-out for a (time, lat, lon) cube (#181)")
+    mdim_wf.add_argument("--dataset", required=True)
+    mdim_wf.add_argument("--input", dest="inputs", action="append", required=True, metavar="PATH",
+                         help="Repeat for a time series split across files, in time order")
+    mdim_wf.add_argument("--variable", dest="variables", action="append", required=True)
+    mdim_wf.add_argument("--bucket", required=True)
+    mdim_wf.add_argument("--output-dir", default=".")
+    mdim_wf.add_argument("--namespace", default=None)
+    mdim_wf.add_argument("--h3-resolution", type=int, default=6)
+    mdim_wf.add_argument("--parent-resolutions", default="0")
+    mdim_wf.add_argument("--hex-resampling", default="mean", choices=["mean", "min", "max"])
+    mdim_wf.add_argument("--time-agg", default="none", choices=["none", "month", "year"])
+    mdim_wf.add_argument("--time-start", default=None)
+    mdim_wf.add_argument("--time-end", default=None)
+    mdim_wf.add_argument("--placement", default="auto", choices=["auto", "aggregate", "sample"])
+    mdim_wf.add_argument("--hex-memory", default="16Gi")
+    mdim_wf.add_argument("--hex-cpu", default="4")
+    mdim_wf.add_argument("--hex-storage", default="10Gi")
+    mdim_wf.add_argument("--max-parallelism", type=int, default=50)
+    mdim_wf.add_argument("--h0-subset", default=None, metavar="POSITIONS", help=POS_NOTE)
+    mdim_wf.add_argument("--h0-cells", default=None, metavar="BASE_CELLS")
+    mdim_wf.add_argument("--chunk-resolution", type=int, default=0)
+    mdim_wf.add_argument("--hex-retries", type=int, default=2)
+    mdim_wf.add_argument("--max-failed-indexes", type=int, default=1)
+    mdim_wf.add_argument("--merge-memory", default="16Gi")
+    mdim_wf.add_argument("--merge-storage", default="50Gi")
+    mdim_wf.add_argument("--no-validate-source", action="store_true",
+                         help="Skip opening the first input at generation time")
+    mdim_wf.add_argument("--backend", choices=["k8s", "armada", "auto"], default="k8s")
+    mdim_wf.add_argument("--armada-queue", default=None)
+    mdim_wf.add_argument("--armada-priority-class", default=None)
+    mdim_wf.add_argument("--profile", default=None)
+
     # Raster processing command
     raster_parser = subparsers.add_parser("raster", help="Process raster datasets")
     raster_parser.add_argument("--input", required=True, action="append", dest="inputs",
@@ -548,6 +582,39 @@ def _dispatch(args):
             placement=args.placement,
         )
         processor.process_chunk(index)
+
+    elif args.command == "mdim-workflow":
+        from .k8s import generate_mdim_workflow
+        generate_mdim_workflow(
+            dataset_name=args.dataset,
+            inputs=args.inputs,
+            variables=args.variables,
+            bucket=args.bucket,
+            output_dir=args.output_dir,
+            namespace=args.namespace,
+            h3_resolution=args.h3_resolution,
+            parent_resolutions=[int(x) for x in args.parent_resolutions.split(",") if x.strip()],
+            hex_resampling=args.hex_resampling,
+            time_agg=args.time_agg,
+            time_start=args.time_start,
+            time_end=args.time_end,
+            placement=args.placement,
+            hex_memory=args.hex_memory,
+            hex_cpu=args.hex_cpu,
+            hex_storage=args.hex_storage,
+            max_parallelism=args.max_parallelism,
+            h0_subset=_resolve_h0_subset(args),
+            chunk_resolution=args.chunk_resolution,
+            hex_retries=args.hex_retries,
+            max_failed_indexes=args.max_failed_indexes,
+            merge_memory=args.merge_memory,
+            merge_storage=args.merge_storage,
+            validate_source=not args.no_validate_source,
+            backend=args.backend,
+            armada_queue=args.armada_queue,
+            armada_priority_class=args.armada_priority_class,
+            profile=args.profile,
+        )
 
     elif args.command == "raster":
         from .raster import RasterProcessor, create_mosaic_cog
