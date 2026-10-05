@@ -21,18 +21,12 @@ jobs:
     
     - name: Run tests
       run: |
-        pytest tests/ -v --cov=cng_datasets --cov-report=xml --cov-report=term
+        pytest tests/ -v --cov=cng_datasets --cov-report=term
     
     - name: Show test summary
       run: |
         echo "Test Summary:"
         pytest tests/ --co -q | tail -1
-    
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        file: ./coverage.xml
-        fail_ci_if_error: false
 
   lint:
     runs-on: ubuntu-latest
