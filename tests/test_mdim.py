@@ -449,3 +449,157 @@ class TestMdimWorkflow:
             with pytest.raises(ValueError, match=match):
                 generate_mdim_workflow(**args)
             assert not out.exists() or not any(out.iterdir())
+
+
+# -- time fan-out (#267) --------------------------------------------------------
+
+def _run_pod_command(cmd, index):
+    """Run a generated hex pod script in real bash, with `cng-datasets` stubbed
+    to print its argv, and return that argv as the pod would have called it."""
+    import subprocess
+    stub = 'cng-datasets() { printf "%s\\n" "$@"; }\n'
+    out = subprocess.run(["bash", "-c", stub + cmd], capture_output=True, text=True,
+                         env={**os.environ, "JOB_COMPLETION_INDEX": str(index)})
+    assert out.returncode == 0, out.stderr
+    return out.stdout.splitlines()
+
+
+class TestTimeFanOut:
+    def _series(self, tmp_path, n_files=2, days=3, calendar="standard", step=0.25, block=None):
+        lat, lon = grid(4, 6, step)
+        paths, t0 = [], 0
+        for k in range(n_files):
+            v = field(lat, lon, days) + 100 * k
+            paths.append(make_cube(str(tmp_path / f"y{k}.nc"), "netCDF", lat, lon,
+                                   np.arange(t0, t0 + days), calendar=calendar,
+                                   data={"tas": v}, block=block))
+            t0 += days
+        return paths
+
+    def _all_rows(self, glob):
+        return duckdb.sql(f"SELECT * EXCLUDE (h0) FROM read_parquet('{glob}', hive_partitioning=true) "
+                          f"ORDER BY ALL").fetchall()
+
+    @pytest.mark.timeout(180)
+    @pytest.mark.parametrize("time_agg, days, calendar", [("none", 3, "standard"),
+                                                           ("year", 365, "noleap")])
+    def test_time_units_then_merge_equal_the_spatial_fan_out(self, tmp_path, h0_grid,
+                                                            time_agg, days, calendar):
+        from cng_datasets.raster.merge import merge_raster_chunks
+        paths = self._series(tmp_path, days=days, calendar=calendar)
+        space = processor(paths, ["tas"], tmp_path / "space", h0_grid, h3_resolution=6,
+                          time_agg=time_agg)
+        space.process_chunk(0)
+        for k, path in enumerate(paths):
+            unit = processor([path], ["tas"], tmp_path / "chunks", h0_grid, h3_resolution=6,
+                             time_agg=time_agg)
+            assert unit.process_region(k)
+        merge_raster_chunks(str(tmp_path / "chunks"), str(tmp_path / "merged"),
+                            cleanup=False, expect_chunks=len(paths))
+        merged = self._all_rows(f"{tmp_path}/merged/h0=*/data_0.parquet")
+        assert merged and merged == self._all_rows(f"{tmp_path}/space/h0=*/data_0.parquet")
+
+    def test_a_file_that_splits_a_year_is_refused(self, tmp_path, h0_grid):
+        paths = self._series(tmp_path, n_files=1, days=400, calendar="noleap")
+        unit = processor(paths, ["tas"], tmp_path / "c", h0_grid, h3_resolution=6, time_agg="year")
+        with pytest.raises(ValueError, match="end mid-year"):
+            unit.process_region(0)
+
+    @pytest.mark.timeout(60)
+    def test_a_unit_outside_the_window_is_a_clean_no_op(self, tmp_path, h0_grid):
+        paths = self._series(tmp_path, n_files=1)
+        unit = processor(paths, ["tas"], tmp_path / "c", h0_grid, h3_resolution=6,
+                         time_start="2001-01-01", allow_empty_window=True)
+        assert unit.process_region(3) is None
+        assert duckdb.sql(f"SELECT chunk_index, wrote_data FROM "
+                          f"'{tmp_path}/c/_manifest/chunk-3.parquet'").fetchall() == [(3, False)]
+
+    def test_units_split_only_between_keys(self):
+        from cng_datasets.k8s.workflows import _time_units
+        t = decode_cf_time(np.arange(400), "days since 2000-01-01", "noleap")
+        starts, ends = _time_units(t, "month", None, None, steps=40)
+        assert all(s.endswith("-01") for s in starts)
+        assert ends[0] == "2000-02-28"               # 59 days: Jan + Feb, never mid-month
+        assert starts[-1] <= "2001-02-01" and ends[-1] == "2001-02-05"
+        none_s, none_e = _time_units(t, "none", "2000-01-10", "2000-01-19", steps=4)
+        assert (none_s, none_e) == (["2000-01-10", "2000-01-14", "2000-01-18"],
+                                    ["2000-01-13", "2000-01-17", "2000-01-19"])
+
+
+class TestTimeFanOutWorkflow:
+    def _cubes(self, tmp_path, block):
+        lat, lon = grid(4, 6, 0.25)
+        return [make_cube(str(tmp_path / f"y{k}.nc"), "netCDF", lat, lon, np.arange(3 * k, 3 * k + 3),
+                          data={"tas": field(lat, lon, 3)}, block=block) for k in range(3)]
+
+    @staticmethod
+    def _hex_cmd(out, name="nex-tas"):
+        import yaml
+        job = yaml.safe_load(open(out / f"{name}-hex.yaml"))
+        return job, job["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+
+    @pytest.mark.timeout(60)
+    def test_auto_picks_time_for_whole_grid_chunks_and_runs_each_file(self, tmp_path):
+        import sys
+        from unittest.mock import patch
+        import yaml
+        from cng_datasets.cli import main
+        from cng_datasets.k8s import generate_mdim_workflow
+        cubes = self._cubes(tmp_path, block=(1, 4, 6))          # one chunk = the whole grid
+        out = tmp_path / "wf"
+        generate_mdim_workflow("nex/tas", cubes, ["tas"], "b", output_dir=str(out),
+                               h3_resolution=5, h0_subset=[50], time_agg="none")
+        job, cmd = self._hex_cmd(out)
+        assert job["spec"]["completions"] == 3
+        merge = yaml.safe_load(open(out / "nex-tas-merge.yaml"))
+        assert "--expect-chunks 3" in merge["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+        argv = _run_pod_command(cmd, 2)
+        assert argv[0] == "mdim"
+        calls = {}
+
+        class Fake:
+            def __init__(self, **kwargs):
+                calls.update(kwargs)
+
+            def process_region(self, index):
+                calls["region"] = index
+
+        with patch("cng_datasets.mdim.MdimProcessor", Fake), \
+                patch.object(sys, "argv", ["cng-datasets"] + argv):
+            main()
+        assert calls["inputs"] == [cubes[2]] and calls["region"] == 2
+        assert calls["h0_subset"] == [50] and calls["allow_empty_window"] is True
+        assert calls["output_parquet_path"] == "s3://b/nex/tas/hex-chunks/"
+
+    @pytest.mark.timeout(60)
+    def test_auto_keeps_space_for_tiled_chunks(self, tmp_path):
+        from cng_datasets.k8s import generate_mdim_workflow
+        cubes = self._cubes(tmp_path, block=(3, 2, 2))
+        out = tmp_path / "wf"
+        generate_mdim_workflow("nex/tas", cubes, ["tas"], "b", output_dir=str(out),
+                               h3_resolution=5, h0_subset=[50])
+        _, cmd = self._hex_cmd(out)
+        assert "--fan-out time" not in cmd and "--h0-index" in cmd
+
+    @pytest.mark.timeout(60)
+    def test_a_single_input_is_split_into_time_windows(self, tmp_path):
+        from cng_datasets.k8s import generate_mdim_workflow
+        lat, lon = grid(4, 6, 0.25)
+        cube = make_cube(str(tmp_path / "one.nc"), "netCDF", lat, lon, np.arange(10),
+                         data={"tas": field(lat, lon, 10)}, block=(1, 4, 6))
+        out = tmp_path / "wf"
+        generate_mdim_workflow("nex/tas", [cube], ["tas"], "b", output_dir=str(out),
+                               h3_resolution=5, time_unit_steps=4)
+        job, cmd = self._hex_cmd(out)
+        assert job["spec"]["completions"] == 3
+        argv = _run_pod_command(cmd, 1)
+        assert argv[argv.index("--time-start") + 1] == "2000-01-05"
+        assert argv[argv.index("--time-end") + 1] == "2000-01-08"
+        assert argv[argv.index("--unit-index") + 1] == "1"
+
+    def test_chunk_resolution_is_refused_with_time(self, tmp_path):
+        from cng_datasets.k8s import generate_mdim_workflow
+        cubes = self._cubes(tmp_path, block=(1, 4, 6))
+        with pytest.raises(ValueError, match="spatial fan-out"):
+            generate_mdim_workflow("nex/tas", cubes, ["tas"], "b", output_dir=str(tmp_path / "w"),
+                                   h3_resolution=5, fan_out="time", chunk_resolution=1)
