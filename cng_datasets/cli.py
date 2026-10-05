@@ -122,6 +122,14 @@ def main():
     mdim_parser.add_argument("--time-agg", default="none", choices=["none", "month", "year"])
     mdim_parser.add_argument("--time-start", default=None, metavar="YYYY-MM-DD")
     mdim_parser.add_argument("--time-end", default=None, metavar="YYYY-MM-DD")
+    mdim_parser.add_argument("--fan-out", default="space", choices=["space", "time"],
+                             help="space: process one spatial chunk (--h0-index / --chunk-index) over "
+                                  "all time. time: process every h0 (in --h0-subset) over this "
+                                  "call's time range, and write per-h0 parts for merge-chunks; "
+                                  "for sources whose chunks span the whole grid (#267).")
+    mdim_parser.add_argument("--unit-index", type=int, default=None,
+                             help="With --fan-out time: this unit's index, which names its parts "
+                                  "and its completion marker.")
     mdim_parser.add_argument("--placement", default="auto", choices=["auto", "aggregate", "sample"],
                              help="aggregate: pixel centres into cells (pixels finer than cells); "
                                   "sample: cell centres read their pixel (pixels coarser). "
@@ -154,6 +162,12 @@ def main():
     mdim_wf.add_argument("--max-failed-indexes", type=int, default=1)
     mdim_wf.add_argument("--merge-memory", default="16Gi")
     mdim_wf.add_argument("--merge-storage", default="50Gi")
+    mdim_wf.add_argument("--fan-out", default="auto", choices=["auto", "space", "time"],
+                         help="Axis the hex Job splits over (#267). auto: time when one chunk of "
+                              "the source spans the whole grid (NEX-GDDP), space otherwise.")
+    mdim_wf.add_argument("--time-unit-steps", type=int, default=365,
+                         help="With --fan-out time on a single input: about this many time steps "
+                              "per pod, cut only at --time-agg key boundaries")
     mdim_wf.add_argument("--no-validate-source", action="store_true",
                          help="Skip opening the first input at generation time")
     mdim_wf.add_argument("--backend", choices=["k8s", "armada", "auto"], default="k8s")
@@ -562,11 +576,18 @@ def _dispatch(args):
 
     elif args.command == "mdim":
         from .mdim import MdimProcessor
-        if args.h0_index is not None and args.chunk_index is not None:
-            raise SystemExit("give --h0-index or --chunk-index, not both")
-        index = args.chunk_index if args.chunk_index is not None else args.h0_index
-        if index is None:
-            raise SystemExit("--h0-index or --chunk-index is required")
+        if args.fan_out == "time":
+            if args.unit_index is None:
+                raise SystemExit("--fan-out time needs --unit-index")
+            if args.h0_index is not None or args.chunk_index is not None:
+                raise SystemExit("--fan-out time covers every h0; drop --h0-index/--chunk-index")
+            index = args.unit_index
+        else:
+            if args.h0_index is not None and args.chunk_index is not None:
+                raise SystemExit("give --h0-index or --chunk-index, not both")
+            index = args.chunk_index if args.chunk_index is not None else args.h0_index
+            if index is None:
+                raise SystemExit("--h0-index or --chunk-index is required")
         processor = MdimProcessor(
             inputs=args.inputs,
             variables=args.variables,
@@ -580,8 +601,12 @@ def _dispatch(args):
             time_start=args.time_start,
             time_end=args.time_end,
             placement=args.placement,
+            allow_empty_window=args.fan_out == "time",
         )
-        processor.process_chunk(index)
+        if args.fan_out == "time":
+            processor.process_region(index)
+        else:
+            processor.process_chunk(index)
 
     elif args.command == "mdim-workflow":
         from .k8s import generate_mdim_workflow
@@ -610,6 +635,8 @@ def _dispatch(args):
             merge_memory=args.merge_memory,
             merge_storage=args.merge_storage,
             validate_source=not args.no_validate_source,
+            fan_out=args.fan_out,
+            time_unit_steps=args.time_unit_steps,
             backend=args.backend,
             armada_queue=args.armada_queue,
             armada_priority_class=args.armada_priority_class,

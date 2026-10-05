@@ -1583,6 +1583,49 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-preprocess-cog.yaml"))
 
 
+def _time_units(t, time_agg: str, time_start: Optional[str], time_end: Optional[str],
+                steps: int):
+    """(starts, ends) as YYYY-MM-DD strings: consecutive runs of whole --time-agg
+    keys, each about *steps* time steps, covering the requested window (#267).
+
+    Cuts fall only between keys, so no month or year is split between units;
+    the merge step concatenates units, which is correct only under that rule.
+    """
+    import numpy as np
+    from cng_datasets.mdim.processor import _date_key
+    key = t.year.astype(np.int64) * 10000 + t.month * 100 + t.day
+    mask = np.ones(len(key), dtype=bool)
+    if time_start:
+        mask &= key >= _date_key(time_start)
+    if time_end:
+        mask &= key <= _date_key(time_end)
+    idx = np.nonzero(mask)[0]
+    if len(idx) == 0:
+        raise ValueError(f"no time steps between {time_start} and {time_end}")
+    if time_agg == "year":
+        group = t.year.astype(np.int64)
+    elif time_agg == "month":
+        group = t.year.astype(np.int64) * 12 + t.month
+    else:
+        group = np.arange(len(key))
+    steps = max(1, int(steps))
+
+    def fmt(i):
+        return f"{int(t.year[i]):04d}-{int(t.month[i]):02d}-{int(t.day[i]):02d}"
+
+    starts, ends = [], []
+    first, count = idx[0], 0
+    for n, i in enumerate(idx):
+        count += 1
+        last = n == len(idx) - 1
+        if last or (count >= steps and group[idx[n + 1]] != group[i]):
+            starts.append(fmt(first))
+            ends.append(fmt(i))
+            if not last:
+                first, count = idx[n + 1], 0
+    return starts, ends
+
+
 def generate_mdim_workflow(
     dataset_name: str,
     inputs: Union[str, List[str]],
@@ -1609,6 +1652,8 @@ def generate_mdim_workflow(
     merge_memory: str = "16Gi",
     merge_storage: str = "50Gi",
     validate_source: bool = True,
+    fan_out: str = "auto",
+    time_unit_steps: int = 365,
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
     armada_queue: Optional[str] = None,
@@ -1627,6 +1672,14 @@ def generate_mdim_workflow(
     chunk_resolution > 0). The same chunk list, output layout, merge step and
     orchestrator as `raster-workflow`, so the two products are interchangeable
     downstream.
+
+    fan_out picks the axis the hex Job splits over (#267). "space" gives one
+    pod per spatial chunk over all time. "time" gives one pod per time unit
+    over every h0 — a unit per input file, or a single input split at
+    --time-agg key boundaries into units of about time_unit_steps steps — with
+    a merge step that concatenates the per-h0 parts. "auto" picks time when one
+    chunk of the source spans the whole grid, where a spatial fan-out would make
+    every pod fetch every chunk.
 
     validate_source opens the *first* input at generation time, so a wrong
     variable, an unsupported calendar or an empty time window fails here rather
@@ -1671,34 +1724,92 @@ def generate_mdim_workflow(
     parent_resolutions = parent_resolutions if parent_resolutions is not None else [0]
     h0_subset = _normalize_h0_subset(h0_subset)
 
+    src = None
     if validate_source:
         from cng_datasets.mdim.reader import CubeSource
         src = CubeSource(inputs[:1], variables)
         dy, dx = src.pixel_deg
         t = src.time
         print(f"  Source: {len(src.lat)}x{len(src.lon)} grid, {dy:g}x{dx:g} deg pixels, "
-              f"calendar {t.calendar}, first file {t.year[0]}-{t.month[0]:02d}-{t.day[0]:02d} "
-              f"to {t.year[-1]}-{t.month[-1]:02d}-{t.day[-1]:02d}")
+              f"chunks {src.block}, calendar {t.calendar}, first file "
+              f"{t.year[0]}-{t.month[0]:02d}-{t.day[0]:02d} to "
+              f"{t.year[-1]}-{t.month[-1]:02d}-{t.day[-1]:02d}")
         if time_agg == "none" and t.dates is None:
             raise ValueError(f"calendar {t.calendar!r} needs --time-agg month or year")
 
-    chunk_count = _count_chunks(chunk_resolution, h0_subset)
-    _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, None, config)
+    # Which axis to fan out over (#267). A spatial fan-out reads only the tiles
+    # under each pod's window — unless one chunk spans the whole grid, when
+    # every pod must fetch every chunk (NEX-GDDP: ~122x the transfer).
+    if fan_out not in ("auto", "space", "time"):
+        raise ValueError("fan_out must be 'auto', 'space' or 'time'")
+    if fan_out == "auto":
+        whole_grid = (src is not None
+                      and src.block[src.axis["lat"]] >= len(src.lat)
+                      and src.block[src.axis["lon"]] >= len(src.lon))
+        fan_out = "time" if whole_grid else "space"
+        reason = ("each chunk spans the whole grid" if whole_grid else
+                  "chunks are spatial tiles" if src is not None else
+                  "source not inspected (--no-validate-source)")
+        print(f"  Fan-out: {fan_out} ({reason})")
+    if fan_out == "time" and chunk_resolution:
+        raise ValueError("--chunk-resolution applies to the spatial fan-out; drop it "
+                         "with --fan-out time, where each pod covers every h0")
 
-    completions, h0_preamble, selector, out_url = _hex_fanout(
-        bucket, dataset_name, chunk_resolution, chunk_count, h0_subset)
-    flags = [f"--input {shlex.quote(i)}" for i in inputs]
-    flags += [f"--variable {shlex.quote(v)}" for v in variables]
-    flags += [f"--output-parquet {out_url}", selector,
-              f"--resolution {h3_resolution}",
-              f"--parent-resolutions {','.join(map(str, parent_resolutions))}",
-              f"--hex-resampling {hex_resampling}", f"--time-agg {time_agg}",
-              f"--placement {placement}"]
-    if time_start:
-        flags.append(f"--time-start {time_start}")
-    if time_end:
-        flags.append(f"--time-end {time_end}")
-    command_str = "set -e\n\n" + h0_preamble + "cng-datasets mdim \\\n  " + " \\\n  ".join(flags)
+    _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, None, config)
+    common = [f"--variable {shlex.quote(v)}" for v in variables]
+    common += [f"--resolution {h3_resolution}",
+               f"--parent-resolutions {','.join(map(str, parent_resolutions))}",
+               f"--hex-resampling {hex_resampling}", f"--time-agg {time_agg}",
+               f"--placement {placement}"]
+
+    if fan_out == "space":
+        chunk_count = _count_chunks(chunk_resolution, h0_subset)
+        completions, preamble, selector, out_url = _hex_fanout(
+            bucket, dataset_name, chunk_resolution, chunk_count, h0_subset)
+        flags = [f"--input {shlex.quote(i)}" for i in inputs] + common
+        flags += [f"--output-parquet {out_url}", selector]
+        if time_start:
+            flags.append(f"--time-start {time_start}")
+        if time_end:
+            flags.append(f"--time-end {time_end}")
+        merge_chunks = chunk_count if chunk_resolution else None
+    else:
+        out_url = f"s3://{bucket}/{dataset_name}/hex-chunks/"
+        guard = ('if [ -z "${JOB_COMPLETION_INDEX}" ] || [ -z "$UNIT" ]; then\n'
+                 '  echo "No time unit for completion index ${JOB_COMPLETION_INDEX}" >&2\n'
+                 '  exit 1\nfi\n\n')
+        flags = []
+        if len(inputs) > 1:
+            # One unit per input file: NEX-GDDP ships a file per year.
+            completions = len(inputs)
+            preamble = ("# One time unit per input file (#267).\n"
+                        f"INPUTS=({' '.join(shlex.quote(i) for i in inputs)})\n"
+                        'UNIT="${INPUTS[$JOB_COMPLETION_INDEX]}"\n' + guard)
+            flags.append('--input "$UNIT"')
+            if time_start:
+                flags.append(f"--time-start {time_start}")
+            if time_end:
+                flags.append(f"--time-end {time_end}")
+        else:
+            if src is None:
+                raise ValueError("--fan-out time on a single input splits its time axis, "
+                                 "which needs the source inspected; drop --no-validate-source")
+            starts, ends = _time_units(src.time, time_agg, time_start, time_end, time_unit_steps)
+            completions = len(starts)
+            preamble = ("# Time units split at --time-agg key boundaries (#267).\n"
+                        f"STARTS=({' '.join(starts)})\nENDS=({' '.join(ends)})\n"
+                        'UNIT="${STARTS[$JOB_COMPLETION_INDEX]}"\n' + guard)
+            flags.append(f"--input {shlex.quote(inputs[0])}")
+            flags += ['--time-start "$UNIT"', '--time-end "${ENDS[$JOB_COMPLETION_INDEX]}"']
+        flags += common
+        flags += [f"--output-parquet {out_url}", "--fan-out time",
+                  "--unit-index ${JOB_COMPLETION_INDEX}"]
+        if h0_subset:
+            flags.append(f"--h0-subset \"{','.join(str(h) for h in h0_subset)}\"")
+        chunk_count = completions
+        merge_chunks = completions
+
+    command_str = "set -e\n\n" + preamble + "cng-datasets mdim \\\n  " + " \\\n  ".join(flags)
     env = _s3_env_vars(config) + [
         {"name": "GDAL_DATA", "value": "/usr/share/gdal"},
         {"name": "BUCKET", "value": bucket},
@@ -1718,34 +1829,35 @@ def generate_mdim_workflow(
         max_parallelism, hex_retries, max_failed_indexes, config)
     manager.save_job_yaml(job_spec, str(output_path / f"{k8s_name}-hex.yaml"))
 
-    if chunk_resolution:
+    if merge_chunks:
         _generate_raster_merge_job(
             manager, k8s_name, bucket, output_path, s3_dataset=dataset_name,
             merge_memory=merge_memory, merge_storage=merge_storage, config=config,
-            expect_chunks=chunk_count,
+            expect_chunks=merge_chunks,
         )
     _generate_workflow_rbac(namespace, output_path)
     gen_command = (f"cng-datasets mdim-workflow --dataset {dataset_name} "
                    + " ".join(f"--input {shlex.quote(i)}" for i in inputs) + " "
                    + " ".join(f"--variable {shlex.quote(v)}" for v in variables)
-                   + f" --bucket {bucket} --h3-resolution {h3_resolution}")
+                   + f" --bucket {bucket} --h3-resolution {h3_resolution} --fan-out {fan_out}")
     _generate_raster_configmap(k8s_name, namespace, output_path, gen_command,
-                               needs_preprocess=False, needs_merge=bool(chunk_resolution))
+                               needs_preprocess=False, needs_merge=bool(merge_chunks))
     _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir,
-                                   needs_preprocess=False, needs_merge=bool(chunk_resolution))
+                                   needs_preprocess=False, needs_merge=bool(merge_chunks))
 
     if backend == "auto":
         backend = "armada" if (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE else "k8s"
-    print(f"\n✓ Generated mdim workflow for {dataset_name}: {completions} hex completions"
-          + (f" (res-{chunk_resolution} chunks)" if chunk_resolution else "")
-          + f", {len(inputs)} input(s), variables {', '.join(variables)}")
+    what = ("time units" if fan_out == "time" else
+            f"res-{chunk_resolution} chunks" if chunk_resolution else "h0 cells")
+    print(f"\n✓ Generated mdim workflow for {dataset_name}: {completions} hex completions "
+          f"({what}), {len(inputs)} input(s), variables {', '.join(variables)}")
     if backend == "armada":
         files = convert_workflow_to_armada(
             k8s_yaml_dir=str(output_path), dataset_name=k8s_name,
             queue=armada_queue, priority_class=armada_priority_class)
         print("Armada files:", ", ".join(Path(f).name for f in files))
     elif (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE:
-        print(f"  ⚠ {chunk_count} chunks exceeds the ~{K8S_CHUNK_COUNT_GUIDELINE}-pod "
+        print(f"  ⚠ {chunk_count} completions exceeds the ~{K8S_CHUNK_COUNT_GUIDELINE}-pod "
               f"guideline; consider --backend auto")
     print("To run:")
     print(f"  kubectl apply -f {output_dir}/workflow-rbac.yaml  # one-time")

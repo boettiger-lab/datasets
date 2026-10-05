@@ -84,6 +84,7 @@ class MdimProcessor:
         time_end: Optional[str] = None,
         placement: str = "auto",
         read_budget_bytes: float = DEFAULT_READ_BUDGET,
+        allow_empty_window: bool = False,
     ):
         if hex_resampling == "sum":
             raise ValueError(
@@ -129,11 +130,16 @@ class MdimProcessor:
         if time_end:
             mask &= key <= _date_key(time_end)
         idx = np.nonzero(mask)[0]
-        if len(idx) == 0:
-            raise ValueError(f"no time steps between {time_start} and {time_end}")
         if np.any(np.diff(key) < 0):
             raise ValueError("the time axis is not in ascending order across the inputs")
-        self.t_lo, self.t_hi = int(idx[0]), int(idx[-1]) + 1
+        if len(idx) == 0:
+            # Under the time fan-out a unit (an input file) can lie wholly
+            # outside the window; it has nothing to do, which is not an error.
+            if not allow_empty_window:
+                raise ValueError(f"no time steps between {time_start} and {time_end}")
+            self.t_lo = self.t_hi = 0
+        else:
+            self.t_lo, self.t_hi = int(idx[0]), int(idx[-1]) + 1
         if time_agg == "none":
             self.tkey = (t.dates.astype("datetime64[D]").astype(np.int64)).astype(np.int64)
         elif time_agg == "month":
@@ -194,9 +200,11 @@ class MdimProcessor:
         finally:
             self.con.unregister("slab")
 
-    def _aggregate_chunk(self, chunk_cell: int, windows) -> int:
-        """Pixels finer than cells: pixel centre -> cell. Returns slabs read."""
+    def _aggregate(self, windows, parent_res: int, parents: Sequence[int]) -> int:
+        """Pixels finer than cells: pixel centre -> cell, keeping cells whose
+        res-*parent_res* parent is in *parents*. Returns slabs read."""
         src, reads = self.source, 0
+        parent_list = ", ".join(f"{int(c)}::UBIGINT" for c in parents)
         for window in windows:
             for y0, y1, x0, x1 in src.tiles(window):
                 lat = src.lat[y0:y1]
@@ -211,7 +219,7 @@ class MdimProcessor:
                     picked = self.con.execute(f"""
                         SELECT p, cell FROM (
                             SELECT p, h3_latlng_to_cell(lat, lon, {self.h3_resolution}) AS cell FROM pix)
-                        WHERE h3_cell_to_parent(cell, {self.chunk_resolution}) = {int(chunk_cell)}::UBIGINT
+                        WHERE h3_cell_to_parent(cell, {int(parent_res)}) IN ({parent_list})
                         ORDER BY p
                     """).fetchnumpy()
                 finally:
@@ -228,16 +236,22 @@ class MdimProcessor:
                     reads += 1
         return reads
 
-    def _sample_chunk(self, chunk_cell: int) -> int:
-        """Pixels coarser than cells: cell centre -> pixel. Returns slabs read."""
+    def _sample(self, parents: Sequence[int]) -> int:
+        """Pixels coarser than cells: each native descendant of *parents* reads
+        the pixel containing its centre. Returns slabs read."""
         src, reads = self.source, 0
-        got = self.con.execute(f"""
+        dy, dx = src.pixel_deg
+        lat_lo, lat_hi = float(src.lat.min()) - dy, float(src.lat.max()) + dy
+        frames = [self.con.execute(f"""
             SELECT cell, h3_cell_to_lat(cell) AS lat, h3_cell_to_lng(cell) AS lon
-            FROM (SELECT UNNEST(h3_cell_to_children({int(chunk_cell)}::UBIGINT,
+            FROM (SELECT UNNEST(h3_cell_to_children({int(c)}::UBIGINT,
                                                      {self.h3_resolution})) AS cell)
-        """).fetchnumpy()
-        if len(got["cell"]) == 0:
+            WHERE h3_cell_to_lat(cell) BETWEEN {lat_lo} AND {lat_hi}
+        """).fetchnumpy() for c in parents]
+        frames = [f for f in frames if len(f["cell"])]
+        if not frames:
             return 0
+        got = {k: np.concatenate([f[k] for f in frames]) for k in ("cell", "lat", "lon")}
         iy, ix = src.nearest_pixel(got["lat"], got["lon"])
         keep = (iy >= 0) & (ix >= 0)
         if not keep.any():
@@ -262,9 +276,11 @@ class MdimProcessor:
 
     # -- output ---------------------------------------------------------
 
-    def _write(self, chunk_cell: int, h0_cell: int) -> Optional[str]:
+    def _rows_sql(self, with_h0: bool = False) -> str:
         h = f"h{self.h3_resolution}"
         parents = "".join(f", h3_cell_to_parent(cell, {r}) AS h{r}" for r in self.parent_resolutions)
+        if with_h0 and 0 not in self.parent_resolutions:
+            parents += ", h3_cell_to_parent(cell, 0) AS h0"
         if self.time_agg == "none":
             tcols = "(DATE '1970-01-01' + tkey::INTEGER) AS time"
         elif self.time_agg == "month":
@@ -278,11 +294,14 @@ class MdimProcessor:
             prefix = "mn" if fn == "min" else "mx"
             vals = ", ".join(f"{fn}({prefix}_{c}) AS {c}" for c in self.columns)
         has_data = " + ".join(f"sum(n_{c})" for c in self.columns)
-        rows_sql = f"""
+        return f"""
             SELECT cell AS {h}{parents}, {tcols}, {vals}
             FROM partial GROUP BY cell, tkey HAVING {has_data} > 0
             ORDER BY {h}, tkey
         """
+
+    def _write(self, chunk_cell: int, h0_cell: int) -> Optional[str]:
+        rows_sql = self._rows_sql()
         if self.con.execute(f"SELECT count(*) FROM ({rows_sql})").fetchone()[0] == 0:
             return None
         path = chunk_output_path(self.output_parquet_path, self.chunk_resolution,
@@ -311,8 +330,8 @@ class MdimProcessor:
                   f"{self.t_hi - self.t_lo:,} time steps, {dy:g}x{dx:g} deg pixels, "
                   f"res {self.h3_resolution} -> placement '{placement}'")
             self._create_partial()
-            reads = (self._aggregate_chunk(chunk_cell, windows) if placement == "aggregate"
-                     else self._sample_chunk(chunk_cell))
+            reads = (self._aggregate(windows, self.chunk_resolution, [chunk_cell])
+                     if placement == "aggregate" else self._sample([chunk_cell]))
             print(f"  {reads} slab read(s)")
             result = self._write(chunk_cell, h0_cell) if reads else None
             print(f"  ✓ Wrote {result}" if result else "  ℹ no data in this chunk")
@@ -322,3 +341,93 @@ class MdimProcessor:
             record_chunk_completion(self.con, self.output_parquet_path, chunk_index,
                                     chunk_cell, h0_cell, bool(result))
         return result
+
+    # -- time fan-out (#267) --------------------------------------------
+
+    def _check_whole_keys(self) -> None:
+        """Refuse a time range that splits a --time-agg key at an input edge.
+
+        Under the time fan-out each unit is finalised on its own and the merge
+        only concatenates, so a month or year split across two units would
+        appear twice. A range cut by --time-start/--time-end is fine — the
+        window applies to every unit alike — but an *input* that starts or ends
+        mid-key is not.
+        """
+        if self.time_agg == "none":
+            return
+        t = self.source.time
+        first, last = self.t_lo, self.t_hi - 1
+        if first == 0 and not (t.day[0] == 1 and (self.time_agg == "month" or t.month[0] == 1)):
+            raise ValueError(
+                f"the inputs start mid-{self.time_agg} ({t.year[0]}-{t.month[0]:02d}-{t.day[0]:02d}); "
+                f"under --fan-out time each unit must hold whole {self.time_agg}s. "
+                f"Use --fan-out space, or inputs split on {self.time_agg} boundaries.")
+        if last == len(t.year) - 1:
+            y, m, d = int(t.year[last]), int(t.month[last]), int(t.day[last])
+            if not (d == _month_length(y, m, t.calendar) and (self.time_agg == "month" or m == 12)):
+                raise ValueError(
+                    f"the inputs end mid-{self.time_agg} ({y}-{m:02d}-{d:02d}); under --fan-out "
+                    f"time each unit must hold whole {self.time_agg}s. Use --fan-out space.")
+
+    def process_region(self, unit_index: int) -> Optional[str]:
+        """Time fan-out (#267): every chunk of the region over this processor's
+        time range, in one read of the grid.
+
+        For sources whose chunks span the whole grid (NEX-GDDP: one global day
+        per chunk), a spatial fan-out makes every pod fetch every chunk. Here a
+        pod owns a slice of time instead, reads each chunk once, and writes one
+        part per h0 partition — `part-t{unit}-*.parquet` under the staging
+        prefix, which `merge-chunks` concatenates into `data_0.parquet`.
+        """
+        if self.t_hi == self.t_lo:
+            print(f"Time unit {unit_index}: no time steps in the requested window")
+            record_chunk_completion(self.con, self.output_parquet_path, unit_index, 0, 0, False)
+            return None
+        self._check_whole_keys()
+        h0s = sorted({h0 for _, h0, _ in enumerate_chunk_cells(
+            0, h0_subset=self.h0_subset, h0_grid_path=self.h0_grid_path, con=self.con)})
+        src = self.source
+        dy, dx = src.pixel_deg
+        windows = [(0, len(src.lat), 0, len(src.lon))]
+        placement = self.resolve_placement(float(np.mean(src.lat)))
+        print(f"Time unit {unit_index}: {self.t_hi - self.t_lo:,} time steps over "
+              f"{len(h0s)} h0 cell(s), {dy:g}x{dx:g} deg pixels, res {self.h3_resolution} "
+              f"-> placement '{placement}'")
+        self._create_partial()
+        reads = (self._aggregate(windows, 0, h0s) if placement == "aggregate"
+                 else self._sample(h0s))
+        print(f"  {reads} slab read(s)")
+        result = None
+        if reads:
+            rows_sql = self._rows_sql(with_h0=True)
+            n = self.con.execute(f"SELECT count(*) FROM ({rows_sql})").fetchone()[0]
+            if n:
+                base = self.output_parquet_path.rstrip("/")
+                if not base.startswith(("s3://", "http://", "https://")):
+                    os.makedirs(base, exist_ok=True)
+                keep_h0 = "true" if 0 in self.parent_resolutions else "false"
+                self.con.execute(
+                    f"COPY ({rows_sql}) TO '{base}' (FORMAT PARQUET, COMPRESSION 'zstd', "
+                    f"PARTITION_BY (h0), WRITE_PARTITION_COLUMNS {keep_h0}, "
+                    f"FILENAME_PATTERN 'part-t{int(unit_index)}-{{i}}', OVERWRITE_OR_IGNORE"
+                    f"{kv_metadata_sql()})")
+                result = f"{base}/h0=*/part-t{int(unit_index)}-*.parquet"
+                assert_h3_columns_unsigned(lambda sql: self.con.execute(sql).fetchall(), result)
+                print(f"  ✓ Wrote {n:,} rows to {result}")
+        if not result:
+            print("  ℹ no data in this time unit")
+        record_chunk_completion(self.con, self.output_parquet_path, unit_index, 0, 0, bool(result))
+        return result
+
+
+def _month_length(year: int, month: int, calendar: str) -> int:
+    """Days in *month* of *year* on a CF *calendar*."""
+    if calendar == "360_day":
+        return 30
+    if calendar in ("all_leap", "366_day"):
+        return [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    if calendar in ("noleap", "365_day"):
+        return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    start = np.datetime64(f"{year:04d}-{month:02d}", "M")
+    return int(((start + 1).astype("datetime64[D]") - start.astype("datetime64[D]")).astype(int))
+

@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`mdim-workflow` can fan out over time, and does so automatically when one chunk spans the whole grid** (#267). Splitting over space makes every pod fetch every chunk of such a source. NEX-GDDP-CMIP6 stores one global day per chunk, so a global 122-pod run would move about **2.6 TB per series instead of ~21 GB**. With `--fan-out time` (chosen by `auto` from the first input's chunk shape), each pod processes one input file, or a slice of a single input, across every h0, reading each chunk once. It writes `part-t{unit}-*.parquet` into each h0 partition, and the existing `merge-chunks` step concatenates them.
+  - Slices of a single input are cut only between `--time-agg` keys. A pod whose input starts or ends mid-month or mid-year refuses to run, since concatenation would duplicate that key.
+  - A unit wholly outside `--time-start`/`--time-end` exits cleanly and is recorded as complete.
+  - A time fan-out followed by the merge was tested to produce exactly the same rows as the spatial fan-out. One time unit was checked on a real NEX-GDDP file: 10 global daily chunks in a single 6 MiB read.
+
 ## [0.10.0] - 2026-10-05
 
 ### Added

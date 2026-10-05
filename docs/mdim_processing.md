@@ -77,6 +77,24 @@ kubectl apply -f catalog/climate/k8s/nex-gddp-tas/configmap.yaml \
               -f catalog/climate/k8s/nex-gddp-tas/workflow.yaml
 ```
 
+### Which axis the fan-out splits over
+
+`--fan-out auto` (the default) reads the first input's chunk shape:
+
+| source chunks | fan-out | each pod |
+|---|---|---|
+| spatial tiles (LOCA2: `1952×123×139`) | **space** | one h0, or a sub-h0 chunk, over all time; reads only the tiles under it |
+| one chunk spans the whole grid (NEX-GDDP: `1×600×1440`) | **time** | one input file, or a slice of a single input, over every h0; reads each chunk once |
+
+Splitting a whole-grid source over space would make every pod fetch every
+chunk: about 122× the transfer for a global run (#267). Under `time`, units are
+**one per input file**, or, for a single input, runs of whole `--time-agg` keys
+of about `--time-unit-steps` steps. Each pod writes `part-t{unit}-*.parquet` into
+every h0 partition it touches, and `merge-chunks` concatenates them into
+`data_0.parquet`. A month or year must not be split across files, because the
+merge only concatenates. A pod whose input starts or ends mid-key refuses to
+run. `--fan-out space|time` overrides the choice.
+
 Generation opens the first input, so a wrong variable, an unsupported calendar
 or an empty time window fails before anything is applied. Read public
 object-store sources through `/vsicurl/https://…`, not `s3://`: inside the
