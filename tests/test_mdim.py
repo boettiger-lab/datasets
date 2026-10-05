@@ -376,7 +376,8 @@ class TestMdimWorkflow:
         from cng_datasets.k8s import generate_mdim_workflow
         out = tmp_path / "wf"
         generate_mdim_workflow("cube/loca", [cube], ["tas"], "b", output_dir=str(out),
-                               h3_resolution=5, h0_subset=[50], time_agg="year")
+                               h3_resolution=5, h0_subset=[50], time_agg="year",
+                               fan_out="space")   # the tiny fixture is one chunk, so auto -> time
         names = sorted(p.name for p in out.iterdir())
         assert {"cube-loca-setup-bucket.yaml", "cube-loca-hex.yaml", "workflow.yaml",
                 "configmap.yaml", "workflow-rbac.yaml"} <= set(names)
@@ -400,7 +401,8 @@ class TestMdimWorkflow:
         from cng_datasets.k8s import generate_mdim_workflow
         out = tmp_path / "wf"
         generate_mdim_workflow("cube/loca", [cube, cube], ["tas"], "b", output_dir=str(out),
-                               h3_resolution=5, time_start="2000-01-01", placement="sample")
+                               h3_resolution=5, time_start="2000-01-01", placement="sample",
+                               fan_out="space")
         _, cmd = self._hex_cmd(out)
         line = cmd.split("cng-datasets mdim", 1)[1].replace("\\\n", " ")
         argv = ["cng-datasets", "mdim"] + shlex.split(line.replace("${JOB_COMPLETION_INDEX}", "7"))
@@ -429,7 +431,8 @@ class TestMdimWorkflow:
         from cng_datasets.k8s import generate_mdim_workflow
         out = tmp_path / "wf"
         generate_mdim_workflow("cube/loca", [cube], ["tas"], "b", output_dir=str(out),
-                               h3_resolution=5, chunk_resolution=1, h0_subset=[50])
+                               h3_resolution=5, chunk_resolution=1, h0_subset=[50],
+                               fan_out="space")
         job, cmd = self._hex_cmd(out)
         assert job["spec"]["completions"] == 7
         assert "--chunk-resolution 1 --chunk-index ${JOB_COMPLETION_INDEX}" in cmd
@@ -520,7 +523,7 @@ class TestTimeFanOut:
         starts, ends = _time_units(t, "month", None, None, steps=40)
         assert all(s.endswith("-01") for s in starts)
         assert ends[0] == "2000-02-28"               # 59 days: Jan + Feb, never mid-month
-        assert starts[-1] <= "2001-02-01" and ends[-1] == "2001-02-05"
+        assert starts[-1] <= "2001-02-01" and ends[-1] == "2001-02-04"   # day 399, noleap
         none_s, none_e = _time_units(t, "none", "2000-01-10", "2000-01-19", steps=4)
         assert (none_s, none_e) == (["2000-01-10", "2000-01-14", "2000-01-18"],
                                     ["2000-01-13", "2000-01-17", "2000-01-19"])

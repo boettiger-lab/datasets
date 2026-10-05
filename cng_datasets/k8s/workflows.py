@@ -1609,7 +1609,10 @@ def _time_units(t, time_agg: str, time_start: Optional[str], time_end: Optional[
     else:
         group = np.arange(len(key))
     steps = max(1, int(steps))
-    fmt = lambda i: f"{int(t.year[i]):04d}-{int(t.month[i]):02d}-{int(t.day[i]):02d}"
+
+    def fmt(i):
+        return f"{int(t.year[i]):04d}-{int(t.month[i]):02d}-{int(t.day[i]):02d}"
+
     starts, ends = [], []
     first, count = idx[0], 0
     for n, i in enumerate(idx):
