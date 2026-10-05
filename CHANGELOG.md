@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-05
+
 ### Added
 - **`cng-datasets mdim`: hex a (time, lat, lon) cube without per-slice COGs** (#181). Reads zarr, netCDF, or anything else GDAL's multidimensional API opens, using chunk-aligned slab reads. A series split across files (e.g. NEX-GDDP's one netCDF per year) can be passed as several `--input`s. DuckDB does the H3 indexing, the reduction and the write.
   - **Several `--variable`s** become columns, and time stays a column instead of a fan-out.
@@ -287,6 +289,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.10.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.10.0
 [0.9.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.9.0
 [0.8.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.3
 [0.8.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.8.2
