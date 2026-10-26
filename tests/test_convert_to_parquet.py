@@ -2182,7 +2182,7 @@ class TestAntimeridianSplit:
     """A feature crossing 180° in a projected source is split there on
     reprojection to EPSG:4326, instead of coming out as a ring that runs the
     long way round (issue #274). DuckDB spatial has no split, so only the
-    crossers are sent through GDAL's WRAPDATELINE.
+    crossers are split, in Python (GDAL's WRAPDATELINE fails for EPSG:3338).
     """
 
     @staticmethod
@@ -2240,7 +2240,14 @@ class TestAntimeridianSplit:
     def test_wrap_only_where_the_result_is_wider_than_180(self):
         sql = build_read_reproject_query("dummy.gpkg", source_crs="EPSG:3338",
                                          target_crs="EPSG:4326", wrap_dateline=True)
-        assert "> 180" in sql and "cng_wrap_dateline(ST_AsWKB(geom))" in sql
+        assert "> 180" in sql and "cng_split_dateline(ST_AsWKB(ST_Transform(" in sql
         plain = build_read_reproject_query("dummy.gpkg", source_crs="EPSG:3338",
                                            target_crs="EPSG:4326")
-        assert "cng_wrap_dateline" not in plain
+        assert "cng_split_dateline" not in plain
+
+    def test_a_genuinely_wide_feature_is_left_alone(self):
+        """Shifting does not narrow a feature that really spans > 180°."""
+        import shapely
+        from cng_datasets.vector.convert_to_parquet import split_dateline_wkb
+        wide = shapely.to_wkb(shapely.box(-100, 0, 100, 10))
+        assert split_dateline_wkb(wide) == wide
