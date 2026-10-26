@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **DuckDB 2.0** (#280). DuckDB 2.0 reads Parquet asynchronously, with several requests in flight, where 1.5 read sequentially; every remote read in the hex, repartition and merge steps goes through it. Three changes came with it. Every connection that loads `spatial` now sets `geometry_always_xy = true`, which 2.0 requires before any axis-order-sensitive function (`ST_Area_Spheroid`, `ST_Length_Spheroid`, GDAL `COPY TO` with an SRS) and which becomes the default in 2.1; the geometries were already (lon, lat), so the manual `ST_FlipCoordinates` before the spheroid functions is gone and results are unchanged. SQL lambdas use the Python-style `lambda x: ...` form, since 2.0 disables `x -> ...`. And single-value reads use `fetchall()`, because 2.0 refuses other work on a connection while a result is only partly fetched.
 - **ibis is no longer a dependency** (#291). It was used only to open DuckDB connections in `repartition` and the raster merge, with every query sent through as raw SQL, and the code already routed around it because it could not parse DuckDB's `GEOMETRY(OGC:CRS84)` type. Both now use plain `duckdb` connections, and the second connection repartition opened just to read the source schema is gone. This also clears one blocker for DuckDB 2.0 (#280, ibis-project/ibis#12196).
 
 ## [0.11.4] - 2026-10-26

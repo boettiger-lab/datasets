@@ -164,7 +164,7 @@ class MdimProcessor:
 
     def _footprint(self, chunk_cell: int):
         wkt = self.con.execute(
-            f"SELECT h3_cell_to_boundary_wkt({int(chunk_cell)}::UBIGINT)").fetchone()[0]
+            f"SELECT h3_cell_to_boundary_wkt({int(chunk_cell)}::UBIGINT)").fetchall()[0][0]
         lat_lo, lat_hi, _ = cell_footprint(wkt)
         margin = H3_PROTRUSION_MARGIN * (lat_hi - lat_lo)
         return cell_footprint(wkt, margin_deg=margin)
@@ -175,7 +175,7 @@ class MdimProcessor:
         dy, dx = self.source.pixel_deg
         pixel_km2 = dy * dx * _KM_PER_DEG ** 2 * max(math.cos(math.radians(lat_centre)), 1e-6)
         cell_km2 = self.con.execute(
-            f"SELECT h3_get_hexagon_area_avg({self.h3_resolution}, 'km^2')").fetchone()[0]
+            f"SELECT h3_get_hexagon_area_avg({self.h3_resolution}, 'km^2')").fetchall()[0][0]
         return "aggregate" if pixel_km2 < cell_km2 else "sample"
 
     # -- accumulation ---------------------------------------------------
