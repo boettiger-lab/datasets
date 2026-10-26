@@ -185,10 +185,10 @@ def _lon_gap_sql(geom_expr: str) -> str:
     POLYGON((-180 -78, 180 -78, 180 -50, -180 -50, -180 -78)), whose remaining
     vertex set is empty (NULL gap), so it is still band-split.
     """
-    lons = f"list_transform(ST_Dump(ST_Points({geom_expr})), s -> ST_X(s.geom))"
+    lons = f"list_transform(ST_Dump(ST_Points({geom_expr})), lambda s: ST_X(s.geom))"
     return (
-        f"(list_min(list_filter({lons}, x -> x >= 0 AND x < 180)) "
-        f"- list_max(list_filter({lons}, x -> x < 0 AND x > -180)))"
+        f"(list_min(list_filter({lons}, lambda x: x >= 0 AND x < 180)) "
+        f"- list_max(list_filter({lons}, lambda x: x < 0 AND x > -180)))"
     )
 
 
