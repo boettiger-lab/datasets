@@ -80,7 +80,7 @@ def find_missing_chunks(chunks_dir: str, expect_chunks: int, con=None) -> List[i
         return sorted(set(range(expect_chunks)) - completed)
     finally:
         if own_con:
-            con.disconnect()
+            con.close()
 
 
 def _assert_all_chunks_ran(con, chunks_dir: str, expect_chunks: int) -> None:
