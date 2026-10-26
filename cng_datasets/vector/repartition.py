@@ -9,7 +9,6 @@ import os
 import shutil
 import subprocess
 import duckdb
-import ibis
 from cng_datasets.duckdb_memory import to_duckdb_memory_limit
 from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
@@ -39,9 +38,9 @@ def repartition_by_h0(
     print(f"Repartitioning chunks from {chunks_dir} to {output_dir}")
 
     # Set up DuckDB connection with S3 credentials
-    con = ibis.duckdb.connect()
+    con = duckdb.connect()
     configure_s3_credentials(con)
-    con.raw_sql('SET preserve_insertion_order=false')  # saves RAM
+    con.execute('SET preserve_insertion_order=false')  # saves RAM
     requested_limit = memory_limit or os.environ.get('DUCKDB_MEMORY_LIMIT')
     if requested_limit:
         # DuckDB rejects the Kubernetes spelling of a memory quantity, and this
@@ -49,10 +48,10 @@ def repartition_by_h0(
         effective_limit = to_duckdb_memory_limit(requested_limit)
         suffix = "" if effective_limit == requested_limit else f" (from {requested_limit})"
         print(f"Setting DuckDB memory_limit={effective_limit}{suffix}")
-        con.raw_sql(f"SET memory_limit='{effective_limit}'")
-    con.raw_sql('SET http_timeout=1200')
-    con.raw_sql('SET http_retries=30')
-    con.raw_sql('SET arrow_large_buffer_size=true')
+        con.execute(f"SET memory_limit='{effective_limit}'")
+    con.execute('SET http_timeout=1200')
+    con.execute('SET http_retries=30')
+    con.execute('SET arrow_large_buffer_size=true')
 
     # Create local temporary directory
     local_dir = '/tmp/hex'
@@ -60,14 +59,15 @@ def repartition_by_h0(
 
     # Read chunks (sparse format: ID_column, h10, h9, h8, h0)
     try:
-        chunks = con.read_parquet(f'{chunks_dir}/*.parquet')
+        chunk_cols = [row[0] for row in con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{chunks_dir}/*.parquet')"
+        ).fetchall()]
     except Exception as e:
         raise RuntimeError(
             f"No parquet files found in chunks directory '{chunks_dir}'. "
             f"The hex job may have produced no output (all cells empty?). "
             f"Original error: {e}"
         ) from e
-    chunk_cols = chunks.columns
 
     # Identify ID column in chunks
     # Prioritize _cng_fid (standard from convert_to_parquet), then _fid (fallback), then other non-h3 columns
@@ -96,15 +96,7 @@ def repartition_by_h0(
     if source_parquet:
         print(f'Joining attributes from {source_parquet}...')
 
-        # Use raw DuckDB to read schema — ibis cannot parse GEOMETRY(OGC:CRS84) types
-        # introduced in DuckDB 1.5 / spatial extension updates.
-        _raw = duckdb.connect()
-        try:
-            _raw.execute("INSTALL httpfs; LOAD httpfs")
-            configure_s3_credentials(_raw)
-            desc = _raw.execute(f"DESCRIBE SELECT * FROM read_parquet('{source_parquet}')").fetchdf()
-        finally:
-            _raw.close()
+        desc = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{source_parquet}')").fetchdf()
         source_cols = desc['column_name'].tolist()
 
         # Use helper to find geometry column (case-insensitive or by GEOMETRY type)
@@ -131,9 +123,9 @@ def repartition_by_h0(
         print(f'  Joining on column: {chunk_id_col}')
         print(f'  Adding {len(attr_cols) - 1} attribute columns')
 
-        # Register a view of just the attribute columns so ibis never touches the GEOMETRY type
+        # A view of just the attribute columns: the hex output carries no geometry
         quoted = ', '.join(f'"{c}"' for c in attr_cols)
-        con.raw_sql(f"CREATE OR REPLACE VIEW _source_attrs AS SELECT {quoted} FROM read_parquet('{source_parquet}')")
+        con.execute(f"CREATE OR REPLACE VIEW _source_attrs AS SELECT {quoted} FROM read_parquet('{source_parquet}')")
         join_sql = (
             f"SELECT s.*, c.* EXCLUDE (\"{chunk_id_col}\")"
             f" FROM read_parquet('{chunks_dir}/*.parquet') c"
@@ -157,10 +149,10 @@ def repartition_by_h0(
         # (e.g. a build with known-degenerate geometries that drop to 0 cells).
         if os.environ.get('CNG_SKIP_COMPLETENESS_CHECK') not in ('1', 'true', 'True'):
             geom_filter = f' WHERE "{geom_col}" IS NOT NULL' if geom_col else ''
-            source_features = con.raw_sql(
+            source_features = con.execute(
                 f"SELECT COUNT(*) FROM read_parquet('{source_parquet}'){geom_filter}"
             ).fetchone()[0]
-            hexed_features = con.raw_sql(
+            hexed_features = con.execute(
                 f'SELECT COUNT(DISTINCT "{chunk_id_col}")'
                 f" FROM read_parquet('{chunks_dir}/*.parquet')"
             ).fetchone()[0]
@@ -193,7 +185,7 @@ def repartition_by_h0(
         )
 
     # Get distinct h0 values
-    h0_vals = con.raw_sql(
+    h0_vals = con.execute(
         f"SELECT DISTINCT h0 FROM read_parquet('{chunks_dir}/*.parquet') ORDER BY h0"
     ).fetchall()
     if not h0_vals:
@@ -223,7 +215,7 @@ def repartition_by_h0(
         # [min,max] excludes the targets instead of scanning every row. Wrap in
         # a subquery so ORDER BY references the unambiguous output column (the
         # join exposes the id on both sides). PARTITION BY h0 is unchanged.
-        con.raw_sql(
+        con.execute(
             f"COPY (SELECT * FROM ({join_sql.format(h0=h0)})"
             f" ORDER BY \"{chunk_id_col}\") TO '{local_file}'"
             f" (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
@@ -256,7 +248,7 @@ def repartition_by_h0(
     # (issue #102), leaving chunks intact for debugging if it fails.
     hex_glob = f"{output_dir.rstrip('/')}/h0=*/data_0.parquet"
     print(f'Asserting H3 columns are UBIGINT via {hex_glob}...')
-    assert_h3_columns_unsigned(lambda sql: con.raw_sql(sql).fetchall(), hex_glob)
+    assert_h3_columns_unsigned(lambda sql: con.execute(sql).fetchall(), hex_glob)
 
     print('Cleaning up local directory...')
     shutil.rmtree(local_dir, ignore_errors=True)

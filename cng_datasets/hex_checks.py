@@ -35,9 +35,8 @@ def assert_h3_columns_unsigned(
 
     Args:
         fetch: Callable that runs a SQL string and returns the result rows as a
-            list of tuples. Pass ``lambda sql: con.raw_sql(sql).fetchall()`` for
-            an ibis DuckDB connection, or ``lambda sql: con.execute(sql).fetchall()``
-            for a raw ``duckdb`` connection.
+            list of tuples, e.g. ``lambda sql: con.execute(sql).fetchall()`` for a
+            ``duckdb`` connection.
         hex_glob: A ``read_parquet``-compatible path/glob for the written hex
             output (e.g. ``s3://bucket/foo/hex/h0=*/data_0.parquet``).
 

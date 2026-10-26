@@ -1492,10 +1492,9 @@ class TestRepartitionWithAttributeJoin:
             con.execute(f"COPY chunk_data TO '{chunks_dir}/chunk_000000.parquet' (FORMAT PARQUET)")
             
             # Read back and verify ID detection logic
-            import ibis
-            ibis_con = ibis.duckdb.connect()
-            chunks = ibis_con.read_parquet(f'{chunks_dir}/*.parquet')
-            chunk_cols = chunks.columns
+            chunk_cols = [row[0] for row in con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{chunks_dir}/*.parquet')"
+            ).fetchall()]
             
             # Find ID column (non-h3 column)
             chunk_id_col = None
@@ -1703,20 +1702,15 @@ class TestRepartitionWithAttributeJoin:
             assert 'ObjectID' in chunk_df.columns, f"ObjectID not preserved in chunks! Columns: {chunk_df.columns}"
             
             # Test attribute join manually (since full repartition has issues with local paths)
-            import ibis
-            # Use raw duckdb to get column names — ibis cannot parse GEOMETRY(OGC:CRS84)
-            # types written by DuckDB 1.5+.
-            raw_con = duckdb.connect()
-            desc = raw_con.execute(f"DESCRIBE SELECT * FROM read_parquet('{test_parquet}')").fetchdf()
-            raw_con.close()
+            desc = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{test_parquet}')").fetchdf()
             source_cols = [c for c in desc['column_name'].tolist() if c != 'Geometry']
 
-            ibis_con = ibis.duckdb.connect()
-            chunks = ibis_con.read_parquet(f'{chunks_dir}/*.parquet')
             quoted = ', '.join(f'"{c}"' for c in source_cols)
-            ibis_con.raw_sql(f"CREATE OR REPLACE VIEW _source_attrs AS SELECT {quoted} FROM read_parquet('{test_parquet}')")
-            result = chunks.inner_join(ibis_con.table('_source_attrs'), 'ObjectID')
-            result_df = result.execute()
+            con.execute(f"CREATE OR REPLACE VIEW _source_attrs AS SELECT {quoted} FROM read_parquet('{test_parquet}')")
+            result_df = con.execute(
+                f"SELECT s.*, c.* EXCLUDE (\"ObjectID\") FROM read_parquet('{chunks_dir}/*.parquet') c"
+                f" INNER JOIN _source_attrs s ON c.\"ObjectID\" = s.\"ObjectID\""
+            ).fetchdf()
             
             assert 'ObjectID' in result_df.columns, f"ObjectID not in joined result! Columns: {result_df.columns}"
             assert 'Name' in result_df.columns, f"Name not in joined result! Columns: {result_df.columns}"
