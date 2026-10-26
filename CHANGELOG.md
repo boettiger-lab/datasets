@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The image could not import pyarrow** (`ghcr.io/boettiger-lab/datasets` built on 2026-10-26, including v0.11.1). The image pinned `numpy<2` for GDAL bindings that were once built against NumPy 1, and pyarrow 26 requires NumPy 2, so every step that reads or writes Parquet failed. The base image moved to Ubuntu 26.04 in April, and its GDAL bindings are built against NumPy 2.3, so the pin is removed instead of capping pyarrow.
+
 ## [0.11.1] - 2026-10-26
 
 ### Added
