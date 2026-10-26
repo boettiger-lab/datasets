@@ -798,11 +798,60 @@ def _sql_string(value: str) -> str:
     return f"'{escaped}'"
 
 
+# DuckDB function that splits a (lon, lat) geometry at the antimeridian
+# (registered by write_with_duckdb, issue #274).
+DATELINE_UDF = "cng_split_dateline"
+
+
+def is_geographic_target(target_crs: str) -> bool:
+    """Whether target_crs is geographic, so an antimeridian exists to split at."""
+    from osgeo import osr
+    srs = osr.SpatialReference()
+    srs.SetFromUserInput(target_crs)
+    return bool(srs.IsGeographic())
+
+
+def split_dateline_wkb(wkb: bytes) -> bytes:
+    """Split a (lon, lat) geometry whose rings run the long way round at 180°.
+
+    A feature that crosses 180° in a projected source comes out of
+    ST_Transform with vertices on both sides, joined the long way round
+    (issue #274). Shifting the negative longitudes by 360 makes it continuous
+    again; it is then cut at 180 and the eastern piece shifted back. A
+    feature still wider than 180° after the shift genuinely spans that much
+    and is returned unchanged.
+
+    DuckDB spatial has no antimeridian split, and GDAL's WRAPDATELINE leaves
+    some projections unsplit (EPSG:3338, Alaska Albers), so this is done here.
+    """
+    import numpy as np
+    import shapely
+    from shapely import affinity
+
+    geom = shapely.from_wkb(wkb)
+    shifted = shapely.transform(
+        geom, lambda c: np.where(c[:, :1] < 0, c + [360.0, 0.0], c))
+    xmin, _, xmax, _ = shifted.bounds
+    if xmax - xmin >= 180:
+        return wkb
+    west = shifted.intersection(shapely.box(xmin, -90, 180, 90))
+    east = affinity.translate(
+        shifted.intersection(shapely.box(180, -90, xmax, 90)), xoff=-360)
+    return shapely.to_wkb(shapely.union(west, east))
+
+
+def register_dateline_split(con) -> None:
+    """Register DATELINE_UDF (split_dateline_wkb) on a DuckDB connection."""
+    con.create_function(DATELINE_UDF, split_dateline_wkb, ["BLOB"], "BLOB",
+                        side_effects=False)
+
+
 def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str],
                                target_crs: str, geom_col: str = "geom", layer: Optional[str] = None,
                                verbose: bool = False, geom_is_blob: bool = False,
                                simplify_tolerance: Optional[float] = None,
-                               trim_columns: Optional[List[str]] = None) -> str:
+                               trim_columns: Optional[List[str]] = None,
+                               wrap_dateline: bool = False) -> str:
     """
     Build DuckDB query to read and reproject data. Can handle multiple input files.
 
@@ -822,6 +871,9 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         trim_columns: String columns to strip leading/trailing whitespace from
             (--trim-strings, issue #180). Applied via star-REPLACE so every other
             column, and the column order, is untouched.
+        wrap_dateline: Pass any feature whose result is wider than 180° to
+            DATELINE_UDF, which splits it at the antimeridian (issue #274). The
+            connection running the query must have it registered.
 
     Returns:
         DuckDB SQL query string
@@ -853,6 +905,15 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
             f"ST_Transform({raw_geom}, {_sql_string(source_crs)}, "
             f"{_sql_string(target_crs)}, always_xy := true)"
         )
+        if wrap_dateline:
+            # A crosser comes out of ST_Transform wider than 180°. The split
+            # leaves a feature that is genuinely that wide alone, so the bbox
+            # test only decides which features take the slower path.
+            geom_inner = (
+                f"(CASE WHEN ST_XMax({geom_inner}) - ST_XMin({geom_inner}) > 180 "
+                f"THEN ST_GeomFromWKB({DATELINE_UDF}(ST_AsWKB({geom_inner}))) "
+                f"ELSE {geom_inner} END)"
+            )
     else:
         # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
         geom_inner = raw_geom
@@ -1312,7 +1373,8 @@ def write_with_duckdb(query: str, output_path: str,
                       compression_level: int = 15,
                       row_group_size: int = 100000,
                       verbose: bool = False,
-                      row_group_bytes: str = DEFAULT_ROW_GROUP_BYTES) -> int:
+                      row_group_bytes: str = DEFAULT_ROW_GROUP_BYTES,
+                      split_dateline: bool = False) -> int:
     """
     Write parquet file using DuckDB COPY. Simple and reliable.
 
@@ -1332,6 +1394,8 @@ def write_with_duckdb(query: str, output_path: str,
             chunks. This is what keeps the geometry column chunk small enough to
             be read over httpfs (issue #106 — see DEFAULT_ROW_GROUP_BYTES).
         verbose: Print debug information
+        split_dateline: Register DATELINE_UDF, for a query built with
+            wrap_dateline (issue #274).
 
     Returns:
         Number of rows written to output_path
@@ -1339,6 +1403,8 @@ def write_with_duckdb(query: str, output_path: str,
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    if split_dateline:
+        register_dateline_split(con)
 
     # Enable large buffer size for complex geometries (Total buffer > 2GB)
     con.execute("SET arrow_large_buffer_size=true")
@@ -1744,6 +1810,7 @@ def convert_to_parquet(
 
         # Step 2: Build read/reproject query
         print("  Building read/reproject query...")
+        split_dateline = needs_reprojection and is_geographic_target(target_crs)
         query = build_read_reproject_query(
             source_inputs,
             source_crs if needs_reprojection else None,
@@ -1754,6 +1821,7 @@ def convert_to_parquet(
             geom_is_blob=geom_is_blob,
             simplify_tolerance=simplify_tolerance,
             trim_columns=trim_columns,
+            wrap_dateline=split_dateline,
         )
 
         # Step 3: Check ID column and wrap query if needed
@@ -1778,7 +1846,7 @@ def convert_to_parquet(
             try:
                 # Write data
                 rows_written = write_with_duckdb(query, tmp_path, compression, compression_level,
-                                 row_group_size, verbose)
+                                 row_group_size, verbose, split_dateline=split_dateline)
                 # Checked before the upload, so a short read never reaches the
                 # bucket to be consumed by anything downstream (issue #186).
                 _report_row_count(rows_written, expect_features)
@@ -1792,7 +1860,7 @@ def convert_to_parquet(
         else:
             # Write directly to destination
             rows_written = write_with_duckdb(query, destination, compression, compression_level,
-                            row_group_size, verbose)
+                            row_group_size, verbose, split_dateline=split_dateline)
             _report_row_count(rows_written, expect_features)
 
         if verbose:

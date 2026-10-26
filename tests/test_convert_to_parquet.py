@@ -2176,3 +2176,82 @@ class TestArchiveLayerSelection:
             out = f"{tmpdir}/o.parquet"
             convert_to_parquet(source_url=[a, b], destination=out, progress=False)
             assert [r[0] for r in self._rows(out)] == ["p", "q"]
+
+
+class TestAntimeridianSplit:
+    """A feature crossing 180° in a projected source is split there on
+    reprojection to EPSG:4326, instead of coming out as a ring that runs the
+    long way round (issue #274). DuckDB spatial has no split, so only the
+    crossers are split, in Python (GDAL's WRAPDATELINE fails for EPSG:3338).
+    """
+
+    @staticmethod
+    def _lonlat_box(lon0, lon1, lat0, lat1, n=50):
+        """Densified ring of a lon/lat box; longitudes may run past 180."""
+        edge = [lon0 + (lon1 - lon0) * i / n for i in range(n)]
+        north = [lat0 + (lat1 - lat0) * i / n for i in range(n)]
+        return ([(x, lat0) for x in edge] + [(lon1, y) for y in north]
+                + [(x, lat1) for x in reversed(edge)][:-1] + [(lon0, y) for y in reversed(north)]
+                + [(lon0, lat0)])
+
+    def _source(self, path):
+        """Alaska Albers (EPSG:3338): one box across 180°, one west of it."""
+        import geopandas as gpd
+        from pyproj import Transformer
+        from shapely.geometry import Polygon
+        to_albers = Transformer.from_crs(4326, 3338, always_xy=True)
+        polys = [Polygon([to_albers.transform(x, y) for x, y in self._lonlat_box(*b)])
+                 for b in ((178, 182, 52, 54), (170, 172, 52, 54))]
+        gpd.GeoDataFrame({"name": ["crosser", "west"]}, geometry=polys, crs=3338).to_file(path)
+        return str(path)
+
+    @staticmethod
+    def _geodesic_km2(ring):
+        from pyproj import Geod
+        lons, lats = zip(*ring)
+        return abs(Geod(ellps="WGS84").polygon_area_perimeter(lons, lats)[0]) / 1e6
+
+    @pytest.mark.timeout(30)
+    def test_crosser_is_split_and_keeps_its_area(self, tmp_path):
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(source_url=self._source(tmp_path / "src.gpkg"),
+                           destination=out, progress=False)
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        import shapely
+        rows = {}
+        for name, wkb, km2 in con.execute(f"""
+                SELECT name, ST_AsWKB(geom), ST_Area_Spheroid(ST_FlipCoordinates(geom)) / 1e6
+                FROM '{out}'""").fetchall():
+            g = shapely.from_wkb(bytes(wkb))
+            parts = getattr(g, "geoms", [g])
+            span = max(p.bounds[2] - p.bounds[0] for p in parts)
+            rows[name] = (span, g.bounds[0], g.bounds[2], km2)
+
+        span, xmin, xmax, km2 = rows["crosser"]
+        assert span < 5, f"a part spans {span:.1f}° of longitude"
+        assert xmin < -177.9 and xmax > 177.9, "both sides of 180° are kept"
+        expected = self._geodesic_km2(self._lonlat_box(178, 182, 52, 54))
+        assert km2 == pytest.approx(expected, rel=0.01)
+
+        span, xmin, xmax, km2 = rows["west"]
+        assert 169.9 < xmin and xmax < 172.1, "a non-crosser is reprojected as before"
+
+    def test_wrap_only_where_the_result_is_wider_than_180(self):
+        sql = build_read_reproject_query("dummy.gpkg", source_crs="EPSG:3338",
+                                         target_crs="EPSG:4326", wrap_dateline=True)
+        assert "> 180" in sql and "cng_split_dateline(ST_AsWKB(ST_Transform(" in sql
+        plain = build_read_reproject_query("dummy.gpkg", source_crs="EPSG:3338",
+                                           target_crs="EPSG:4326")
+        assert "cng_split_dateline" not in plain
+
+    def test_a_genuinely_wide_feature_is_left_alone(self):
+        """Shifting does not narrow a feature that really spans > 180°.
+
+        Densified like a reprojected feature: a bare four-corner box from
+        -100 to 100 cannot say which way its edges run.
+        """
+        import shapely
+        from cng_datasets.vector.convert_to_parquet import split_dateline_wkb
+        wide = shapely.to_wkb(shapely.Polygon(self._lonlat_box(-100, 100, 0, 10, n=200)))
+        assert split_dateline_wkb(wide) == wide

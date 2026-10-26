@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Convert splits features that cross the antimeridian when it reprojects to EPSG:4326** (#274). DuckDB's `ST_Transform` has no dateline split, so a polygon that is continuous in a projected source came out with a ring running the long way round, spanning about 356° of longitude, with its area overstated (PAD-US: 29 features, one of them 28% too large). Features whose reprojected extent is wider than 180° are now split at 180° after reprojection. All other features still go through DuckDB. Layers with features near 180° (Alaska, the Pacific, Fiji/Kiribati) that were built from projected sources should be rebuilt.
+
 ## [0.11.2] - 2026-10-26
 
 ### Fixed
