@@ -2218,12 +2218,14 @@ class TestAntimeridianSplit:
                            destination=out, progress=False)
         con = duckdb.connect()
         con.execute("LOAD spatial")
+        # The column is renamed so that p.geom below can only mean the
+        # ST_Dump part, not the whole geometry.
         rows = {r[0]: r[1:] for r in con.execute(f"""
             SELECT name, (SELECT max(ST_XMax(p.geom) - ST_XMin(p.geom))
-                          FROM (SELECT UNNEST(ST_Dump(geom)) AS p)),
-                   ST_XMin(geom), ST_XMax(geom),
-                   ST_Area_Spheroid(ST_FlipCoordinates(geom)) / 1e6
-            FROM '{out}'""").fetchall()}
+                          FROM (SELECT UNNEST(ST_Dump(g)) AS p)),
+                   ST_XMin(g), ST_XMax(g),
+                   ST_Area_Spheroid(ST_FlipCoordinates(g)) / 1e6
+            FROM (SELECT name, geom AS g FROM '{out}')""").fetchall()}
 
         span, xmin, xmax, km2 = rows["crosser"]
         assert span < 5, f"a part spans {span:.1f}° of longitude"
