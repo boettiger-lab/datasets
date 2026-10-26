@@ -2218,14 +2218,15 @@ class TestAntimeridianSplit:
                            destination=out, progress=False)
         con = duckdb.connect()
         con.execute("LOAD spatial")
-        # The column is renamed so that p.geom below can only mean the
-        # ST_Dump part, not the whole geometry.
-        rows = {r[0]: r[1:] for r in con.execute(f"""
-            SELECT name, (SELECT max(ST_XMax(p.geom) - ST_XMin(p.geom))
-                          FROM (SELECT UNNEST(ST_Dump(g)) AS p)),
-                   ST_XMin(g), ST_XMax(g),
-                   ST_Area_Spheroid(ST_FlipCoordinates(g)) / 1e6
-            FROM (SELECT name, geom AS g FROM '{out}')""").fetchall()}
+        import shapely
+        rows = {}
+        for name, wkb, km2 in con.execute(f"""
+                SELECT name, ST_AsWKB(geom), ST_Area_Spheroid(ST_FlipCoordinates(geom)) / 1e6
+                FROM '{out}'""").fetchall():
+            g = shapely.from_wkb(bytes(wkb))
+            parts = getattr(g, "geoms", [g])
+            span = max(p.bounds[2] - p.bounds[0] for p in parts)
+            rows[name] = (span, g.bounds[0], g.bounds[2], km2)
 
         span, xmin, xmax, km2 = rows["crosser"]
         assert span < 5, f"a part spans {span:.1f}° of longitude"
