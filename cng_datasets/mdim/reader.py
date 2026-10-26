@@ -93,6 +93,25 @@ def _open_array(path: str, variable: str):
     return ds, arr
 
 
+def _valid_range(arr) -> Tuple[Optional[float], Optional[float]]:
+    """CF `valid_min` / `valid_max`, or `valid_range`, in stored (packed) units.
+
+    CF says values outside the valid range are missing. GDAL's classic netCDF
+    driver applies this, but its multidimensional API does not (#278).
+    """
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    rng = _attr(arr, "valid_range")
+    if rng is not None and np.size(rng) == 2:
+        lo, hi = np.ravel(rng)
+        return num(lo), num(hi)
+    return num(_attr(arr, "valid_min")), num(_attr(arr, "valid_max"))
+
+
 def _coordinate(dim) -> np.ndarray:
     iv = dim.GetIndexingVariable()
     if iv is None:
@@ -280,7 +299,8 @@ class CubeSource:
     def read(self, variable: str, t0: int, t1: int, y0: int, y1: int,
              x0: int, x1: int) -> np.ndarray:
         """Values as float64 (time, lat, lon) in storage lat/lon order, with
-        nodata as NaN and CF scale/offset applied. [t0, t1) must lie in one file."""
+        nodata and values outside the CF valid range as NaN, and CF scale/offset
+        applied. [t0, t1) must lie in one file."""
         seg = next(s for s in self.segments if s.start <= t0 < s.start + s.size)
         if t1 > seg.start + seg.size:
             raise ValueError("a read may not span files")
@@ -299,6 +319,11 @@ class CubeSource:
             pass
         if nodata is not None and not np.isnan(nodata):
             data[data == nodata] = np.nan
+        lo, hi = _valid_range(arr)
+        if lo is not None:
+            data[data < lo] = np.nan
+        if hi is not None:
+            data[data > hi] = np.nan
         scale, offset = arr.GetScale(), arr.GetOffset()
         if scale not in (None, 1.0) or offset not in (None, 0.0):
             data = data * (scale if scale is not None else 1.0) + (offset or 0.0)
