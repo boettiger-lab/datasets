@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **ibis is no longer a dependency** (#291). It was used only to open DuckDB connections in `repartition` and the raster merge, with every query sent through as raw SQL, and the code already routed around it because it could not parse DuckDB's `GEOMETRY(OGC:CRS84)` type. Both now use plain `duckdb` connections, and the second connection repartition opened just to read the source schema is gone. This also clears one blocker for DuckDB 2.0 (#280, ibis-project/ibis#12196).
+
 ## [0.11.4] - 2026-10-26
 
 ### Changed

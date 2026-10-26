@@ -21,7 +21,7 @@ from typing import List, Optional
 
 from ..provenance import kv_metadata_sql
 
-import ibis
+import duckdb
 import yaml
 
 from cng_datasets.duckdb_memory import to_duckdb_memory_limit
@@ -53,12 +53,12 @@ def find_missing_chunks(chunks_dir: str, expect_chunks: int, con=None) -> List[i
     """
     own_con = con is None
     if own_con:
-        con = ibis.duckdb.connect()
+        con = duckdb.connect()
         configure_s3_credentials(con)
     try:
         manifest_glob = f"{chunks_dir.rstrip('/')}/_manifest/chunk-*.parquet"
         try:
-            rows = con.raw_sql(
+            rows = con.execute(
                 f"SELECT DISTINCT chunk_index FROM read_parquet('{manifest_glob}')"
             ).fetchall()
         except Exception as e:
@@ -142,9 +142,9 @@ def merge_raster_chunks(
     """
     print(f"Merging raster hex chunks from {chunks_dir} to {output_dir}")
 
-    con = ibis.duckdb.connect()
+    con = duckdb.connect()
     configure_s3_credentials(con)
-    con.raw_sql("SET preserve_insertion_order=false")
+    con.execute("SET preserve_insertion_order=false")
     requested_limit = memory_limit or os.environ.get("DUCKDB_MEMORY_LIMIT")
     if requested_limit:
         # Normalised because the value reaching here has usually passed through
@@ -153,9 +153,9 @@ def merge_raster_chunks(
         effective_limit = to_duckdb_memory_limit(requested_limit)
         suffix = "" if effective_limit == requested_limit else f" (from {requested_limit})"
         print(f"Setting DuckDB memory_limit={effective_limit}{suffix}")
-        con.raw_sql(f"SET memory_limit='{effective_limit}'")
-    con.raw_sql("SET http_timeout=1200")
-    con.raw_sql("SET http_retries=30")
+        con.execute(f"SET memory_limit='{effective_limit}'")
+    con.execute("SET http_timeout=1200")
+    con.execute("SET http_retries=30")
 
     # Checked before anything is read or written, so an incomplete fan-out costs
     # nothing and leaves every chunk in place to inspect.
@@ -170,7 +170,7 @@ def merge_raster_chunks(
     # right partition, and a mis-filed part is visible rather than silently
     # merged into whatever its first row's h0 happens to be.
     try:
-        h0_vals = con.raw_sql(
+        h0_vals = con.execute(
             f"SELECT DISTINCT h0 FROM read_parquet('{parts_glob}', hive_partitioning=true) "
             "ORDER BY h0"
         ).fetchall()
@@ -203,7 +203,7 @@ def merge_raster_chunks(
         # when 0 is among --parent-resolutions, and re-adding the path-derived
         # one would either duplicate the column or change the output schema
         # relative to an unchunked build.
-        con.raw_sql(
+        con.execute(
             f"COPY (SELECT * EXCLUDE (h0) FROM "
             f"read_parquet('{chunks_dir.rstrip('/')}/h0={h0}/part-*.parquet', "
             f"hive_partitioning=true)) "
@@ -230,7 +230,7 @@ def merge_raster_chunks(
     # failure leaves the chunks intact to debug (issue #102's UBIGINT check).
     hex_glob = f"{output_dir.rstrip('/')}/h0=*/data_0.parquet"
     print(f"Asserting H3 columns are UBIGINT via {hex_glob}...")
-    assert_h3_columns_unsigned(lambda sql: con.raw_sql(sql).fetchall(), hex_glob)
+    assert_h3_columns_unsigned(lambda sql: con.execute(sql).fetchall(), hex_glob)
 
     shutil.rmtree(local_dir, ignore_errors=True)
     print(f"✓ Merged {written} h0 partitions")

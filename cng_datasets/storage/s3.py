@@ -31,24 +31,14 @@ def configure_s3_credentials(con) -> None:
     Configure S3 credentials for DuckDB using environment variables.
 
     Args:
-        con: DuckDB connection (raw or ibis) to configure
+        con: DuckDB connection to configure
     """
     # Install and load httpfs extension for S3/HTTP access FIRST
-    # Handle both raw DuckDB and Ibis connections
-    if hasattr(con, 'raw_sql'):
-        # Ibis connection
-        con.raw_sql("INSTALL httpfs")
-        con.raw_sql("LOAD httpfs")
-    else:
-        # Raw DuckDB connection
-        con.execute("INSTALL httpfs")
-        con.execute("LOAD httpfs")
+    con.execute("INSTALL httpfs")
+    con.execute("LOAD httpfs")
 
     # Enable large buffer size for complex geometries
-    if hasattr(con, 'raw_sql'):
-        con.raw_sql("SET arrow_large_buffer_size=true")
-    else:
-        con.execute("SET arrow_large_buffer_size=true")
+    con.execute("SET arrow_large_buffer_size=true")
 
     key = os.getenv("AWS_ACCESS_KEY_ID", "")
     secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -76,10 +66,7 @@ def configure_s3_credentials(con) -> None:
         REGION '{region}'
     );
     """
-    if hasattr(con, 'raw_sql'):
-        con.raw_sql(query)
-    else:
-        con.execute(query)
+    con.execute(query)
 
 
 class S3Manager:
