@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-26
+
 ### Added
 - **`workflow --convert-memory`** sizes the convert pod (#275). Before this flag existed, the convert pod silently used `--hex-memory`, so a convert that ran out of memory could only be fixed by raising hex memory too, or by editing the manifest by hand. Without the flag, the convert pod still uses `--hex-memory`, as before.
 - The PyPI package now links to the repository, issues and changelog (#262).
@@ -305,6 +307,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.11.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.1
 [0.11.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.0
 [0.10.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.10.0
 [0.9.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.9.0
