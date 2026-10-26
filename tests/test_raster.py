@@ -4655,7 +4655,8 @@ class TestMosaicScratch:
         self._mosaic(tiles, out, os.path.join(temp_dir, "work"), monkeypatch,
                      nodata="-9999,-1111", resampling="nearest")
 
-        band = gdal.Open(out).GetRasterBand(1)
+        ds = gdal.Open(out)
+        band = ds.GetRasterBand(1)
         arr = band.ReadAsArray()
         assert band.GetNoDataValue() == -9999
         assert -1111 not in arr
