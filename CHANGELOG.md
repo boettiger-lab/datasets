@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The image has one GDAL and one GEOS** (#285). rasterio, pyogrio, pyproj, shapely and exactextract were installed as wheels, each bundling its own copy of GDAL, PROJ or GEOS, so the image held three GDALs (3.14.0dev, 3.12.2, 3.12.4) and `raster/cog.py` loaded two of them in one process, each with its own config options, credentials and caches. They are now built from source against the base image's libraries, and the build fails if any binding reports a different GDAL or GEOS. PROJ drops from four copies to two: the osgeo base links GDAL to a private PROJ that ships no headers, so pyproj links Ubuntu's libproj, which GDAL's dependencies already load.
+
 ## [0.11.3] - 2026-10-26
 
 ### Fixed

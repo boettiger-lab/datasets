@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     python3-numpy \
     libgeos-dev \
+    libproj-dev \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Build tippecanoe 2.79.0 from source
@@ -52,7 +54,40 @@ RUN uv pip install pip
 # Install the package with uv for fast resolution (GDAL already available from system).
 # [raster] extras pulls in exactextract and rasterio for the raster→H3 pipeline (#84).
 # Include pytest and pytest-timeout so tests can run inside the container without extra installs.
-RUN uv pip install -e ".[raster]" pytest pytest-timeout pytest-mock
+#
+# The packages that link GDAL, PROJ or GEOS are built from source against the
+# base image's libraries (#285). Their wheels each bundle a private copy, so the
+# image held three GDALs, and raster/cog.py loaded two of them in one process.
+# GDAL in this base links a private PROJ that has no headers, so pyproj links
+# Ubuntu's libproj, which GDAL's own dependencies already load.
+# The build constraint pins NumPy in the isolated build environments to the
+# system NumPy; a newer one fails shapely's Cython build against older headers.
+RUN echo "numpy==$(/usr/bin/python3 -c 'import numpy; print(numpy.__version__)')" > /tmp/build-constraints.txt \
+    && uv pip install --build-constraint /tmp/build-constraints.txt \
+    --no-binary rasterio --no-binary pyogrio --no-binary pyproj \
+    --no-binary shapely --no-binary exactextract \
+    -e ".[raster]" pytest pytest-timeout pytest-mock
+
+# Fail the build if any binding carries a GDAL or GEOS other than the system one.
+RUN python3 - <<'EOF'
+import subprocess
+from osgeo import gdal
+import pyogrio, rasterio, shapely
+
+gdal_version = subprocess.check_output(["gdal-config", "--version"], text=True).strip()
+geos_version = subprocess.check_output(["geos-config", "--version"], text=True).strip()
+found = {
+    "osgeo": gdal.__version__,
+    "rasterio": rasterio.__gdal_version__,
+    "pyogrio": pyogrio.__gdal_version_string__,
+}
+print(f"gdal-config {gdal_version}: {found}")
+print(f"geos-config {geos_version}: shapely {shapely.geos_version_string}")
+# A development GDAL reports "3.14.0dev-<commit>" where gdal-config says "3.14.0dev".
+bad = {k: v for k, v in found.items() if v.split("-")[0] != gdal_version}
+if bad or shapely.geos_version_string != geos_version:
+    raise SystemExit(f"bindings disagree with the system libraries: {bad}")
+EOF
 
 # Point PROJ CLI tools to the highest-versioned proj.db on the system.
 # The gdal:ubuntu-full image ships GDAL 3.13 with a compatible PROJ (requires
