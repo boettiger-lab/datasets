@@ -2218,10 +2218,11 @@ class TestAntimeridianSplit:
                            destination=out, progress=False)
         con = duckdb.connect()
         con.execute("LOAD spatial")
+        con.execute("SET geometry_always_xy = true")
         import shapely
         rows = {}
         for name, wkb, km2 in con.execute(f"""
-                SELECT name, ST_AsWKB(geom), ST_Area_Spheroid(ST_FlipCoordinates(geom)) / 1e6
+                SELECT name, ST_AsWKB(geom), ST_Area_Spheroid(geom) / 1e6
                 FROM '{out}'""").fetchall():
             g = shapely.from_wkb(bytes(wkb))
             parts = getattr(g, "geoms", [g])

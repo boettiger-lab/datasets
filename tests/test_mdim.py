@@ -278,7 +278,7 @@ class TestAggregatePlacement:
                 parts.extend(rows(p, "h6, v", order="h6"))
         assert sorted(parts) == whole
         manifest = duckdb.sql(
-            f"SELECT count(*) FROM read_parquet('{tmp_path}/sub/_manifest/*.parquet')").fetchone()[0]
+            f"SELECT count(*) FROM read_parquet('{tmp_path}/sub/_manifest/*.parquet')").fetchall()[0][0]
         assert manifest == len(sub.chunk_cells())
 
 
@@ -369,7 +369,7 @@ class TestTimeAndOptions:
         assert all(proc.process_chunk(i) is None for i in range(len(proc.chunk_cells())))
         assert not any(p.startswith("h0=") for p in os.listdir(tmp_path / "o"))
         wrote = duckdb.sql(f"SELECT bool_or(wrote_data), count(*) FROM "
-                           f"read_parquet('{tmp_path}/o/_manifest/*.parquet')").fetchone()
+                           f"read_parquet('{tmp_path}/o/_manifest/*.parquet')").fetchall()[0]
         assert wrote == (False, 7)
 
 

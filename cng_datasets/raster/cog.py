@@ -207,6 +207,9 @@ def _worker_con():
             except duckdb.Error:
                 con.execute(f"INSTALL {extension}{source}")
                 con.execute(f"LOAD {extension}")
+        # Boundaries are (lon, lat); DuckDB 2.0 requires this before the GDAL
+        # copy with an SRS (#280).
+        con.execute("SET geometry_always_xy = true")
         # Bound it, and bound it small. This connection resolves boundaries and
         # writes one part per chunk — kilobytes of working set — but a worker
         # handles many chunks in its lifetime and DuckDB does not return its
@@ -426,9 +429,11 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
             f"COPY (SELECT * FROM ({select}) WHERE {keep}) "
             f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
         )
+        # fetchall, not fetchone: DuckDB 2.0 refuses other work on the
+        # connection while a result is only partly fetched (#280).
         empty = con.execute(
             f"SELECT count(*) = 0 FROM read_parquet('{path}')"
-        ).fetchone()[0]
+        ).fetchall()[0][0]
     finally:
         for raw_path in raws:
             os.remove(raw_path)
@@ -497,9 +502,11 @@ def _write_chunk_part(frame, op_name, out_dir, index):
             f"COPY (SELECT {cols} FROM part_frame WHERE {keep}) "
             f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
         )
+        # fetchall, not fetchone: DuckDB 2.0 refuses other work on the
+        # connection while a result is only partly fetched (#280).
         empty = con.execute(
             f"SELECT count(*) = 0 FROM read_parquet('{path}')"
-        ).fetchone()[0]
+        ).fetchall()[0][0]
     finally:
         con.unregister("part_frame")
     if empty:
@@ -2205,6 +2212,7 @@ class RasterProcessor:
         # Install and load extensions
         con.execute("INSTALL spatial")
         con.execute("LOAD spatial")
+        con.execute("SET geometry_always_xy = true")  # (lon, lat) throughout (#280)
         con.execute("INSTALL h3 FROM community")
         con.execute("LOAD h3")
 

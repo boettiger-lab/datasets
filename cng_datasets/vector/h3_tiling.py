@@ -185,10 +185,10 @@ def _lon_gap_sql(geom_expr: str) -> str:
     POLYGON((-180 -78, 180 -78, 180 -50, -180 -50, -180 -78)), whose remaining
     vertex set is empty (NULL gap), so it is still band-split.
     """
-    lons = f"list_transform(ST_Dump(ST_Points({geom_expr})), s -> ST_X(s.geom))"
+    lons = f"list_transform(ST_Dump(ST_Points({geom_expr})), lambda s: ST_X(s.geom))"
     return (
-        f"(list_min(list_filter({lons}, x -> x >= 0 AND x < 180)) "
-        f"- list_max(list_filter({lons}, x -> x < 0 AND x > -180)))"
+        f"(list_min(list_filter({lons}, lambda x: x >= 0 AND x < 180)) "
+        f"- list_max(list_filter({lons}, lambda x: x < 0 AND x > -180)))"
     )
 
 
@@ -237,15 +237,15 @@ def _planar_area_deg2_sql(geom_expr: str) -> str:
 def _spheroid_area_m2_sql(geom_expr: str) -> str:
     """Geodesic area in m² of a (lon, lat) geometry.
 
-    DuckDB's ``ST_Area_Spheroid`` reads its input as (latitude, longitude),
-    while every geometry here is (lon, lat) (convert writes it that way with
-    ``always_xy``). Unflipped, a feature beyond ±90° longitude has an
-    out-of-range "latitude" and measures NaN, and one inside it is measured
-    with its axes swapped. NaN sorts above every number in DuckDB, so a single
-    such feature also hid the chunk's true worst feature from the #107 guard
-    (issue #253).
+    Every geometry here is (lon, lat): convert writes it that way with
+    ``always_xy``, and connections set ``geometry_always_xy`` so
+    ``ST_Area_Spheroid`` reads it that way too. Before DuckDB 2.0 the function
+    read (latitude, longitude), and the input was flipped here: unflipped, a
+    feature beyond ±90° longitude has an out-of-range "latitude" and measures
+    NaN, and NaN sorts above every number in DuckDB, so a single such feature
+    hid the chunk's true worst feature from the #107 guard (issue #253).
     """
-    return f"ST_Area_Spheroid(ST_FlipCoordinates({geom_expr}))"
+    return f"ST_Area_Spheroid({geom_expr})"
 
 
 def _feature_area_m2_sql(geom_expr: str) -> str:
@@ -656,6 +656,10 @@ def setup_duckdb_connection(
     for ext in extensions:
         con.execute(f"INSTALL {ext}")
         con.execute(f"LOAD {ext}")
+    if "spatial" in extensions:
+        # Geometries are (lon, lat) throughout; DuckDB 2.0 refuses axis-order
+        # sensitive functions until this is set (#280).
+        con.execute("SET geometry_always_xy = true")
 
     # Install h3 from community repository
     con.execute("INSTALL h3 FROM community")
@@ -786,7 +790,7 @@ class H3VectorProcessor:
         converts an otherwise-fatal C++ page-size assertion in the Pass-1 COPY
         into an actionable error.
 
-        Area is measured geodesically (``ST_Area_Spheroid``, on flipped axes —
+        Area is measured geodesically (``ST_Area_Spheroid`` on (lon, lat) —
         see ``_spheroid_area_m2_sql``) for the common case.
         Features whose longitude bbox spans more than 180 deg need a planar
         estimate instead, because ``ST_Area_Spheroid`` returns NaN for them (or a

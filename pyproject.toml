@@ -13,7 +13,7 @@ authors = [
     {name = "Boettiger Lab", email = "cboettig@berkeley.edu"}
 ]
 dependencies = [
-    "duckdb==1.5.4",
+    "duckdb==2.0.0",
     "polars>=0.20.0",
     "pyarrow>=15.0.0",
     "geopandas>=0.14.0",
