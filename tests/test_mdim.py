@@ -25,7 +25,8 @@ LAT0, LON0 = 37.0, -122.5  # fixture cubes sit here
 
 def make_cube(path, driver, lat, lon, time_vals, units="days since 2000-01-01",
               calendar="standard", data=None, block=None, nodata=None,
-              order=("time", "lat", "lon"), typed_dims=True, scale=None, offset=None):
+              order=("time", "lat", "lon"), typed_dims=True, scale=None, offset=None,
+              attrs=None):
     """Write a (time, lat, lon) cube with GDAL's multidimensional API."""
     drv = gdal.GetDriverByName(driver)
     ds = drv.CreateMultiDimensional(path)
@@ -60,6 +61,9 @@ def make_cube(path, driver, lat, lon, time_vals, units="days since 2000-01-01",
             a.SetScale(scale)
         if offset is not None:
             a.SetOffset(offset)
+        for name, val in (attrs or {}).items():
+            shape = [len(val)] if np.ndim(val) else []
+            a.CreateAttribute(name, shape, gdal.ExtendedDataType.Create(gdal.GDT_Float32)).Write(val)
         a.Write(np.ascontiguousarray(np.transpose(arr, perm)).astype(np.float32))
     ds = None
     return path
@@ -193,6 +197,26 @@ class TestReader:
         path = make_cube(str(tmp_path / "s.nc"), "netCDF", lat, lon, [0],
                          data={"v": np.full((1, 2, 2), 10.0)}, scale=0.5, offset=273.15)
         np.testing.assert_allclose(CubeSource([path], ["v"]).read("v", 0, 1, 0, 2, 0, 2), 278.15, rtol=1e-6)
+
+    @pytest.mark.parametrize("driver, ext", [("Zarr", ".zarr"), ("netCDF", ".nc")])
+    def test_values_outside_cf_valid_range_are_nodata(self, tmp_path, driver, ext):
+        """CF valid_min/valid_max are in stored units, before scale (#278)."""
+        from cng_datasets.mdim import CubeSource
+        lat, lon = grid(1, 4, 0.1)
+        v = np.array([[[-5.0, 0.0, 100.0, 120.0]]])
+        path = make_cube(str(tmp_path / f"r{ext}"), driver, lat, lon, [0], data={"v": v},
+                         scale=0.5, attrs={"valid_min": 0.0, "valid_max": 100.0})
+        got = CubeSource([path], ["v"]).read("v", 0, 1, 0, 1, 0, 4)
+        np.testing.assert_allclose(got, [[[np.nan, 0.0, 50.0, np.nan]]])
+
+    def test_valid_range_attribute(self, tmp_path):
+        from cng_datasets.mdim import CubeSource
+        lat, lon = grid(1, 3, 0.1)
+        path = make_cube(str(tmp_path / "vr.nc"), "netCDF", lat, lon, [0],
+                         data={"v": np.array([[[-1.0, 3.0, 11.0]]])},
+                         attrs={"valid_range": [0.0, 10.0]})
+        got = CubeSource([path], ["v"]).read("v", 0, 1, 0, 1, 0, 3)
+        np.testing.assert_allclose(got, [[[np.nan, 3.0, np.nan]]])
 
     def test_untyped_dimensions_are_classified_by_name(self, tmp_path):
         from cng_datasets.mdim import CubeSource
