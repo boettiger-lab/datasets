@@ -298,6 +298,48 @@ class TestWorkflowGeneration:
             # A plain (un-exported) assignment is invisible to the child process.
             assert "export TIPPECANOE_MAX_THREADS=" in command
 
+    @pytest.mark.parametrize("quota, expected", [(256, 128), (16, 16), (6, 4), (None, 4)])
+    def test_pmtiles_threads_follow_pod_quota_capped_at_128(self, monkeypatch, quota, expected):
+        """Threads come from the cgroup quota, not the node's cores, and stay <= 128 (#273)."""
+        import re
+        from cng_datasets.raster import cog
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            with open(Path(tmpdir) / "test-ds-pmtiles.yaml") as f:
+                command = yaml.safe_load(f)["spec"]["template"]["spec"]["containers"][0]["command"][2]
+        snippet = re.search(r'export TIPPECANOE_MAX_THREADS=\$\(python3 -c "(.*)"\)', command).group(1)
+        monkeypatch.setattr(cog, "_cgroup_cpu_count", lambda: quota)
+        import io, contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(snippet, {})
+        assert int(out.getvalue()) == expected
+
+    def test_convert_memory_defaults_to_hex_memory_and_can_be_set(self):
+        """--convert-memory sizes the convert pod; unset it keeps following --hex-memory (#275)."""
+        def convert_memory(tmpdir, **kw):
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                hex_memory="16Gi",
+                **kw,
+            )
+            with open(Path(tmpdir) / "test-ds-convert.yaml") as f:
+                res = yaml.safe_load(f)["spec"]["template"]["spec"]["containers"][0]["resources"]
+            return res["requests"]["memory"], res["limits"]["memory"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assert convert_memory(tmpdir) == ("16Gi", "16Gi")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assert convert_memory(tmpdir, convert_memory="32Gi") == ("32Gi", "32Gi")
+
     def test_pmtiles_job_raises_open_file_limit(self):
         """Soft fd limit must be raised before tippecanoe on high-core nodes (#154)."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1027,8 +1069,25 @@ class TestRasterWorkflowGeneration:
             cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
             assert '--nodata "-9999,-1111,32767"' in cmd
             assert "--hex-resampling mode" in cmd
-            # Regression guard: --resampling must keep its line continuation so
-            # the appended flags stay part of the same shell command.
+            # A categorical source warps with nearest, never bilinear (#272).
+            # The trailing continuation is a regression guard: the appended
+            # flags must stay part of the same shell command.
+            assert "--resampling nearest \\\n" in cmd
+            assert "bilinear" not in cmd
+
+    @pytest.mark.timeout(5)
+    def test_preprocess_job_continuous_source_keeps_bilinear(self):
+        """A continuous (mean) source still warps bilinear (#272 only changes categorical)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(
+                dataset_name="test-mosaic",
+                source_urls=self.TILE_URLS,
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                hex_resampling="mean",
+            )
+            job = self._load_yaml(Path(tmpdir) / "test-mosaic-preprocess-cog.yaml")
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
             assert "--resampling bilinear \\\n" in cmd
 
     @pytest.mark.timeout(5)

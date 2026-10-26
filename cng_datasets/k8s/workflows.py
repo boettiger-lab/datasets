@@ -783,6 +783,7 @@ def generate_dataset_workflow(
     id_column: Optional[str] = None,
     layer: Optional[str] = None,
     hex_memory: str = "8Gi",
+    convert_memory: Optional[str] = None,
     hex_retries: int = DEFAULT_HEX_RETRIES,
     max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
     max_parallelism: int = 50,
@@ -839,6 +840,8 @@ def generate_dataset_workflow(
         parent_resolutions: List of parent H3 resolutions to include (default: [9, 8, 0])
         id_column: ID column name (auto-detected if not specified)
         hex_memory: Memory request/limit for hex job pods (default: "8Gi")
+        convert_memory: Memory request/limit for the convert job pod
+            (default: same as hex_memory, issue #275)
         hex_retries: Per-index retry budget for the hex fan-out
             (backoffLimitPerIndex, default 2). A preemption is already ignored
             by the pod failure policy; this covers everything else that can end
@@ -987,7 +990,7 @@ def generate_dataset_workflow(
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo, config)
 
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config, simplify_tolerance=simplify_tolerance, trim_strings=trim_strings, lat_column=lat_column, lon_column=lon_column, expect_features=expect_features)
+    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=convert_memory or hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config, simplify_tolerance=simplify_tolerance, trim_strings=trim_strings, lat_column=lat_column, lon_column=lon_column, expect_features=expect_features)
 
     # Generate pmtiles job (uses converted parquet, not source)
     _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config, h3_resolution=h3_resolution, max_zoom=pmtiles_max_zoom)
@@ -1510,7 +1513,10 @@ def _generate_cog_preprocess_job(
     flags = [f'--input "{u}"' for u in source_urls]
     flags.append(f'--output-cog "{output_cog_url}"')
     flags.append("--target-crs EPSG:4326")
-    flags.append("--resampling bilinear")
+    # Bilinear invents class codes at every boundary of a categorical source,
+    # so those warp with nearest (issue #272).
+    categorical = hex_resampling in ("mode", "fractions")
+    flags.append(f"--resampling {'nearest' if categorical else 'bilinear'}")
     if target_extent is not None:
         xmin, ymin, xmax, ymax = target_extent
         flags.append(f'--target-extent "{xmin},{ymin},{xmax},{ymax}"')
@@ -2452,11 +2458,13 @@ ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$DATASET.geojsonl /v
 # TIPPECANOE_MAX_THREADS must be a power of 2; Kubernetes nodes can expose
 # non-power-of-2 logical CPU counts which triggers an internal assertion
 # failure "N shards not a power of 2" (felt/tippecanoe#216).
-# Round detected CPU count down to nearest power of 2 to preserve I/O parallelism.
+# Size from the pod's cgroup CPU quota, not os.cpu_count() (the node's cores),
+# round down to a power of 2, and cap at 128: at 256+ threads tippecanoe caps
+# its shards at 745, not a power of 2, and aborts anyway (issue #273).
 # Must be `export`ed: tippecanoe is a child process and reads this from the
 # environment, not the shell. A plain assignment is invisible to it, so it
 # falls back to the raw (non-power-of-2) CPU count and crashes (issue #77).
-export TIPPECANOE_MAX_THREADS=$(python3 -c "import os; n=os.cpu_count() or 1; print(1<<(n.bit_length()-1))")
+export TIPPECANOE_MAX_THREADS=$(python3 -c "from cng_datasets.raster.cog import _cgroup_cpu_count as c; n=min(c() or 4, 128); print(1<<(n.bit_length()-1))")
 
 # Raise the soft open-file limit before tippecanoe (issue #154). It opens many
 # temp files (per-thread x per-tile shards); on high-core nodes os.cpu_count()
