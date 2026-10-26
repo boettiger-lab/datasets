@@ -44,9 +44,10 @@ COPY cng_datasets/ ./cng_datasets/
 RUN uv venv /opt/venv --system-site-packages
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Pin NumPy to 1.x for compatibility with system GDAL
+# NumPy comes from the base image (Ubuntu 26.04: python3-numpy 2.x), which the
+# system GDAL bindings are built against; do not shadow it in the venv.
 # Also install pip so users can pip install instead of uv pip install.
-RUN uv pip install "numpy<2" pip
+RUN uv pip install pip
 
 # Install the package with uv for fast resolution (GDAL already available from system).
 # [raster] extras pulls in exactextract and rasterio for the raster→H3 pipeline (#84).
