@@ -207,6 +207,9 @@ def _worker_con():
             except duckdb.Error:
                 con.execute(f"INSTALL {extension}{source}")
                 con.execute(f"LOAD {extension}")
+        # Boundaries are (lon, lat); DuckDB 2.0 requires this before the GDAL
+        # copy with an SRS (#280).
+        con.execute("SET geometry_always_xy = true")
         # Bound it, and bound it small. This connection resolves boundaries and
         # writes one part per chunk — kilobytes of working set — but a worker
         # handles many chunks in its lifetime and DuckDB does not return its
@@ -2205,6 +2208,7 @@ class RasterProcessor:
         # Install and load extensions
         con.execute("INSTALL spatial")
         con.execute("LOAD spatial")
+        con.execute("SET geometry_always_xy = true")  # (lon, lat) throughout (#280)
         con.execute("INSTALL h3 FROM community")
         con.execute("LOAD h3")
 

@@ -604,6 +604,7 @@ def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: b
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    con.execute("SET geometry_always_xy = true")  # (lon, lat) throughout (#280)
     con.execute("SET arrow_large_buffer_size=true")
 
     try:
@@ -670,6 +671,7 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    con.execute("SET geometry_always_xy = true")  # (lon, lat) throughout (#280)
     con.execute("SET arrow_large_buffer_size=true")
 
     try:
@@ -746,6 +748,7 @@ def get_string_columns(source_url: str, layer: Optional[str] = None,
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    con.execute("SET geometry_always_xy = true")  # (lon, lat) throughout (#280)
     con.execute("SET arrow_large_buffer_size=true")
 
     try:
@@ -1026,6 +1029,7 @@ def process_parquet_input(
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    con.execute("SET geometry_always_xy = true")  # (lon, lat) throughout (#280)
 
     # Enable large buffer size for complex geometries
     con.execute("SET arrow_large_buffer_size=true")
@@ -1255,6 +1259,7 @@ def process_csv_input(
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    con.execute("SET geometry_always_xy = true")  # (lon, lat) throughout (#280)
     con.execute("SET arrow_large_buffer_size=true")
 
     try:
@@ -1403,6 +1408,7 @@ def write_with_duckdb(query: str, output_path: str,
     con = duckdb.connect(':memory:')
     con.install_extension("spatial")
     con.load_extension("spatial")
+    con.execute("SET geometry_always_xy = true")  # (lon, lat) throughout (#280)
     if split_dateline:
         register_dateline_split(con)
 

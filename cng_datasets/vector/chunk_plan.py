@@ -83,7 +83,7 @@ def feature_cells_sql(geom_expr: str, h3_resolution: int,
         f"CASE WHEN {gtype} = 'POINT' THEN 1 "
         f"WHEN {gtype} = 'MULTIPOINT' THEN ST_NPoints({geom_expr}) "
         f"WHEN {gtype} IN ('LINESTRING', 'MULTILINESTRING') THEN "
-        f"ST_Length_Spheroid(ST_FlipCoordinates({geom_expr})) / "
+        f"ST_Length_Spheroid({geom_expr}) / "
         f"h3_get_hexagon_edge_length_avg({res}, 'm') "
         f"ELSE {_polygon_cells_sql(geom_expr, h3_resolution, resolution_by_area)} END"
     )
