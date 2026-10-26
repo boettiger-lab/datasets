@@ -4570,3 +4570,109 @@ class TestEmptyCells:
         monkeypatch.setattr(os, "makedirs", makedirs)
 
         assert proc.process_h0_region(0) is None
+
+
+@requires_gdal_array
+class TestMosaicScratch:
+    """The mosaic COG's local scratch scales with the data, not the grid (#277)."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _tile(self, path, x0, data, epsg=4326, pixel=0.01, nodata=None):
+        ny, nx = data.shape
+        ds = gdal.GetDriverByName("GTiff").Create(
+            path, nx, ny, 1, gdal_array.NumericTypeCodeToGDALTypeCode(data.dtype),
+            options=["TILED=YES", "COMPRESS=DEFLATE"])
+        ds.SetGeoTransform([x0, pixel, 0, 1.0, 0, -pixel])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(epsg)
+        ds.SetProjection(srs.ExportToWkt())
+        if nodata is not None:
+            ds.GetRasterBand(1).SetNoDataValue(nodata)
+        ds.GetRasterBand(1).WriteArray(data)
+        ds = None
+        return path
+
+    def _mosaic(self, tiles, out, workdir, monkeypatch, **kwargs):
+        """Run create_mosaic_cog, keeping its workdir to inspect."""
+        from cng_datasets.raster.cog import create_mosaic_cog
+        os.makedirs(workdir)
+        monkeypatch.setattr(tempfile, "mkdtemp", lambda **k: workdir)
+        monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: None)
+        create_mosaic_cog(tiles, out, **kwargs)
+        return sorted(os.listdir(workdir))
+
+    @staticmethod
+    def _compression(path):
+        return gdal.Info(path, format="json")["metadata"]["IMAGE_STRUCTURE"].get("COMPRESSION")
+
+    @pytest.mark.timeout(60)
+    def test_tiles_on_target_grid_are_not_warped(self, temp_dir, monkeypatch):
+        rng = np.random.default_rng(0)
+        a = rng.integers(1, 9, (200, 200), dtype=np.uint8)
+        b = rng.integers(1, 9, (200, 200), dtype=np.uint8)
+        tiles = [self._tile(os.path.join(temp_dir, "a.tif"), 0.0, a),
+                 self._tile(os.path.join(temp_dir, "b.tif"), 2.0, b)]
+        out = os.path.join(temp_dir, "out.tif")
+        files = self._mosaic(tiles, out, os.path.join(temp_dir, "work"), monkeypatch,
+                             nodata=255, resampling="bilinear")
+
+        assert not [f for f in files if f.startswith("warped_")]
+        assert self._compression(os.path.join(temp_dir, "work", "intermediate.tif")) == "ZSTD"
+        # Bit-identical: no resampling happened, even though bilinear was asked for.
+        ds = gdal.Open(out)
+        assert (ds.RasterXSize, ds.RasterYSize) == (400, 200)
+        np.testing.assert_array_equal(ds.ReadAsArray(), np.hstack([a, b]))
+        assert ds.GetRasterBand(1).GetOverviewCount() > 0
+
+    @pytest.mark.timeout(60)
+    def test_other_crs_is_warped_to_compressed_scratch(self, temp_dir, monkeypatch):
+        data = np.full((100, 100), 7, dtype=np.uint8)
+        tile = self._tile(os.path.join(temp_dir, "m.tif"), 0.0, data, epsg=3857, pixel=1000.0)
+        out = os.path.join(temp_dir, "out.tif")
+        work = os.path.join(temp_dir, "work")
+        files = self._mosaic([tile], out, work, monkeypatch, nodata=255,
+                             resampling="nearest")
+
+        assert "warped_0.tif" in files
+        assert self._compression(os.path.join(work, "warped_0.tif")) == "ZSTD"
+        assert self._compression(os.path.join(work, "intermediate.tif")) == "ZSTD"
+        assert 7 in gdal.Open(out).ReadAsArray()
+
+    @pytest.mark.timeout(60)
+    def test_fill_codes_collapse_without_warp(self, temp_dir, monkeypatch):
+        a = np.full((50, 50), 11, dtype=np.int16)
+        a[0, :5] = -1111
+        b = np.full((50, 50), 22, dtype=np.int16)
+        b[0, :5] = -9999
+        tiles = [self._tile(os.path.join(temp_dir, "a.tif"), 0.0, a),
+                 self._tile(os.path.join(temp_dir, "b.tif"), 0.5, b)]
+        out = os.path.join(temp_dir, "out.tif")
+        self._mosaic(tiles, out, os.path.join(temp_dir, "work"), monkeypatch,
+                     nodata="-9999,-1111", resampling="nearest")
+
+        band = gdal.Open(out).GetRasterBand(1)
+        arr = band.ReadAsArray()
+        assert band.GetNoDataValue() == -9999
+        assert -1111 not in arr
+        assert (arr == -9999).sum() == 10
+        assert set(np.unique(arr)) == {-9999, 11, 22}
+
+    def test_shares_target_grid(self, temp_dir):
+        from cng_datasets.raster.cog import _shares_target_grid
+        data = np.zeros((10, 10), dtype=np.uint8)
+        a = self._tile(os.path.join(temp_dir, "a.tif"), 0.0, data)
+        b = self._tile(os.path.join(temp_dir, "b.tif"), 0.1, data)
+        half = self._tile(os.path.join(temp_dir, "half.tif"), 0.105, data)
+        coarse = self._tile(os.path.join(temp_dir, "coarse.tif"), 0.2, data, pixel=0.02)
+        merc = self._tile(os.path.join(temp_dir, "m.tif"), 0.0, data, epsg=3857, pixel=1000.0)
+
+        assert _shares_target_grid([a, b], "EPSG:4326")
+        assert not _shares_target_grid([a, half], "EPSG:4326")
+        assert not _shares_target_grid([a, coarse], "EPSG:4326")
+        assert not _shares_target_grid([merc], "EPSG:4326")
+        assert not _shares_target_grid([a], "EPSG:3857")

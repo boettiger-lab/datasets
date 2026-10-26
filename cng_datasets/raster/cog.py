@@ -1139,6 +1139,59 @@ def _collapse_fill_values(tif_path: str, fill_values: List[float], primary: floa
         ds = None
 
 
+def _scratch_gtiff_options(source_path: str) -> List[str]:
+    """Creation options for a local intermediate GeoTIFF.
+
+    An uncompressed intermediate is `grid pixels x bytes per pixel`, however
+    well the source compresses: about 595 GB for a 30 m global grid tiled from
+    0.12 GB of zips (issue #277). Compressed, tiled and sparse, the scratch
+    scales with the data instead, and empty blocks are not written at all.
+    """
+    return [
+        "TILED=YES",
+        "COMPRESS=ZSTD",
+        f"PREDICTOR={_compression_predictor(source_path)}",
+        "SPARSE_OK=TRUE",
+        "BIGTIFF=IF_SAFER",
+        "NUM_THREADS=ALL_CPUS",
+    ]
+
+
+def _shares_target_grid(paths: List[str], target_crs: str) -> bool:
+    """True when every raster is already in `target_crs` on one pixel grid.
+
+    Such a group mosaics exactly through a VRT, so warping it would only copy
+    every pixel to local disk (and resample them with the warp's algorithm,
+    which corrupts categorical sources unless it is nearest; #272, #277).
+    """
+    target = osr.SpatialReference()
+    if target.SetFromUserInput(target_crs) != 0:
+        return False
+    ref = None
+    for path in paths:
+        ds = gdal.Open(path)
+        if ds is None:
+            return False
+        try:
+            srs = osr.SpatialReference(wkt=ds.GetProjection())
+            gt = ds.GetGeoTransform(can_return_null=True)
+        finally:
+            ds = None
+        if gt is None or gt[2] != 0 or gt[4] != 0 or not srs.IsSame(target):
+            return False
+        if ref is None:
+            ref = gt
+            continue
+        if not (math.isclose(gt[1], ref[1], rel_tol=1e-9)
+                and math.isclose(gt[5], ref[5], rel_tol=1e-9)):
+            return False
+        for offset, size in ((gt[0] - ref[0], ref[1]), (gt[3] - ref[3], ref[5])):
+            steps = offset / size
+            if abs(steps - round(steps)) > 1e-6:
+                return False
+    return ref is not None
+
+
 def _h3_res_to_degrees(h3_resolution: int) -> float:
     """Approximate pixel size in degrees for a given H3 resolution.
 
@@ -1689,7 +1742,6 @@ def create_mosaic_cog(
             resampleAlg=resampling,
             multithread=True,
             format="GTiff",
-            creationOptions=["COMPRESS=NONE", "BIGTIFF=IF_SAFER"],
         )
         if target_extent is not None:
             xmin, ymin, xmax, ymax = target_extent
@@ -1699,23 +1751,38 @@ def create_mosaic_cog(
             warp_kwargs["xRes"] = target_resolution
             warp_kwargs["yRes"] = target_resolution
         primary_nodata = nodata_values[0] if nodata_values else None
+        build_vrt_opts = {}
         if primary_nodata is not None:
             # A band carries one nodata value; declare the primary here and
             # remap any remaining fill codes to it after the merge (issue #108).
             warp_kwargs["srcNodata"] = _fmt_gdal(primary_nodata)
             warp_kwargs["dstNodata"] = primary_nodata
+            build_vrt_opts["srcNodata"] = primary_nodata
+            build_vrt_opts["VRTNodata"] = primary_nodata
 
         for i, (crs_key, tiles) in enumerate(crs_groups.items()):
             print(f"  Building VRT for {crs_key} ({len(tiles)} tiles)...")
             vrt_path = os.path.join(workdir, f"group_{i}.vrt")
-            vrt_ds = gdal.BuildVRT(vrt_path, tiles, bandList=[band] if band else None)
+            # Tiles already on one grid in the target CRS need no warp: the VRT
+            # is the mosaic (issue #277). A clip or a new resolution still warps.
+            no_warp = (target_extent is None and target_resolution is None
+                       and _shares_target_grid(tiles, target_crs))
+            vrt_ds = gdal.BuildVRT(vrt_path, tiles, bandList=[band] if band else None,
+                                   **(build_vrt_opts if no_warp else {}))
             if vrt_ds is None:
                 raise RuntimeError(f"gdal.BuildVRT failed for CRS group {crs_key}")
             vrt_ds = None  # flush
 
+            if no_warp:
+                print(f"  {crs_key} is already on the target grid; not warping")
+                warped_paths.append(vrt_path)
+                continue
+
             warped_path = os.path.join(workdir, f"warped_{i}.tif")
             print(f"  Warping {crs_key} → {target_crs}...")
-            result = gdal.Warp(warped_path, vrt_path, **warp_kwargs)
+            result = gdal.Warp(warped_path, vrt_path,
+                               creationOptions=_scratch_gtiff_options(vrt_path),
+                               **warp_kwargs)
             if result is None:
                 raise RuntimeError(f"gdal.Warp failed for CRS group {crs_key}: {gdal.GetLastErrorMsg()}")
             result = None
@@ -1724,34 +1791,42 @@ def create_mosaic_cog(
         # Merge all warped groups into a final VRT
         print(f"  Merging {len(warped_paths)} warped group(s)...")
         merged_vrt = os.path.join(workdir, "merged.vrt")
-        build_vrt_opts = {}
-        if primary_nodata is not None:
-            build_vrt_opts["srcNodata"] = primary_nodata
-            build_vrt_opts["VRTNodata"] = primary_nodata
         merged_ds = gdal.BuildVRT(merged_vrt, warped_paths, **build_vrt_opts)
         if merged_ds is None:
             raise RuntimeError(f"gdal.BuildVRT failed for merge: {gdal.GetLastErrorMsg()}")
         merged_ds = None
 
+        # Collapse any secondary fill codes to the primary nodata before
+        # overviews so the merged COG carries a single nodata (issue #108).
+        # Integer bands do it as a lookup table on read; float bands are
+        # remapped in place after the intermediate is written.
+        collapse_in_place = False
+        if len(nodata_values) > 1:
+            print(f"  Collapsing fill codes {nodata_values} → {primary_nodata}...")
+            collapsed = _fill_collapse_vrt(merged_vrt, nodata_values, primary_nodata,
+                                           os.path.join(workdir, "collapsed.vrt"))
+            if collapsed is None:
+                collapse_in_place = True
+            else:
+                merged_vrt = collapsed
+
         # Write intermediate GTiff, build overviews, then write final COG.
         # Writing directly to COG via auto-overview generation is unreliable for S3
-        # output and for large files; the explicit BuildOverviews + COPY_SRC_OVERVIEWS
-        # pattern is the recommended approach for fast GDAL downsampling (issue #25).
+        # output and for large files; building overviews on the intermediate, which
+        # the COG driver then reuses, is the recommended approach for fast GDAL
+        # downsampling (issue #25).
         print("  Writing intermediate GTiff...")
         tmp_tif = os.path.join(workdir, "intermediate.tif")
         tmp_opts = gdal.TranslateOptions(
             format="GTiff",
-            creationOptions=["COMPRESS=NONE", "BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS"],
+            creationOptions=_scratch_gtiff_options(merged_vrt),
         )
         result = gdal.Translate(tmp_tif, merged_vrt, options=tmp_opts)
         if result is None:
             raise RuntimeError(f"gdal.Translate (GTiff) failed: {gdal.GetLastErrorMsg()}")
         result = None
 
-        # Collapse any secondary fill codes to the primary nodata before
-        # overviews so the merged COG carries a single nodata (issue #108).
-        if len(nodata_values) > 1:
-            print(f"  Collapsing fill codes {nodata_values} → {primary_nodata}...")
+        if collapse_in_place:
             _collapse_fill_values(tmp_tif, nodata_values, primary_nodata)
 
         print("  Building overviews...")
@@ -1769,7 +1844,6 @@ def create_mosaic_cog(
             creationOptions=[
                 f"COMPRESS={compression.upper()}",
                 "PREDICTOR=YES",
-                "COPY_SRC_OVERVIEWS=YES",
                 f"OVERVIEW_RESAMPLING={overview_resampling.upper()}",
                 "BIGTIFF=IF_SAFER",
                 "NUM_THREADS=ALL_CPUS",
@@ -2301,7 +2375,7 @@ class RasterProcessor:
                 warp_kwargs = dict(
                     dstSRS='EPSG:4326',
                     format='GTiff',
-                    creationOptions=['COMPRESS=NONE', 'BIGTIFF=IF_SAFER'],
+                    creationOptions=_scratch_gtiff_options(self.input_path),
                     resampleAlg=self.resampling,
                     multithread=True,
                 )
@@ -2313,7 +2387,7 @@ class RasterProcessor:
             else:
                 translate_kwargs = dict(
                     format='GTiff',
-                    creationOptions=['COMPRESS=NONE', 'BIGTIFF=IF_SAFER'],
+                    creationOptions=_scratch_gtiff_options(self.input_path),
                 )
                 if primary_nodata is not None:
                     translate_kwargs["noData"] = primary_nodata
@@ -2335,7 +2409,6 @@ class RasterProcessor:
                 tmp_ds = gdal.Open(tmp_tif, gdal.GA_Update)
                 tmp_ds.BuildOverviews(overview_resampling.upper(), [2, 4, 8, 16, 32, 64])
                 tmp_ds = None
-                cog_creation_opts.append('COPY_SRC_OVERVIEWS=YES')
                 cog_creation_opts.append(f'OVERVIEW_RESAMPLING={overview_resampling.upper()}')
 
             print("  Writing COG...")
