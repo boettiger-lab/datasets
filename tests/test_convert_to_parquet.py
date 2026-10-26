@@ -2246,8 +2246,12 @@ class TestAntimeridianSplit:
         assert "cng_split_dateline" not in plain
 
     def test_a_genuinely_wide_feature_is_left_alone(self):
-        """Shifting does not narrow a feature that really spans > 180°."""
+        """Shifting does not narrow a feature that really spans > 180°.
+
+        Densified like a reprojected feature: a bare four-corner box from
+        -100 to 100 cannot say which way its edges run.
+        """
         import shapely
         from cng_datasets.vector.convert_to_parquet import split_dateline_wkb
-        wide = shapely.to_wkb(shapely.box(-100, 0, 100, 10))
+        wide = shapely.to_wkb(shapely.Polygon(self._lonlat_box(-100, 100, 0, 10, n=200)))
         assert split_dateline_wkb(wide) == wide
