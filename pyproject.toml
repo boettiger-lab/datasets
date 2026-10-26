@@ -52,6 +52,12 @@ docs = [
     "linkify-it-py",
 ]
 
+[project.urls]
+Homepage = "https://github.com/boettiger-lab/datasets"
+Repository = "https://github.com/boettiger-lab/datasets"
+Issues = "https://github.com/boettiger-lab/datasets/issues"
+Changelog = "https://github.com/boettiger-lab/datasets/blob/main/CHANGELOG.md"
+
 [project.scripts]
 cng-datasets = "cng_datasets.cli:main"
 cng-convert-to-parquet = "cng_datasets.vector.convert_to_parquet:main"

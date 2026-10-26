@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`workflow --convert-memory`** sizes the convert pod (#275). Before this flag existed, the convert pod silently used `--hex-memory`, so a convert that ran out of memory could only be fixed by raising hex memory too, or by editing the manifest by hand. Without the flag, the convert pod still uses `--hex-memory`, as before.
+- The PyPI package now links to the repository, issues and changelog (#262).
+
+### Fixed
+- **`preprocess-cog` no longer warps categorical rasters with bilinear resampling** (#272). With `--hex-resampling mode` or `fractions`, the warp to EPSG:4326 now uses `nearest`. Bilinear invented class codes along every class boundary and blended codes with nodata. Continuous sources still warp bilinear. Categorical datasets built through `preprocess-cog` (multi-tile mosaics, `--band`, or a reprojected source) should be rebuilt.
+- **The PMTiles job no longer aborts on nodes with 256 or more cores** (#273). tippecanoe's thread count now comes from the pod's CPU quota rather than the node's core count, rounded down to a power of 2 and capped at 128. From 256 threads upward tippecanoe caps its shard count at 745, which is not a power of 2, so it aborted.
+
 ## [0.11.0] - 2026-10-05
 
 ### Added
