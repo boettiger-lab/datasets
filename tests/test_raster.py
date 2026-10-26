@@ -514,7 +514,7 @@ class TestRasterToH3Conversion:
 
             # Verify parquet structure
             con = processor.con
-            df = con.read_parquet(result).fetchdf()
+            df = con.execute(f"SELECT * FROM read_parquet('{result}')").fetchdf()
             assert 'test_value' in df.columns
             assert 'h4' in df.columns
             assert 'h0' in df.columns
@@ -1618,7 +1618,7 @@ class TestMultiValueNodata:
             nodata_value=nodata_value,
         )
         result = proc.process_h0_region(0)
-        df = proc.con.read_parquet(result).fetchdf() if result else None
+        df = proc.con.execute(f"SELECT * FROM read_parquet('{result}')").fetchdf() if result else None
         return result, df
 
     @pytest.mark.timeout(180)

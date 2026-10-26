@@ -429,9 +429,11 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
             f"COPY (SELECT * FROM ({select}) WHERE {keep}) "
             f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
         )
+        # fetchall, not fetchone: DuckDB 2.0 refuses other work on the
+        # connection while a result is only partly fetched (#280).
         empty = con.execute(
             f"SELECT count(*) = 0 FROM read_parquet('{path}')"
-        ).fetchone()[0]
+        ).fetchall()[0][0]
     finally:
         for raw_path in raws:
             os.remove(raw_path)
@@ -500,9 +502,11 @@ def _write_chunk_part(frame, op_name, out_dir, index):
             f"COPY (SELECT {cols} FROM part_frame WHERE {keep}) "
             f"TO '{path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
         )
+        # fetchall, not fetchone: DuckDB 2.0 refuses other work on the
+        # connection while a result is only partly fetched (#280).
         empty = con.execute(
             f"SELECT count(*) = 0 FROM read_parquet('{path}')"
-        ).fetchone()[0]
+        ).fetchall()[0][0]
     finally:
         con.unregister("part_frame")
     if empty:
