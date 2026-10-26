@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-26
+
 ### Fixed
 - **Convert splits features that cross the antimeridian when it reprojects to EPSG:4326** (#274). DuckDB's `ST_Transform` has no dateline split, so a polygon that is continuous in a projected source came out with a ring running the long way round, spanning about 356° of longitude, with its area overstated (PAD-US: 29 features, one of them 28% too large). Features whose reprojected extent is wider than 180° are now split at 180° after reprojection. All other features still go through DuckDB. Layers with features near 180° (Alaska, the Pacific, Fiji/Kiribati) that were built from projected sources should be rebuilt.
 - **`mdim` treats values outside the CF valid range as missing** (#278). It applied `_FillValue` and scale/offset but not `valid_min`, `valid_max` or `valid_range`, which GDAL's multidimensional API leaves to the caller, so out-of-range pixels were hexed as real data. NOAA Coral Reef Watch degree heating weeks on 2026-10-24 had 2,413 pixels above `valid_max` at Arctic ice edges; over H3 base cell 5 the hex output had 620 cells above the valid maximum of 100 and a maximum of 158.67, and now has none. The range is compared in stored units, before scale and offset, as CF specifies. GDAL's classic netCDF driver, used by the `raster` path, already did this.
@@ -317,6 +319,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.11.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.3
 [0.11.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.2
 [0.11.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.1
 [0.11.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.0
