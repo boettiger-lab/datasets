@@ -4554,7 +4554,9 @@ class TestChunkVecBuiltInDuckDB:
             f"SELECT UNNEST(h3_cell_to_children({parent}, {res}))").fetchall()]
 
         reference = self._extract(raster, self._in_memory_vec(ids))
-        sources, _ = _chunk_vec_sources(ids, temp_dir, 0)
+        # Placed in the raster's own frame, as `_hex_aggregate_h0` does (#295).
+        sources, _ = _chunk_vec_sources(ids, temp_dir, 0,
+                                        ref_lon=(bbox[0] + bbox[2]) / 2)
         built = {}
         for _, vec in sources:
             built.update(self._extract(raster, vec))
