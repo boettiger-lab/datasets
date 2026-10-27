@@ -1123,6 +1123,163 @@ class TestSeamIntegration:
         )
 
 
+class TestSeamFrame:
+    """Issue #295: cells are read in the source's own longitude frame.
+
+    A cell straddling +/-180 used to be split into a MultiPolygon, whose
+    bounding box spans ~360 deg. exactextract reads the raster over that whole
+    box, which on a 10 m global source cost 7 s per seam cell against 0.12 s
+    for the same cell unwrapped, and an antimeridian h0 has thousands. The
+    split also assumed the source's frame is [-180, 180]; on a mosaic running
+    -170..190 the part at -180 read nothing, and the prune dropped every cell
+    between -180 and -170.
+    """
+
+    H0 = 579768083279773695  # an antimeridian h0, ~7% of its children wrap
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _global(self, temp_dir, name, west, data):
+        """A 1-degree global raster whose first column starts at *west*."""
+        path = os.path.join(temp_dir, name)
+        ds = gdal.GetDriverByName("GTiff").Create(path, 360, 180, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([west, 1.0, 0, 90.0, 0, -1.0])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).WriteArray(data.astype(np.float32))
+        ds.GetRasterBand(1).SetNoDataValue(-9999)
+        ds.FlushCache(); ds = None
+        return path
+
+    def _by_true_longitude(self):
+        """Values that differ by longitude, laid out from -180 west to east."""
+        yy, xx = np.mgrid[0:180, 0:360]
+        return (1000 + xx + 0.001 * yy).astype(np.float32)
+
+    def _seam_wkts(self, res=5):
+        con = duckdb.connect()
+        for ext in ("spatial", "h3"):
+            try:
+                con.execute(f"LOAD {ext}")
+            except duckdb.Error:
+                con.execute(f"INSTALL {ext}" + (" FROM community" if ext == "h3" else ""))
+                con.execute(f"LOAD {ext}")
+        rows = con.execute(
+            f"SELECT h3_cell_to_boundary_wkt(c) FROM (SELECT UNNEST("
+            f"h3_cell_to_children({self.H0}, {res})) AS c)").fetchall()
+        from shapely import wkt as shapely_wkt
+        geoms = [shapely_wkt.loads(w) for (w,) in rows]
+        return [g for g in geoms if g.bounds[2] - g.bounds[0] > 180]
+
+    def test_a_seam_cell_is_one_narrow_polygon_of_the_same_area(self):
+        from cng_datasets.raster.cog import _place_in_frame, _split_antimeridian
+        seam = self._seam_wkts()
+        assert seam, "fixture error: no straddling cells"
+        for geom in seam:
+            placed = _place_in_frame(geom, 0.0)
+            assert placed.geom_type == "Polygon"
+            assert placed.bounds[2] - placed.bounds[0] < 5
+            assert placed.area == pytest.approx(_split_antimeridian(geom).area, rel=1e-9)
+
+    def test_a_cell_is_moved_into_the_frame_of_the_source(self):
+        """On a -170..190 source, a cell at -175 is read at 185."""
+        from shapely.geometry import box
+        from cng_datasets.raster.cog import _place_in_frame
+        placed = _place_in_frame(box(-176, 10, -174, 12), ref_lon=10.0)
+        assert placed.bounds[0] == pytest.approx(184) and placed.bounds[2] == pytest.approx(186)
+        unmoved = _place_in_frame(box(20, 10, 22, 12), ref_lon=10.0)
+        assert unmoved.bounds[0] == pytest.approx(20)
+
+    def test_the_wrapped_source_repeats_the_source_past_both_edges(self, temp_dir):
+        from cng_datasets.raster.cog import _wrap_padded_vrt
+        data = self._by_true_longitude()
+        src = self._global(temp_dir, "src.tif", -180.0, data)
+        vrt = gdal.Open(_wrap_padded_vrt(src, 5.0, os.path.join(temp_dir, "w")))
+        gt = vrt.GetGeoTransform()
+        assert gt[0] == pytest.approx(-185.0) and vrt.RasterXSize == 370
+        got = vrt.GetRasterBand(1).ReadAsArray()
+        np.testing.assert_array_equal(got[:, 5:365], data)
+        np.testing.assert_array_equal(got[:, :5], data[:, -5:])   # west of -180
+        np.testing.assert_array_equal(got[:, 365:], data[:, :5])  # east of +180
+        assert vrt.GetRasterBand(1).GetNoDataValue() == -9999
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("window_reads", ["never", "always"])
+    def test_a_source_in_another_frame_gives_the_same_cells(self, temp_dir, window_reads):
+        """The same geography written -180..180 and -170..190 must hex the same.
+
+        Before #295 the -170..190 copy lost every cell between -180 and -170
+        to the prune, and the -180 half of every seam cell to the split.
+        """
+        import geopandas as gpd
+        from shapely.geometry import box
+        from cng_datasets.raster import RasterProcessor
+
+        data = self._by_true_longitude()
+        sources = {
+            "standard": self._global(temp_dir, "standard.tif", -180.0, data),
+            # Column j of this one covers -170 + j, i.e. true column j + 10.
+            "shifted": self._global(temp_dir, "shifted.tif", -170.0, np.roll(data, -10, axis=1)),
+        }
+        grid = os.path.join(temp_dir, "grid.parquet")
+        gpd.GeoDataFrame(
+            {"i": [0], "h0": [self.H0], "geometry": [box(-180, -90, 180, 90)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(grid)
+
+        values = {}
+        for name, path in sources.items():
+            proc = RasterProcessor(
+                input_path=path,
+                output_parquet_path=os.path.join(temp_dir, f"hex-{name}-{window_reads}"),
+                h3_resolution=3, parent_resolutions=[0], h0_grid_path=grid,
+                value_column="v", hex_resampling="mean", window_reads=window_reads,
+            )
+            out = proc.process_h0_region(0)
+            assert out, name
+            values[name] = dict(duckdb.connect().execute(
+                f"SELECT h3, v FROM read_parquet('{out}')").fetchall())
+
+        standard, shifted = values["standard"], values["shifted"]
+        assert set(shifted) == set(standard), (
+            f"{len(set(standard) - set(shifted))} cells missing from the shifted source"
+        )
+        for cell, v in standard.items():
+            assert shifted[cell] == pytest.approx(v, rel=1e-9), cell
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_a_straddling_chunk_reads_a_window_not_the_whole_source(self, temp_dir):
+        from shapely import wkt as shapely_wkt
+        from cng_datasets.raster import RasterProcessor
+        from cng_datasets.raster.cog import _H3_PROTRUSION_MARGIN, _WINDOW_NO_OVERLAP
+
+        src = self._global(temp_dir, "src.tif", -180.0, self._by_true_longitude())
+        proc = RasterProcessor(
+            input_path=src, output_parquet_path=os.path.join(temp_dir, "hex"),
+            h3_resolution=3, value_column="v", window_reads="always",
+        )
+        geom = proc.con.execute(
+            f"SELECT h3_cell_to_boundary_wkt({self.H0})").fetchone()[0]
+        _, miny, _, maxy = shapely_wkt.loads(geom).bounds
+        path = proc._windowed_source_for(
+            geom, _H3_PROTRUSION_MARGIN * (maxy - miny), self.H0)
+        assert path is not None and path is not _WINDOW_NO_OVERLAP, (
+            "a straddling h0 fell back to reading the whole source"
+        )
+        ds = gdal.Open(path)
+        gt = ds.GetGeoTransform()
+        xmin, xmax = gt[0], gt[0] + gt[1] * ds.RasterXSize
+        ds = None
+        assert xmax - xmin < 90, (xmin, xmax)
+        assert xmin < 180 < xmax or xmin < -180 < xmax, (xmin, xmax)
+
+
 class TestAntimeridianSplit:
     """Issue #88(B): h3_cell_to_boundary_wkt returns, for a cell touching
     +/-180, a planar polygon whose vertices on each side are joined the long
@@ -4360,17 +4517,15 @@ class TestChunkVecBuiltInDuckDB:
 
         seam = sources[1][1]
         assert len(seam) > 0
-        # Split, not the raw ribbon. A correctly split geometry has parts
-        # against both edges of the dateline, so its own bounds legitimately
-        # run -180..180 — it is each PART that must be narrow.
-        assert (seam.geometry.geom_type == "MultiPolygon").any()
+        # Unwrapped, not the raw ribbon and not split (#295): one narrow
+        # polygon across the dateline, whose own bounds are as small as the cell.
         for geometry in seam.geometry:
-            parts = getattr(geometry, "geoms", [geometry])
-            for part in parts:
-                minx, _, maxx, _ = part.bounds
-                assert maxx - minx <= 180, (
-                    "a seam geometry still spans the globe; it was not split"
-                )
+            assert geometry.geom_type == "Polygon", geometry.geom_type
+            minx, _, maxx, _ = geometry.bounds
+            assert maxx - minx < 10, (
+                "a seam geometry still spans the globe; it was not unwrapped"
+            )
+            assert minx < 180 < maxx or minx < -180 < maxx, geometry.bounds
 
         from osgeo import ogr
         ds = ogr.Open(sources[0][1])
@@ -4399,7 +4554,9 @@ class TestChunkVecBuiltInDuckDB:
             f"SELECT UNNEST(h3_cell_to_children({parent}, {res}))").fetchall()]
 
         reference = self._extract(raster, self._in_memory_vec(ids))
-        sources, _ = _chunk_vec_sources(ids, temp_dir, 0)
+        # Placed in the raster's own frame, as `_hex_aggregate_h0` does (#295).
+        sources, _ = _chunk_vec_sources(ids, temp_dir, 0,
+                                        ref_lon=(bbox[0] + bbox[2]) / 2)
         built = {}
         for _, vec in sources:
             built.update(self._extract(raster, vec))

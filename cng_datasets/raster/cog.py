@@ -88,6 +88,122 @@ def _split_antimeridian(geom):
         return valid if not valid.is_empty else geom
 
 
+def _frame_shift(ref_lon: float, center_lon: float) -> float:
+    """The multiple of 360 that moves *center_lon* to within 180 deg of *ref_lon*.
+
+    floor(x + 0.5) rather than round(): Python rounds half to even and DuckDB
+    rounds half away from zero, and the bulk cells are placed in SQL while the
+    seam cells are placed here, so both must break the tie the same way.
+    """
+    return 360.0 * math.floor((ref_lon - center_lon) / 360.0 + 0.5)
+
+
+def _frame_shift_sql(ref_lon: float, geom: str = "geom") -> str:
+    """`_frame_shift` for a DuckDB geometry, by its bounding-box centre."""
+    return (f"360.0 * floor(({float(ref_lon)!r} - "
+            f"(ST_XMin({geom}) + ST_XMax({geom})) / 2) / 360.0 + 0.5)")
+
+
+def _place_in_frame(geom, ref_lon: float):
+    """A cell polygon as one contiguous polygon in the read raster's frame.
+
+    The raster a chunk reads has one longitude frame: [-180, 180] for most
+    sources, but a mosaic can run -170..190 (#295), and the wrap-padded read
+    source (`_wrap_padded_vrt`) extends past both edges. A cell is placed in
+    that frame by shifting it a multiple of 360 deg to within 180 deg of the
+    frame's centre, *ref_lon*.
+
+    A cell that straddles +/-180 is unwrapped first rather than split. A split
+    cell is a MultiPolygon whose bounding box spans ~360 deg, and exactextract
+    reads the raster over that whole box: a 10 m global source took 7 s per
+    seam cell against 0.12 s unwrapped, and a whole antimeridian h0 has
+    thousands of them (#295). The split was also wrong for a source whose
+    frame is not [-180, 180], whose pixels for the part at -180 sit at +180.
+
+    A cell touching a pole does not unwrap to anything narrow, since every
+    meridian meets there; it keeps the tested split (#88, #92).
+    """
+    minx, _, maxx, _ = geom.bounds
+    if maxx - minx > 180:
+        from shapely import make_valid
+        from shapely.geometry import Polygon
+        from shapely.errors import GEOSException
+        try:
+            unwrapped = make_valid(Polygon([(x + 360.0 if x < 0 else x, y)
+                                            for x, y in geom.exterior.coords]))
+        except GEOSException:
+            unwrapped = None
+        if unwrapped is None or unwrapped.is_empty:
+            return _split_antimeridian(geom)
+        uminx, _, umaxx, _ = unwrapped.bounds
+        if umaxx - uminx > 180:
+            return _split_antimeridian(geom)
+        geom, minx, maxx = unwrapped, uminx, umaxx
+    shift = _frame_shift(ref_lon, (minx + maxx) / 2)
+    if shift == 0.0:
+        return geom
+    from shapely.affinity import translate
+    return translate(geom, xoff=shift)
+
+
+def _raster_lon_frame(path: str):
+    """(xmin, xmax, pixel width) in degrees of a geographic raster, else None.
+
+    None for a projected raster: its x is not a longitude, so it has no frame
+    to place cells in, and they stay on [-180, 180] as they always have.
+    """
+    ds = gdal.Open(path)
+    try:
+        srs = osr.SpatialReference(wkt=ds.GetProjection())
+        if not srs.IsGeographic():
+            return None
+        gt = ds.GetGeoTransform()
+        x0, x1 = gt[0], gt[0] + gt[1] * ds.RasterXSize
+        return min(x0, x1), max(x0, x1), abs(gt[1])
+    finally:
+        ds = None
+
+
+def _spans_globe(xmin: float, xmax: float, pixel: float) -> bool:
+    """Whether a geographic raster's columns cover 360 deg of longitude once."""
+    return abs((xmax - xmin) - 360.0) <= 1.5 * pixel
+
+
+def _wrap_padded_vrt(source: str, pad_deg: float, out_dir: str) -> str:
+    """A VRT of a 360-deg source extended past both edges with its own columns.
+
+    A cell, or a chunk window, that straddles the source's edge then reads real
+    pixels on both sides of it from one contiguous region (#295). Nothing is
+    copied: the padding is two more references to the same file, shifted by
+    the source's own span, which keeps them on the source's pixel grid.
+    """
+    ds = gdal.Open(source)
+    gt = ds.GetGeoTransform()
+    width, height = ds.RasterXSize, ds.RasterYSize
+    ds = None
+    xmin, ymax, res_x, res_y = gt[0], gt[3], gt[1], gt[5]
+    span = width * res_x
+    ymin = ymax + height * res_y
+    pad = math.ceil(pad_deg / res_x) * res_x
+
+    os.makedirs(out_dir, exist_ok=True)
+    tiles = []
+    for name, offset in (("west", -span), ("east", span)):
+        path = os.path.join(out_dir, f"wrap-{name}.vrt")
+        gdal.Translate(path, source, format="VRT",
+                       outputBounds=[xmin + offset, ymax, xmin + offset + span, ymin])
+        tiles.append(path)
+    out = os.path.join(out_dir, "wrapped.vrt")
+    vrt = gdal.BuildVRT(out, [tiles[0], source, tiles[1]],
+                        outputBounds=(xmin - pad, ymin, xmin + span + pad, ymax),
+                        xRes=res_x, yRes=abs(res_y))
+    if vrt is None:
+        raise RuntimeError(f"gdal.BuildVRT failed to wrap {source}: "
+                           f"{gdal.GetLastErrorMsg()}")
+    vrt = None
+    return out
+
+
 def _explode_fractions(df):
     """Explode exactextract's per-cell unique/frac arrays into long rows.
 
@@ -267,21 +383,24 @@ def _exact_extract_chunk(args):
     inputs are still referenced, so the parent's peak doubled at exactly its
     largest moment. Measured at ~150 bytes per cell, which on a res-10 h0 is
     ~39 GiB: essentially the whole of that job's peak.
+
+    `ref_lon` is the centre of the raster's longitude frame, which every cell
+    is placed in before it is read (`_place_in_frame`, #295).
     """
-    raster_path, op_name, chunk_ids, out_dir, index = args
+    raster_path, op_name, chunk_ids, out_dir, index, ref_lon = args
     if len(chunk_ids) == 0:
         return None
     if ogr_supports_parquet():
         return _exact_extract_to_parquet(raster_path, op_name, chunk_ids,
-                                         out_dir, index)
+                                         out_dir, index, ref_lon)
     frame = _exact_extract_cells(raster_path, op_name,
-                                 _boundary_wkt_for(chunk_ids))
+                                 _boundary_wkt_for(chunk_ids), ref_lon)
     if frame is None or len(frame) == 0:
         return None
     return _write_chunk_part(frame, op_name, out_dir, index)
 
 
-def _chunk_vec_sources(chunk_ids, out_dir, index):
+def _chunk_vec_sources(chunk_ids, out_dir, index, ref_lon=0.0):
     """`(sources, cleanup)` — what to hand exactextract as its `vec`.
 
     Builds the chunk's cell boundaries **in DuckDB, straight to a file GDAL can
@@ -290,13 +409,15 @@ def _chunk_vec_sources(chunk_ids, out_dir, index):
     boundary WKT strings, 32 MiB of shapely objects and 35 MiB of GeoDataFrame,
     about 2.1 KB per cell, in every worker, for every chunk (issue #173).
 
-    The exception is the antimeridian. A cell with vertices either side of
-    +/-180 has a planar polygon that is a ~360-degree ribbon, and integrating
-    that rather than the cell's true footprint is issue #88. Splitting it into
-    a MultiPolygon is done with shapely, as it always has been, on the handful
-    of cells that need it — at resolution 8 that is ~2,300 of an h0's 5.7M, and
-    for most h0s none at all. So the bulk of the chunk takes the cheap path and
-    the hard case keeps the tested one, as two vec sources over the same ops.
+    Every cell is placed in the raster's longitude frame, centred on
+    *ref_lon* (`_place_in_frame`): in SQL for the bulk, which only ever moves
+    by a whole 360 deg, and with shapely for the cells that straddle +/-180.
+    Those have a planar polygon that is a ~360-degree ribbon, and integrating
+    that rather than the cell's true footprint is issue #88. They are unwrapped
+    into one narrow polygon, which at resolution 8 is ~3,300 of an h0's 5.7M
+    cells and for most h0s none at all. So the bulk of the chunk takes the
+    cheap path and the hard case takes shapely, as two vec sources over the
+    same ops.
     """
     con = _worker_con()
     values = ",".join(f"({int(c)}::UBIGINT)" for c in chunk_ids)
@@ -314,7 +435,9 @@ def _chunk_vec_sources(chunk_ids, out_dir, index):
     con.execute(f"""
         COPY (
             WITH cells AS ({cells_cte})
-            SELECT cell::VARCHAR AS _h3_str, geom FROM cells WHERE NOT ({straddles})
+            SELECT cell::VARCHAR AS _h3_str,
+                   ST_Translate(geom, {_frame_shift_sql(ref_lon)}, 0.0) AS geom
+            FROM cells WHERE NOT ({straddles})
         ) TO '{vec}' (FORMAT GDAL, DRIVER 'FlatGeobuf', SRS 'EPSG:4326')
     """)
     if os.path.exists(vec):
@@ -331,7 +454,7 @@ def _chunk_vec_sources(chunk_ids, out_dir, index):
         sources.append(("-seam", gpd.GeoDataFrame(
             {
                 "_h3_str": [str(cell) for cell, _ in seam],
-                "geometry": [_split_antimeridian(shapely_wkt.loads(wkt))
+                "geometry": [_place_in_frame(shapely_wkt.loads(wkt), ref_lon)
                              for _, wkt in seam],
             },
             crs="EPSG:4326",
@@ -339,7 +462,8 @@ def _chunk_vec_sources(chunk_ids, out_dir, index):
     return sources, cleanup
 
 
-def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
+def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index,
+                              ref_lon=0.0):
     """Aggregate one chunk with exactextract writing straight to disk.
 
     exactextract is C++ and can serialise its results through GDAL itself, so
@@ -363,7 +487,7 @@ def _exact_extract_to_parquet(raster_path, op_name, chunk_ids, out_dir, index):
     ops = _extract_ops(op_name)
 
     os.makedirs(out_dir, exist_ok=True)
-    sources, cleanup = _chunk_vec_sources(chunk_ids, out_dir, index)
+    sources, cleanup = _chunk_vec_sources(chunk_ids, out_dir, index, ref_lon)
     if not sources:
         return None
 
@@ -515,7 +639,7 @@ def _write_chunk_part(frame, op_name, out_dir, index):
     return path
 
 
-def _exact_extract_cells(raster_path, op_name, chunk_cells):
+def _exact_extract_cells(raster_path, op_name, chunk_cells, ref_lon=0.0):
     """Run exact_extract over (h3_id, boundary_wkt) pairs.
 
     Each worker reopens the raster itself (each process has its own
@@ -540,9 +664,10 @@ def _exact_extract_cells(raster_path, op_name, chunk_cells):
     is_fractions = op_name == "fractions"
     ops = _extract_ops(op_name)
 
-    # Split cells that straddle +/-180 into a MultiPolygon so exact_extract
-    # integrates their true footprint, not a 360-deg ribbon (issue #88).
-    geometries = [_split_antimeridian(shapely_wkt.loads(wkt))
+    # Each cell as one polygon in the raster's frame, so a cell that
+    # straddles +/-180 integrates its true footprint, not a 360-deg ribbon
+    # (issue #88), and reads only that footprint (#295).
+    geometries = [_place_in_frame(shapely_wkt.loads(wkt), ref_lon)
                   for _, wkt in chunk_cells]
     gdf = gpd.GeoDataFrame(
         {
@@ -617,6 +742,12 @@ _H3_PRUNE_MARGIN_FACTOR = 2.0
 # directly"), because conflating the two turns a chunk that provably has
 # nothing to contribute into one that reads the entire raster to find out.
 _WINDOW_NO_OVERLAP = "__no_overlap__"
+
+# How far the wrapped read source (`_wrap_padded_vrt`) extends past each edge
+# of a 360-deg source. It has to hold the widest window a chunk straddling the
+# edge asks for: half an h0's longitude extent plus the protrusion margin. A
+# window that would still run past it is read from the source directly.
+_WRAP_PAD_DEG = 60.0
 
 # Warn at most once per process that the CPU quota could not be read.
 _CPU_QUOTA_WARNED = False
@@ -2204,6 +2335,7 @@ class RasterProcessor:
 
         # Pre-compute source raster bounds in EPSG:4326 for fast h0 intersection checks
         self._src_bounds_4326 = self._compute_src_bounds_4326()
+        self._read_source_cache = None
 
     def _setup_duckdb(self) -> duckdb.DuckDBPyConnection:
         """Set up DuckDB connection with extensions."""
@@ -2618,13 +2750,13 @@ class RasterProcessor:
                 wymin, wymax, wide = _widen_footprint(ymin, ymax, lon_intervals, margin)
                 if symax < wymin or symin > wymax:
                     continue
-                if not any(not (sxmax < lo or sxmin > hi) for lo, hi in wide):
+                if not any(self._lon_overlaps(lo, hi) for lo, hi in wide):
                     continue
                 if level == self.h3_resolution:
                     leaves.append(int(cell))
                 elif (len(lon_intervals) == 1
                       and symin <= ymin and symax >= ymax
-                      and sxmin <= lon_intervals[0][0] and sxmax >= lon_intervals[0][1]):
+                      and self._lon_contains(*lon_intervals[0])):
                     # Wholly inside the source: every descendant is kept. A cell
                     # straddling +/-180 is never claimed here — its two intervals
                     # would each have to be contained, and descending it instead
@@ -2659,7 +2791,54 @@ class RasterProcessor:
         sxmin, symin, sxmax, symax = self._src_bounds_4326  # (xmin,ymin,xmax,ymax)
         if symax < miny or symin > maxy:  # no latitude overlap
             return False
-        return any(not (sxmax < lo or sxmin > hi) for lo, hi in lon_intervals)
+        return any(self._lon_overlaps(lo, hi) for lo, hi in lon_intervals)
+
+    def _source_lon_ranges(self):
+        """The source's longitude extent, and the same extent 360 deg either way.
+
+        A footprint is on [-180, 180], but a source need not be: a mosaic can
+        run -170..190 (#295), and its pixels for -175 sit at 185. Comparing
+        against all three copies makes the tests indifferent to which frame
+        the source was written in.
+        """
+        sxmin, _, sxmax, _ = self._src_bounds_4326
+        return [(sxmin + k, sxmax + k) for k in (-360.0, 0.0, 360.0)]
+
+    def _lon_overlaps(self, lo: float, hi: float) -> bool:
+        """Whether [lo, hi] meets the source's longitude extent, in any frame."""
+        return any(not (sxmax < lo or sxmin > hi)
+                   for sxmin, sxmax in self._source_lon_ranges())
+
+    def _lon_contains(self, lo: float, hi: float) -> bool:
+        """Whether [lo, hi] lies inside the source's longitude extent, in one frame."""
+        return any(sxmin <= lo and sxmax >= hi
+                   for sxmin, sxmax in self._source_lon_ranges())
+
+    def _read_source(self):
+        """`(path, (xmin, xmax))` — the raster every chunk reads, and its frame.
+
+        A source whose columns cover 360 deg is read through a VRT padded on
+        both sides with its own columns (`_wrap_padded_vrt`), so a cell or a
+        chunk window that straddles the source's edge is one contiguous read
+        rather than two disjoint ones (#295). Any other source is read as is.
+        """
+        if self._read_source_cache is None:
+            sxmin, _, sxmax, _ = self._src_bounds_4326
+            path, frame = self.input_path, (sxmin, sxmax)
+            native = _raster_lon_frame(self.input_path)
+            if native is not None and _spans_globe(*native):
+                if self._window_cache_dir:
+                    os.makedirs(self._window_cache_dir, exist_ok=True)
+                path = _wrap_padded_vrt(
+                    self.input_path, _WRAP_PAD_DEG,
+                    tempfile.mkdtemp(prefix="cng_wrap_",
+                                     dir=self._window_cache_dir or None),
+                )
+                frame = _raster_lon_frame(path)[:2]
+                print(f"  ℹ source spans 360 deg; reading it wrapped to "
+                      f"[{frame[0]:.4f}, {frame[1]:.4f}]")
+            self._read_source_cache = (path, frame)
+        return self._read_source_cache
 
     def _collapsed_aggregation_input(self, source_path: Optional[str] = None) -> str:
         """Local raster with every fill code collapsed to the primary nodata.
@@ -2756,8 +2935,11 @@ class RasterProcessor:
         if h0_cell is None:
             h0_cell = chunk_cell
         # source_path is the windowed copy when lever C is active; everything
-        # below reads it in place of the full raster.
-        source_path = source_path or self.input_path
+        # below reads it in place of the full raster. Every cell is placed in
+        # the frame of whichever raster that is, centred on ref_lon (#295).
+        source_path = source_path or self._read_source()[0]
+        frame = _raster_lon_frame(source_path)
+        ref_lon = (frame[0] + frame[1]) / 2 if frame else 0.0
         cells_arr = self._native_cells_for_h0(chunk_cell)
 
         if len(cells_arr) == 0:
@@ -2828,7 +3010,7 @@ class RasterProcessor:
             parts_dir = os.path.join(
                 tempfile.gettempdir(), f"cng_hex_parts_{chunk_cell}_{os.getpid()}"
             )
-            args_iter = [(rast_arg, self.hex_resampling, c, parts_dir, i)
+            args_iter = [(rast_arg, self.hex_resampling, c, parts_dir, i, ref_lon)
                          for i, c in enumerate(chunks)]
             print(
                 f"  exact_extract: {sum(len(c) for c in chunks)} cells in "
@@ -3023,29 +3205,53 @@ class RasterProcessor:
         boundary and their pixels have to be in the window or the aggregation
         silently reads nodata there.
 
+        A chunk that straddles +/-180 is unwrapped into one longitude range and
+        placed in the read source's frame, the same way its cells are
+        (`_place_in_frame`). A 360-deg source is read wrapped
+        (`_read_source`), so that range is one contiguous window too. Reading
+        such a chunk from the whole source instead cost ~15x per cell (#295).
+
         Returns a local path; None to fall back to reading the source directly
-        (a chunk straddling the antimeridian, whose window is two disjoint
-        longitude ranges a single projWin cannot express); or
-        _WINDOW_NO_OVERLAP when the window misses the source entirely, which
-        the pruning test can allow through because it deliberately runs a looser
-        margin.
+        (a chunk around a pole, which no longitude range describes, or one
+        wider than the wrapped source); or _WINDOW_NO_OVERLAP when the window
+        misses the source entirely, which the pruning test can allow through
+        because it deliberately runs a looser margin.
         """
         from shapely import wkt as shapely_wkt
 
         poly = shapely_wkt.loads(geom_wkt)
         minx, miny, maxx, maxy = poly.bounds
+        read_path, (fxmin, fxmax) = self._read_source()
         if maxx - minx > 180:
-            print("  ℹ chunk straddles the antimeridian; reading the source directly")
-            return None
+            if _raster_lon_frame(self.input_path) is None:
+                # A projected source's cells stay on [-180, 180], so no single
+                # window holds both sides of a straddling chunk.
+                print("  ℹ chunk straddles the antimeridian of a projected source; "
+                      "reading the source directly")
+                return None
+            uxs = [x + 360.0 if x < 0 else x for x, _ in poly.exterior.coords]
+            minx, maxx = min(uxs), max(uxs)
+            if maxx - minx > 180:
+                print("  ℹ chunk surrounds a pole; reading the source directly")
+                return None
 
-        sxmin, symin, sxmax, symax = self._src_bounds_4326
+        shift = _frame_shift((fxmin + fxmax) / 2, (minx + maxx) / 2)
+        minx, maxx = minx + shift, maxx + shift
+
+        _, symin, _, symax = self._src_bounds_4326
         lat = min(max(abs(miny), abs(maxy)), 89.0)
         lon_margin = min(margin_deg / max(math.cos(math.radians(lat)), 1e-6), 180.0)
 
-        # Clamp to the source's own extent: projWin outside it either errors or
-        # pads with nodata, and either way costs more than it reads.
-        wxmin = max(minx - lon_margin, sxmin)
-        wxmax = min(maxx + lon_margin, sxmax)
+        # Clamp to the read source's own extent: projWin outside it either
+        # errors or pads with nodata, and either way costs more than it reads.
+        # On a wrapped source that extent is padding, not the edge of the data,
+        # so a window that would need more of it is read directly instead.
+        if read_path != self.input_path and (minx - lon_margin < fxmin
+                                             or maxx + lon_margin > fxmax):
+            print("  ℹ chunk window runs past the wrapped source; reading the source directly")
+            return None
+        wxmin = max(minx - lon_margin, fxmin)
+        wxmax = min(maxx + lon_margin, fxmax)
         wymin = max(miny - margin_deg, symin)
         wymax = min(maxy + margin_deg, symax)
         if wxmin >= wxmax or wymin >= wymax:
@@ -3059,7 +3265,7 @@ class RasterProcessor:
         try:
             result = gdal.Translate(
                 window_path,
-                self.input_path,
+                read_path,
                 format="GTiff",
                 projWin=[wxmin, wymax, wxmax, wymin],
                 projWinSRS="EPSG:4326",
