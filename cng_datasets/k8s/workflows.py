@@ -2373,7 +2373,9 @@ cng-convert-to-parquet \\
             "image": "ghcr.io/boettiger-lab/datasets:latest",
             "imagePullPolicy": "Always",
             "env": _s3_env_vars(config) + [
-                {"name": "BUCKET", "value": bucket}
+                {"name": "BUCKET", "value": bucket},
+                # convert sorts the dataset along a Hilbert curve (issue #276)
+                {"name": "DUCKDB_MEMORY_LIMIT", "value": _duckdb_memory_limit(memory)},
             ],
             "volumeMounts": [
                 {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}

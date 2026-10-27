@@ -1615,11 +1615,12 @@ class TestRepartitionWithAttributeJoin:
 
     @pytest.mark.timeout(15)
     def test_repartition_orders_by_cng_fid_within_partition(self):
-        """Rows within each h0 partition are sorted by _cng_fid (issue #103).
+        """Rows within each h0 partition are sorted by _cng_fid (issue #103),
+        then by the finest H3 cell (issue #276).
 
         The intra-partition ORDER BY tightens row-group [min,max] zonemaps so a
         `WHERE _cng_fid IN (...)` can prune. We assert the physical row order is
-        non-decreasing in _cng_fid even when the chunk input is shuffled.
+        non-decreasing in (_cng_fid, h10) even when the chunk input is shuffled.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             con = setup_duckdb_connection()
@@ -1632,7 +1633,7 @@ class TestRepartitionWithAttributeJoin:
                 CREATE TABLE chunk_data AS
                 SELECT
                     _cng_fid,
-                    (613196575302221823 + row_number() OVER ())::UBIGINT as h10,
+                    (613196575302221823 + 100 - row_number() OVER ())::UBIGINT as h10,
                     613196575302221823::UBIGINT as h8,
                     577199624117288959 as h0
                 FROM (VALUES (5),(1),(3),(1),(5),(2),(3)) t(_cng_fid)
@@ -1653,12 +1654,12 @@ class TestRepartitionWithAttributeJoin:
             con = setup_duckdb_connection()
             part = f"{tmpdir}/output/h0=577199624117288959/data_0.parquet"
             # Read in physical (file) order — no ORDER BY in the query.
-            fids = [r[0] for r in con.execute(
-                f"SELECT _cng_fid FROM read_parquet('{part}')"
-            ).fetchall()]
+            rows = con.execute(
+                f"SELECT _cng_fid, h10 FROM read_parquet('{part}')"
+            ).fetchall()
             con.close()
 
-            assert fids == sorted(fids), f"rows not ordered by _cng_fid: {fids}"
+            assert rows == sorted(rows), f"rows not ordered by (_cng_fid, h10): {rows}"
 
     @pytest.mark.timeout(15)
     def test_repartition_with_mixed_case_columns(self):

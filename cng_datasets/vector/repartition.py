@@ -92,6 +92,10 @@ def repartition_by_h0(
 
     print(f"Chunks ID column: {chunk_id_col}")
 
+    # Finest H3 column in the chunks: within a feature, rows are ordered by it
+    h_cols = [c for c in chunk_cols if c.startswith('h') and c[1:].isdigit()]
+    finest_h = max(h_cols, key=lambda c: int(c[1:]))
+
     # If source parquet provided, join back all attributes (except geometry)
     if source_parquet:
         print(f'Joining attributes from {source_parquet}...')
@@ -212,12 +216,16 @@ def repartition_by_h0(
         # ORDER BY the row id within each h0 partition (issue #103) so parquet
         # row-group zonemaps can prune by feature identity: a plain
         # `WHERE _cng_fid IN (...)` then skips the partitions/row-groups whose
-        # [min,max] excludes the targets instead of scanning every row. Wrap in
-        # a subquery so ORDER BY references the unambiguous output column (the
-        # join exposes the id on both sides). PARTITION BY h0 is unchanged.
+        # [min,max] excludes the targets instead of scanning every row. Convert
+        # numbers _cng_fid in Hilbert order (issue #276), so the same order
+        # also groups rows by location; ordering each feature's cells by the
+        # finest H3 column keeps them compact and their attributes compress.
+        # Wrap in a subquery so ORDER BY references the unambiguous output
+        # column (the join exposes the id on both sides). PARTITION BY h0 is
+        # unchanged.
         con.execute(
             f"COPY (SELECT * FROM ({join_sql.format(h0=h0)})"
-            f" ORDER BY \"{chunk_id_col}\") TO '{local_file}'"
+            f" ORDER BY \"{chunk_id_col}\", \"{finest_h}\") TO '{local_file}'"
             f" (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
         )
 

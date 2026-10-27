@@ -2256,3 +2256,100 @@ class TestAntimeridianSplit:
         from cng_datasets.vector.convert_to_parquet import split_dateline_wkb
         wide = shapely.to_wkb(shapely.Polygon(self._lonlat_box(-100, 100, 0, 10, n=200)))
         assert split_dateline_wkb(wide) == wide
+
+
+class TestSpatialOrder:
+    """Rows are written in Hilbert order, with _cng_fid numbered in it (issue #276)."""
+
+    # Two clusters far apart, listed alternately so source order mixes them
+    POINTS = [(-122.0 + 0.01 * i, 37.0) if i % 2 == 0 else (10.0 + 0.01 * i, 50.0) for i in range(40)]
+
+    def _geojson(self, tmp_path):
+        features = [
+            {"type": "Feature", "properties": {"src": i},
+             "geometry": {"type": "Point", "coordinates": list(xy)}}
+            for i, xy in enumerate(self.POINTS)
+        ]
+        path = tmp_path / "points.geojson"
+        path.write_text(json.dumps({"type": "FeatureCollection", "features": features}))
+        return str(path)
+
+    def _rows(self, path, box="{'min_x': -180, 'min_y': -90, 'max_x': 180, 'max_y': 90}::BOX_2D"):
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        rows = con.execute(
+            f"SELECT file_row_number, _cng_fid, src, ST_Hilbert(geom, {box}) AS h "
+            f"FROM read_parquet('{path}', file_row_number = true) ORDER BY file_row_number"
+        ).fetchall()
+        con.close()
+        return rows
+
+    def test_ids_follow_the_hilbert_curve_and_file_order(self, tmp_path):
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(self._geojson(tmp_path), out, progress=False)
+        rows = self._rows(out)
+        assert [r[1] for r in rows] == list(range(1, len(self.POINTS) + 1))
+        hilbert = [r[3] for r in rows]
+        assert hilbert == sorted(hilbert)
+
+    def test_row_groups_hold_one_cluster_each(self, tmp_path):
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(self._geojson(tmp_path), out, row_group_size=10, progress=False)
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        spans = con.execute(
+            f"SELECT row_group_id, max(ST_X(geom)) - min(ST_X(geom)) "
+            f"FROM (SELECT geom, file_row_number // 10 AS row_group_id "
+            f"      FROM read_parquet('{out}', file_row_number = true)) GROUP BY 1"
+        ).fetchall()
+        con.close()
+        # Source order alternates clusters, so every 10-row group spanned 130 deg
+        assert len(spans) == 4
+        assert all(span < 1 for _, span in spans)
+
+    def test_no_spatial_order_keeps_source_order(self, tmp_path):
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(self._geojson(tmp_path), out, spatial_order=False, progress=False)
+        rows = self._rows(out)
+        assert sorted((r[1], r[2]) for r in rows) == [(i + 1, i) for i in range(len(self.POINTS))]
+
+    def test_parquet_input_with_projected_coordinates(self, tmp_path):
+        """The parquet path orders over the data's own extent, outside lon/lat range."""
+        src = str(tmp_path / "src.parquet")
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        values = ", ".join(f"({i}, ST_Point({x * 1e5}, {y * 1e5}))" for i, (x, y) in enumerate(self.POINTS))
+        con.execute(f"COPY (SELECT * FROM (VALUES {values}) t(src, geom)) TO '{src}' (FORMAT PARQUET)")
+        con.close()
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(src, out, progress=False)
+        box = "{'min_x': -12200000, 'min_y': 3700000, 'max_x': 1039000, 'max_y': 5000000}::BOX_2D"
+        rows = self._rows(out, box)
+        assert [r[1] for r in rows] == list(range(1, len(self.POINTS) + 1))
+        # Clusters are contiguous in the file
+        clusters = [r[2] % 2 for r in rows]
+        assert sum(a != b for a, b in zip(clusters, clusters[1:])) == 1
+
+    def test_existing_cng_fid_kept_and_rows_ordered(self, tmp_path):
+        src = str(tmp_path / "src.parquet")
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        values = ", ".join(f"({i + 1000}, {i}, ST_Point({x}, {y}))" for i, (x, y) in enumerate(self.POINTS))
+        con.execute(f"COPY (SELECT * FROM (VALUES {values}) t(_cng_fid, src, geom)) TO '{src}' (FORMAT PARQUET)")
+        con.close()
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(src, out, progress=False)
+        rows = self._rows(out)
+        assert all(fid == src_i + 1000 for _, fid, src_i, _ in rows)
+        clusters = [r[2] % 2 for r in rows]
+        assert sum(a != b for a, b in zip(clusters, clusters[1:])) == 1
+
+    def test_csv_points_are_ordered(self, tmp_path):
+        src = tmp_path / "points.csv"
+        src.write_text("src,lon,lat\n" + "\n".join(f"{i},{x},{y}" for i, (x, y) in enumerate(self.POINTS)))
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(str(src), out, progress=False)
+        rows = self._rows(out)
+        assert [r[1] for r in rows] == list(range(1, len(self.POINTS) + 1))
+        clusters = [r[2] % 2 for r in rows]
+        assert sum(a != b for a, b in zip(clusters, clusters[1:])) == 1
