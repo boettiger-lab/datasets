@@ -24,6 +24,7 @@ import duckdb
 import geopandas as gpd
 from urllib.request import urlretrieve
 from urllib.parse import urlparse
+from ..duckdb_memory import to_duckdb_memory_limit
 from ..provenance import kv_metadata_sql
 
 
@@ -975,6 +976,52 @@ def add_id_column_query(base_query: str, id_column: str = "_cng_fid") -> str:
     """
 
 
+# The whole lon/lat plane, as the Hilbert curve's extent for geographic output.
+# ST_Hilbert encodes 16 bits per axis, so a cell is about 0.0055 deg (~600 m),
+# far finer than a row group.
+WORLD_BOX = "{'min_x': -180, 'min_y': -90, 'max_x': 180, 'max_y': 90}::BOX_2D"
+
+
+def spatial_order_query(base_query: str, geom_col: str, id_column: Optional[str] = None,
+                        geographic: bool = True) -> str:
+    """
+    Order rows along a Hilbert curve, numbering them in that order (issue #276).
+
+    Nearby features land in the same row groups, so the geometry statistics
+    prune by location, as Portolan requires of GeoParquet. Numbering
+    ``id_column`` in the same order carries that locality into the hex output,
+    where repartition orders rows by id: a feature's cells stay together, which
+    compresses its repeated attributes, and a county query reads few row groups.
+
+    Args:
+        base_query: Query producing the rows, with a GEOMETRY column ``geom_col``
+        geom_col: Geometry column to order by (the centre of its bbox is encoded)
+        id_column: Synthetic id to number in Hilbert order; None keeps the
+            source's own id and only orders the rows
+        geographic: The output is lon/lat, so the curve spans the whole plane.
+            Otherwise it spans the data's own extent, computed in a first pass.
+
+    Returns:
+        Query with rows in Hilbert order (null geometries last)
+    """
+    if geographic:
+        source, box = f"({base_query}) AS src", WORLD_BOX
+    else:
+        source = f"({base_query}) AS src, (SELECT ST_Extent(ST_Extent_Agg(\"{geom_col}\")) AS box FROM ({base_query})) AS b"
+        box = "b.box"
+    key = f'ST_Hilbert(src."{geom_col}", {box})'
+    if id_column:
+        return f"""
+    SELECT ROW_NUMBER() OVER (ORDER BY {key} NULLS LAST) AS {id_column}, src.*
+    FROM {source}
+    ORDER BY {id_column}
+    """
+    return f"""
+    SELECT src.* FROM {source}
+    ORDER BY {key} NULLS LAST
+    """
+
+
 def process_parquet_input(
     source_url: str,
     destination: str,
@@ -989,6 +1036,7 @@ def process_parquet_input(
     simplify_tolerance: Optional[float] = None,
     trim_strings: bool = False,
     expect_features: Optional[int] = None,
+    spatial_order: bool = True,
 ):
     """
     Process a parquet input file to ensure it has global ID and cloud optimization.
@@ -1018,6 +1066,9 @@ def process_parquet_input(
             independently by the caller (issue #186). The count is always logged;
             when this is given and the written count differs, the conversion
             raises FeatureCountMismatch so a pipeline can gate on it.
+        spatial_order: Write rows in Hilbert order of their geometry and
+            number a synthetic _cng_fid in that order (issue #276). Turn off to
+            keep source order, e.g. when the sort will not fit the pod.
     """
     print(f"Processing parquet file: {source_url}")
     print(f"               Output to: {destination}")
@@ -1148,8 +1199,16 @@ def process_parquet_input(
         else:
             cols_expr = f"*{trim_clause}"
 
-        # Build query to read, cast geometry, and optionally add ID
-        if needs_id:
+        # Build query to read, cast geometry, and optionally add ID. The
+        # geometry is ordered over its own extent: this path does not
+        # reproject, so nothing guarantees lon/lat coordinates (issue #276).
+        if spatial_order and geom_name:
+            print("  Ordering rows along a Hilbert curve"
+                  + (f" and numbering {id_col_name} in that order" if needs_id else ""))
+            query = spatial_order_query(
+                f"SELECT {cols_expr} FROM read_parquet('{read_url}')", geom_name,
+                id_col_name if needs_id else None, geographic=False)
+        elif needs_id:
             query = f"""
             SELECT
                 ROW_NUMBER() OVER () AS {id_col_name},
@@ -1220,6 +1279,7 @@ def process_csv_input(
     trim_strings: bool = False,
     expect_features: Optional[int] = None,
     csv_sample_size: int = -1,
+    spatial_order: bool = True,
 ):
     """
     Convert a CSV with latitude/longitude columns into point GeoParquet (issue #78).
@@ -1252,6 +1312,9 @@ def process_csv_input(
             default) scans the whole file, so a numeric column that is entirely
             NULL in the head of the file is still typed numerically rather than
             as VARCHAR (issue #188).
+        spatial_order: Write rows in Hilbert order of their geometry and
+            number a synthetic _cng_fid in that order (issue #276). Turn off to
+            keep source order, e.g. when the sort will not fit the pod.
     """
     print(f"Processing CSV point file: {source_url}")
     print(f"                Output to: {destination}")
@@ -1338,11 +1401,20 @@ def process_csv_input(
             trim_clause = trim_replace_clause(string_cols)
             print(f"  Trimming whitespace from {len(string_cols)} string column(s)")
 
-        id_prefix = f"ROW_NUMBER() OVER () AS {id_col_name}, " if needs_id else ""
-        query = f"""
-            SELECT {id_prefix}*{trim_clause}, {geom_expr}
-            FROM {csv_read}
-        """
+        if spatial_order:
+            # Ordered over the points' own extent: out-of-range coordinates are
+            # only warned about above, and the target may be projected.
+            print("  Ordering rows along a Hilbert curve"
+                  + (f" and numbering {id_col_name} in that order" if needs_id else ""))
+            query = spatial_order_query(
+                f"SELECT *{trim_clause}, {geom_expr} FROM {csv_read}", "geom",
+                id_col_name if needs_id else None, geographic=False)
+        else:
+            id_prefix = f"ROW_NUMBER() OVER () AS {id_col_name}, " if needs_id else ""
+            query = f"""
+                SELECT {id_prefix}*{trim_clause}, {geom_expr}
+                FROM {csv_read}
+            """
 
         is_s3_dest = destination.startswith('s3://')
         if is_s3_dest:
@@ -1415,10 +1487,15 @@ def write_with_duckdb(query: str, output_path: str,
     # Enable large buffer size for complex geometries (Total buffer > 2GB)
     con.execute("SET arrow_large_buffer_size=true")
 
-    # ROW_GROUP_SIZE_BYTES requires insertion order not to be preserved. Output
-    # row order carries no meaning here — every row has an explicit _cng_fid (or
-    # source id) that travels with it and is what downstream joins key on — so
-    # this is safe and lets DuckDB flush row groups on the byte budget.
+    # The Hilbert sort (issue #276) holds the whole dataset, so cap DuckDB at the
+    # pod's budget and let it spill rather than be OOM-killed.
+    requested_limit = os.environ.get("DUCKDB_MEMORY_LIMIT")
+    if requested_limit:
+        con.execute(f"SET memory_limit='{to_duckdb_memory_limit(requested_limit)}'")
+
+    # ROW_GROUP_SIZE_BYTES requires insertion order not to be preserved. That
+    # only frees DuckDB to reorder a query without ORDER BY; a spatially
+    # ordered query (issue #276) keeps its order.
     con.execute("SET preserve_insertion_order=false")
 
     try:
@@ -1534,6 +1611,7 @@ def convert_to_parquet(
     trim_strings: bool = False,
     expect_features: Optional[int] = None,
     csv_sample_size: int = -1,
+    spatial_order: bool = True,
 ):
     """
     Convert a vector dataset to optimized GeoParquet.
@@ -1579,6 +1657,9 @@ def convert_to_parquet(
             raises FeatureCountMismatch so a pipeline can gate on it.
         csv_sample_size: For CSV point sources, rows read_csv_auto samples for
             type inference; -1 (the default) scans the whole file (issue #188).
+        spatial_order: Write rows in Hilbert order of their geometry and
+            number a synthetic _cng_fid in that order (issue #276). Turn off to
+            keep source order, e.g. when the sort will not fit the pod.
     """
     # CSV with lat/lon columns -> point geometry (issue #78). Handled before the
     # ST_Read path since CSV is not a spatial format GDAL/ST_Read opens directly.
@@ -1599,6 +1680,7 @@ def convert_to_parquet(
             trim_strings=trim_strings,
             expect_features=expect_features,
             csv_sample_size=csv_sample_size,
+            spatial_order=spatial_order,
         )
 
     # Check if input is already parquet
@@ -1634,6 +1716,7 @@ def convert_to_parquet(
             simplify_tolerance=simplify_tolerance,
             trim_strings=trim_strings,
             expect_features=expect_features,
+            spatial_order=spatial_order,
         )
 
     # Original processing for non-parquet inputs
@@ -1837,9 +1920,18 @@ def convert_to_parquet(
 
         if needs_id:
             print(f"  Adding synthetic ID column: {id_col_name}")
-            query = add_id_column_query(query, id_col_name)
         else:
             print(f"  Using existing ID column: {id_col_name}")
+        if spatial_order:
+            # A source with no readable CRS may hold any coordinates, so its
+            # curve spans its own extent rather than the lon/lat plane.
+            geographic = source_crs is not None and is_geographic_target(target_crs)
+            print("  Ordering rows along a Hilbert curve"
+                  + (f" and numbering {id_col_name} in that order" if needs_id else ""))
+            query = spatial_order_query(query, geom_col, id_col_name if needs_id else None,
+                                        geographic=geographic)
+        elif needs_id:
+            query = add_id_column_query(query, id_col_name)
 
         # Step 4: Write with DuckDB
         is_s3_dest = destination.startswith('s3://')
@@ -1973,6 +2065,10 @@ Examples:
                             "empty in the head of the file as VARCHAR even when it is "
                             "cleanly numeric later on. Issue #188.")
 
+    parser.add_argument("--no-spatial-order", dest="spatial_order", action="store_false",
+                       help="Keep source row order instead of writing rows in Hilbert "
+                            "order of their geometry, with _cng_fid numbered in that "
+                            "order. Use it when the sort does not fit the pod. Issue #276.")
     parser.add_argument("--no-progress", action="store_true",
                        help="Disable progress output")
     parser.add_argument("--verbose", action="store_true",
@@ -2003,6 +2099,7 @@ Examples:
             trim_strings=args.trim_strings,
             expect_features=args.expect_features,
             csv_sample_size=args.csv_sample_size,
+            spatial_order=args.spatial_order,
         )
         sys.exit(0)
     except Exception as e:
