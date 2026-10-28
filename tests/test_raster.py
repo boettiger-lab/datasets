@@ -2772,6 +2772,68 @@ class TestChunkCompleteness:
         with pytest.raises(RuntimeError, match="[Nn]o completion markers"):
             merge_raster_chunks(out, merged, cleanup=False, expect_chunks=49)
 
+    @pytest.fixture
+    def empty_raster(self, temp_dir):
+        """The same grid as `raster`, every pixel no-data."""
+        from osgeo import gdal, osr
+        w = h = 64
+        path = os.path.join(temp_dir, "empty.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-123.0, 1/64, 0, 37.0 + h/64, 0, -1/64])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        band.SetNoDataValue(-9999)
+        band.Fill(-9999)
+        ds.FlushCache(); ds = None
+        return path
+
+    @pytest.mark.timeout(300)
+    def test_merge_of_an_all_empty_fan_out_succeeds_and_writes_nothing(
+            self, empty_raster, temp_dir):
+        """Every chunk ran and none held data: an empty result, not a failure (#299)."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+        proc, out = self._chunks(empty_raster, temp_dir)
+        n = len(proc.chunk_cells())
+        for i in range(n):
+            proc.process_chunk(i)
+        assert not glob.glob(os.path.join(out, "h0=*", "part-*.parquet")), (
+            "fixture wrote parts, so it no longer exercises an all-empty fan-out"
+        )
+        merged = os.path.join(temp_dir, "merged5")
+        os.makedirs(merged, exist_ok=True)
+        assert merge_raster_chunks(out, merged, cleanup=False, expect_chunks=n) == 0
+        assert not glob.glob(os.path.join(merged, "h0=*"))
+
+    @pytest.mark.timeout(300)
+    def test_empty_merge_still_fails_without_proof_every_chunk_ran(
+            self, empty_raster, temp_dir):
+        """Without --expect-chunks no parts could mean chunks never ran."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+        proc, out = self._chunks(empty_raster, temp_dir)
+        for i in range(len(proc.chunk_cells())):
+            proc.process_chunk(i)
+        merged = os.path.join(temp_dir, "merged6")
+        os.makedirs(merged, exist_ok=True)
+        with pytest.raises(RuntimeError, match="No parquet parts found"):
+            merge_raster_chunks(out, merged, cleanup=False)
+
+    @pytest.mark.timeout(300)
+    def test_merge_still_fails_when_a_chunk_claimed_data_but_left_no_part(
+            self, raster, temp_dir):
+        """A marker saying wrote_data with no part beside it is a lost write."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+        proc, out = self._chunks(raster, temp_dir)
+        n = len(proc.chunk_cells())
+        for i in range(n):
+            proc.process_chunk(i)
+        for part in glob.glob(os.path.join(out, "h0=*", "part-*.parquet")):
+            os.remove(part)
+        merged = os.path.join(temp_dir, "merged7")
+        os.makedirs(merged, exist_ok=True)
+        with pytest.raises(RuntimeError, match="No parquet parts found"):
+            merge_raster_chunks(out, merged, cleanup=False, expect_chunks=n)
+
 
 class TestGapfill:
     """
