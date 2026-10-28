@@ -116,6 +116,23 @@ def _assert_all_chunks_ran(con, chunks_dir: str, expect_chunks: int) -> None:
     print(f"✓ All {expect_chunks} chunks recorded completion")
 
 
+def _every_chunk_ran_empty(con, chunks_dir: str) -> bool:
+    """True when the markers exist and none of them says its chunk wrote data.
+
+    A marker claiming data with no part beside it is a lost write, not an
+    empty result, so it keeps the merge failing.
+    """
+    manifest_glob = f"{chunks_dir.rstrip('/')}/_manifest/chunk-*.parquet"
+    try:
+        (n, wrote), = con.execute(
+            f"SELECT count(*), count(*) FILTER (WHERE wrote_data) "
+            f"FROM read_parquet('{manifest_glob}')"
+        ).fetchall()
+    except Exception:
+        return False
+    return n > 0 and wrote == 0
+
+
 def merge_raster_chunks(
     chunks_dir: str,
     output_dir: str,
@@ -169,22 +186,28 @@ def merge_raster_chunks(
     # data — a part whose rows were filtered down to nothing still lands in the
     # right partition, and a mis-filed part is visible rather than silently
     # merged into whatever its first row's h0 happens to be.
+    no_parts = None
     try:
         h0_vals = con.execute(
             f"SELECT DISTINCT h0 FROM read_parquet('{parts_glob}', hive_partitioning=true) "
             "ORDER BY h0"
         ).fetchall()
     except Exception as e:
-        raise RuntimeError(
-            f"No parquet parts found under '{parts_glob}'. The sub-chunked hex "
-            f"step may have produced no output, or wrote somewhere else."
-        ) from e
+        h0_vals, no_parts = [], e
 
     if not h0_vals:
+        # A fan-out over an h0 with no valid pixels completes correctly and
+        # writes no parts (issue #299). That is only knowable when the markers
+        # have already proven every chunk ran, and none of them claims data.
+        if expect_chunks is not None and _every_chunk_ran_empty(con, chunks_dir):
+            print(f"✓ All {expect_chunks} chunks ran and none held data: "
+                  f"the result is empty, so no h0 partition was written")
+            _cleanup_chunks(chunks_dir, cleanup)
+            return 0
         raise RuntimeError(
             f"No parquet parts found under '{parts_glob}'. The sub-chunked hex "
             f"step may have produced no output, or wrote somewhere else."
-        )
+        ) from no_parts
 
     print(f"Merging {len(h0_vals)} h0 partitions one at a time (bounded memory)...")
 
@@ -235,13 +258,16 @@ def merge_raster_chunks(
     shutil.rmtree(local_dir, ignore_errors=True)
     print(f"✓ Merged {written} h0 partitions")
 
+    _cleanup_chunks(chunks_dir, cleanup)
+    return written
+
+
+def _cleanup_chunks(chunks_dir: str, cleanup: bool) -> None:
     if cleanup and chunks_dir.startswith("s3://"):
         print("Removing chunks prefix from S3...")
         dest = _rclone_dest(chunks_dir)
         if dest:
             subprocess.run(["rclone", "purge", dest], check=False)
-
-    return written
 
 
 def generate_gapfill(
