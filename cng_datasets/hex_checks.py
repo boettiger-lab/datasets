@@ -14,7 +14,7 @@ def assert_h3_columns_unsigned(
 ) -> None:
     """Assert every physical H3 index column ``h{N>=1}`` reads back as ``UBIGINT``.
 
-    Native-cell columns (``h3_polygon_wkt_to_cells`` / ``h3_latlng_to_cell``)
+    Native-cell columns (``h3_polygon_wkb_to_cells`` / ``h3_latlng_to_cell``)
     are always ``UBIGINT``, but ``h3_cell_to_parent`` changed its return type
     from signed ``BIGINT`` to ``UBIGINT`` in a newer h3 community-extension
     release. Because both the pipeline and the MCP do *unpinned*

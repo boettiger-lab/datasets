@@ -14,7 +14,7 @@ from cng_datasets.duckdb_memory import to_duckdb_memory_limit
 
 
 # Line geometries are polyfilled as the H3 cells they *intersect* (issue #239).
-# h3_polygon_wkt_to_cells only accepts polygons, so a line is first given a
+# h3_polygon_wkb_to_cells only accepts polygons, so a line is first given a
 # negligible buffer (~1 cm; 2% of an edge even at res 15) purely to make it a
 # polygon, then filled with the 'overlap' containment mode, which returns every
 # cell whose boundary meets the polygon. Because the sliver contains the line,
@@ -470,6 +470,12 @@ def geom_to_h3_cells(
     # containment so every cell the line passes through is kept (issue #239; see
     # _LINE_BUFFER_DEG). `_is_line` carries that choice past the buffer, transmeridian
     # split and ST_Dump, after which the geometry type alone no longer tells.
+    #
+    # Polygon parts are filled from WKB, which skips a WKT text round trip. The
+    # WKB functions raise on anything that is not a POLYGON, where the WKT ones
+    # returned an empty list, so a part that is not a polygon (a line left in a
+    # GEOMETRYCOLLECTION by ST_Dump) gets that empty list explicitly and falls
+    # through to the representative-cell fallback exactly as before.
     line_buffer = f"{_LINE_BUFFER_DEG}, {_LINE_BUFFER_QUAD_SEGS}"
     is_line = "ST_GeometryType({g}) IN ('LINESTRING', 'MULTILINESTRING')"
 
@@ -477,10 +483,12 @@ def geom_to_h3_cells(
         return f"""CASE
                        WHEN ST_GeometryType(geom) = 'POINT'
                        THEN [h3_latlng_to_cell(ST_Y(geom), ST_X(geom), {res})]
+                       WHEN ST_GeometryType(geom) <> 'POLYGON'
+                       THEN []::UBIGINT[]
                        WHEN _is_line
-                       THEN h3_polygon_wkt_to_cells_experimental(
-                                ST_AsText(ST_Force2D(geom)), {res}, 'overlap')
-                       ELSE h3_polygon_wkt_to_cells(ST_AsText(ST_Force2D(geom)), {res})
+                       THEN h3_polygon_wkb_to_cells_experimental(
+                                ST_AsWKB(ST_Force2D(geom)), {res}, 'overlap')
+                       ELSE h3_polygon_wkb_to_cells(ST_AsWKB(ST_Force2D(geom)), {res})
                    END"""
 
     if line_count > 0:
@@ -545,7 +553,7 @@ def geom_to_h3_cells(
     # Line geometries are buffered into sliver polygons before polyfill.
     #
     # Any polygon smaller than one H3 cell at this resolution contains no cell
-    # centre, so h3_polygon_wkt_to_cells returns an empty array and the feature
+    # centre, so h3_polygon_wkb_to_cells returns an empty array and the feature
     # would vanish from the output entirely; a chunk in which every feature is
     # sub-cell produces no rows at all (issue #104). When the polyfill is empty
     # we fall back to the single cell containing the feature's ST_PointOnSurface

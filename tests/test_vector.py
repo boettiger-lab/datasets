@@ -315,6 +315,21 @@ class TestH3Functions:
         assert n >= 1
 
     @pytest.mark.timeout(10)
+    def test_collection_with_a_line_part_does_not_fail_the_polyfill(self):
+        """ST_Dump leaves a LINESTRING from a GEOMETRYCOLLECTION; the WKB polyfill
+        raises on non-polygons, so that part must get the fallback, not an error."""
+        con = setup_duckdb_connection()
+        con.execute("""
+            CREATE TABLE gc AS
+            SELECT 1::BIGINT AS _cng_fid,
+                   ST_GeomFromText('GEOMETRYCOLLECTION(POLYGON((10 10,10.1 10,10.1 10.1,10 10.1,10 10)),LINESTRING(11 11,11.0001 11.0001))') AS geom
+        """)
+        sql = geom_to_h3_cells(con, "gc", zoom=8)
+        lens = sorted(r[0] for r in con.execute(f"SELECT len(h3id) FROM ({sql})").fetchall())
+        con.close()
+        assert len(lens) == 2 and lens[0] == 1 and lens[1] > 1, lens
+
+    @pytest.mark.timeout(10)
     def test_swapped_coordinate_polygon_stays_empty(self):
         """The fallback is gated on valid latitude: swapped (lat,lon) input stays
         empty so the downstream swapped-coordinate check still raises (#104)."""
