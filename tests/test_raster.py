@@ -739,6 +739,45 @@ class TestCOGOptimization:
         ds = None
 
 
+    @pytest.mark.timeout(60)
+    def test_cog_leaves_empty_tiles_unwritten(self, temp_dir):
+        """All-nodata tiles are left out of the COG, and read back as nodata,
+        so the hex step's coverage prune can skip them (#251)."""
+        from osgeo import osr
+        from cng_datasets.raster import create_cog
+        from cng_datasets.raster.cog import _DataCoverage
+
+        n, nodata = 1024, -9999.0
+        src = os.path.join(temp_dir, "patchy.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(src, n, n, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([-10.0, 20.0 / n, 0, 10.0, 0, -20.0 / n])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        data = np.full((n, n), nodata, dtype=np.float32)
+        data[100:300, 600:900] = 7.0
+        band = ds.GetRasterBand(1)
+        band.SetNoDataValue(nodata)
+        band.WriteArray(data)
+        ds = None
+
+        out = create_cog(input_path=src, output_path=os.path.join(temp_dir, "sparse.tif"),
+                         blocksize=256)
+
+        ds = gdal.Open(out)
+        band = ds.GetRasterBand(1)
+        np.testing.assert_array_equal(band.ReadAsArray(), data)
+        empty = [
+            (i, j) for i in range(4) for j in range(4)
+            if band.GetDataCoverageStatus(i * 256, j * 256, 256, 256)[0]
+            == gdal.GDAL_DATA_COVERAGE_STATUS_EMPTY
+        ]
+        assert len(empty) == 12, empty
+        ds = None
+        cov, reason = _DataCoverage.open(out, [nodata])
+        assert cov is not None, reason
+
+
 class TestIntegration:
     """Integration tests for complete workflows."""
     
