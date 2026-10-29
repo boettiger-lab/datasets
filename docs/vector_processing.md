@@ -46,7 +46,7 @@ cng-convert-to-parquet https://example.com/parks.gdb s3://my-bucket/parks.parque
 | `--no-spatial-order` | off | Keep source row order instead of Hilbert order (see [Output Format](#output-format)) |
 
 `cng-datasets workflow` exposes the same options for its convert step, except
-`--no-spatial-order`, `--target-crs` and `--csv-sample-size`.
+`--no-spatial-order`, `--target-crs` and `--csv-sample-size` (#311).
 
 ### H3 tiling from Python
 
