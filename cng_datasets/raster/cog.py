@@ -2570,11 +2570,16 @@ class RasterProcessor:
         print(f"Creating COG: {output_path}")
         print(f"  Input: {self.input_path}")
 
+        # SPARSE_OK leaves every all-nodata tile out of the file, so the hex
+        # step's coverage prune (#251) can skip it from the tile index alone.
+        # GDAL, rasterio, tifffile and geotiff.js >= 3.0 read an unwritten tile
+        # as nodata; geotiff.js 1.x and 2.x fail on it with "buffer error".
         cog_creation_opts = [
             f'COMPRESS={self.compression.upper()}',
             f'BLOCKSIZE={self.blocksize}',
             'BIGTIFF=IF_SAFER',
             'NUM_THREADS=ALL_CPUS',
+            'SPARSE_OK=TRUE',
         ]
 
         # Reproject to EPSG:4326 if needed
