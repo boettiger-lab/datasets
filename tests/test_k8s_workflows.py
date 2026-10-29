@@ -2525,7 +2525,7 @@ class TestChunkBackendRouting:
             out = self._build(tmpdir, chunk_resolution=3, backend="k8s")
             assert not list(out.glob("armada-*.yaml"))
             printed = capsys.readouterr().out
-            assert "343 chunks exceeds" in printed
+            assert "343 hex completions exceeds" in printed
             assert "--backend armada" in printed
 
     @pytest.mark.timeout(60)
