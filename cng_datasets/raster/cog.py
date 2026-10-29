@@ -169,6 +169,90 @@ def _spans_globe(xmin: float, xmax: float, pixel: float) -> bool:
     return abs((xmax - xmin) - 360.0) <= 1.5 * pixel
 
 
+# A mixed window this many blocks across or fewer is kept rather than
+# descended: below about a block, a cell that is still mixed is one that
+# straddles a tile edge, and its children mostly will be too.
+_COVERAGE_MIN_BLOCKS = 2
+
+
+class _DataCoverage:
+    """Which parts of a sparse source hold written tiles (issue #251).
+
+    A tiled GeoTIFF written with SPARSE_OK leaves all-nodata tiles out of the
+    file, and `GetDataCoverageStatus` answers from the tile index, without
+    reading pixels. The first query over a region loads that region's index
+    (about 38 s for 20 x 20 deg of a 30 m global COG over the public
+    endpoint); every later query inside it takes microseconds.
+
+    Built only by `open`, which refuses any source where an unwritten tile
+    would not read as a value the build already treats as nodata. That is the
+    whole safety argument: dropping a subtree over unwritten tiles drops only
+    pixels that the aggregation would have skipped anyway.
+    """
+
+    DATA = gdal.GDAL_DATA_COVERAGE_STATUS_DATA
+    EMPTY = gdal.GDAL_DATA_COVERAGE_STATUS_EMPTY
+
+    def __init__(self, ds, band):
+        self._ds, self._band = ds, band
+        gt = ds.GetGeoTransform()
+        self._x0, self._dx, self._y0, self._dy = gt[0], gt[1], gt[3], gt[5]
+        self._w, self._h = ds.RasterXSize, ds.RasterYSize
+        self._bx, self._by = band.GetBlockSize()
+
+    @classmethod
+    def open(cls, path: str, nodata_values):
+        """`(coverage, None)`, or `(None, reason)` when the prune cannot be trusted."""
+        ds = gdal.Open(path)
+        if ds is None:
+            return None, "the source could not be opened"
+        srs = osr.SpatialReference(wkt=ds.GetProjection())
+        if not srs.IsGeographic():
+            return None, "the source is not in geographic coordinates"
+        gt = ds.GetGeoTransform()
+        if gt[2] != 0 or gt[4] != 0 or gt[1] <= 0 or gt[5] >= 0:
+            return None, "the source's geotransform is rotated or flipped"
+        band = ds.GetRasterBand(1)
+        # GDAL reads an unwritten tile as the band's nodata, or 0 without one.
+        unwritten = band.GetNoDataValue()
+        unwritten = 0.0 if unwritten is None else unwritten
+        if not any(v == unwritten for v in nodata_values):
+            return None, (f"unwritten tiles read as {unwritten:g}, which is not "
+                          f"among the nodata values {list(nodata_values)}")
+        flags, _ = band.GetDataCoverageStatus(0, 0, min(ds.RasterXSize, 1),
+                                              min(ds.RasterYSize, 1))
+        if flags & gdal.GDAL_DATA_COVERAGE_STATUS_UNIMPLEMENTED:
+            return None, "the source's format does not report tile coverage"
+        return cls(ds, band), None
+
+    def status(self, ymin: float, ymax: float, lon_intervals):
+        """`(flags, blocks)` for a footprint: DATA and/or EMPTY, and its size.
+
+        Every longitude interval is tried in all three frames (shifted by 360
+        either way), as the bbox prune does, so a source written in a frame
+        other than [-180, 180] (#295) is read where its pixels are. `flags`
+        is 0 when the footprint misses the raster; `blocks` is the widest
+        window queried, in blocks.
+        """
+        r0 = max(0, int(math.floor((ymax - self._y0) / self._dy)))
+        r1 = min(self._h, int(math.ceil((ymin - self._y0) / self._dy)))
+        flags, blocks = 0, 0.0
+        if r1 <= r0:
+            return flags, blocks
+        for lo, hi in lon_intervals:
+            for k in (-360.0, 0.0, 360.0):
+                c0 = max(0, int(math.floor((lo + k - self._x0) / self._dx)))
+                c1 = min(self._w, int(math.ceil((hi + k - self._x0) / self._dx)))
+                if c1 <= c0:
+                    continue
+                f, _ = self._band.GetDataCoverageStatus(c0, r0, c1 - c0, r1 - r0)
+                if f & gdal.GDAL_DATA_COVERAGE_STATUS_UNIMPLEMENTED:
+                    f = self.DATA | self.EMPTY
+                flags |= f
+                blocks = max(blocks, (c1 - c0) / self._bx, (r1 - r0) / self._by)
+        return flags, blocks
+
+
 def _wrap_padded_vrt(source: str, pad_deg: float, out_dir: str) -> str:
     """A VRT of a 360-deg source extended past both edges with its own columns.
 
@@ -2183,6 +2267,10 @@ class RasterProcessor:
         # Off via CNG_HEX_PRUNE_CELLS=0, which restores the full 7^n
         # enumeration for a like-for-like comparison.
         self._prune_cells = os.environ.get("CNG_HEX_PRUNE_CELLS", "1") != "0"
+        # ...and, inside that, drop subtrees over a sparse source's unwritten
+        # tiles (issue #251). Off via CNG_HEX_PRUNE_COVERAGE=0.
+        self._prune_coverage = os.environ.get("CNG_HEX_PRUNE_COVERAGE", "1") != "0"
+        self._coverage_cache = None
 
         if local_cache_dir and not self._windowing and remote_source:
             input_path = _localize_input(input_path, local_cache_dir)
@@ -2639,9 +2727,11 @@ class RasterProcessor:
             return full, None
         sxmin, symin, sxmax, symax = self._src_bounds_4326
         if (sxmin <= -180.0 and sxmax >= 180.0
-                and symin <= -90.0 and symax >= 90.0):
+                and symin <= -90.0 and symax >= 90.0
+                and self._coverage() is None):
             # A global source (or one whose bounds could not be computed, which
-            # falls back to global) has nothing to prune against.
+            # falls back to global) has nothing to prune against, unless it is
+            # sparse.
             return full, None
 
         start = self.con.execute(
@@ -2672,6 +2762,20 @@ class RasterProcessor:
             values = ",".join(f"({int(c)}::UBIGINT)" for c in leaves)
             parts.append(f"SELECT cell AS {h3_col} FROM (VALUES {values}) t(cell)")
         return " UNION ALL ".join(parts), int(total)
+
+    def _coverage(self):
+        """The source's tile coverage, or None when the #251 prune is off."""
+        if not self._prune_coverage:
+            return None
+        if self._coverage_cache is None:
+            coverage, reason = _DataCoverage.open(self.input_path, self.nodata_values)
+            if coverage is None:
+                print(f"  ℹ coverage prune off: {reason}")
+                self._coverage_cache = False
+            else:
+                print("  ✓ coverage prune on: subtrees over unwritten tiles are skipped")
+                self._coverage_cache = coverage
+        return self._coverage_cache or None
 
     def _classify_descendants(self, chunk_cell: int, start: int):
         """Descend the H3 hierarchy, keeping only what can reach the source.
@@ -2709,8 +2813,16 @@ class RasterProcessor:
         Containment needs no margin, only the opposite bias: taking a subtree
         wholesale can over-include, and an extra cell yields no covered pixels
         and is dropped by the aggregation. Under-including cannot be recovered.
+
+        A sparse source refines both tests by its tile index (issue #251). A
+        cell whose widened window holds only unwritten tiles is dropped, and a
+        cell inside the source is kept wholesale only if its window holds no
+        unwritten tile, or is too small (`_COVERAGE_MIN_BLOCKS`) for
+        descending to pay. So the work follows the data's footprint rather
+        than its bounding box.
         """
         sxmin, symin, sxmax, symax = self._src_bounds_4326
+        coverage = self._coverage()
         frontier = [int(chunk_cell)]
         interior, leaves = [], []
         for level in range(start + 1, self.h3_resolution + 1):
@@ -2752,9 +2864,16 @@ class RasterProcessor:
                     continue
                 if not any(self._lon_overlaps(lo, hi) for lo, hi in wide):
                     continue
+                mixed = False
+                if coverage is not None:
+                    flags, blocks = coverage.status(wymin, wymax, wide)
+                    if flags == coverage.EMPTY:
+                        continue
+                    mixed = (flags & coverage.EMPTY) and blocks > _COVERAGE_MIN_BLOCKS
                 if level == self.h3_resolution:
                     leaves.append(int(cell))
-                elif (len(lon_intervals) == 1
+                elif (not mixed
+                      and len(lon_intervals) == 1
                       and symin <= ymin and symax >= ymax
                       and self._lon_contains(*lon_intervals[0])):
                     # Wholly inside the source: every descendant is kept. A cell
