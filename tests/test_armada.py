@@ -580,3 +580,71 @@ class TestWorkflowBackendFlag:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestArmadaPodSizeCap:
+    """NRP refuses a controller-less pod, which every Armada pod is, above 16
+    cores or 32Gi. A job past that is refused at generation, before any Armada
+    file is written, rather than failing at admission after submission (#183)."""
+
+    def _raster(self, tmpdir, monkeypatch, **kwargs):
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+        generate_raster_workflow(
+            dataset_name="capdemo", source_urls="https://example.com/x.tif",
+            bucket="b", output_dir=tmpdir, backend="armada", **kwargs)
+
+    @pytest.mark.timeout(10)
+    def test_a_pod_at_the_cap_converts(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._raster(tmpdir, monkeypatch, hex_memory="32Gi", hex_cpu="16")
+            assert list(Path(tmpdir).glob("armada-*.yaml"))
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize("sizing, named", [
+        (dict(hex_memory="64Gi"), "memory 64Gi > 32Gi"),
+        (dict(hex_memory="32.1Gi"), "memory 32.1Gi > 32Gi"),
+        (dict(hex_cpu="17"), "cpu 17 > 16"),
+    ])
+    def test_a_pod_past_the_cap_is_refused_and_nothing_is_written(
+            self, monkeypatch, sizing, named):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="no controller") as err:
+                self._raster(tmpdir, monkeypatch, **sizing)
+            assert named in str(err.value)
+            assert "capdemo-hex.yaml" in str(err.value)
+            assert not list(Path(tmpdir).glob("armada-*.yaml"))
+
+    @pytest.mark.timeout(10)
+    def test_decimal_units_are_compared_as_bytes(self, monkeypatch):
+        """34G is 31.7Gi, which NRP admits."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._raster(tmpdir, monkeypatch, hex_memory="34G")
+
+    @pytest.mark.timeout(10)
+    def test_k8s_backend_is_not_capped(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import cng_datasets.raster.cog as cog
+            monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+            generate_raster_workflow(
+                dataset_name="capdemo", source_urls="https://example.com/x.tif",
+                bucket="b", output_dir=tmpdir, backend="k8s", hex_memory="64Gi")
+
+    @pytest.mark.timeout(10)
+    def test_a_profile_can_lift_the_cap(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir) / "open.yaml"
+            profile.write_text('armada_max_cpu: ""\narmada_max_memory: ""\n')
+            out = Path(tmpdir) / "out"
+            self._raster(str(out), monkeypatch, hex_memory="64Gi", profile=str(profile))
+            assert list(out.glob("armada-*.yaml"))
+
+    def test_direct_callers_are_unchecked_unless_they_ask(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = _make_simple_job(name="big-job")
+            job["spec"]["template"]["spec"]["containers"][0]["resources"] = {
+                "requests": {"memory": "64Gi"}, "limits": {"memory": "64Gi"}}
+            Path(tmpdir, "big-job.yaml").write_text(yaml.safe_dump(job))
+            assert convert_workflow_to_armada(tmpdir, "big")
+            with pytest.raises(ValueError, match="memory 64Gi > 32Gi"):
+                convert_workflow_to_armada(tmpdir, "big", max_cpu="16", max_memory="32Gi")

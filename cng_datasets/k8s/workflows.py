@@ -24,7 +24,7 @@ from .armada import (
 _CONFIG_KEYS = {
     "s3_endpoint", "s3_public_endpoint", "s3_secret_name",
     "rclone_secret_name", "rclone_remote", "priority_class", "node_affinity",
-    "namespace", "armada_queue",
+    "namespace", "armada_queue", "armada_max_cpu", "armada_max_memory",
 }
 
 
@@ -89,6 +89,14 @@ class ClusterConfig:
     # Armada queue. None means "use the namespace", which is right on NRP and
     # was the only possible behaviour before this was configurable.
     armada_queue: Optional[str] = None
+    # Largest pod Armada can place. Every Armada pod is controller-less, and
+    # NRP's admission webhook refuses such a pod above 16 cores or 32Gi (its
+    # message says "32 GB", but 34G is admitted and 32.1Gi is refused, measured
+    # with server-side dry runs). Checked when converting to Armada, because a
+    # pod past it fails at admission, job by job, after submission (#183).
+    # Empty string = no limit, for a cluster without one.
+    armada_max_cpu: str = "16"
+    armada_max_memory: str = "32Gi"
     # Priority class (empty string = omit from spec, giving default priority 0).
     #
     # Default is now to omit it. On NRP `opportunistic` is priority
@@ -1097,6 +1105,8 @@ def generate_dataset_workflow(
             dataset_name=k8s_name,
             queue=armada_queue,
             priority_class=armada_priority_class,
+            max_cpu=config.armada_max_cpu,
+            max_memory=config.armada_max_memory,
         )
         effective_priority = (
             resolve_armada_priority_class(armada_priority_class)
@@ -1538,6 +1548,8 @@ def generate_raster_workflow(
             dataset_name=k8s_name,
             queue=armada_queue,
             priority_class=armada_priority_class,
+            max_cpu=config.armada_max_cpu,
+            max_memory=config.armada_max_memory,
         )
         effective_priority = (
             resolve_armada_priority_class(armada_priority_class)
@@ -1942,6 +1954,8 @@ def generate_mdim_workflow(
         {"name": "GDAL_CACHEMAX", "value": "1024"},
         {"name": "GDAL_HTTP_MAX_RETRY", "value": "5"},
         {"name": "GDAL_HTTP_RETRY_DELAY", "value": "2"},
+        # The cpu request, for the usage each chunk records (#183).
+        {"name": "CNG_POD_CPU", "value": str(hex_cpu)},
     ]
     resources = {
         "requests": {"cpu": str(hex_cpu), "memory": hex_memory, "ephemeral-storage": hex_storage},
@@ -1977,7 +1991,8 @@ def generate_mdim_workflow(
     if backend == "armada":
         files = convert_workflow_to_armada(
             k8s_yaml_dir=str(output_path), dataset_name=k8s_name,
-            queue=armada_queue, priority_class=armada_priority_class)
+            queue=armada_queue, priority_class=armada_priority_class,
+            max_cpu=config.armada_max_cpu, max_memory=config.armada_max_memory)
         print("Armada files:", ", ".join(Path(f).name for f in files))
     elif (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE:
         print(f"  ⚠ {chunk_count} completions exceeds the ~{K8S_CHUNK_COUNT_GUIDELINE}-pod "
@@ -2261,6 +2276,9 @@ def _generate_raster_hex_job(
         # tuned value survives regeneration (issue #195).
         {"name": "CNG_HEX_WORKERS", "value": str(hex_workers)},
         {"name": "CNG_HEX_CHUNK_SIZE", "value": str(hex_chunk_size)},
+        # The cpu request, for the usage each chunk records (#183): NRP
+        # enforces no cpu quota, so the pod cannot read it from its cgroup.
+        {"name": "CNG_POD_CPU", "value": hex_cpu},
         # The hex step's own DuckDB writes the partition by scanning
         # every part its workers produced. Unset, DuckDB sizes its
         # buffer manager from the *host's* RAM rather than the pod's

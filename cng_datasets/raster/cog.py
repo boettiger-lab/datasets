@@ -26,6 +26,7 @@ from cng_datasets.h3_chunks import (  # shared with mdim (#181)
     chunk_output_path,
     enumerate_chunk_cells,
     record_chunk_completion,
+    start_usage_monitor,
     widen_footprint as _widen_footprint,
 )
 
@@ -3436,6 +3437,8 @@ class RasterProcessor:
         if self.chunk_resolution == 0:
             return self.process_h0_region(chunk_index)
 
+        # Measured into the chunk's completion marker (#183).
+        start_usage_monitor()
         cells = self.chunk_cells()
         if not 0 <= chunk_index < len(cells):
             raise ValueError(

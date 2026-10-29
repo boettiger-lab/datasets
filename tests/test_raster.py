@@ -5136,3 +5136,110 @@ class TestMosaicScratch:
         assert not _shares_target_grid([a, coarse], "EPSG:4326")
         assert not _shares_target_grid([merc], "EPSG:4326")
         assert not _shares_target_grid([a], "EPSG:3857")
+
+
+class TestChunkUsageReport:
+    """Each chunk's marker records what its pod used, and merge-chunks turns
+    the fan-out's figures into a size for the next build (issue #183)."""
+
+    def _cgroup(self, tmp_path, monkeypatch, limit="8589934592", anon=1 << 30):
+        from cng_datasets import h3_chunks
+        cg = tmp_path / "cgroup"
+        cg.mkdir()
+        (cg / "memory.max").write_text(limit + "\n")
+        (cg / "memory.peak").write_text(str(3 << 30) + "\n")
+        (cg / "memory.stat").write_text(f"anon {anon}\nfile 123\n")
+        (cg / "cpu.max").write_text("max 100000\n")
+        monkeypatch.setenv("CNG_POD_CPU", "4")
+        monkeypatch.setenv("CNG_HEX_WORKERS", "4")
+        (cg / "cpu.stat").write_text("usage_usec 5000000\nuser_usec 4000000\n")
+        monkeypatch.setattr(h3_chunks, "_CGROUP", str(cg))
+        monkeypatch.setattr(h3_chunks, "_anon_peak", None)
+        return cg
+
+    @pytest.mark.timeout(30)
+    def test_pod_usage_reads_a_bounded_cgroup(self, tmp_path, monkeypatch):
+        import time
+        from cng_datasets import h3_chunks
+        cg = self._cgroup(tmp_path, monkeypatch)
+        h3_chunks.start_usage_monitor(interval_s=0.02)
+        (cg / "memory.stat").write_text(f"anon {2 << 30}\nfile 1\n")
+        time.sleep(0.3)
+        (cg / "memory.stat").write_text(f"anon {1 << 30}\nfile 1\n")
+        u = h3_chunks.pod_usage()
+        assert u["mem_limit_bytes"] == 8 << 30
+        assert u["peak_bytes"] == 3 << 30
+        assert u["anon_peak_bytes"] == 2 << 30, "the sampled peak, not the current value"
+        assert u["cpu_request"] == 4.0
+        assert u["workers"] == 4
+        assert u["elapsed_s"] > 0 and u["cpu_mean"] > 0
+
+    @pytest.mark.timeout(10)
+    def test_an_enforced_quota_is_read_directly(self, tmp_path, monkeypatch):
+        from cng_datasets import h3_chunks
+        cg = self._cgroup(tmp_path, monkeypatch)
+        (cg / "cpu.max").write_text("250000 100000\n")
+        monkeypatch.delenv("CNG_POD_CPU")
+        assert h3_chunks.pod_usage()["cpu_request"] == 2.5
+
+    @pytest.mark.timeout(10)
+    def test_an_unbounded_cgroup_measures_nothing(self, tmp_path, monkeypatch):
+        """Its counters are the whole host's."""
+        from cng_datasets import h3_chunks
+        self._cgroup(tmp_path, monkeypatch, limit="max")
+        h3_chunks.start_usage_monitor()
+        usage = h3_chunks.pod_usage()
+        assert usage.pop("workers") == 4, "configuration, not a measurement"
+        assert all(v is None for v in usage.values())
+
+    def _markers(self, tmp_path, monkeypatch, usages):
+        from cng_datasets import h3_chunks
+        chunks = tmp_path / "chunks"
+        con = duckdb.connect()
+        for i, usage in enumerate(usages):
+            monkeypatch.setattr(h3_chunks, "pod_usage", lambda u=usage: u)
+            h3_chunks.record_chunk_completion(con, str(chunks), i, 100 + i, 7, True)
+        con.close()
+        return str(chunks)
+
+    @staticmethod
+    def _usage(peak_gib, anon_gib, cpu_mean, limit_gib=32, cpu_request=8.0, workers=8):
+        gib = 2 ** 30
+        return dict(mem_limit_bytes=limit_gib * gib, peak_bytes=int(peak_gib * gib),
+                    anon_peak_bytes=None if anon_gib is None else int(anon_gib * gib),
+                    cpu_request=cpu_request, cpu_mean=cpu_mean, elapsed_s=300.0,
+                    workers=workers)
+
+    @pytest.mark.timeout(30)
+    def test_suggestion_is_tight_on_memory_and_mean_on_cpu(self, tmp_path, monkeypatch, capsys):
+        from cng_datasets.raster.merge import report_chunk_usage
+        chunks = self._markers(tmp_path, monkeypatch, [
+            self._usage(6.0, 4.1, 3.3), self._usage(5.0, 3.0, 2.9), self._usage(2.0, 1.0, 1.1)])
+        summary = report_chunk_usage(chunks)
+        # Memory from the largest anonymous peak plus 25%: 4.1 x 1.25 -> 6Gi.
+        # Cpu from the mean of the pods' averages: 2.43 -> 3.
+        assert summary["suggested_memory"] == "6Gi"
+        assert summary["suggested_cpu"] == 3
+        out = capsys.readouterr().out
+        assert "--hex-memory 6Gi --hex-cpu 3 --hex-workers 8" in out
+        assert "asked for 32 GiB" in out
+
+    @pytest.mark.timeout(30)
+    def test_without_anon_samples_the_cgroup_peak_is_the_basis(self, tmp_path, monkeypatch):
+        from cng_datasets.raster.merge import report_chunk_usage
+        chunks = self._markers(tmp_path, monkeypatch, [
+            self._usage(6.0, None, 3.0), self._usage(2.0, 1.0, 3.0)])
+        assert report_chunk_usage(chunks)["suggested_memory"] == "8Gi"  # 6 x 1.25 = 7.5
+
+    @pytest.mark.timeout(30)
+    def test_markers_without_usage_report_nothing(self, tmp_path, monkeypatch):
+        """Older builds' markers, and pods outside a bounded cgroup."""
+        from cng_datasets.raster.merge import report_chunk_usage
+        old = tmp_path / "old" / "_manifest"
+        old.mkdir(parents=True)
+        duckdb.connect().execute(
+            f"COPY (SELECT 0::BIGINT AS chunk_index, 1::UBIGINT AS chunk_cell, 2::UBIGINT AS h0, "
+            f"true AS wrote_data) TO '{old}/chunk-0.parquet' (FORMAT PARQUET)")
+        assert report_chunk_usage(str(tmp_path / "old")) is None
+        empty = dict.fromkeys(self._usage(1, 1, 1))
+        assert report_chunk_usage(self._markers(tmp_path, monkeypatch, [empty])) is None

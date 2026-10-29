@@ -34,6 +34,7 @@ from ..h3_chunks import (
     chunk_output_path,
     enumerate_chunk_cells,
     record_chunk_completion,
+    start_usage_monitor,
 )
 from ..hex_checks import assert_h3_columns_unsigned
 from ..provenance import kv_metadata_sql
@@ -315,6 +316,7 @@ class MdimProcessor:
 
     def process_chunk(self, chunk_index: int) -> Optional[str]:
         """Hex chunk *chunk_index*; returns the parquet written, or None."""
+        start_usage_monitor()  # measured into the completion marker (#183)
         cells = self.chunk_cells()
         if not 0 <= chunk_index < len(cells):
             raise ValueError(f"chunk index {chunk_index} is outside the {len(cells)} chunks "
@@ -379,6 +381,7 @@ class MdimProcessor:
         part per h0 partition — `part-t{unit}-*.parquet` under the staging
         prefix, which `merge-chunks` concatenates into `data_0.parquet`.
         """
+        start_usage_monitor()  # measured into the completion marker (#183)
         if self.t_hi == self.t_lo:
             print(f"Time unit {unit_index}: no time steps in the requested window")
             record_chunk_completion(self.con, self.output_parquet_path, unit_index, 0, 0, False)

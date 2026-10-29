@@ -133,6 +133,95 @@ def _every_chunk_ran_empty(con, chunks_dir: str) -> bool:
     return n > 0 and wrote == 0
 
 
+# Headroom over the measured peak in the suggested memory request. Memory is
+# sized tight because it is the inelastic dimension: it decides how many
+# placement slots exist, and NRP refuses an Armada pod above 32Gi outright. The
+# headroom covers a spike shorter than the sampling interval (#183).
+_SUGGESTED_MEMORY_HEADROOM = 1.25
+
+
+def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
+    """Summarise the resources a fan-out's pods used against what they asked
+    for, and suggest a size for the next build of the same shape (issue #183).
+
+    Reads the usage columns of the completion markers (`pod_usage`). Memory is
+    suggested from the largest peak with modest headroom, using anonymous
+    memory where it was sampled, since page cache is reclaimed before anything
+    is killed. Cpu is suggested from the mean of each pod's lifetime average,
+    because a slice given fewer cores mostly just runs longer.
+
+    Returns the summary, or None when no marker carries usage (an older build,
+    or pods outside a bounded cgroup). Printing it is the point: the requests
+    in a manifest tend to be inherited rather than measured, and this is the
+    one place the measured figures for the whole fan-out meet.
+    """
+    import math
+
+    own_con = con is None
+    if own_con:
+        con = duckdb.connect()
+        configure_s3_credentials(con)
+    manifest_glob = f"{chunks_dir.rstrip('/')}/_manifest/chunk-*.parquet"
+    try:
+        row = con.execute(f"""
+            SELECT count(*), count(peak_bytes),
+                   max(mem_limit_bytes), max(cpu_request),
+                   max(peak_bytes), quantile_cont(peak_bytes, 0.95),
+                   max(anon_peak_bytes), count(anon_peak_bytes),
+                   avg(cpu_mean), quantile_cont(cpu_mean, 0.95), max(elapsed_s),
+                   max(workers), min(workers)
+            FROM read_parquet('{manifest_glob}', union_by_name = true)
+        """).fetchone()
+    except Exception:
+        return None
+    finally:
+        if own_con:
+            con.close()
+    (n, measured, mem_limit, cpu_request, peak, peak_p95,
+     anon_peak, n_anon, cpu_mean, cpu_p95, slowest, workers, min_workers) = row
+    if not measured:
+        return None
+
+    gib = 2 ** 30
+    basis = anon_peak if n_anon == measured and anon_peak else peak
+    memory_gi = max(1, math.ceil(basis * _SUGGESTED_MEMORY_HEADROOM / gib))
+    cpu = max(1, math.ceil(cpu_mean)) if cpu_mean else None
+    summary = dict(chunks=n, measured=measured, mem_limit_bytes=mem_limit,
+                   cpu_request=cpu_request, peak_bytes=peak, anon_peak_bytes=anon_peak,
+                   cpu_mean=cpu_mean, suggested_memory=f"{memory_gi}Gi",
+                   suggested_cpu=cpu)
+
+    asked = []
+    if mem_limit:
+        asked.append(f"{mem_limit / gib:g} GiB")
+    if cpu_request:
+        asked.append(f"{cpu_request:g} cpu")
+    print(f"Resource use, measured on {measured} of {n} chunks"
+          + (f" (requested {' × '.join(asked)} each)" if asked else "") + ":")
+    anon = (f"; anonymous {anon_peak / gib:.2f} GiB" if anon_peak and n_anon == measured
+            else "")
+    print(f"  memory peak {peak / gib:.2f} GiB (95th percentile {peak_p95 / gib:.2f}){anon}")
+    if cpu_mean is not None:
+        print(f"  cpu {cpu_mean:.1f} cores on average over each pod's life "
+              f"(95th percentile {cpu_p95:.1f}); slowest pod "
+              + (f"{slowest / 60:.0f} min" if slowest >= 120 else f"{slowest:.0f} s"))
+    flags = f"--hex-memory {memory_gi}Gi" + (f" --hex-cpu {cpu}" if cpu else "")
+    if workers and workers == min_workers:
+        # Pinned, because --hex-workers defaults to --hex-cpu, and the memory
+        # measured here is what this many workers used.
+        flags += f" --hex-workers {workers}"
+        print(f"  For the next build of this shape: {flags}")
+    else:
+        print(f"  For the next build of this shape: {flags}, keeping --hex-workers "
+              f"where it was (it defaults to --hex-cpu, and the memory measured "
+              f"here depends on it).")
+    if mem_limit and mem_limit > 2 * memory_gi * gib:
+        print(f"  ⚠ The pods asked for {mem_limit / gib:g} GiB and needed at most "
+              f"{basis / gib:.2f}. An oversized memory request costs placement: it "
+              f"decides how many pods fit at once, and Armada refuses pods above 32Gi.")
+    return summary
+
+
 def merge_raster_chunks(
     chunks_dir: str,
     output_dir: str,
@@ -173,6 +262,10 @@ def merge_raster_chunks(
         con.execute(f"SET memory_limit='{effective_limit}'")
     con.execute("SET http_timeout=1200")
     con.execute("SET http_retries=30")
+
+    # Reported first, so a fan-out that the checks below refuse still says what
+    # its pods used (#183).
+    report_chunk_usage(chunks_dir, con=con)
 
     # Checked before anything is read or written, so an incomplete fan-out costs
     # nothing and leaves every chunk in place to inspect.
