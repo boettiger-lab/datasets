@@ -2338,6 +2338,8 @@ class TestSubH0Chunking:
         """A multi-year build (#172) stages chunks under hex-chunks/year=<year>/;
         the merged file must not carry a year column of its own, which would
         clash with the year partition above it on read."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+
         sub_proc, chunks_dir = self._processor(raster, temp_dir, "year=2000", chunk_resolution=2)
         for i in range(len(sub_proc.chunk_cells())):
             sub_proc.process_chunk(i)
