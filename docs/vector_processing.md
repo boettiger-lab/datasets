@@ -149,8 +149,9 @@ processor = H3VectorProcessor(
 ## Variable Resolution by Area
 
 **When to use this.** Reach for `--resolution-by-area` when a single dataset mixes
-small and very large polygons and a uniform fine resolution either OOMs in Pass 2
-or trips the 2 GB parquet-page limit on the biggest features — but dropping the
+small and very large polygons and a uniform fine resolution makes the biggest
+features produce more cells than you want to store or than a hex pod can handle —
+but dropping the
 *whole* dataset to a coarse resolution would throw away edge precision on the many
 small features. The canonical case is a species-range or protected-areas layer
 where a handful of continental/global polygons dominate cost while most features
@@ -181,15 +182,36 @@ across the mixed-resolution union (no compaction / ancestor-walks needed).
 - Include `0` in `--parent-resolutions` — it is the `h0` hive partition key (the
   tool errors clearly if you omit it).
 - Mutually exclusive with `--resolution` / `--h3-resolution`.
-- The [oversized-feature guardrail](#memory-optimization) estimates cells at each
-  feature's *own* native resolution, so a polygon that would exceed the per-feature
-  cell-array limit at a fine resolution passes once a coarse bin is assigned.
+- The oversized-feature guard (`CNG_MAX_CELLS_PER_FEATURE`, default 1 billion
+  cells) estimates cells at each feature's *own* native resolution, so a polygon
+  that would exceed it at a fine resolution passes once a coarse bin is assigned.
 - **Chunk-size caveat:** because larger features are hexed coarser, cells-per-feature
   still *rises* with the tier, so coarser/larger-feature tiers want a *smaller*
   `--chunk-size` (aim for a roughly constant few-million cells per chunk, not a
   constant row count). Automatic cells-per-chunk scaling is tracked in issue #124.
-- For a *single* feature too large even for the coarsest bin, see issue #125
-  (recursive classify-and-descend) — not yet implemented.
+- A single very large feature no longer needs a coarse bin just to be hexed at
+  all: since issue #125 every large polygon is cut into pieces before the
+  polyfill (see below).
+
+## Large and complex polygons
+
+Before the polyfill, a polygon part that is large or complex is cut into pieces,
+and H3 fills each piece separately (issue #125). The pieces come from halving the
+part's bounding box in both directions, again and again, until each piece has at
+most ~1 million cells and its cells × vertices stays under 100 million. H3 tests
+every candidate cell centre against every edge, so the second limit is what keeps
+a long, detailed coastline from taking hours: a 200,000-vertex polygon took 565 s
+to fill whole at res 7.
+
+The output is unchanged. A cell belongs to the fill exactly when its centre is
+inside the polygon, so the pieces' fills add up to the fill of the whole part,
+with no gaps or overlaps. Each piece's cells are a separate list in Pass 1, so no
+single list gets near the 2 GB limit on one parquet value, which used to cap a
+feature at ~134 million cells.
+
+Not cut: line features, invalid polygons (clipping one can fail) and parts too
+small to need it. A large part that crosses the antimeridian is first cut at
+180° into two ordinary parts.
 
 ## Output Format
 

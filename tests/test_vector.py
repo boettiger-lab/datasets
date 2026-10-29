@@ -2156,3 +2156,123 @@ class TestVectorDuckDBMemoryLimit:
         env = {e["name"]: e.get("value") for e in c["env"]}
         assert env["DUCKDB_MEMORY_LIMIT"] == "13GiB"
         assert c["resources"]["limits"]["memory"] == "16Gi"
+
+
+def _jagged_ring(cx, cy, r, n, seed):
+    """WKT coordinates of a closed, simple, star-shaped ring with a rough edge."""
+    import math
+    import random
+    rng = random.Random(seed)
+    pts = []
+    for k in range(n):
+        t = 2 * math.pi * k / n
+        a = r * (0.7 + 0.3 * rng.random())
+        pts.append(f"{cx + a * math.cos(t):.9f} {cy + a * math.sin(t):.9f}")
+    return ", ".join(pts + pts[:1])
+
+
+class TestPolygonPieces:
+    """Issue #125: a large polygon part is cut into pieces that H3 fills one by
+    one. With center containment the pieces' fills partition the whole fill, so
+    the output must be exactly the cells of filling the part whole."""
+
+    _HOLED = (f"POLYGON(({_jagged_ring(10, 45, 2.0, 600, 1)}), "
+              f"(10.3 45.3, 9.7 45.3, 9.7 44.7, 10.3 44.7, 10.3 45.3))")
+    # Crosses the antimeridian; H3 fills it the short way, 170E..170W.
+    _CROSSER = ("POLYGON((170 50, 175 49.5, 180 50.5, -175 49.5, -170 50, "
+                "-170.5 55, -170 60, -175 60.5, 180 59.5, 175 60.5, 170 60, "
+                "170.5 55, 170 50))")
+
+    def _cells(self, monkeypatch, wkt, res, max_cells=None, max_work=None):
+        """(rows the polyfill emits, their cells, H3's fill of the whole part)."""
+        from cng_datasets.vector import h3_tiling
+        if max_cells is not None:
+            monkeypatch.setattr(h3_tiling, "_PIECE_MAX_CELLS", max_cells)
+        if max_work is not None:
+            monkeypatch.setattr(h3_tiling, "_PIECE_MAX_WORK", max_work)
+        con = setup_duckdb_connection()
+        con.execute(f"CREATE TABLE t AS SELECT 1 AS id, ST_GeomFromText('{wkt}') AS geom")
+        sql = geom_to_h3_cells(con, "t", zoom=res, keep_cols=["id"])
+        rows = con.execute(f"SELECT h3id FROM ({sql})").fetchall()
+        whole = con.execute(
+            f"SELECT h3_polygon_wkb_to_cells(ST_AsWKB(geom), {res}) FROM t").fetchone()[0]
+        con.close()
+        cells = [c for (lst,) in rows for c in lst]
+        return len(rows), cells, set(whole)
+
+    @pytest.mark.timeout(120)
+    def test_pieces_fill_exactly_the_whole_polygon(self, monkeypatch):
+        n_rows, cells, whole = self._cells(monkeypatch, self._HOLED, 8, max_cells=5_000)
+        assert n_rows > 10, "the polygon should have been cut"
+        assert len(cells) == len(set(cells)), "pieces must not overlap"
+        assert set(cells) == whole
+
+    @pytest.mark.timeout(120)
+    def test_vertex_budget_cuts_a_complex_polygon(self, monkeypatch):
+        """Few cells but many vertices is still costly to fill as one piece."""
+        n_rows, cells, whole = self._cells(monkeypatch, self._HOLED, 6, max_work=1_000_000)
+        assert len(whole) < 5_000
+        assert n_rows > 1
+        assert set(cells) == whole
+
+    @pytest.mark.timeout(60)
+    def test_small_polygon_is_filled_whole(self):
+        n_rows, cells, whole = self._cells(None, self._HOLED, 6)
+        assert n_rows == 1
+        assert set(cells) == whole
+
+    @pytest.mark.timeout(120)
+    def test_antimeridian_crosser_is_cut_the_short_way(self, monkeypatch):
+        n_rows, cells, whole = self._cells(monkeypatch, self._CROSSER, 6, max_cells=500)
+        assert n_rows > 2
+        assert set(cells) == whole
+        con = setup_duckdb_connection()
+        lons = [con.execute(f"SELECT h3_cell_to_lng({c})").fetchone()[0] for c in cells[:200]]
+        con.close()
+        assert all(abs(x) >= 169 for x in lons), "cells must lie near the antimeridian"
+
+    @pytest.mark.timeout(60)
+    def test_invalid_polygon_is_filled_whole(self, monkeypatch):
+        """Clipping an invalid polygon can throw, so it is not cut."""
+        bowtie = "POLYGON((0 0, 3 3, 3 0, 0 3, 0 0))"
+        n_rows, cells, whole = self._cells(monkeypatch, bowtie, 7, max_cells=100)
+        assert n_rows == 1
+        assert set(cells) == whole
+
+    @pytest.mark.timeout(180)
+    @pytest.mark.parametrize("by_area", [False, True])
+    def test_chunk_output_is_unchanged_by_cutting(self, monkeypatch, by_area):
+        """End to end through both passes: same rows, no duplicates, and the
+        sub-cell fallback (#104) still applies to a small feature."""
+        from cng_datasets.vector import h3_tiling
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = f"{tmpdir}/src.parquet"
+            con = setup_duckdb_connection()
+            con.execute(f"""
+                COPY (
+                    SELECT 1 AS _cng_fid, ST_GeomFromText('{self._HOLED}') AS geom
+                    UNION ALL
+                    SELECT 2, ST_GeomFromText('POLYGON((20 20, 20.0001 20, 20.0001 20.0001, 20 20.0001, 20 20))')
+                ) TO '{src}' (FORMAT PARQUET)
+            """)
+            con.close()
+
+            def run(out, max_cells):
+                monkeypatch.setattr(h3_tiling, "_PIECE_MAX_CELLS", max_cells)
+                os.makedirs(out)
+                kwargs = dict(resolution_by_area=parse_resolution_by_area("100:7,6"),
+                              parent_resolutions=[5, 0]) if by_area else \
+                    dict(h3_resolution=7, parent_resolutions=[5, 0])
+                p = H3VectorProcessor(input_url=src, output_url=out, chunk_size=10,
+                                      intermediate_chunk_size=3, **kwargs)
+                f = p.process_chunk(0)
+                rows = p.con.execute(
+                    f"SELECT * FROM read_parquet('{f}') ORDER BY ALL").fetchall()
+                p.con.close()
+                return rows
+
+            whole = run(f"{tmpdir}/whole", 10**12)
+            cut = run(f"{tmpdir}/cut", 500)
+            assert cut == whole
+            assert len(cut) == len(set(cut))
+            assert sum(1 for r in cut if r[0] == 2) == 1
