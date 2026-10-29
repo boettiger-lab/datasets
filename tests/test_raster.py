@@ -2324,6 +2324,37 @@ class TestSubH0Chunking:
         ).fetchall()
         assert merged_cols == base_cols
 
+        # And in the files themselves, not only through a hive read, which
+        # fills h0 back in from the directory name: the merge used to drop the
+        # parts' own h0 column.
+        def file_cols(glob):
+            return con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{glob}', hive_partitioning=false)"
+            ).fetchall()
+        assert file_cols(merged_file) == file_cols(f"{base_out}/h0=*/data_0.parquet")
+
+    @pytest.mark.timeout(300)
+    def test_merge_under_a_year_partition_adds_no_year_column(self, raster, temp_dir):
+        """A multi-year build (#172) stages chunks under hex-chunks/year=<year>/;
+        the merged file must not carry a year column of its own, which would
+        clash with the year partition above it on read."""
+        sub_proc, chunks_dir = self._processor(raster, temp_dir, "year=2000", chunk_resolution=2)
+        for i in range(len(sub_proc.chunk_cells())):
+            sub_proc.process_chunk(i)
+        merged_dir = os.path.join(temp_dir, "hex", "year=2000")
+        os.makedirs(merged_dir, exist_ok=True)
+        assert merge_raster_chunks(chunks_dir, merged_dir, cleanup=False) == 1
+
+        con = duckdb.connect()
+        cols = [r[0] for r in con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{merged_dir}/h0=*/data_0.parquet', "
+            f"hive_partitioning=false)").fetchall()]
+        assert "year" not in cols and "h0" in cols, cols
+        years = con.execute(
+            f"SELECT DISTINCT year FROM read_parquet('{temp_dir}/hex/**/*.parquet', "
+            f"hive_partitioning=true)").fetchall()
+        assert years == [(2000,)]
+
     @pytest.mark.timeout(300)
     def test_merge_survives_a_kubernetes_spelled_memory_limit(self, raster, temp_dir, monkeypatch):
         """

@@ -221,15 +221,17 @@ def merge_raster_chunks(
         os.makedirs(local_partition, exist_ok=True)
         local_file = os.path.join(local_partition, "data_0.parquet")
 
-        # EXCLUDE (h0) drops the hive column that read_parquet synthesised from
-        # the directory name; the parts already carry their own h0 value column
-        # when 0 is among --parent-resolutions, and re-adding the path-derived
-        # one would either duplicate the column or change the output schema
-        # relative to an unchunked build.
+        # The parts' own columns, exactly: an unchunked build writes those, so
+        # the merged file must too. Hive columns from the path are left out. The
+        # parts' h0 column (present when 0 is among --parent-resolutions) is
+        # kept; excluding the hive h0 used to drop it as well, since DuckDB
+        # gives a path key precedence over a file column of the same name. A
+        # year=<year>/ partition above the chunks (#172) must not become a
+        # column inside its own files either.
         con.execute(
-            f"COPY (SELECT * EXCLUDE (h0) FROM "
+            f"COPY (SELECT * FROM "
             f"read_parquet('{chunks_dir.rstrip('/')}/h0={h0}/part-*.parquet', "
-            f"hive_partitioning=true)) "
+            f"hive_partitioning=false)) "
             f"TO '{local_file}' (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
         )
 
