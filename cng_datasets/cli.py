@@ -452,7 +452,14 @@ def main():
                                              "band, so the hex job is handed a single-band COG. "
                                              "Required for a multi-band source: the hex job refuses "
                                              "one it cannot disambiguate (#214).")
-    raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif)")
+    raster_workflow_parser.add_argument("--output-cog-name", help="S3 key for intermediate COG (default: {dataset}-cog.tif, or {dataset}-{year}-cog.tif with --years)")
+    raster_workflow_parser.add_argument("--years", type=str, default=None, metavar="LIST",
+                                        help="Build an annual series, e.g. '1985,1990,2015-2025' (#172). "
+                                             "--source-url must hold a {year} placeholder. Each year gets "
+                                             "its own COG, and the hex output is one collection partitioned "
+                                             "as hex/year=<year>/h0=<cell>/data_0.parquet. The hex Job runs "
+                                             "the per-year fan-out once per year, so combine it with "
+                                             "--h0-cells for a regional source.")
     raster_workflow_parser.add_argument("--backend", choices=["k8s", "armada", "auto"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission, 'auto' to pick armada once the chunk count exceeds the ~200-pod namespace guideline")
     raster_workflow_parser.add_argument("--chunk-resolution", type=int, default=0, metavar="N",
                                         help="H3 resolution of one hex pod's unit of work (default: 0, "
@@ -885,6 +892,7 @@ def _dispatch(args):
             target_resolution=getattr(args, 'target_resolution', None),
             band=getattr(args, 'band', None),
             output_cog_name=getattr(args, 'output_cog_name', None),
+            years=args.years,
             backend=args.backend,
             armada_priority_class=args.armada_priority_class,
             armada_queue=args.armada_queue,

@@ -472,6 +472,48 @@ job = manager.generate_chunked_job(
 manager.save_job_yaml(job, "wetlands-job.yaml")
 ```
 
+### Annual series: `--years`
+
+A product released once a year, such as Annual NLCD, MTBS burn severity or
+Hansen tree-cover loss, is built as one collection rather than one dataset per
+year (issue #172). Give the years and put a `{year}` placeholder in the source URL:
+
+```bash
+cng-datasets raster-workflow \
+  --dataset land-cover/nlcd --bucket public-land-cover \
+  --source-url 's3://public-land-cover/raw/Annual_NLCD_LndCov_{year}_CU_C1V2.tif' \
+  --years 1985,1990,1994,1996,1998,2000,2005,2010,2015-2025 \
+  --h0-cells 9,19,20,21,34,36 \
+  --value-column nlcd --hex-resampling mode \
+  --h3-resolution 10 --parent-resolutions 9,8,7,6,5,0
+```
+
+The generated steps run the per-year work for every year:
+
+- **preprocess-cog**, when the source needs it, is an indexed Job with one pod
+  per year, writing `land-cover/nlcd-<year>-cog.tif`.
+- **hex** fans out over years × h0 cells (or years × sub-h0 chunks with
+  `--chunk-resolution`), writing `land-cover/nlcd/hex/year=<year>/h0=<cell>/data_0.parquet`.
+  Completions run year by year.
+- **merge**, with `--chunk-resolution`, merges each year's chunks in turn and
+  checks each against the full chunk count.
+
+`year` is a hive partition, so it is a column to any reader that reads hive
+partitioning:
+
+```sql
+SELECT year, h8, nlcd FROM read_parquet('s3://public-land-cover/land-cover/nlcd/hex/**', hive_partitioning = true)
+WHERE year = 2020;
+```
+
+A change between two years is a self-join on the cell.
+
+The hex Job's completions are the per-year fan-out times the number of years.
+For a global source that quickly passes the ~200-pod guideline for one indexed
+Job, so pass `--h0-cells` for a regional source, or `--backend auto` to route a
+large series to Armada. Build a whole series from one release of the product:
+mixing releases makes cross-year differences reflect the release, not the land.
+
 ## Output Format
 
 Output is partitioned by h0 (continent-scale) H3 cells:

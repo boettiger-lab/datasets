@@ -2874,3 +2874,133 @@ class TestOrchestratorStopsOnFailedStep:
                                      bucket="b", output_dir=tmpdir)
             script = self._script(tmpdir)
         self._check(script, ["setup-bucket", "hex"])
+
+
+class TestMultiYearRasterWorkflow:
+    """`raster-workflow --years` builds an annual series as one collection
+    (issue #172): a COG per year and one hex tree partitioned by year."""
+
+    CONUS = [12, 14, 20, 50, 71, 78]
+    YEARS = "1985,2000-2001"
+
+    def _generate(self, tmpdir, monkeypatch, cog=True, **kwargs):
+        import cng_datasets.raster.cog as cogmod
+        monkeypatch.setattr(cogmod, "is_cog", lambda *a, **k: cog)
+        kwargs.setdefault("source_urls", "s3://src/nlcd_{year}.tif")
+        kwargs.setdefault("years", self.YEARS)
+        generate_raster_workflow(
+            dataset_name="land-cover/nlcd", bucket="public-land-cover",
+            output_dir=tmpdir, h3_resolution=8, **kwargs)
+        return lambda step: yaml.safe_load(open(Path(tmpdir) / f"land-cover-nlcd-{step}.yaml"))
+
+    @staticmethod
+    def _run(job, index, program="cng-datasets"):
+        import subprocess
+        script = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+        script = script.replace(program, "echo RAN:")
+        env = {"PATH": "/usr/bin:/bin"}
+        if index is not None:
+            env["JOB_COMPLETION_INDEX"] = str(index)
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+    def test_parse_years(self):
+        from cng_datasets.k8s.workflows import parse_years
+        assert parse_years("1985, 1990,2015-2017,1990") == [1985, 1990, 2015, 2016, 2017]
+        assert parse_years([2001, 1999]) == [1999, 2001]
+        assert parse_years(None) is None
+        for bad in ("2020-2015", "x", ","):
+            with pytest.raises(ValueError):
+                parse_years(bad)
+
+    @pytest.mark.timeout(10)
+    def test_index_selects_year_and_h0(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._generate(tmpdir, monkeypatch, h0_subset=self.CONUS)("hex")
+            assert job["spec"]["completions"] == 3 * 6
+            # Index 7 is the second year's second h0 position.
+            run = self._run(job, 7)
+            assert run.returncode == 0, run.stderr
+            assert 'nlcd_2000.tif' in run.stdout
+            assert "--h0-index 14" in run.stdout
+            assert "s3://public-land-cover/land-cover/nlcd/hex/year=2000/" in run.stdout
+
+    @pytest.mark.timeout(10)
+    def test_index_past_the_end_fails_loudly(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._generate(tmpdir, monkeypatch, h0_subset=self.CONUS)("hex")
+            for index in (18, None):
+                run = self._run(job, index)
+                assert run.returncode == 1, run.stdout
+                assert "RAN:" not in run.stdout
+
+    @pytest.mark.timeout(10)
+    def test_armada_literal_index_is_valid_bash(self, monkeypatch):
+        """The converter rewrites ${JOB_COMPLETION_INDEX} to a literal, which
+        must still be arithmetic bash can evaluate."""
+        from cng_datasets.k8s.armada import _replace_completion_index
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._generate(tmpdir, monkeypatch, h0_subset=self.CONUS)("hex")
+            _replace_completion_index(job["spec"]["template"]["spec"], 17)
+            run = self._run(job, None)
+            assert run.returncode == 0, run.stderr
+            assert 'nlcd_2001.tif' in run.stdout and "--h0-index 78" in run.stdout
+
+    @pytest.mark.timeout(30)
+    def test_sub_h0_chunks_are_merged_per_year(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            step = self._generate(tmpdir, monkeypatch, h0_subset=self.CONUS, chunk_resolution=1)
+            hex_job, merge = step("hex"), step("merge")
+            per_year = hex_job["spec"]["completions"] // 3
+            assert hex_job["spec"]["completions"] == per_year * 3
+            run = self._run(hex_job, per_year + 2)
+            assert run.returncode == 0, run.stderr
+            assert "--chunk-index 2" in run.stdout
+            assert "hex-chunks/year=2000/" in run.stdout
+            run = self._run(merge, None)
+            assert run.returncode == 0, run.stderr
+            for year in (1985, 2000, 2001):
+                assert (f"--chunks-dir s3://public-land-cover/land-cover/nlcd/hex-chunks/year={year} "
+                        f"--output-dir s3://public-land-cover/land-cover/nlcd/hex/year={year} "
+                        f"--expect-chunks {per_year}") in " ".join(run.stdout.split())
+
+    @pytest.mark.timeout(10)
+    def test_preprocess_writes_a_cog_per_year(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            step = self._generate(tmpdir, monkeypatch, cog=False, h0_subset=self.CONUS)
+            pre, hex_job = step("preprocess-cog"), step("hex")
+            assert pre["spec"]["completions"] == 3
+            assert pre["spec"]["completionMode"] == "Indexed"
+            assert "backoffLimit" not in pre["spec"]
+            run = self._run(pre, 2)
+            assert run.returncode == 0, run.stderr
+            assert 'nlcd_2001.tif' in run.stdout
+            assert "s3://public-land-cover/land-cover/nlcd-2001-cog.tif" in run.stdout
+            run = self._run(hex_job, 0)
+            assert "s3://public-land-cover/land-cover/nlcd-1985-cog.tif" in run.stdout
+
+    @pytest.mark.timeout(10)
+    def test_orchestrator_waits_scale_with_years(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._generate(tmpdir, monkeypatch, h0_subset=self.CONUS)
+            wf = yaml.safe_load(open(Path(tmpdir) / "workflow.yaml"))
+            script = wf["spec"]["template"]["spec"]["containers"][0]["args"][0]
+            assert "wait_job land-cover-nlcd-hex geo-workflows 21600" in script
+
+    @pytest.mark.timeout(10)
+    def test_placeholder_and_years_must_come_together(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="placeholder"):
+                self._generate(tmpdir, monkeypatch, source_urls="s3://src/nlcd.tif")
+            with pytest.raises(ValueError, match="--years"):
+                self._generate(tmpdir, monkeypatch, years=None)
+            with pytest.raises(ValueError, match="output-cog-name"):
+                self._generate(tmpdir, monkeypatch, cog=False, output_cog_name="nlcd.tif")
+
+    @pytest.mark.timeout(10)
+    def test_single_year_build_is_unchanged(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = self._generate(tmpdir, monkeypatch, source_urls="s3://src/x.tif",
+                                 years=None, h0_subset=self.CONUS)("hex")
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert job["spec"]["completions"] == 6
+            assert "YEAR" not in cmd and "year=" not in cmd
