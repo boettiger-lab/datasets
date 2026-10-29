@@ -187,18 +187,127 @@ def chunk_manifest_path(output_base: str, chunk_index: int) -> str:
     return f"{output_base.rstrip('/')}/_manifest/chunk-{chunk_index}.parquet"
 
 
+# A pod's measured use of what it asked for, recorded in each chunk's
+# completion marker so `merge-chunks` can report it for the whole fan-out
+# (issue #183). The memory and cpu requests were inherited numbers, never
+# measured ones: the CHELSA build asked for 32Gi against a 5.2 GiB peak and
+# 8 cores against a 3.3-core mean. Pod logs carry the same figures, but Armada
+# reaps its pods, and nobody reads 4,000 logs.
+_CGROUP = "/sys/fs/cgroup"
+_anon_peak = None
+
+
+def _read(path: str) -> Optional[str]:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def _memory_limit_bytes() -> Optional[int]:
+    """The pod's memory limit, or None when the cgroup is unbounded, as on a
+    dev machine, where its counters measure the whole host."""
+    text = _read(f"{_CGROUP}/memory.max")
+    if text is None or text == "max" or int(text) >= 2 ** 62:
+        return None
+    return int(text)
+
+
+def _anon_bytes() -> Optional[int]:
+    text = _read(f"{_CGROUP}/memory.stat")
+    for line in (text or "").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "anon":
+            return int(value)
+    return None
+
+
+def start_usage_monitor(interval_s: float = 1.0) -> None:
+    """Start sampling the pod's anonymous memory, once per process.
+
+    `memory.peak` counts page cache, which the kernel reclaims before it kills
+    anything, so a pod that writes a large window file reports a peak well
+    above what it needed. Anonymous memory is what an OOM kill is about, and
+    the cgroup keeps no high-water mark for it, so it is sampled. A spike
+    shorter than the interval can be missed; the suggested size adds headroom
+    for that. A no-op outside a bounded cgroup.
+    """
+    global _anon_peak
+    if _anon_peak is not None or _memory_limit_bytes() is None or _anon_bytes() is None:
+        return
+    import threading
+    import time
+    peak = _anon_peak = [_anon_bytes() or 0]
+
+    def sample():
+        while True:
+            now = _anon_bytes()
+            if now is not None and now > peak[0]:
+                peak[0] = now
+            time.sleep(interval_s)
+
+    threading.Thread(target=sample, name="anon-memory-sampler", daemon=True).start()
+
+
+def pod_usage() -> dict:
+    """This pod's resource use so far, from its cgroup (cgroup v2 only).
+
+    Keys are the marker's usage columns; each is None when it cannot be read.
+    cpu_mean is the pod's lifetime average in cores, which is what a cpu
+    request should be sized to: the hot loop is parallel, but the localize,
+    read and upload phases around it are not (#183).
+    """
+    usage = dict(mem_limit_bytes=_memory_limit_bytes(), peak_bytes=None,
+                 anon_peak_bytes=None, cpu_limit=None, cpu_mean=None, elapsed_s=None)
+    if usage["mem_limit_bytes"] is None:
+        return usage
+    peak = _read(f"{_CGROUP}/memory.peak")
+    usage["peak_bytes"] = int(peak) if peak else None
+    if _anon_peak is not None:
+        usage["anon_peak_bytes"] = max(_anon_peak[0], _anon_bytes() or 0)
+    quota, _, period = (_read(f"{_CGROUP}/cpu.max") or "max").partition(" ")
+    if quota != "max" and period:
+        usage["cpu_limit"] = int(quota) / int(period)
+    # Wall time since the container started: PID 1's start, in clock ticks
+    # since boot, against the host's uptime.
+    import os
+    stat, uptime = _read("/proc/1/stat"), _read("/proc/uptime")
+    cpu = dict(line.split(" ", 1) for line in (_read(f"{_CGROUP}/cpu.stat") or "").splitlines()
+               if " " in line)
+    if stat and uptime and "usage_usec" in cpu:
+        started = int(stat.rsplit(")", 1)[1].split()[19]) / os.sysconf("SC_CLK_TCK")
+        elapsed = float(uptime.split()[0]) - started
+        if elapsed > 0:
+            usage["elapsed_s"] = elapsed
+            usage["cpu_mean"] = int(cpu["usage_usec"]) / 1e6 / elapsed
+    return usage
+
+
+_USAGE_TYPES = dict(mem_limit_bytes="BIGINT", peak_bytes="BIGINT", anon_peak_bytes="BIGINT",
+                    cpu_limit="DOUBLE", cpu_mean="DOUBLE", elapsed_s="DOUBLE")
+
+
 def record_chunk_completion(con, output_base: str, chunk_index: int, chunk_cell: int,
                             h0_cell: int, wrote_data: bool) -> None:
-    """Write one chunk's completion marker, which `merge-chunks` requires."""
+    """Write one chunk's completion marker, which `merge-chunks` requires.
+
+    It also carries the pod's measured resource use (`pod_usage`), which
+    `merge-chunks` summarises into a size for the next build (#183).
+    """
     import os
     path = chunk_manifest_path(output_base, chunk_index)
     if not path.startswith(("s3://", "http://", "https://")):
         os.makedirs(os.path.dirname(path), exist_ok=True)
+    usage = pod_usage()
+    usage_cols = "".join(
+        f",\n                   {'NULL' if usage[k] is None else repr(usage[k])}::{t} AS {k}"
+        for k, t in _USAGE_TYPES.items())
     con.execute(f"""
         COPY (
             SELECT {int(chunk_index)}::BIGINT AS chunk_index,
                    {int(chunk_cell)}::UBIGINT AS chunk_cell,
                    {int(h0_cell)}::UBIGINT AS h0,
-                   {"true" if wrote_data else "false"}::BOOLEAN AS wrote_data
+                   {"true" if wrote_data else "false"}::BOOLEAN AS wrote_data{usage_cols}
         ) TO '{path}' (FORMAT PARQUET)
     """)

@@ -264,12 +264,47 @@ def save_armada_yaml(armada_spec: Dict[str, Any], output_path: str):
     print(f"Armada YAML saved to {output_path}")
 
 
+def _cpu_cores(quantity) -> float:
+    """Cores in a Kubernetes CPU quantity ("16", "3500m")."""
+    text = str(quantity).strip()
+    return float(text[:-1]) / 1000.0 if text.endswith("m") else float(text)
+
+
+def _memory_bytes(quantity) -> float:
+    """Bytes in a Kubernetes memory quantity ("32Gi", "34G", "512Mi")."""
+    text = str(quantity).strip()
+    units = {"Ki": 2 ** 10, "Mi": 2 ** 20, "Gi": 2 ** 30, "Ti": 2 ** 40,
+             "k": 10 ** 3, "K": 10 ** 3, "M": 10 ** 6, "G": 10 ** 9, "T": 10 ** 12}
+    for suffix in sorted(units, key=len, reverse=True):
+        if text.endswith(suffix):
+            return float(text[:-len(suffix)]) * units[suffix]
+    return float(text)
+
+
+def _oversized_containers(job_spec: Dict[str, Any], max_cpu: Optional[str],
+                          max_memory: Optional[str]) -> List[str]:
+    """Descriptions of this job's containers that ask for more than an Armada
+    pod may have; empty when every one fits (issue #183)."""
+    over = []
+    for c in _extract_pod_spec(job_spec).get("containers", []):
+        res = c.get("resources", {})
+        asked = {**res.get("requests", {}), **res.get("limits", {})}
+        if max_cpu and "cpu" in asked and _cpu_cores(asked["cpu"]) > _cpu_cores(max_cpu):
+            over.append(f"cpu {asked['cpu']} > {max_cpu}")
+        if (max_memory and "memory" in asked
+                and _memory_bytes(asked["memory"]) > _memory_bytes(max_memory)):
+            over.append(f"memory {asked['memory']} > {max_memory}")
+    return over
+
+
 def convert_workflow_to_armada(
     k8s_yaml_dir: str,
     dataset_name: str,
     queue: str = "geo-workflows",
     output_dir: Optional[str] = None,
     priority_class: Optional[str] = None,
+    max_cpu: Optional[str] = None,
+    max_memory: Optional[str] = None,
 ) -> List[str]:
     """
     Convert a directory of k8s Job YAMLs to Armada submission YAMLs.
@@ -287,9 +322,18 @@ def convert_workflow_to_armada(
             as a literal name or a shorthand ("default", "preemptible",
             "high"). Defaults to DEFAULT_ARMADA_PRIORITY_CLASS when None
             (issue #183).
+        max_cpu, max_memory: The largest pod the cluster admits for Armada,
+            e.g. "16" and "32Gi" on NRP, where Armada pods have no controller
+            and an admission webhook refuses bigger ones. A job asking for more
+            raises before any file is written: submitted, every one of its
+            jobs would fail at admission, and `armadactl submit --dry-run`
+            does not catch it (#183). None skips the check.
 
     Returns:
         List of generated Armada YAML file paths
+
+    Raises:
+        ValueError: If a job asks for more than max_cpu or max_memory.
     """
     k8s_path = Path(k8s_yaml_dir)
     out_path = Path(output_dir) if output_dir else k8s_path
@@ -300,16 +344,34 @@ def convert_workflow_to_armada(
     # Process each job YAML (skip workflow/configmap/rbac files)
     skip_files = {"workflow.yaml", "configmap.yaml", "workflow-rbac.yaml"}
 
+    jobs = []
     for yaml_file in sorted(k8s_path.glob(f"{dataset_name}-*.yaml")):
         if yaml_file.name in skip_files:
             continue
-
         with open(yaml_file) as f:
             job_spec = yaml.safe_load(f)
+        if job_spec and job_spec.get("kind") == "Job":
+            jobs.append((yaml_file, job_spec))
 
-        if not job_spec or job_spec.get("kind") != "Job":
-            continue
+    # All jobs are checked before any is written, so a refused workflow leaves
+    # no partial set of Armada files behind.
+    oversized = {
+        yaml_file.name: over for yaml_file, job_spec in jobs
+        if (over := _oversized_containers(job_spec, max_cpu, max_memory))
+    }
+    if oversized:
+        detail = "\n".join(f"  {name}: {', '.join(over)}" for name, over in oversized.items())
+        raise ValueError(
+            f"These jobs ask for more than an Armada pod may have "
+            f"({max_cpu} cpu, {max_memory} memory):\n{detail}\n"
+            f"Armada pods have no controller, and this cluster's admission webhook "
+            f"refuses such a pod past that size, so each job would fail at admission "
+            f"after submission. Make the units smaller instead: a finer "
+            f"--chunk-resolution (or --max-hex-memory) cuts each hex pod's memory "
+            f"about sevenfold per level, after which --hex-memory can come down. Or "
+            f"use --backend k8s, whose Job-managed pods are not capped.")
 
+    for yaml_file, job_spec in jobs:
         # Derive step name from job file (e.g., "dataset-hex.yaml" -> "hex")
         step = yaml_file.stem.replace(f"{dataset_name}-", "")
         job_set_id = f"{dataset_name}-{step}"

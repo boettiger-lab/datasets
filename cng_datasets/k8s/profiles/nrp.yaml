@@ -16,3 +16,7 @@ rclone_remote: nrp
 priority_class: ""
 namespace: geo-workflows
 node_affinity: gpu-avoid
+# Largest Armada pod NRP admits. Armada pods have no controller, and the
+# admission webhook limits such pods to 16 cores and 32Gi (#183).
+armada_max_cpu: "16"
+armada_max_memory: 32Gi
