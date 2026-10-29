@@ -30,15 +30,33 @@ from cng_datasets.duckdb_memory import to_duckdb_memory_limit
 _LINE_BUFFER_DEG = 1e-7
 _LINE_BUFFER_QUAD_SEGS = 1
 
-# Pass 1 writes each feature's H3 cells as a single list value. DuckDB/Arrow
-# cannot hold one list value larger than 2^31-1 bytes — i.e. ~268M UBIGINT
-# cells — and the parquet page-size assertion (PrimitiveColumnWriter::NextPage)
-# can fire below that. We refuse a feature whose estimated cell count exceeds a
-# conservative fraction of that ceiling, raising a clear error instead of a C++
-# assertion (issue #107). The estimate (spheroid area / average hex area)
-# undercounts the true polyfill by ~1.3x, so the default leaves wide margin.
+# Pass 1 writes one H3 cell list per polygon piece, and a large polygon is cut
+# into pieces first (see _PIECE_MAX_CELLS), so no list approaches the ~268M-cell
+# (2 GB) ceiling of one Arrow/parquet value that used to cap a feature (#107).
+# What still bounds one feature is the hex pod: all of its cells go through one
+# chunk's Pass 2, and a billion rows is about what 50Gi of scratch holds there.
+# A feature estimated past that is refused with a clear error. The estimate
+# (spheroid area / average hex area) undercounts the true polyfill by ~1.3x.
 # Override via the CNG_MAX_CELLS_PER_FEATURE environment variable.
-_DEFAULT_MAX_CELLS_PER_FEATURE = 134_000_000
+_DEFAULT_MAX_CELLS_PER_FEATURE = 1_000_000_000
+
+# A large polygon part is cut into pieces before polyfill (issue #125), and H3
+# fills each piece on its own. Center containment makes this exact: a cell is in
+# the fill iff its centre is inside the polygon, so the pieces' fills partition
+# the whole fill. The cuts run through the middle of a piece's bbox, offset by
+# _PIECE_CUT_JITTER degrees so they do not land on round coordinates, where cell
+# centres could sit exactly on a cut.
+#
+# Two things are bounded. H3 tests every candidate centre against every edge,
+# so a fill costs about (cells x vertices): a 200k-vertex polygon with 156k
+# cells at res 7 took 565 s as one piece. A piece above _PIECE_MAX_WORK is split
+# again, which divides both terms, while a piece in the interior is just a
+# 4-vertex box. And a piece above _PIECE_MAX_CELLS is split so that each cell
+# list stays small, however large the feature.
+_PIECE_MAX_CELLS = 1_000_000
+_PIECE_MAX_WORK = 100_000_000
+_PIECE_MAX_DEPTH = 16
+_PIECE_CUT_JITTER = 3.14159e-9
 
 
 def parse_resolution_by_area(spec: str) -> List[Tuple[Optional[float], int]]:
@@ -334,6 +352,88 @@ def _transmeridian_split_sql(carry_cols: str, source: str) -> str:
     '''
 
 
+def _needs_split_sql(geom_expr: str, res: str) -> str:
+    """SQL predicate: is this polygon too large or too costly to fill as one
+    piece? Never true for an area that is not finite (see _PIECE_MAX_CELLS)."""
+    cells = f"(({_feature_area_m2_sql(geom_expr)}) / h3_get_hexagon_area_avg({res}, 'm^2'))"
+    return (
+        f"(isfinite({cells}) AND ({cells} > {_PIECE_MAX_CELLS} "
+        f"OR {cells} * ST_NPoints({geom_expr}) > {_PIECE_MAX_WORK}))"
+    )
+
+
+def _piece_split_sql(carry_cols: str, source: str, res: str) -> str:
+    """SQL for CTE bodies that cut large polygon parts into pieces (issue #125).
+
+    Returns the bodies of three CTEs, ``tbig``, ``twrap`` and ``tpieces``, to be
+    defined in that order under ``WITH RECURSIVE``; the leaves are the rows of
+    ``tpieces`` with ``NOT _split``. Each row carries ``_depth``, which is 0 for
+    a part that was not cut.
+
+    Only valid polygon parts are cut, because clipping an invalid one can
+    throw; lines (already ~1 cm slivers) and invalid parts are filled whole, as
+    before. A large antimeridian crosser is first read in a 0..360 longitude
+    frame and cut at 180, and its eastern half is moved back by -360, so that it
+    becomes two ordinary parts that the bbox cuts below can handle.
+    """
+    split = _needs_split_sql("geom", res)
+    j = _PIECE_CUT_JITTER
+    mx = f"(ST_XMin(geom) + ST_XMax(geom)) / 2 + {j}"
+    my = f"(ST_YMin(geom) + ST_YMax(geom)) / 2 + {j}"
+    quadrants = (
+        f"[ST_MakeEnvelope(ST_XMin(geom), ST_YMin(geom), {mx}, {my}), "
+        f"ST_MakeEnvelope({mx}, ST_YMin(geom), ST_XMax(geom), {my}), "
+        f"ST_MakeEnvelope(ST_XMin(geom), {my}, {mx}, ST_YMax(geom)), "
+        f"ST_MakeEnvelope({mx}, {my}, ST_XMax(geom), ST_YMax(geom))]"
+    )
+    wgs84 = "+proj=longlat +datum=WGS84 +no_defs"
+    tbig = f"""
+            SELECT {carry_cols}, geom,
+                   CASE WHEN NOT _is_line AND ST_GeometryType(geom) = 'POLYGON' AND {split}
+                        THEN ST_IsValid(geom) ELSE FALSE END AS _split
+            FROM {source}
+    """
+    twrap = f"""
+            SELECT {carry_cols}, geom, _split
+            FROM tbig WHERE NOT (_split AND {_dateline_crosser_sql('geom')})
+            UNION ALL
+            SELECT {carry_cols},
+                   CASE WHEN ST_XMin(geom) >= 180 THEN ST_Translate(geom, -360, 0)
+                        ELSE geom END AS geom,
+                   TRUE AS _split
+            FROM (
+                SELECT {carry_cols},
+                       UNNEST(ST_Dump(ST_Intersection(
+                           ST_Transform(geom, '{wgs84}', '{wgs84} +lon_wrap=180',
+                                        always_xy := true),
+                           _half))).geom AS geom
+                FROM tbig,
+                     (VALUES (ST_MakeEnvelope(0, -90, 180, 90)),
+                             (ST_MakeEnvelope(180, -90, 360, 90))) AS _halves(_half)
+                WHERE _split AND {_dateline_crosser_sql('geom')}
+            )
+            WHERE ST_GeometryType(geom) = 'POLYGON' AND NOT ST_IsEmpty(geom)
+    """
+    tpieces = f"""
+            SELECT {carry_cols}, geom, 0 AS _depth,
+                   CASE WHEN _split THEN {split} ELSE FALSE END AS _split
+            FROM twrap
+            UNION ALL
+            SELECT {carry_cols}, geom, _depth,
+                   _depth < {_PIECE_MAX_DEPTH} AND {split} AS _split
+            FROM (
+                SELECT {carry_cols}, _depth + 1 AS _depth,
+                       UNNEST(ST_Dump(ST_Intersection(geom, _quad))).geom AS geom
+                FROM (
+                    SELECT {carry_cols}, _depth, geom, UNNEST({quadrants}) AS _quad
+                    FROM tpieces WHERE _split
+                )
+            )
+            WHERE ST_GeometryType(geom) = 'POLYGON' AND NOT ST_IsEmpty(geom)
+    """
+    return tbig, twrap, tpieces
+
+
 def identify_id_column(
     con: duckdb.DuckDBPyConnection,
     table_name: str,
@@ -505,8 +605,10 @@ def geom_to_h3_cells(
     # original single-`zoom` path below is used unchanged.
     if resolution_by_area is not None:
         native_res_case = _native_res_case_sql(resolution_by_area, geom_col)
+        tbig_ba, twrap_ba, tpieces_ba = _piece_split_sql(
+            f'{col_list}, native_res, _is_line', 't1', 'native_res')
         return f'''
-        WITH tbase AS (
+        WITH RECURSIVE tbase AS (
             SELECT {col_list},
                    {geom_col} AS _geom_orig,
                    {native_res_case} AS native_res
@@ -530,15 +632,18 @@ def geom_to_h3_cells(
                    UNNEST(ST_Dump(geom)).geom AS geom
             FROM tsplit
         ),
+        tbig AS ({tbig_ba}),
+        twrap AS ({twrap_ba}),
+        tpieces AS ({tpieces_ba}),
         t2 AS (
-            SELECT {col_list}, native_res, geom,
+            SELECT {col_list}, native_res, geom, _depth,
                    {polyfill('native_res')} AS h3id
-            FROM t1
+            FROM tpieces WHERE NOT _split
         )
         SELECT {col_list}, native_res,
                CASE
                    WHEN h3id IS NOT NULL AND len(h3id) > 0 THEN h3id
-                   WHEN ST_YMin(geom) >= -90 AND ST_YMax(geom) <= 90
+                   WHEN _depth = 0 AND ST_YMin(geom) >= -90 AND ST_YMax(geom) <= 90
                    THEN [h3_latlng_to_cell(
                             ST_Y({_representative_point_sql('geom')}),
                             ST_X({_representative_point_sql('geom')}),
@@ -546,6 +651,7 @@ def geom_to_h3_cells(
                    ELSE h3id
                END AS h3id
         FROM t2
+        WHERE _depth = 0 OR len(h3id) > 0
         '''
 
     # Convert to multi-polygons and unnest, then generate H3 cells
@@ -562,8 +668,14 @@ def geom_to_h3_cells(
     # range: a polygon with empty polyfill AND out-of-range Y is left empty on
     # purpose so the downstream swapped-(lat,lon) check still raises a clear
     # error rather than feeding an invalid latitude into h3_latlng_to_cell.
+    #
+    # A large polygon part is cut into pieces that are filled separately (issue
+    # #125; see _PIECE_MAX_CELLS). The fallback above applies to a part as a
+    # whole, so a piece of a cut part never takes it, and a piece that holds no
+    # cell centre is dropped rather than kept as an empty list.
+    tbig, twrap, tpieces = _piece_split_sql(f'{col_list}, _is_line', 't1', str(zoom))
     sql = f'''
-        WITH t0 AS (
+        WITH RECURSIVE t0 AS (
             SELECT {col_list},
                    {is_line.format(g=geom_col)} AS _is_line,
                    CASE
@@ -581,16 +693,19 @@ def geom_to_h3_cells(
                    UNNEST(ST_Dump(geom)).geom AS geom
             FROM tsplit
         ),
+        tbig AS ({tbig}),
+        twrap AS ({twrap}),
+        tpieces AS ({tpieces}),
         t2 AS (
             SELECT {col_list},
-                   geom,
+                   geom, _depth,
                    {polyfill(str(zoom))} AS h3id
-            FROM t1
+            FROM tpieces WHERE NOT _split
         )
         SELECT {col_list},
                CASE
                    WHEN h3id IS NOT NULL AND len(h3id) > 0 THEN h3id
-                   WHEN ST_YMin(geom) >= -90 AND ST_YMax(geom) <= 90
+                   WHEN _depth = 0 AND ST_YMin(geom) >= -90 AND ST_YMax(geom) <= 90
                    THEN [h3_latlng_to_cell(
                             ST_Y({_representative_point_sql('geom')}),
                             ST_X({_representative_point_sql('geom')}),
@@ -598,6 +713,7 @@ def geom_to_h3_cells(
                    ELSE h3id
                END AS h3id
         FROM t2
+        WHERE _depth = 0 OR len(h3id) > 0
     '''
 
     return sql
@@ -789,14 +905,15 @@ class H3VectorProcessor:
         return find_geometry_column(self.con, table_name)
 
     def _assert_no_oversized_feature(self, id_col: str, chunk_id: int) -> None:
-        """Fail fast if any feature in `chunk_table` would produce an H3 cell
-        array exceeding the single-array size limit (issue #107).
+        """Fail fast if any feature in `chunk_table` would produce more H3
+        cells than one hex pod can handle (issues #107, #125).
 
         Estimates per-feature cell count as area / average hex area at the target
         resolution and raises a clear RuntimeError naming the worst offender (id,
-        area, estimated cells) if it exceeds ``self.max_cells_per_feature``. This
-        converts an otherwise-fatal C++ page-size assertion in the Pass-1 COPY
-        into an actionable error.
+        area, estimated cells) if it exceeds ``self.max_cells_per_feature``.
+        Before polygons were cut into pieces (#125) the limit was one cell
+        array's 2 GB ceiling and the failure a C++ page-size assertion; now it is
+        what one chunk's Pass 2 can hold (see _DEFAULT_MAX_CELLS_PER_FEATURE).
 
         Area is measured geodesically (``ST_Area_Spheroid`` on (lon, lat) —
         see ``_spheroid_area_m2_sql``) for the common case.
@@ -841,12 +958,11 @@ class H3VectorProcessor:
                 f"Chunk {chunk_id}: feature {id_col}={fid} is too large to hex at "
                 f"resolution {native_res} — estimated {int(est_cells):,} H3 "
                 f"cells ({area_m2 / 1e6:,.0f} km²) would exceed the per-feature "
-                f"cell-array limit ({self.max_cells_per_feature:,}). A single "
-                f"feature's cells are written as one array value, which cannot "
-                f"exceed the ~268M-element (2GB) Arrow/parquet-page ceiling. "
-                f"Hex this feature at a coarser resolution (see #98 for adaptive "
-                f"variable-resolution polyfill), or raise CNG_MAX_CELLS_PER_FEATURE "
-                f"if your build tolerates a larger array."
+                f"limit ({self.max_cells_per_feature:,}). All of a feature's "
+                f"cells go through one hex pod, and this many would not fit its "
+                f"scratch disk. Hex this feature at a coarser resolution (see "
+                f"--resolution-by-area), or raise CNG_MAX_CELLS_PER_FEATURE if "
+                f"your hex pods have the disk for it."
             )
 
     def process_chunk(
@@ -1100,14 +1216,13 @@ class H3VectorProcessor:
 
             parent_cols_str = ', ' + ', '.join(parent_cols) if parent_cols else ''
 
-        # Use local /tmp for fast batch processing, then copy to final destination
-        local_output = f"/tmp/h3_output_{chunk_id:06d}.parquet"
+        # Batches are written to local /tmp, then merged into the final output
         final_output = f"{self.output_url.rstrip('/')}/chunk_{chunk_id:06d}.parquet"
 
         # A chunk whose features all produced zero H3 cells — most commonly a
         # contiguous block of null-geometry features (issue #169) — yields a
-        # zero-row intermediate. The per-batch loop below would then never create
-        # `local_output`, and the final COPY would abort with "No files found".
+        # zero-row intermediate. The per-batch loop below would then write no
+        # batch file, and the final COPY would abort with "No files found".
         # Instead, write an empty partition with the correct output schema so the
         # chunk completes cleanly (there is genuinely no data to hex). Selecting
         # the unnest expression over the empty intermediate reproduces exactly the
@@ -1136,6 +1251,7 @@ class H3VectorProcessor:
             print(f"  ✓ Pass 2 complete (empty): {final_output}")
             return final_output
 
+        batch_files = []
         for batch_id in range(num_batches):
             batch_offset = batch_id * self.intermediate_chunk_size
 
@@ -1165,37 +1281,16 @@ class H3VectorProcessor:
                     )
                 """
 
-            # Build up local file with fast local disk I/O
-            if batch_id == 0:
-                # First batch: create local file
-                self.con.execute(f"""
-                    COPY ({unnest_sql})
-                    TO '{local_output}'
-                    (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
-                """)
-            else:
-                # Subsequent batches: append using local temp files
-                temp_batch_file = f"/tmp/h3_batch_{chunk_id:06d}_{batch_id}.tmp"
-                self.con.execute(f"""
-                    COPY ({unnest_sql})
-                    TO '{temp_batch_file}'
-                    (FORMAT PARQUET, COMPRESSION 'ZSTD')
-                """)
-
-                # Merge into local output using fast local disk
-                self.con.execute(f"""
-                    COPY (
-                        SELECT * FROM read_parquet('{local_output}')
-                        UNION ALL
-                        SELECT * FROM read_parquet('{temp_batch_file}')
-                    )
-                    TO '{local_output}.new'
-                    (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
-                """)
-
-                # Fast local file operations
-                os.replace(f"{local_output}.new", local_output)
-                os.remove(temp_batch_file)
+            # One file per batch, merged once below. Appending by rewriting a
+            # single growing file cost O(batches²) I/O, which a feature cut
+            # into many pieces (#125) would turn into hours.
+            batch_file = f"/tmp/h3_batch_{chunk_id:06d}_{batch_id:06d}.parquet"
+            self.con.execute(f"""
+                COPY ({unnest_sql})
+                TO '{batch_file}'
+                (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
+            """)
+            batch_files.append(batch_file)
 
             if (batch_id + 1) % 10 == 0 or batch_id == num_batches - 1:
                 print(f"  Progress: {batch_id + 1}/{num_batches} batches")
@@ -1216,16 +1311,16 @@ class H3VectorProcessor:
         # one chunk, so a per-chunk DISTINCT is both complete and sufficient.
         print(f"  Writing final output to {final_output}...")
         self.con.execute(f"""
-            COPY (SELECT DISTINCT * FROM read_parquet('{local_output}'))
+            COPY (SELECT DISTINCT * FROM read_parquet({batch_files!r}))
             TO '{final_output}'
             (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
         """)
 
-        # Clean up local file
-        try:
-            os.remove(local_output)
-        except Exception as e:
-            print(f"  Warning: Could not remove local output file: {e}")
+        for batch_file in batch_files:
+            try:
+                os.remove(batch_file)
+            except Exception as e:
+                print(f"  Warning: Could not remove batch file: {e}")
 
         print(f"  ✓ Pass 2 complete: {final_output}")
         return final_output
