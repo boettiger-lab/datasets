@@ -21,7 +21,7 @@ Output uses the same layout as `raster`: `hex/h0={cell}/data_0.parquet`, or
 `merge-chunks`. Each file has columns `h<res>`, the parents, the time key, and
 one column per `--variable`.
 
-### From Python
+## From Python
 
 `MdimProcessor` hexes one chunk at a time, the unit a cluster pod runs. Chunks
 are h0 cells at the default `chunk_resolution=0`, and `chunk_cells()` lists them.
