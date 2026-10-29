@@ -5188,7 +5188,9 @@ class TestChunkUsageReport:
         from cng_datasets import h3_chunks
         self._cgroup(tmp_path, monkeypatch, limit="max")
         h3_chunks.start_usage_monitor()
-        assert all(v is None for v in h3_chunks.pod_usage().values())
+        usage = h3_chunks.pod_usage()
+        assert usage.pop("workers") == 4, "configuration, not a measurement"
+        assert all(v is None for v in usage.values())
 
     def _markers(self, tmp_path, monkeypatch, usages):
         from cng_datasets import h3_chunks
