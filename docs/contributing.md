@@ -11,39 +11,21 @@ git clone https://github.com/boettiger-lab/datasets.git
 cd datasets
 ```
 
-2. **Create a virtual environment:**
+2. **Work in the project's Docker image.** GDAL, PROJ, exactextract and DuckDB are built into `ghcr.io/boettiger-lab/datasets`, and the tests expect that stack. Mount your checkout and install it over the image's copy:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+docker run --rm -it -v "$PWD":/app -w /app ghcr.io/boettiger-lab/datasets:latest \
+  bash -c 'pip install -q -e ".[dev]" && python -m pytest tests/ -q'
 ```
 
-3. **Install in development mode:**
-
-```bash
-pip install -e ".[dev]"
-```
-
-4. **Install pre-commit hooks (optional):**
-
-```bash
-pip install pre-commit
-pre-commit install
-```
+A plain virtualenv works for the pure-Python parts, but raster tests need a system GDAL that matches the Python bindings.
 
 ## Code Style
 
-We use:
-- **black** for code formatting (line length: 100)
-- **ruff** for linting
-- **mypy** for type checking
-
-Format your code before committing:
+CI runs ruff on every pull request and the check is blocking:
 
 ```bash
-black cng_datasets/
-ruff check cng_datasets/
-mypy cng_datasets/
+ruff check cng_datasets/ --select E,F,W --ignore E501
 ```
 
 ## Testing
@@ -61,7 +43,7 @@ pytest --cov=cng_datasets
 pytest tests/test_vector.py
 
 # Run specific test
-pytest tests/test_vector.py::test_h3_processor
+pytest tests/test_vector.py -k fid_column
 ```
 
 ### Writing Tests
@@ -94,9 +76,9 @@ Documentation is built with Sphinx and hosted on GitHub Pages.
 ### Build Documentation Locally
 
 ```bash
+pip install -e ".[docs]"
 cd docs/
-pip install sphinx furo myst-parser
-make html
+make html SPHINXOPTS="-W --keep-going"   # CI fails on any warning
 ```
 
 View at `docs/_build/html/index.html`

@@ -22,7 +22,7 @@ processor = H3VectorProcessor(
 output_files = processor.process_all_chunks()
 ```
 
-See: `wdpa/` directory
+See: `catalog/wdpa/`
 
 ### Redlining Data
 
@@ -42,7 +42,7 @@ processor = H3VectorProcessor(
 output_files = processor.process_all_chunks()
 ```
 
-See: `redlining/` directory
+See: `catalog/mappinginequality/`
 
 ### PAD-US
 
@@ -61,7 +61,7 @@ processor = H3VectorProcessor(
 output_files = processor.process_all_chunks()
 ```
 
-See: `pad-us/` directory
+See: `catalog/pad-us/`
 
 ## Raster Processing Examples
 
@@ -103,9 +103,11 @@ Species range maps processing:
 ```python
 from cng_datasets.raster import RasterProcessor
 import glob
+from pathlib import Path
 
 # Process each species raster
 for raster_file in glob.glob("species/*.tif"):
+    species = Path(raster_file).stem
     processor = RasterProcessor(
         input_path=raster_file,
         output_cog_path=f"s3://public-iucn/{species}-cog.tif",
@@ -119,7 +121,7 @@ for raster_file in glob.glob("species/*.tif"):
     processor.process_all_h0_regions()
 ```
 
-See: `iucn/` directory
+See: `catalog/iucn/`
 
 ## Kubernetes Examples
 
@@ -133,13 +135,11 @@ cng-datasets workflow \
   --bucket public-wdpa \
   --h3-resolution 10 \
   --parent-resolutions "9,8,0" \
-  --namespace biodiversity \
   --output-dir wdpa/k8s/
 
 # Run workflow
 kubectl apply -f wdpa/k8s/workflow-rbac.yaml
-kubectl apply -f wdpa/k8s/workflow-pvc.yaml
-kubectl apply -f wdpa/k8s/workflow.yaml
+kubectl apply -f wdpa/k8s/configmap.yaml -f wdpa/k8s/workflow.yaml
 ```
 
 ### Raster Dataset Workflow
@@ -148,7 +148,7 @@ kubectl apply -f wdpa/k8s/workflow.yaml
 from cng_datasets.k8s import K8sJobManager
 
 # Generate indexed job for h0 regions
-manager = K8sJobManager(namespace="biodiversity")
+manager = K8sJobManager(namespace="geo-workflows")
 
 job = manager.generate_chunked_job(
     job_name="wetlands-h3",
@@ -180,7 +180,6 @@ syncer = RcloneSync()
 syncer.sync(
     source="aws:public-wdpa/",
     destination="cloudflare:public-wdpa/",
-    args=["--progress"]
 )
 
 # Sync from AWS to Google Cloud Storage

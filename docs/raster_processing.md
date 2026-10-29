@@ -42,7 +42,7 @@ processor.process_all_h0_regions()
 cng-datasets raster \
     --input wetlands.tif \
     --output-cog s3://bucket/wetlands-cog.tif \
-    --compression zstd
+    --compression deflate
 
 # Raster to H3 parquet (auto-detect resolution)
 cng-datasets raster \
@@ -100,12 +100,12 @@ A finer target only carries h8 if h8 is among the parent resolutions, and the ra
 `--parent-resolutions 0` — so an h10 build emits h10 and h0, and nothing to join on either.
 
 `raster` warns in both cases, naming the consequence and the flag that fixes it. Pass
-`--h3-resolution 8` for a coarse global product, or add `8` to `--parent-resolutions` for a finer
+`--resolution 8` for a coarse global product, or add `8` to `--parent-resolutions` for a finer
 one, whenever a joinable output matters (issue #182):
 
 ```bash
 cng-datasets raster --input chelsa-bio1.tif ... \
-    --h3-resolution 8 --parent-resolutions "7,6,0"
+    --resolution 8 --parent-resolutions "7,6,0"
 
 cng-datasets raster --input nlcd-2021.tif ... \
     --resolution 10 --parent-resolutions "9,8,0"
@@ -126,7 +126,7 @@ cng-datasets raster --input nlcd-2021.tif ... \
   categorical product often carries several fill codes in one band (LANDFIRE: `-9999`
   Fill-NoData, `-1111` Fill-Not-Mapped, `32767` internal), and a GDAL band can declare only
   one — see [Several fill codes in one band](#several-fill-codes-in-one-band).
-- `compression` (str): COG compression method (default: "zstd")
+- `compression` (str): COG compression method (default: "deflate")
 - `blocksize` (int): COG tile size (default: 512)
 - `resampling` (str): Resampling method for COG (default: "nearest")
 - `method` (str): Raster→H3 algorithm (default: `"exact-extract"`). One of `exact-extract` or `warp-centroid` — see [Aggregation methods](#aggregation-methods).
@@ -170,7 +170,7 @@ COGs are optimized for cloud rendering with titiler:
 processor = RasterProcessor(
     input_path="data.tif",
     output_cog_path="s3://bucket/data-cog.tif",
-    compression="zstd",  # or "deflate", "lzw"
+    compression="deflate",  # or "zstd", "lzw"
     blocksize=512,  # Tile size
     resampling="bilinear"  # or "nearest", "cubic"
 )
@@ -522,15 +522,15 @@ Output is partitioned by h0 (continent-scale) H3 cells:
 s3://bucket/dataset/
 ├── dataset-cog.tif          # Cloud-Optimized GeoTIFF
 └── hex/                     # H3-indexed parquet
-    └── h0=0/
-        └── h0_0.parquet
-    └── h0=1/
-        └── h0_1.parquet
-    ...
+    ├── h0=<cell>/data_0.parquet
+    └── ...
 ```
 
+An annual series built with `raster-workflow --years` adds a level above the cell:
+`hex/year=<year>/h0=<cell>/data_0.parquet`.
+
 Each parquet file contains one row per native H3 cell:
-- `h3_cell`: H3 cell ID at specified resolution
+- `h{res}`: H3 cell ID at the target resolution, e.g. `h8`
 - `value`: Aggregated raster value using area-weighted aggregation (customizable column name)
 - Parent H3 cells if `parent_resolutions` specified
 - Excludes nodata values if specified
@@ -570,6 +570,6 @@ processor = RasterProcessor(
 ## Examples
 
 See the following directories for complete examples:
-- `wetlands/glwd/` - Raster to H3 conversion with global h0 processing
-- `iucn/` - Species range maps raster processing
+- `catalog/wetlands/` - Raster to H3 conversion with global h0 processing
+- `catalog/iucn/` - Species range maps raster processing
 - `ncp/` - Nature contributions to people raster data

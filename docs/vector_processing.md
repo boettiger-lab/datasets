@@ -188,7 +188,7 @@ across the mixed-resolution union (no compaction / ancestor-walks needed).
 - **Chunk-size caveat:** because larger features are hexed coarser, cells-per-feature
   still *rises* with the tier, so coarser/larger-feature tiers want a *smaller*
   `--chunk-size` (aim for a roughly constant few-million cells per chunk, not a
-  constant row count). Automatic cells-per-chunk scaling is tracked in issue #124.
+  constant row count). `cng-datasets workflow` plans chunks by estimated cells by default (`--cells-per-chunk`), which does this for you.
 - A single very large feature no longer needs a coarse bin just to be hexed at
   all: since issue #125 every large polygon is cut into pieces before the
   polyfill (see below).
@@ -218,22 +218,26 @@ small to need it. A large part that crosses the antimeridian is first cut at
 Output is partitioned by h0 (continent-scale) H3 cells:
 
 ```
-s3://bucket/output/
-└── h0=0/
-    └── chunk_0.parquet
-└── h0=1/
-    └── chunk_0.parquet
-...
+s3://bucket/<dataset>/
+├── chunks/chunk_000000.parquet   # written by each hex pod, removed by repartition
+└── hex/
+    ├── h0=<cell>/data_0.parquet  # written by repartition
+    └── ...
 ```
 
-Each parquet file contains:
-- `h3_cell`: H3 cell ID at specified resolution
-- Original attributes from input dataset
-- Parent H3 cells if `parent_resolutions` specified
+Each hex file contains:
+- The feature id (`_cng_fid` unless the source has its own id column)
+- `h{res}`: H3 cell ID at the target resolution, e.g. `h10`
+- One column per parent resolution, e.g. `h9`, `h8`, `h0`
+
+Join back to the GeoParquet on the id for feature attributes. Rows are in spatial
+(Hilbert) order and `_cng_fid` is numbered in that order, so **`_cng_fid` values
+change when a dataset is rebuilt**. Pass `--no-spatial-order` to `cng-convert-to-parquet`
+(or `spatial_order=False` to `convert_to_parquet`) to keep source order.
 
 ## Examples
 
 See the following directories for complete examples:
-- `redlining/` - Vector polygon processing with chunking
-- `wdpa/` - Large-scale protected areas processing
-- `pad-us/` - Protected areas database H3 tiling
+- `catalog/wdpa/` - Large-scale protected areas processing
+- `catalog/pad-us/` - Multi-layer geodatabase, one workflow per layer
+- `catalog/mappinginequality/` - Vector polygon processing

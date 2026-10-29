@@ -2,7 +2,7 @@
 
 ## Basic Installation
 
-Install from PyPI:
+Install from PyPI (Python 3.10 or later):
 
 ```bash
 pip install cng-datasets
@@ -25,14 +25,11 @@ pip install -e ".[dev]"
 ```
 
 This includes:
-- pytest for testing
-- black for code formatting
-- ruff for linting
-- mypy for type checking
+- pytest, ruff, black and mypy
 
 ## Raster Processing Support
 
-For raster processing, GDAL requires system libraries. Install GDAL first:
+The `[raster]` extra adds exactextract and rasterio but deliberately leaves out the GDAL Python bindings, which must match the system's libgdal exactly. Install GDAL from your system package manager first:
 
 ### Ubuntu/Debian
 
@@ -65,7 +62,8 @@ docker run --rm -v $(pwd):/data ghcr.io/boettiger-lab/datasets:latest \
 ```
 
 The Docker image includes:
-- GDAL with full NumPy array support
+- One GDAL and one GEOS: rasterio, pyogrio, pyproj, shapely and exactextract are built from source against the system libraries
+- DuckDB 2.0
 - All Python dependencies
 - AWS CLI and rclone for cloud storage
 - Pre-installed cng-datasets package
