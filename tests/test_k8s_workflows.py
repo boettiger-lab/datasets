@@ -3004,3 +3004,18 @@ class TestMultiYearRasterWorkflow:
             cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
             assert job["spec"]["completions"] == 6
             assert "YEAR" not in cmd and "year=" not in cmd
+
+
+@pytest.mark.timeout(10)
+def test_hex_manifest_states_its_cpu_request(monkeypatch):
+    """NRP enforces no cpu quota, so a pod cannot read its request from the
+    cgroup; the usage each chunk records takes it from CNG_POD_CPU (#183)."""
+    import cng_datasets.raster.cog as cog
+    monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        generate_raster_workflow(dataset_name="cpudemo", source_urls="https://example.com/x.tif",
+                                 bucket="b", output_dir=tmpdir, hex_cpu="6")
+        job = yaml.safe_load(open(Path(tmpdir) / "cpudemo-hex.yaml"))
+        env = {e["name"]: e.get("value") for e in
+               job["spec"]["template"]["spec"]["containers"][0]["env"]}
+        assert env["CNG_POD_CPU"] == "6"

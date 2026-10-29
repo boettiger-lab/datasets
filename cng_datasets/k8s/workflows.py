@@ -1954,6 +1954,8 @@ def generate_mdim_workflow(
         {"name": "GDAL_CACHEMAX", "value": "1024"},
         {"name": "GDAL_HTTP_MAX_RETRY", "value": "5"},
         {"name": "GDAL_HTTP_RETRY_DELAY", "value": "2"},
+        # The cpu request, for the usage each chunk records (#183).
+        {"name": "CNG_POD_CPU", "value": str(hex_cpu)},
     ]
     resources = {
         "requests": {"cpu": str(hex_cpu), "memory": hex_memory, "ephemeral-storage": hex_storage},
@@ -2274,6 +2276,9 @@ def _generate_raster_hex_job(
         # tuned value survives regeneration (issue #195).
         {"name": "CNG_HEX_WORKERS", "value": str(hex_workers)},
         {"name": "CNG_HEX_CHUNK_SIZE", "value": str(hex_chunk_size)},
+        # The cpu request, for the usage each chunk records (#183): NRP
+        # enforces no cpu quota, so the pod cannot read it from its cgroup.
+        {"name": "CNG_POD_CPU", "value": hex_cpu},
         # The hex step's own DuckDB writes the partition by scanning
         # every part its workers produced. Unset, DuckDB sizes its
         # buffer manager from the *host's* RAM rather than the pod's

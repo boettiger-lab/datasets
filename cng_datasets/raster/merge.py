@@ -168,7 +168,8 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
                    max(mem_limit_bytes), max(cpu_request),
                    max(peak_bytes), quantile_cont(peak_bytes, 0.95),
                    max(anon_peak_bytes), count(anon_peak_bytes),
-                   avg(cpu_mean), quantile_cont(cpu_mean, 0.95), max(elapsed_s)
+                   avg(cpu_mean), quantile_cont(cpu_mean, 0.95), max(elapsed_s),
+                   max(workers), min(workers)
             FROM read_parquet('{manifest_glob}', union_by_name = true)
         """).fetchone()
     except Exception:
@@ -177,7 +178,7 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
         if own_con:
             con.close()
     (n, measured, mem_limit, cpu_request, peak, peak_p95,
-     anon_peak, n_anon, cpu_mean, cpu_p95, slowest) = row
+     anon_peak, n_anon, cpu_mean, cpu_p95, slowest, workers, min_workers) = row
     if not measured:
         return None
 
@@ -205,9 +206,15 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
               f"(95th percentile {cpu_p95:.1f}); slowest pod "
               + (f"{slowest / 60:.0f} min" if slowest >= 120 else f"{slowest:.0f} s"))
     flags = f"--hex-memory {memory_gi}Gi" + (f" --hex-cpu {cpu}" if cpu else "")
-    print(f"  For the next build of this shape: {flags}, keeping --hex-workers "
-          f"where it was (it defaults to --hex-cpu, and the memory measured here "
-          f"depends on it).")
+    if workers and workers == min_workers:
+        # Pinned, because --hex-workers defaults to --hex-cpu, and the memory
+        # measured here is what this many workers used.
+        flags += f" --hex-workers {workers}"
+        print(f"  For the next build of this shape: {flags}")
+    else:
+        print(f"  For the next build of this shape: {flags}, keeping --hex-workers "
+              f"where it was (it defaults to --hex-cpu, and the memory measured "
+              f"here depends on it).")
     if mem_limit and mem_limit > 2 * memory_gi * gib:
         print(f"  ⚠ The pods asked for {mem_limit / gib:g} GiB and needed at most "
               f"{basis / gib:.2f}. An oversized memory request costs placement: it "

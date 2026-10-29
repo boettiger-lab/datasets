@@ -9,6 +9,7 @@ cannot drift apart about any of it (#181).
 """
 
 import math
+import os
 from typing import List, Optional
 
 import duckdb
@@ -224,22 +225,21 @@ def _anon_bytes() -> Optional[int]:
 
 
 def _cpu_request() -> Optional[float]:
-    """The pod's cpu, in cores: its quota where one is enforced, else its
-    request, which Kubernetes encodes in `cpu.weight`.
+    """The pod's cpu request in cores: CNG_POD_CPU, which the generated hex
+    manifests set, else an enforced cgroup quota.
 
-    NRP enforces no cpu quota (`cpu.max` reads "max" whatever the limit), so
-    the weight is usually the only record. Kubernetes sets it from the request
-    as weight = 1 + (shares - 2) * 9999 / 262142, with shares = 1024 per core;
-    inverting that recovers the request to within about 1%.
+    The cgroup is not a reliable record of the request. NRP enforces no quota
+    (`cpu.max` reads "max" whatever the limit), and `cpu.weight` maps from the
+    request differently between container runtimes: a 2-core pod there inverts
+    to 4.4 cores under Kubernetes' documented linear mapping.
     """
+    text = os.environ.get("CNG_POD_CPU", "").strip()
+    if text:
+        return float(text[:-1]) / 1000 if text.endswith("m") else float(text)
     quota, _, period = (_read(f"{_CGROUP}/cpu.max") or "max").partition(" ")
     if quota != "max" and period:
         return int(quota) / int(period)
-    weight = _read(f"{_CGROUP}/cpu.weight")
-    if not weight:
-        return None
-    shares = (int(weight) - 1) * 262142 / 9999 + 2
-    return round(shares / 1024, 1)
+    return None
 
 
 def start_usage_monitor(interval_s: float = 1.0) -> None:
@@ -277,8 +277,10 @@ def pod_usage() -> dict:
     request should be sized to: the hot loop is parallel, but the localize,
     read and upload phases around it are not (#183).
     """
+    workers = os.environ.get("CNG_HEX_WORKERS", "").strip()
     usage = dict(mem_limit_bytes=_memory_limit_bytes(), peak_bytes=None,
-                 anon_peak_bytes=None, cpu_request=None, cpu_mean=None, elapsed_s=None)
+                 anon_peak_bytes=None, cpu_request=None, cpu_mean=None, elapsed_s=None,
+                 workers=int(workers) if workers.isdigit() else None)
     if usage["mem_limit_bytes"] is None:
         return usage
     peak = _read(f"{_CGROUP}/memory.peak")
@@ -288,7 +290,6 @@ def pod_usage() -> dict:
     usage["cpu_request"] = _cpu_request()
     # Wall time since the container started: PID 1's start, in clock ticks
     # since boot, against the host's uptime.
-    import os
     stat, uptime = _read("/proc/1/stat"), _read("/proc/uptime")
     cpu = dict(line.split(" ", 1) for line in (_read(f"{_CGROUP}/cpu.stat") or "").splitlines()
                if " " in line)
@@ -302,7 +303,8 @@ def pod_usage() -> dict:
 
 
 _USAGE_TYPES = dict(mem_limit_bytes="BIGINT", peak_bytes="BIGINT", anon_peak_bytes="BIGINT",
-                    cpu_request="DOUBLE", cpu_mean="DOUBLE", elapsed_s="DOUBLE")
+                    cpu_request="DOUBLE", cpu_mean="DOUBLE", elapsed_s="DOUBLE",
+                    workers="INTEGER")
 
 
 def record_chunk_completion(con, output_base: str, chunk_index: int, chunk_cell: int,

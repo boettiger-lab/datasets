@@ -5150,7 +5150,8 @@ class TestChunkUsageReport:
         (cg / "memory.peak").write_text(str(3 << 30) + "\n")
         (cg / "memory.stat").write_text(f"anon {anon}\nfile 123\n")
         (cg / "cpu.max").write_text("max 100000\n")
-        (cg / "cpu.weight").write_text("157\n")  # Kubernetes' weight for a 4-core request
+        monkeypatch.setenv("CNG_POD_CPU", "4")
+        monkeypatch.setenv("CNG_HEX_WORKERS", "4")
         (cg / "cpu.stat").write_text("usage_usec 5000000\nuser_usec 4000000\n")
         monkeypatch.setattr(h3_chunks, "_CGROUP", str(cg))
         monkeypatch.setattr(h3_chunks, "_anon_peak", None)
@@ -5170,6 +5171,7 @@ class TestChunkUsageReport:
         assert u["peak_bytes"] == 3 << 30
         assert u["anon_peak_bytes"] == 2 << 30, "the sampled peak, not the current value"
         assert u["cpu_request"] == 4.0
+        assert u["workers"] == 4
         assert u["elapsed_s"] > 0 and u["cpu_mean"] > 0
 
     @pytest.mark.timeout(10)
@@ -5177,6 +5179,7 @@ class TestChunkUsageReport:
         from cng_datasets import h3_chunks
         cg = self._cgroup(tmp_path, monkeypatch)
         (cg / "cpu.max").write_text("250000 100000\n")
+        monkeypatch.delenv("CNG_POD_CPU")
         assert h3_chunks.pod_usage()["cpu_request"] == 2.5
 
     @pytest.mark.timeout(10)
@@ -5198,11 +5201,12 @@ class TestChunkUsageReport:
         return str(chunks)
 
     @staticmethod
-    def _usage(peak_gib, anon_gib, cpu_mean, limit_gib=32, cpu_request=8.0):
+    def _usage(peak_gib, anon_gib, cpu_mean, limit_gib=32, cpu_request=8.0, workers=8):
         gib = 2 ** 30
         return dict(mem_limit_bytes=limit_gib * gib, peak_bytes=int(peak_gib * gib),
                     anon_peak_bytes=None if anon_gib is None else int(anon_gib * gib),
-                    cpu_request=cpu_request, cpu_mean=cpu_mean, elapsed_s=300.0)
+                    cpu_request=cpu_request, cpu_mean=cpu_mean, elapsed_s=300.0,
+                    workers=workers)
 
     @pytest.mark.timeout(30)
     def test_suggestion_is_tight_on_memory_and_mean_on_cpu(self, tmp_path, monkeypatch, capsys):
@@ -5215,7 +5219,7 @@ class TestChunkUsageReport:
         assert summary["suggested_memory"] == "6Gi"
         assert summary["suggested_cpu"] == 3
         out = capsys.readouterr().out
-        assert "--hex-memory 6Gi --hex-cpu 3" in out
+        assert "--hex-memory 6Gi --hex-cpu 3 --hex-workers 8" in out
         assert "asked for 32 GiB" in out
 
     @pytest.mark.timeout(30)
