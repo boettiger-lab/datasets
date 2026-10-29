@@ -12,7 +12,43 @@ The vector processing module provides tools to convert geospatial vector data in
 
 ## Basic Usage
 
-### Python API
+### Converting the source to GeoParquet
+
+The hex step reads GeoParquet in EPSG:4326 with an id column. `convert_to_parquet` (CLI:
+`cng-convert-to-parquet`) produces it from anything GDAL or DuckDB reads: Shapefile,
+GeoPackage, FileGDB, GeoJSON, GeoParquet, or a CSV of points. Several sources are merged
+with `UNION ALL`, so they must share their columns in order.
+
+```python
+from cng_datasets.vector.convert_to_parquet import convert_to_parquet
+
+convert_to_parquet(
+    "https://example.com/parks.gdb",
+    "s3://my-bucket/parks.parquet",
+    layer="Parks",
+)
+```
+
+```bash
+cng-convert-to-parquet https://example.com/parks.gdb s3://my-bucket/parks.parquet --layer Parks
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `--layer` | the only layer | Layer of a multi-layer source |
+| `--id-column` | auto-detected | Id column to keep. Without one, a `_cng_fid` column is added (`--no-force-id` skips it) |
+| `--target-crs` | `EPSG:4326` | Output CRS. Features that cross the antimeridian are split at 180° after reprojection |
+| `--simplify-tolerance` | none | Simplify geometry, in target-CRS units (0.0001° ≈ 10 m), for very high-vertex sources |
+| `--trim-strings` | off | Strip whitespace from every string column, which otherwise silently breaks equality filters |
+| `--lat-column`, `--lon-column` | auto-detected | Coordinate columns of a CSV of points |
+| `--csv-sample-size` | -1 (whole file) | Rows sampled for CSV type inference |
+| `--expect-features` | none | Fail unless exactly this many features are written, to catch a truncated source |
+| `--no-spatial-order` | off | Keep source row order instead of Hilbert order (see [Output Format](#output-format)) |
+
+`cng-datasets workflow` exposes the same options for its convert step, except
+`--no-spatial-order`, `--target-crs` and `--csv-sample-size` (#311).
+
+### H3 tiling from Python
 
 ```python
 from cng_datasets.vector import H3VectorProcessor
@@ -78,26 +114,10 @@ This prevents OOM errors when processing large polygons at high H3 resolutions. 
 - `parent_resolutions` (list[int]): Parent resolutions for aggregation (default: [9, 8, 0])
 - `chunk_size` (int): Number of rows to process at once in Pass 1 (default: 500)
 - `intermediate_chunk_size` (int): Number of array rows to unnest at once in Pass 2 (default: 10)
+- `id_column` (str, optional): Id column to carry into the hex output (auto-detected if not given)
+- `plan_url` (str, optional): A chunk plan from `cng-datasets vector-plan`. With a plan, `process_chunk(k)` processes the plan's row range k instead of a fixed `chunk_size` slice (see [Chunk Planning](#chunk-planning))
 - `read_credentials` (dict, optional): S3 credentials for reading
 - `write_credentials` (dict, optional): S3 credentials for writing
-
-## Chunked Processing
-
-For large datasets, process in chunks to avoid memory issues:
-
-```python
-# Process in parallel using Kubernetes
-from cng_datasets.k8s import K8sJobManager
-
-manager = K8sJobManager()
-job = manager.generate_chunked_job(
-    job_name="dataset-h3-tiling",
-    script_path="/app/tile_vectors.py",
-    num_chunks=100,
-    parallelism=20
-)
-manager.save_job_yaml(job, "tiling-job.yaml")
-```
 
 ## Chunk Planning
 
@@ -188,7 +208,7 @@ across the mixed-resolution union (no compaction / ancestor-walks needed).
 - **Chunk-size caveat:** because larger features are hexed coarser, cells-per-feature
   still *rises* with the tier, so coarser/larger-feature tiers want a *smaller*
   `--chunk-size` (aim for a roughly constant few-million cells per chunk, not a
-  constant row count). Automatic cells-per-chunk scaling is tracked in issue #124.
+  constant row count). `cng-datasets workflow` plans chunks by estimated cells by default (`--cells-per-chunk`), which does this for you.
 - A single very large feature no longer needs a coarse bin just to be hexed at
   all: since issue #125 every large polygon is cut into pieces before the
   polyfill (see below).
@@ -209,6 +229,9 @@ with no gaps or overlaps. Each piece's cells are a separate list in Pass 1, so n
 single list gets near the 2 GB limit on one parquet value, which used to cap a
 feature at ~134 million cells.
 
+Each polygon part is passed to H3 as WKB (`h3_polygon_wkb_to_cells`), not as WKT text.
+Multipolygons are split into parts first.
+
 Not cut: line features, invalid polygons (clipping one can fail) and parts too
 small to need it. A large part that crosses the antimeridian is first cut at
 180° into two ordinary parts.
@@ -218,22 +241,26 @@ small to need it. A large part that crosses the antimeridian is first cut at
 Output is partitioned by h0 (continent-scale) H3 cells:
 
 ```
-s3://bucket/output/
-└── h0=0/
-    └── chunk_0.parquet
-└── h0=1/
-    └── chunk_0.parquet
-...
+s3://bucket/<dataset>/
+├── chunks/chunk_000000.parquet   # written by each hex pod, removed by repartition
+└── hex/
+    ├── h0=<cell>/data_0.parquet  # written by repartition
+    └── ...
 ```
 
-Each parquet file contains:
-- `h3_cell`: H3 cell ID at specified resolution
-- Original attributes from input dataset
-- Parent H3 cells if `parent_resolutions` specified
+Each hex file contains:
+- The feature id (`_cng_fid` unless the source has its own id column)
+- `h{res}`: H3 cell ID at the target resolution, e.g. `h10`
+- One column per parent resolution, e.g. `h9`, `h8`, `h0`
+
+Join back to the GeoParquet on the id for feature attributes. Rows are in spatial
+(Hilbert) order and `_cng_fid` is numbered in that order, so **`_cng_fid` values
+change when a dataset is rebuilt**. Pass `--no-spatial-order` to `cng-convert-to-parquet`
+(or `spatial_order=False` to `convert_to_parquet`) to keep source order.
 
 ## Examples
 
 See the following directories for complete examples:
-- `redlining/` - Vector polygon processing with chunking
-- `wdpa/` - Large-scale protected areas processing
-- `pad-us/` - Protected areas database H3 tiling
+- `catalog/wdpa/` - Large-scale protected areas processing
+- `catalog/pad-us/` - Multi-layer geodatabase, one workflow per layer
+- `catalog/mappinginequality/` - Vector polygon processing

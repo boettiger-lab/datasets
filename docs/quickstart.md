@@ -78,17 +78,16 @@ cng-datasets workflow \
   --source-url https://example.com/data.gpkg \
   --bucket public-my-dataset \
   --h3-resolution 10 \
-  --namespace biodiversity \
   --output-dir my-dataset/
 
 # Apply RBAC
 kubectl apply -f my-dataset/workflow-rbac.yaml
 
 # Run workflow
-kubectl apply -f my-dataset/workflow.yaml
+kubectl apply -f my-dataset/configmap.yaml -f my-dataset/workflow.yaml
 
 # Monitor
-kubectl logs -f job/my-dataset-workflow -n biodiversity
+kubectl logs -f job/my-dataset-workflow -n geo-workflows
 ```
 
 ## Next Steps

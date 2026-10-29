@@ -21,6 +21,31 @@ Output uses the same layout as `raster`: `hex/h0={cell}/data_0.parquet`, or
 `merge-chunks`. Each file has columns `h<res>`, the parents, the time key, and
 one column per `--variable`.
 
+## From Python
+
+`MdimProcessor` hexes one chunk at a time, the unit a cluster pod runs. Chunks
+are h0 cells at the default `chunk_resolution=0`, and `chunk_cells()` lists them.
+
+```python
+from cng_datasets.mdim import MdimProcessor
+
+proc = MdimProcessor(
+    inputs=['ZARR:"/vsicurl/https://cadcat.s3.us-west-2.amazonaws.com/loca2/ucsd/gfdl-esm4/ssp370/r1i1p1f1/day/tasmax/d03"'],
+    variables=["tasmax"],
+    output_parquet_path="loca2/hex",
+    h3_resolution=6,
+    parent_resolutions=[0],
+    time_agg="year",
+    time_start="2040-01-01",
+    time_end="2069-12-31",
+)
+for i in range(len(proc.chunk_cells())):
+    proc.process_chunk(i)
+```
+
+`CubeSource` is the reader underneath: it opens the inputs, decodes their time
+axis and reads windows of the grid.
+
 ## How it reads
 
 GDAL reads **chunk-aligned slabs**, so a query transfers only the chunks it
@@ -43,6 +68,12 @@ How pixels are put into cells depends on their size relative to the cells:
 Neither placement is area-weighted, so `--hex-resampling` is `mean`, `min` or
 `max`, and **`sum` is refused**. Extensive or density variables should still go
 through a 2-D COG and `cng-datasets raster` (`exact-extract`).
+
+## Missing values
+
+`_FillValue`, `scale_factor` and `add_offset` are applied as CF specifies, and
+values outside `valid_min`, `valid_max` or `valid_range` are treated as missing.
+The range is compared in stored units, before scale and offset.
 
 ## Time
 
@@ -76,6 +107,22 @@ cng-datasets mdim-workflow --dataset climate/nex-gddp-tas \
 kubectl apply -f catalog/climate/k8s/nex-gddp-tas/configmap.yaml \
               -f catalog/climate/k8s/nex-gddp-tas/workflow.yaml
 ```
+
+Flags shared with `raster-workflow`:
+
+- `--h0-subset` (grid positions) or `--h0-cells` (H3 base cell numbers) limits a
+  regional source to the h0 cells it overlaps. See
+  [Positions are not H3 base cell numbers](raster_processing.md#positions-are-not-h3-base-cell-numbers).
+- `--chunk-resolution N` splits each h0 into its res-N descendants, adding a
+  merge step.
+- `--backend armada` writes Armada job sets, and `--backend auto` uses Armada
+  only past the ~200-pod guideline for one indexed Job. `--armada-queue`
+  defaults to the namespace (`geo-workflows`).
+- `--hex-memory` (16Gi), `--hex-cpu` (4) and `--max-parallelism` (50) size the
+  hex pods. A chunked build's `merge-chunks` log suggests sizes for the next
+  build from what the pods used.
+- `--no-validate-source` skips opening the first input at generation time, for
+  a source that is not readable from where you generate.
 
 ### Which axis the fan-out splits over
 

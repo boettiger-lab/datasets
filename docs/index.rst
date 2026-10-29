@@ -21,6 +21,7 @@ A Python toolkit for processing large geospatial datasets into cloud-native form
 
    api/vector
    api/raster
+   api/mdim
    api/k8s
    api/storage
 

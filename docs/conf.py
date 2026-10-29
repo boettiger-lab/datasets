@@ -34,13 +34,12 @@ source_suffix = {
 }
 
 templates_path = ['_templates']
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
+exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store', 'README.md', 'superpowers']
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = 'furo'
-html_static_path = ['_static']
 html_title = 'CNG Datasets Toolkit'
 
 html_theme_options = {
@@ -73,6 +72,7 @@ intersphinx_mapping = {
 }
 
 # MyST parser settings
+myst_heading_anchors = 4
 myst_enable_extensions = [
     "colon_fence",
     "deflist",

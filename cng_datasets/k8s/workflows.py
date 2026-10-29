@@ -131,6 +131,7 @@ def load_profile(name_or_path: str) -> Dict[str, Any]:
     """Load a cluster profile and return its values as a dict.
 
     Resolution order:
+
     1. Treat as a file path if it ends in ``.yaml`` / ``.yml`` or contains
        a path separator — resolved relative to the current working directory.
     2. ``~/.config/cng-datasets/profiles/<name>.yaml``

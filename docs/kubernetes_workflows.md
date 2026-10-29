@@ -4,35 +4,37 @@ Generate and run complete Kubernetes workflows for large-scale geospatial proces
 
 ## Overview
 
-The K8s workflow module generates complete workflows for processing datasets into cloud-native formats. The workflow uses a **PVC-based orchestration** approach that allows stateless execution entirely within Kubernetes.
+`cng-datasets workflow`, `raster-workflow` and `mdim-workflow` generate every manifest a build needs and an orchestrator Job that runs them in order inside the cluster. Nothing runs on the machine that generates the YAML, and once the orchestrator is applied you can disconnect.
+
+The steps all call the same Python functions documented in the [API reference](api_reference.md), so a small dataset can be converted directly in Python without any of this.
 
 ## Architecture
 
-### PVC-Based Orchestration
+### Vector pipeline
 
-The workflow uses a Persistent Volume Claim (PVC) to store job YAML files, enabling:
-- **Stateless execution**: No git repository dependencies
-- **Laptop disconnect**: Workflows run entirely in cluster
-- **Clean separation**: YAML files remain readable and separate
-- **Reusability**: Same RBAC across all datasets in a namespace
+`cng-datasets workflow` writes these files to `--output-dir`:
 
-### Workflow Components
+| File | Purpose |
+|------|---------|
+| `<name>-setup-bucket.yaml` | Create the S3 bucket with a public-read policy and CORS |
+| `<name>-convert.yaml` | Read the source, reproject to EPSG:4326 and write GeoParquet |
+| `<name>-plan.yaml` | Cut the GeoParquet into hex chunks by estimated H3 cells |
+| `<name>-pmtiles.yaml` | Build PMTiles vector tiles |
+| `<name>-hex.yaml` | H3 tiling as an indexed Job, one completion per chunk |
+| `<name>-repartition.yaml` | Consolidate the chunks into `hex/h0=<cell>/data_0.parquet` |
+| `configmap.yaml` | The step manifests above, packaged for the orchestrator |
+| `workflow-rbac.yaml` | ServiceAccount, Role and RoleBinding, shared by every workflow in a namespace |
+| `workflow.yaml` | Orchestrator Job: setup-bucket → convert → plan → (pmtiles ∥ hex) → repartition |
 
-1. **Processing Jobs**:
-   - `convert-job.yaml` - Convert source format → GeoParquet
-   - `pmtiles-job.yaml` - Generate PMTiles vector tiles
-   - `hex-job.yaml` - H3 hexagonal tiling with automatic chunking
-   - `repartition-job.yaml` - Consolidate chunks by h0 partition
+The plan step runs only when chunks are planned by cells (the default). With `--chunk-size` the hex Job is cut into a fixed number of features per chunk and there is no plan step. When there is a plan, the hex manifest holds only an upper bound on completions and the orchestrator resizes it to the plan, so always apply the hex step through `workflow.yaml` rather than on its own.
 
-2. **Orchestration Infrastructure**:
-   - `workflow-rbac.yaml` - ServiceAccount/Role/RoleBinding (one per namespace)
-   - `workflow-pvc.yaml` - PVC for storing YAML files
-   - `workflow-upload.yaml` - Job for uploading YAMLs to PVC
-   - `workflow.yaml` - Orchestrator job that applies jobs from PVC
+### Raster and mdim pipelines
+
+`raster-workflow` writes setup-bucket, preprocess (when needed), cog, hex and repartition steps, plus a merge step when `--chunk-resolution` splits each h0 cell. `mdim-workflow` has the same shape for NetCDF and Zarr cubes. Both also write `configmap.yaml`, `workflow-rbac.yaml` and `workflow.yaml`.
 
 ## Quick Start
 
-### 1. Generate Workflow Files
+### 1. Generate workflow files
 
 ```bash
 cng-datasets workflow \
@@ -41,54 +43,22 @@ cng-datasets workflow \
   --bucket public-my-dataset \
   --h3-resolution 10 \
   --parent-resolutions "9,8,0" \
-  --namespace biodiversity \
   --output-dir my-dataset/
 ```
 
-### 2. Run Complete Workflow
+Jobs run in the `geo-workflows` namespace unless `--namespace` or a profile says otherwise. Every manifest carries `metadata.namespace`, so `kubectl apply` targets that namespace whatever your current context is.
+
+### 2. Run the workflow
 
 ```bash
 # One-time setup per namespace
 kubectl apply -f my-dataset/workflow-rbac.yaml
 
-# Create PVC for YAML storage
-kubectl apply -f my-dataset/workflow-pvc.yaml
-
-# Upload YAML files to PVC
-kubectl apply -f my-dataset/workflow-upload.yaml
-kubectl wait --for=condition=ready pod -l job-name=my-dataset-upload-yamls -n biodiversity
-
-# Copy YAML files to PVC
-POD=$(kubectl get pods -l job-name=my-dataset-upload-yamls -n biodiversity -o jsonpath='{.items[0].metadata.name}')
-kubectl cp my-dataset/convert-job.yaml $POD:/yamls/ -n biodiversity
-kubectl cp my-dataset/pmtiles-job.yaml $POD:/yamls/ -n biodiversity
-kubectl cp my-dataset/hex-job.yaml $POD:/yamls/ -n biodiversity
-kubectl cp my-dataset/repartition-job.yaml $POD:/yamls/ -n biodiversity
-
-# Start orchestrator (laptop can disconnect after this)
-kubectl apply -f my-dataset/workflow.yaml
+# Apply the step manifests and start the orchestrator (safe to re-run)
+kubectl apply -f my-dataset/configmap.yaml -f my-dataset/workflow.yaml
 
 # Monitor progress
-kubectl logs -f job/my-dataset-workflow -n biodiversity
-```
-
-### 3. Run Jobs Individually (Alternative)
-
-```bash
-# Apply RBAC once
-kubectl apply -f my-dataset/workflow-rbac.yaml
-
-# Run each job manually
-kubectl apply -f my-dataset/convert-job.yaml
-kubectl apply -f my-dataset/pmtiles-job.yaml
-
-# Wait for convert to finish before hex
-kubectl wait --for=condition=complete job/my-dataset-convert -n biodiversity
-
-kubectl apply -f my-dataset/hex-job.yaml
-kubectl wait --for=condition=complete job/my-dataset-hex -n biodiversity
-
-kubectl apply -f my-dataset/repartition-job.yaml
+kubectl -n geo-workflows logs -f job/my-dataset-workflow
 ```
 
 ## Configuration
@@ -112,10 +82,10 @@ kubectl apply -f my-dataset/repartition-job.yaml
 ### Namespace
 
 ```bash
---namespace biodiversity  # Kubernetes namespace (must exist)
+--namespace geo-workflows  # Kubernetes namespace (default: geo-workflows, or the profile's)
 ```
 
-All jobs and RBAC use the specified namespace. Every generated manifest carries
+All jobs and RBAC use the specified namespace. It is also the Armada queue unless `--armada-queue` overrides it. Every generated manifest carries
 `metadata.namespace`, including the per-step Job manifests, so applying one on its own
 (`kubectl apply -f <dataset>-hex.yaml`) targets the workflow's namespace rather than
 whatever `kubectl` currently defaults to.
@@ -131,7 +101,8 @@ All cluster-specific values default to NRP Nautilus. Override any of them to tar
 | `--s3-secret-name` | `aws` | Kubernetes secret holding `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` |
 | `--rclone-secret-name` | `rclone-config` | Kubernetes secret holding the rclone config file |
 | `--rclone-remote` | `nrp` | Rclone remote name used in setup-bucket and PMTiles upload |
-| `--priority-class` | `opportunistic` | Kubernetes `priorityClassName`; pass `""` to omit the field entirely |
+| `--priority-class` | omitted | Kubernetes `priorityClassName`. Omitted by default, which means default priority. Pass `opportunistic` only for short, interruptible work: on NRP it is the lowest priority and a long fan-out at that priority is preempted repeatedly |
+| `--namespace` | `geo-workflows` | Namespace the jobs run in |
 | `--node-affinity` | `gpu-avoid` | `gpu-avoid` adds an NRP NFD rule to avoid GPU nodes; `none` omits affinity |
 
 #### Example: Using a profile file
@@ -186,7 +157,7 @@ Use separate S3 credentials for each dataset bucket to limit the blast radius of
 kubectl create secret generic s3-creds-my-dataset \
   --from-literal=AWS_ACCESS_KEY_ID=<bucket-specific-key> \
   --from-literal=AWS_SECRET_ACCESS_KEY=<bucket-specific-secret> \
-  -n biodiversity
+  -n geo-workflows
 
 # Generate workflow using the scoped secret
 cng-datasets workflow \
@@ -222,111 +193,68 @@ generate_dataset_workflow(
 )
 ```
 
-### Chunking Behavior
+### Chunking
 
-The hex job automatically determines optimal chunking:
-- Uses GDAL to count features from source URL
-- Targets 200 completions with 50 parallelism
-- Falls back to defaults if counting fails
+The hex step is an indexed Job whose completions are chunks of the GeoParquet.
+
+- **Planned by cells (default).** The plan step estimates each feature's H3 cell count and cuts chunks at `--cells-per-chunk` (default 5,000,000), never more than 1000 features per chunk. Memory follows cells, not features, so a few continent-sized polygons get their own chunks. Lower `--cells-per-chunk` if hex pods run out of memory or straggle.
+- **Fixed size.** `--chunk-size N` cuts N features per chunk with no plan step. It is mutually exclusive with `--cells-per-chunk`.
+- `--max-completions` (default 200) caps the number of chunks and `--max-parallelism` (default 50) caps the pods alive at once.
+
+Raster workflows chunk by H3 cell instead: one h0 base cell per pod by default, or each h0 split into its descendants at `--chunk-resolution N`. `--max-hex-memory 8Gi` picks the coarsest chunk resolution that fits the budget.
 
 ## Processing Details
 
-### Two-Pass H3 Approach
+### Two-pass H3 approach
 
-1. **Chunking Phase** (`hex-job.yaml`):
-   - Process source data in parallel chunks
-   - Write to temporary `s3://bucket/dataset-name/chunks/`
-   - Each chunk contains all H3 resolutions
+1. **Hex** (`<name>-hex.yaml`): each pod tiles its chunk at the target resolution and all parent resolutions, and writes `s3://bucket/<dataset>/chunks/chunk_<id>.parquet`.
+2. **Repartition** (`<name>-repartition.yaml`): reads all chunks, partitions them by h0 cell, writes `s3://bucket/<dataset>/hex/h0=<cell>/data_0.parquet` and deletes `chunks/`.
 
-2. **Repartition Phase** (`repartition-job.yaml`):
-   - Read all chunks
-   - Repartition by h0 hexagon (continent-scale)
-   - Write to final `s3://bucket/dataset-name/hex/`
-   - Delete temporary `chunks/` directory
-
-### Output Structure
+### Output structure
 
 ```
 s3://bucket/
-├── dataset-name.parquet         # GeoParquet with all attributes
-├── dataset-name.pmtiles         # PMTiles vector tiles
-└── dataset-name/
-    └── hex/                     # H3-indexed parquet (partitioned by h0)
-        └── h0=0/
-            └── *.parquet
-        └── h0=1/
-            └── *.parquet
-        ...
+├── <dataset>.parquet         # GeoParquet with all attributes
+├── <dataset>.pmtiles         # PMTiles vector tiles
+└── <dataset>/
+    └── hex/                  # H3-indexed parquet, partitioned by h0
+        ├── h0=<cell>/data_0.parquet   # <cell> is the h0 cell id as an integer
+        └── ...
 ```
+
+Hex files carry one column per resolution (`h10`, `h9`, `h8`, `h0`) alongside the feature id. The GeoParquet and hex files record the cng-datasets and DuckDB versions that built them in their Parquet key-value metadata.
 
 ## Monitoring & Debugging
 
-### Check Status
+### Check status
 
 ```bash
-# List all jobs
-kubectl get jobs -n biodiversity
-
-# Check specific job
-kubectl describe job my-dataset-hex -n biodiversity
-
-# View logs
-kubectl logs job/my-dataset-workflow -n biodiversity
-kubectl logs job/my-dataset-hex-0-xxxxx -n biodiversity
-
-# List pods for a job
-kubectl get pods -n biodiversity | grep my-dataset-hex
+kubectl -n geo-workflows get jobs | grep my-dataset
+kubectl -n geo-workflows logs job/my-dataset-workflow   # which step the orchestrator is on
+kubectl -n geo-workflows logs job/my-dataset-plan       # chunk count and largest chunk
+kubectl -n geo-workflows get pods | grep my-dataset-hex
 ```
 
-### Common Issues
+### Common issues
 
-**PVC Upload Fails:**
+**Orchestrator can't apply jobs:**
 ```bash
-# Check uploader pod status
-kubectl get pod -l job-name=my-dataset-upload-yamls -n biodiversity
-
-# Check PVC status
-kubectl get pvc my-dataset-workflow-yamls -n biodiversity
+kubectl -n geo-workflows get sa,role,rolebinding | grep cng-datasets-workflow
 ```
 
-**Orchestrator Can't Apply Jobs:**
-```bash
-# Check RBAC permissions
-kubectl get sa,role,rolebinding -n biodiversity | grep cng-datasets-workflow
+**Hex pods run out of memory:** lower `--cells-per-chunk` (vector) or raise `--chunk-resolution` / lower `--hex-workers` (raster), regenerate, delete the failed Job and re-apply.
 
-# Check orchestrator logs
-kubectl logs job/my-dataset-workflow -n biodiversity
-```
-
-**Job Stuck Pending:**
+**Pod stuck pending:**
 ```bash
-# Check resource limits and node capacity
-kubectl describe pod <pod-name> -n biodiversity
+kubectl -n geo-workflows describe pod <pod-name>
 ```
 
 ## Cleanup
 
-### Delete Jobs and Resources
-
 ```bash
-# Delete all dataset jobs and PVC
-kubectl delete job my-dataset-convert my-dataset-pmtiles \
-  my-dataset-hex my-dataset-repartition \
-  my-dataset-upload-yamls my-dataset-workflow \
-  -n biodiversity --ignore-not-found=true
-
-kubectl delete pvc my-dataset-workflow-yamls -n biodiversity --ignore-not-found=true
-```
-
-### Delete Output Data
-
-```bash
-# Using rclone
-rclone purge nrp:bucket-name
-
-# Or specific paths
-rclone delete nrp:bucket-name/dataset.parquet
-rclone purge nrp:bucket-name/hex/
+kubectl delete -f my-dataset/workflow.yaml -f my-dataset/configmap.yaml
+kubectl -n geo-workflows delete job my-dataset-setup-bucket my-dataset-convert my-dataset-plan \
+  my-dataset-pmtiles my-dataset-hex my-dataset-repartition --ignore-not-found
 ```
 
 ## Armada Backend (Experimental)
@@ -345,7 +273,7 @@ Install `armadactl` from the [Armada releases page](https://github.com/armadapro
 
 ### Generate Armada Workflow
 
-Add `--backend armada` to any workflow command:
+Add `--backend armada` to any workflow command. `raster-workflow` and `mdim-workflow` also take `--backend auto`, which uses Armada only when the chunk count passes the ~200-pod guideline for one indexed Job. `--armada-queue` sets the queue, which defaults to the namespace.
 
 ```bash
 # Vector workflow
@@ -375,6 +303,8 @@ Submit each step in order, waiting for completion between steps:
 armadactl submit my-dataset/armada-my-dataset-setup-bucket.yaml
 # wait for completion in Lookout UI
 armadactl submit my-dataset/armada-my-dataset-convert.yaml
+# wait for completion
+armadactl submit my-dataset/armada-my-dataset-plan.yaml
 # wait for completion
 armadactl submit my-dataset/armada-my-dataset-hex.yaml
 # wait for completion (this is the long parallel step)
@@ -419,8 +349,10 @@ cng-datasets workflow ... --backend armada --armada-priority-class preemptible
 
 Preemptible is the right choice once the unit of work is small enough that losing one to a
 preemption is cheap. The converter currently reproduces the *shape* of the k8s job it reads — one
-Armada job per completion, at the same cpu/memory/runtime — so units are as large as the k8s ones
-until sub-h0 chunking lands (issue #173).
+Armada job per completion, at the same cpu/memory/runtime — so units are as large as the k8s ones.
+For rasters, `--chunk-resolution` makes them small: each h0 cell splits into its descendants.
+
+Generation refuses an Armada pod larger than 16 cores or 32Gi, the size NRP's Armada nodes can schedule. Lower the pod's memory, for example with `--chunk-resolution` or `--max-hex-memory`, rather than raising the cap.
 
 ### Differences from Standard k8s Backend
 
@@ -431,7 +363,7 @@ until sub-h0 chunking lands (issue #173).
 | Parallel hex jobs | Single k8s Indexed Job | N individual Armada jobs |
 | Pod limit | Bounded by namespace quota | Armada queues excess jobs |
 | Monitoring | `kubectl logs` | Lookout UI |
-| Priority class | `opportunistic` | `armada-default` (set with `--armada-priority-class`) |
+| Priority class | omitted (default priority) | `armada-default` (set with `--armada-priority-class`) |
 | Retry on failure | Job-level `backoffLimit` | none (dropped in conversion) |
 
 ## Advanced Usage
@@ -463,21 +395,15 @@ kubectl apply -f dataset1/workflow.yaml
 kubectl apply -f dataset2/workflow.yaml
 ```
 
-Each dataset gets its own PVC for YAML files.
+Each dataset gets its own ConfigMap holding its step manifests.
 
 ## Design Rationale
 
-### Why PVC Instead of Git?
-- No dev repository dependency
-- Stateless K8s execution
-- No initContainer overhead
+### Why a ConfigMap?
+- The orchestrator reads the step manifests from inside the cluster, with no git checkout or volume to populate
+- `kubectl apply` of two files starts a build, and re-applying is safe
 
-### Why Not ConfigMaps?
-- Better readability (files not embedded strings)
-- No 1MB size limit
-- Easier to inspect and modify
-
-### Why Generic RBAC?
+### Why generic RBAC?
 - One ServiceAccount per namespace
 - Consistent permissions
 - No per-dataset RBAC proliferation

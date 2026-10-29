@@ -15,8 +15,11 @@ All cluster-specific values in generated Kubernetes job specs default to NRP Nau
 | `s3_secret_name` | `aws` | Kubernetes secret providing `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` |
 | `rclone_secret_name` | `rclone-config` | Kubernetes secret providing the rclone configuration file |
 | `rclone_remote` | `nrp` | Rclone remote name used in setup-bucket and PMTiles upload commands |
-| `priority_class` | `opportunistic` | Kubernetes `priorityClassName`; set to `""` to omit the field |
+| `namespace` | `geo-workflows` | Namespace the jobs run in, and the default Armada queue |
+| `priority_class` | `""` (omitted) | Kubernetes `priorityClassName`. Omitted means default priority; `opportunistic` is for short, interruptible work only |
 | `node_affinity` | `gpu-avoid` | `gpu-avoid` adds NRP NFD GPU-avoidance rule; `none` omits affinity entirely |
+| `armada_queue` | the namespace | Armada queue for `--backend armada` or `auto` |
+| `armada_max_cpu`, `armada_max_memory` | `16`, `32Gi` | Largest Armada pod the cluster admits; generation refuses a bigger one. Empty turns the check off |
 
 ### Profile Files (recommended for repeated use)
 
@@ -158,7 +161,7 @@ By default all jobs in a namespace share a single `aws` secret. Use `--s3-secret
 kubectl create secret generic s3-creds-redlining \
   --from-literal=AWS_ACCESS_KEY_ID=<bucket-key> \
   --from-literal=AWS_SECRET_ACCESS_KEY=<bucket-secret> \
-  -n biodiversity
+  -n geo-workflows
 
 # 2. Generate workflow using that scoped secret
 cng-datasets workflow \
@@ -228,7 +231,7 @@ For Kubernetes workflows, use secrets:
 kubectl create secret generic aws-credentials \
   --from-literal=AWS_ACCESS_KEY_ID=your-key \
   --from-literal=AWS_SECRET_ACCESS_KEY=your-secret \
-  -n biodiversity
+  -n geo-workflows
 
 # Reference in job
 env:
@@ -302,8 +305,8 @@ Configure CORS for public bucket access:
 from cng_datasets.storage import configure_bucket_cors
 
 configure_bucket_cors(
-    bucket="my-public-bucket",
-    endpoint="https://s3.amazonaws.com"
+    bucket_name="my-public-bucket",
+    endpoint_url="https://s3.amazonaws.com"
 )
 ```
 
@@ -407,20 +410,15 @@ processor = RasterProcessor(
 # Kubernetes job parallelism
 cng-datasets workflow \
   --dataset my-dataset \
-  --parallelism 50  # Adjust based on cluster capacity
+  --max-parallelism 50  # Adjust based on cluster capacity
 ```
 
 ### Compression
 
 ```python
-# Vector output
-processor = H3VectorProcessor(
-    input_url="s3://bucket/data.parquet",
-    output_url="s3://bucket/output/",
-    compression="zstd",  # or "snappy", "gzip"
-)
+# Hex parquet is always written with ZSTD compression.
 
-# COG compression
+# COG compression (default "deflate")
 processor = RasterProcessor(
     input_path="data.tif",
     output_cog_path="s3://bucket/output.tif",
