@@ -223,6 +223,25 @@ def _anon_bytes() -> Optional[int]:
     return None
 
 
+def _cpu_request() -> Optional[float]:
+    """The pod's cpu, in cores: its quota where one is enforced, else its
+    request, which Kubernetes encodes in `cpu.weight`.
+
+    NRP enforces no cpu quota (`cpu.max` reads "max" whatever the limit), so
+    the weight is usually the only record. Kubernetes sets it from the request
+    as weight = 1 + (shares - 2) * 9999 / 262142, with shares = 1024 per core;
+    inverting that recovers the request to within about 1%.
+    """
+    quota, _, period = (_read(f"{_CGROUP}/cpu.max") or "max").partition(" ")
+    if quota != "max" and period:
+        return int(quota) / int(period)
+    weight = _read(f"{_CGROUP}/cpu.weight")
+    if not weight:
+        return None
+    shares = (int(weight) - 1) * 262142 / 9999 + 2
+    return round(shares / 1024, 1)
+
+
 def start_usage_monitor(interval_s: float = 1.0) -> None:
     """Start sampling the pod's anonymous memory, once per process.
 
@@ -259,16 +278,14 @@ def pod_usage() -> dict:
     read and upload phases around it are not (#183).
     """
     usage = dict(mem_limit_bytes=_memory_limit_bytes(), peak_bytes=None,
-                 anon_peak_bytes=None, cpu_limit=None, cpu_mean=None, elapsed_s=None)
+                 anon_peak_bytes=None, cpu_request=None, cpu_mean=None, elapsed_s=None)
     if usage["mem_limit_bytes"] is None:
         return usage
     peak = _read(f"{_CGROUP}/memory.peak")
     usage["peak_bytes"] = int(peak) if peak else None
     if _anon_peak is not None:
         usage["anon_peak_bytes"] = max(_anon_peak[0], _anon_bytes() or 0)
-    quota, _, period = (_read(f"{_CGROUP}/cpu.max") or "max").partition(" ")
-    if quota != "max" and period:
-        usage["cpu_limit"] = int(quota) / int(period)
+    usage["cpu_request"] = _cpu_request()
     # Wall time since the container started: PID 1's start, in clock ticks
     # since boot, against the host's uptime.
     import os
@@ -285,7 +302,7 @@ def pod_usage() -> dict:
 
 
 _USAGE_TYPES = dict(mem_limit_bytes="BIGINT", peak_bytes="BIGINT", anon_peak_bytes="BIGINT",
-                    cpu_limit="DOUBLE", cpu_mean="DOUBLE", elapsed_s="DOUBLE")
+                    cpu_request="DOUBLE", cpu_mean="DOUBLE", elapsed_s="DOUBLE")
 
 
 def record_chunk_completion(con, output_base: str, chunk_index: int, chunk_cell: int,

@@ -165,7 +165,7 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
     try:
         row = con.execute(f"""
             SELECT count(*), count(peak_bytes),
-                   max(mem_limit_bytes), max(cpu_limit),
+                   max(mem_limit_bytes), max(cpu_request),
                    max(peak_bytes), quantile_cont(peak_bytes, 0.95),
                    max(anon_peak_bytes), count(anon_peak_bytes),
                    avg(cpu_mean), quantile_cont(cpu_mean, 0.95), max(elapsed_s)
@@ -176,7 +176,7 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
     finally:
         if own_con:
             con.close()
-    (n, measured, mem_limit, cpu_limit, peak, peak_p95,
+    (n, measured, mem_limit, cpu_request, peak, peak_p95,
      anon_peak, n_anon, cpu_mean, cpu_p95, slowest) = row
     if not measured:
         return None
@@ -186,15 +186,15 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
     memory_gi = max(1, math.ceil(basis * _SUGGESTED_MEMORY_HEADROOM / gib))
     cpu = max(1, math.ceil(cpu_mean)) if cpu_mean else None
     summary = dict(chunks=n, measured=measured, mem_limit_bytes=mem_limit,
-                   cpu_limit=cpu_limit, peak_bytes=peak, anon_peak_bytes=anon_peak,
+                   cpu_request=cpu_request, peak_bytes=peak, anon_peak_bytes=anon_peak,
                    cpu_mean=cpu_mean, suggested_memory=f"{memory_gi}Gi",
                    suggested_cpu=cpu)
 
     asked = []
     if mem_limit:
         asked.append(f"{mem_limit / gib:g} GiB")
-    if cpu_limit:
-        asked.append(f"{cpu_limit:g} cpu")
+    if cpu_request:
+        asked.append(f"{cpu_request:g} cpu")
     print(f"Resource use, measured on {measured} of {n} chunks"
           + (f" (requested {' × '.join(asked)} each)" if asked else "") + ":")
     anon = (f"; anonymous {anon_peak / gib:.2f} GiB" if anon_peak and n_anon == measured
@@ -202,7 +202,8 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
     print(f"  memory peak {peak / gib:.2f} GiB (95th percentile {peak_p95 / gib:.2f}){anon}")
     if cpu_mean is not None:
         print(f"  cpu {cpu_mean:.1f} cores on average over each pod's life "
-              f"(95th percentile {cpu_p95:.1f}); slowest pod {slowest / 60:.0f} min")
+              f"(95th percentile {cpu_p95:.1f}); slowest pod "
+              + (f"{slowest / 60:.0f} min" if slowest >= 120 else f"{slowest:.0f} s"))
     flags = f"--hex-memory {memory_gi}Gi" + (f" --hex-cpu {cpu}" if cpu else "")
     print(f"  For the next build of this shape: {flags}, keeping --hex-workers "
           f"where it was (it defaults to --hex-cpu, and the memory measured here "

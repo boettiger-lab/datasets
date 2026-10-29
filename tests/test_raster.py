@@ -5149,7 +5149,8 @@ class TestChunkUsageReport:
         (cg / "memory.max").write_text(limit + "\n")
         (cg / "memory.peak").write_text(str(3 << 30) + "\n")
         (cg / "memory.stat").write_text(f"anon {anon}\nfile 123\n")
-        (cg / "cpu.max").write_text("400000 100000\n")
+        (cg / "cpu.max").write_text("max 100000\n")
+        (cg / "cpu.weight").write_text("157\n")  # Kubernetes' weight for a 4-core request
         (cg / "cpu.stat").write_text("usage_usec 5000000\nuser_usec 4000000\n")
         monkeypatch.setattr(h3_chunks, "_CGROUP", str(cg))
         monkeypatch.setattr(h3_chunks, "_anon_peak", None)
@@ -5168,8 +5169,15 @@ class TestChunkUsageReport:
         assert u["mem_limit_bytes"] == 8 << 30
         assert u["peak_bytes"] == 3 << 30
         assert u["anon_peak_bytes"] == 2 << 30, "the sampled peak, not the current value"
-        assert u["cpu_limit"] == 4.0
+        assert u["cpu_request"] == 4.0
         assert u["elapsed_s"] > 0 and u["cpu_mean"] > 0
+
+    @pytest.mark.timeout(10)
+    def test_an_enforced_quota_is_read_directly(self, tmp_path, monkeypatch):
+        from cng_datasets import h3_chunks
+        cg = self._cgroup(tmp_path, monkeypatch)
+        (cg / "cpu.max").write_text("250000 100000\n")
+        assert h3_chunks.pod_usage()["cpu_request"] == 2.5
 
     @pytest.mark.timeout(10)
     def test_an_unbounded_cgroup_measures_nothing(self, tmp_path, monkeypatch):
@@ -5190,11 +5198,11 @@ class TestChunkUsageReport:
         return str(chunks)
 
     @staticmethod
-    def _usage(peak_gib, anon_gib, cpu_mean, limit_gib=32, cpu_limit=8.0):
+    def _usage(peak_gib, anon_gib, cpu_mean, limit_gib=32, cpu_request=8.0):
         gib = 2 ** 30
         return dict(mem_limit_bytes=limit_gib * gib, peak_bytes=int(peak_gib * gib),
                     anon_peak_bytes=None if anon_gib is None else int(anon_gib * gib),
-                    cpu_limit=cpu_limit, cpu_mean=cpu_mean, elapsed_s=300.0)
+                    cpu_request=cpu_request, cpu_mean=cpu_mean, elapsed_s=300.0)
 
     @pytest.mark.timeout(30)
     def test_suggestion_is_tight_on_memory_and_mean_on_cpu(self, tmp_path, monkeypatch, capsys):
