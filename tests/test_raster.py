@@ -3582,10 +3582,7 @@ class TestCoveragePrune:
         lat, lon = duckdb_h3_center(self.H0_SEAM)
         data = np.full((720, 1440), -9999.0)
         for plon in (lon, -175.0):
-            for k in (-360.0, 0.0, 360.0):        # place it in the source's frame
-                c = int((plon + k - west) / 0.25)
-                if 0 <= c < 1440 - 4:
-                    break
+            c = min(int(((plon - west) % 360) / 0.25), 1440 - 4)   # in the source's frame
             r = int((90.0 - lat) / 0.25)
             yy, xx = np.mgrid[r:r + 4, c:c + 4]
             data[r:r + 4, c:c + 4] = 1000 + ((xx * 0.25 + west + 180) % 360) + 0.001 * yy
@@ -3623,7 +3620,7 @@ class TestCoveragePrune:
         n = len(proc._native_cells_for_h0(h0))
         out = proc.process_h0_region(0)
         values = dict(duckdb.connect().execute(
-            f"SELECT h3, v FROM read_parquet('{out}')").fetchall()) if out else {}
+            f"SELECT h{res}, v FROM read_parquet('{out}')").fetchall()) if out else {}
         return n, values
 
     def _assert_same(self, on, off):
