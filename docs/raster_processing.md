@@ -130,7 +130,7 @@ cng-datasets raster --input nlcd-2021.tif ... \
 - `blocksize` (int): COG tile size (default: 512)
 - `resampling` (str): Resampling method for COG (default: "nearest")
 - `method` (str): Raster→H3 algorithm (default: `"exact-extract"`). One of `exact-extract` or `warp-centroid` — see [Aggregation methods](#aggregation-methods).
-- `hex_resampling` (str): Reducer for aggregating source pixels into each H3 cell (default: "mean"). Valid values depend on `method`: with `exact-extract`, one of `sum`, `mean`, `mode`; with `warp-centroid`, any GDAL `resampleAlg` (`average`, `sum`, `mode`, `near`, `bilinear`, `cubic`, ...).
+- `hex_resampling` (str): Reducer for aggregating source pixels into each H3 cell (default: "mean"). Valid values depend on `method`: with `exact-extract`, one of `mean`, `sum`, `mode`, `fractions` (the share of each class in a cell, one row per class), `max` or `min`; with `warp-centroid`, any GDAL `resampleAlg` (`average`, `sum`, `mode`, `near`, `bilinear`, `cubic`, ...).
 
 ### Several fill codes in one band
 
@@ -184,6 +184,18 @@ COGs include:
 - Optimized compression
 - EPSG:4326 reprojection if needed
 - Multi-threaded processing
+
+The COG step of `raster-workflow` (`preprocess-cog`) writes **sparse** COGs with GDAL's
+`SPARSE_OK=TRUE`. A tile that is entirely nodata, or entirely 0 when the band has no nodata
+value, is left out of the file, in the full-resolution image and in every overview. Pixel
+values are unchanged, since an unwritten tile reads back as nodata. GDAL, rasterio, terra,
+TiTiler, tifffile and geotiff.js 3.0 or later read these files exactly like dense ones.
+geotiff.js 1.x and 2.x fail on them with `buffer error`, which covers OpenLayers before
+10.9.0 and georaster-layer-for-leaflet.
+
+When the hex reducer is categorical (`mode` or `fractions`), the warp to EPSG:4326 uses
+`nearest` resampling, so no class code is invented along a class boundary. Continuous
+sources warp with `bilinear`.
 
 ## H3 Processing by h0 Regions
 
@@ -256,6 +268,21 @@ exhaustive enumeration of every child in the test suite, including the cells tha
 antimeridian, whose true footprint is two longitude intervals rather than one. Set
 `CNG_HEX_PRUNE_CELLS=0` to enumerate every descendant instead, which is useful only for
 comparing a suspect run like for like.
+
+**Sparse sources.** The prune above tests each subtree against the source's bounding box,
+which does not help a source whose data is scattered across a large extent (coastlines,
+wetlands) or a global one. For a sparse GeoTIFF the descent also reads the file's tile
+index, without reading any pixels, and drops every subtree that lies over unwritten tiles.
+On Global Mangrove Watch at res 10, one h0 went from 282,475,249 cells to 81,955,734. It
+applies only to a geographic source whose unwritten tiles read as a value already treated
+as nodata, so dropping them cannot change the output, and the log says why when it is off.
+`CNG_HEX_PRUNE_COVERAGE=0` turns it off.
+
+**The antimeridian.** A cell that straddles ±180° is read as one polygon, shifted by a
+multiple of 360° into the longitude frame of the raster it reads, rather than split into a
+MultiPolygon whose bounding box spans the globe. A source whose columns cover the full 360°
+is read through a VRT padded on both sides with its own columns, so a cell or a window
+across the edge is one contiguous read.
 
 ### Regional rasters: restrict the fan-out with `--h0-subset` / `--h0-cells`
 
@@ -370,6 +397,16 @@ The two failure modes are not symmetric: too few workers is slower, too many is 
 after hours of un-checkpointed work. Set `CNG_HEX_WORKERS` to pin it; generated manifests
 already do.
 
+`raster-workflow` sets these from flags and writes them into the manifest whether or not you
+pass them, so a tuned pod survives regeneration:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--hex-cpu` | 4 | CPU request and limit per hex pod |
+| `--hex-workers` | one per `--hex-cpu` | Emitted as `CNG_HEX_WORKERS`. Lower this first when a pod runs out of memory |
+| `--hex-chunk-size` | 100000 | Cells per exactextract call, emitted as `CNG_HEX_CHUNK_SIZE` |
+| `--hex-memory` | 32Gi | Memory request and limit. Past ~128Gi a pod waits for scarce large-RAM nodes |
+
 ### Everything in the pod is sized from the pod
 
 Three separate things in a hex pod default to a share of the **host**, which inside a
@@ -397,11 +434,11 @@ file's own key-value metadata rather than a sidecar, so it survives copies and s
 ```sql
 SELECT key, value
 FROM parquet_kv_metadata('s3://bucket/dataset/hex/h0=*/data_0.parquet');
--- cng_datasets_version  0.8.0
+-- cng_datasets_version  0.12.0
 -- built_at              2026-09-21T23:06:45Z
 -- gdal_version          3.13.0
--- duckdb_version        1.5.4
--- image                 ghcr.io/boettiger-lab/datasets:0.8.0
+-- duckdb_version        2.0.0
+-- image                 ghcr.io/boettiger-lab/datasets:0.12.0
 ```
 
 `image` appears when the environment sets `CNG_IMAGE`; its absence means a local run.
@@ -423,53 +460,69 @@ environment-dependent rather than code-dependent: a GDAL without
 
 ## Kubernetes Processing
 
-Process global rasters in parallel using Kubernetes:
+`cng-datasets raster-workflow` generates the whole pipeline: setup-bucket, the COG step,
+the hex fan-out, repartition, and a merge step when chunks are smaller than an h0 cell.
 
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: raster-processing
-spec:
-  completions: 122  # One per h0 region
-  parallelism: 61
-  completionMode: Indexed
-  template:
-    spec:
-      containers:
-      - name: processor
-        image: ghcr.io/boettiger-lab/datasets:latest
-        command:
-        - python
-        - /app/job.py
-        - --i
-        - $(JOB_COMPLETION_INDEX)
-        - --input-url
-        - /vsis3/bucket/data.tif
-        - --output-url
-        - s3://bucket/output/
+```bash
+cng-datasets raster-workflow \
+  --dataset wetlands \
+  --source-url https://example.com/wetlands.tif \
+  --bucket public-wetlands \
+  --h3-resolution 8 \
+  --parent-resolutions "0" \
+  --hex-resampling mode \
+  --output-dir wetlands/k8s
+
+kubectl apply -f wetlands/k8s/workflow-rbac.yaml   # once per namespace
+kubectl apply -f wetlands/k8s/configmap.yaml -f wetlands/k8s/workflow.yaml
 ```
 
-Or use the Python API:
+Repeat `--source-url` to mosaic several tiles into one COG. `--target-extent` clips a
+mosaic to a bounding box, and `--band` picks one band of a multi-band source.
 
-```python
-from cng_datasets.k8s import K8sJobManager
+### Splitting an h0 cell: `--chunk-resolution`
 
-manager = K8sJobManager()
-job = manager.generate_chunked_job(
-    job_name="wetlands-raster-h3",
-    script_path="/app/wetlands/glwd/job.py",
-    num_chunks=122,  # One per h0 region
-    base_args=[
-        "--input-url", "s3://bucket/wetlands.tif",
-        "--output-url", "s3://bucket/wetlands/hex/",
-        "--parent-resolutions", "8,0",
-    ],
-    parallelism=61,
-    cpu="4",
-    memory="34Gi",
-)
-manager.save_job_yaml(job, "wetlands-job.yaml")
+By default one hex pod handles one h0 base cell, about 282 million cells at res 10. A pod's
+memory follows the largest chunk's cell count, so a fine global build can need more memory
+than any node offers. `--chunk-resolution N` makes the unit of work each h0's res-N
+descendants instead, cutting the cells per pod about 7x per level. `--max-hex-memory 8Gi`
+picks the coarsest chunk resolution that fits that budget. Coarsest, because each extra
+level also multiplies the pod count by about 7.
+
+A sub-h0 build adds a `merge-chunks` step that restores the published
+`h0=<cell>/data_0.parquet` layout, so readers see no difference. Past ~200 chunks one
+indexed Job exceeds the namespace pod guideline; `--backend auto` routes the build to
+Armada at that point.
+
+Each pod reads only its own window of the source COG rather than copying the whole file
+(`--window-reads auto`, the default for a remote source), so total transfer follows the
+data rather than the number of pods. `--window-reads never` restores whole-file copies.
+
+### Merging, and checking a fan-out is complete
+
+Every chunk writes a completion marker, whether or not it found data. `merge-chunks` is
+given the number of chunks the fan-out was sized for (`--expect-chunks`, which the workflow
+fills in) and refuses to merge unless every one has a marker, naming the missing indices.
+A partly failed build therefore cannot be published as a complete dataset. A fan-out that
+ran completely and found no data merges to an empty result and exits 0.
+
+Before merging, `merge-chunks` reports what the pods used, from figures each marker
+records: memory limit and peak, peak anonymous memory, CPU request and mean use, worker
+count and elapsed time. It then suggests `--hex-memory`, `--hex-cpu` and `--hex-workers`
+for the next build of the same shape, and warns when a request was more than twice what was
+needed. Read it with `kubectl logs job/<name>-merge`.
+
+On Armada, a preempted job is not rescheduled and converted jobs carry no retry budget.
+`cng-datasets gapfill` reads the markers on S3 and writes an Armada job set that re-runs
+exactly the missing chunks. It exits 0 when nothing is missing and 1 when it wrote a job set:
+
+```bash
+cng-datasets gapfill \
+  --chunks-dir s3://public-wetlands/wetlands/hex-chunks \
+  --expect-chunks 5978 \
+  --hex-manifest wetlands/k8s/wetlands-hex.yaml \
+  --output wetlands/k8s/armada-wetlands-gapfill.yaml
+armadactl submit wetlands/k8s/armada-wetlands-gapfill.yaml
 ```
 
 ### Annual series: `--years`
@@ -547,7 +600,7 @@ Two raster→H3 algorithms are available via the `method` argument (CLI: `--meth
 | How | Polyfill each h0 cell to its H3 children, then `exactextract` the area-weighted overlap of source pixels per cell. | `gdal.Warp` the source to a grid at the H3 edge pitch, then assign each warped pixel to a cell by its centroid. |
 | Schema | **One row per H3 cell.** | **One row per warped pixel** — consumers must `GROUP BY h<res>`. |
 | Mass-conserving | Always (by construction). | Only when the hex pitch is finer than the source pixel pitch (see [#84](https://github.com/boettiger-lab/datasets/issues/84)). |
-| `hex_resampling` vocabulary | `sum`, `mean`, `mode`. | Any GDAL `resampleAlg` (`average`/`mean`, `sum`, `mode`, `near`/`nearest`, `bilinear`, `cubic`, ...). |
+| `hex_resampling` vocabulary | `mean`, `sum`, `mode`, `fractions`, `max`, `min`. | Any GDAL `resampleAlg` (`average`/`mean`, `sum`, `mode`, `near`/`nearest`, `bilinear`, `cubic`, ...). |
 | Cost | Higher memory and wall time at fine resolutions (exact per-cell coverage). | Fast and low-memory. |
 | Antimeridian | Handled. | Not antimeridian-correct by design (planar cutline). |
 | Requires | Any supported GDAL. | A GDAL whose Python bindings accept `WarpOptions(cutlineWKT=...)` — each h0 is warped clipped to its own boundary. Absent from GDAL 3.8.4 (what Ubuntu noble ships); present in the project image. |

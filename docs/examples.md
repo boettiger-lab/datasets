@@ -144,28 +144,50 @@ kubectl apply -f wdpa/k8s/configmap.yaml -f wdpa/k8s/workflow.yaml
 
 ### Raster Dataset Workflow
 
-```python
-from cng_datasets.k8s import K8sJobManager
+```bash
+cng-datasets raster-workflow \
+  --dataset glwd \
+  --source-url https://example.com/glwd.tif \
+  --bucket public-wetlands \
+  --h3-resolution 8 \
+  --parent-resolutions "0" \
+  --hex-resampling mode \
+  --output-dir wetlands/k8s/
 
-# Generate indexed job for h0 regions
-manager = K8sJobManager(namespace="geo-workflows")
-
-job = manager.generate_chunked_job(
-    job_name="wetlands-h3",
-    script_path="/app/wetlands/glwd/job.py",
-    num_chunks=122,  # One per h0 region
-    base_args=[
-        "--input-url", "/vsis3/public-wetlands/glwd.tif",
-        "--output-url", "s3://public-wetlands/hex/",
-        "--parent-resolutions", "8,0",
-    ],
-    parallelism=61,
-    cpu="4",
-    memory="34Gi",
-)
-
-manager.save_job_yaml(job, "wetlands/k8s/hex-job.yaml")
+kubectl apply -f wetlands/k8s/configmap.yaml -f wetlands/k8s/workflow.yaml
 ```
+
+### Annual Raster Series
+
+A `{year}` placeholder in the source URL and `--years` build one collection,
+partitioned as `hex/year=<year>/h0=<cell>/data_0.parquet`. `--h0-cells` keeps a
+regional source to the h0 cells it covers (here CONUS):
+
+```bash
+cng-datasets raster-workflow \
+  --dataset nlcd/annual \
+  --source-url "https://example.com/Annual_NLCD_LndCov_{year}_CU_C1V1.tif" \
+  --years 1985,1990,2015-2024 \
+  --bucket public-nlcd \
+  --h3-resolution 10 --parent-resolutions "9,8,0" \
+  --hex-resampling mode \
+  --h0-cells 9,19,20,21,34,36 \
+  --output-dir nlcd/k8s/
+```
+
+### Climate Cube Workflow
+
+```bash
+cng-datasets mdim-workflow \
+  --dataset climate/loca2-tasmax \
+  --input 'ZARR:"/vsicurl/https://cadcat.s3.us-west-2.amazonaws.com/loca2/ucsd/gfdl-esm4/ssp370/r1i1p1f1/day/tasmax/d03"' \
+  --variable tasmax --bucket public-climate \
+  --h3-resolution 6 --time-agg year \
+  --h0-cells 9,19,20,21,34,36 \
+  --output-dir climate/k8s/
+```
+
+See [Multidimensional processing](mdim_processing.md) for the options.
 
 ## Multi-Provider Sync
 
