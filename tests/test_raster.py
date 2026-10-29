@@ -3526,6 +3526,170 @@ class TestEnumerationPrune:
 
 
 @requires_gdal
+def duckdb_h3_center(cell):
+    """(lat, lon) of an H3 cell's centre."""
+    con = duckdb.connect()
+    try:
+        con.execute("LOAD h3")
+    except duckdb.Error:
+        con.execute("INSTALL h3 FROM community"); con.execute("LOAD h3")
+    return tuple(con.execute(f"SELECT h3_cell_to_lat({cell}), h3_cell_to_lng({cell})").fetchall()[0])
+
+
+class TestCoveragePrune:
+    """Issue #251: the descent skips subtrees over a sparse source's unwritten tiles.
+
+    The bbox prune (#215) cannot help a source whose data is scattered across
+    a large extent: GMW mangroves cover a 39S..35N belt in which 93% of the
+    tiles are unwritten, and a res-10 h0 enumerated and extracted all 282M
+    cells of it. The tile index already says which tiles hold data, so the
+    work can follow the data rather than its bounding box. The gate is that
+    the output does not change.
+    """
+
+    H0_SEAM = 579768083279773695      # an antimeridian h0 (see TestSeamFrame)
+    H0_MID = 577199624117288959       # contains (-123, 37)
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _sparse(self, temp_dir, name, gt, data, nodata=-9999.0):
+        """A tiled GeoTIFF that leaves all-nodata tiles unwritten."""
+        h, w = data.shape
+        path = os.path.join(temp_dir, name)
+        ds = gdal.GetDriverByName("GTiff").Create(
+            path, w, h, 1, gdal.GDT_Float32,
+            ["TILED=YES", "BLOCKXSIZE=16", "BLOCKYSIZE=16", "SPARSE_OK=TRUE"])
+        ds.SetGeoTransform(gt)
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        if nodata is not None:
+            band.SetNoDataValue(nodata)
+        band.WriteArray(data.astype(np.float32))
+        ds.FlushCache(); ds = None
+        return path
+
+    def _global_patches(self, west):
+        """A 0.25-degree global grid in the frame starting at *west*, with data
+        in two 1-degree patches inside the seam h0 and nodata everywhere else.
+
+        One patch sits at -175, which a -170..190 source stores at 185.
+        """
+        lat, lon = duckdb_h3_center(self.H0_SEAM)
+        data = np.full((720, 1440), -9999.0)
+        for plon in (lon, -175.0):
+            for k in (-360.0, 0.0, 360.0):        # place it in the source's frame
+                c = int((plon + k - west) / 0.25)
+                if 0 <= c < 1440 - 4:
+                    break
+            r = int((90.0 - lat) / 0.25)
+            yy, xx = np.mgrid[r:r + 4, c:c + 4]
+            data[r:r + 4, c:c + 4] = 1000 + ((xx * 0.25 + west + 180) % 360) + 0.001 * yy
+        return data
+
+    def _grid(self, temp_dir, h0):
+        import geopandas as gpd
+        from shapely.geometry import box
+        grid = os.path.join(temp_dir, f"grid-{h0}.parquet")
+        gpd.GeoDataFrame(
+            {"i": [0], "h0": [h0], "geometry": [box(-180, -90, 180, 90)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(grid)
+        return grid
+
+    def _run(self, temp_dir, path, h0, res, tag, monkeypatch, coverage, **kw):
+        """(cells enumerated, {h3: v} written) for one h0."""
+        from cng_datasets.raster import RasterProcessor
+        monkeypatch.setenv("CNG_HEX_PRUNE_COVERAGE", "1" if coverage else "0")
+        proc = RasterProcessor(
+            input_path=path,
+            output_parquet_path=os.path.join(temp_dir, f"hex-{tag}-{coverage}"),
+            h3_resolution=res, parent_resolutions=[0],
+            h0_grid_path=self._grid(temp_dir, h0),
+            value_column="v", hex_resampling="mean", **kw,
+        )
+        assert (proc._coverage() is not None) == coverage
+        n = len(proc._native_cells_for_h0(h0))
+        out = proc.process_h0_region(0)
+        values = dict(duckdb.connect().execute(
+            f"SELECT h3, v FROM read_parquet('{out}')").fetchall()) if out else {}
+        return n, values
+
+    def _assert_same(self, on, off):
+        assert on.keys() == off.keys(), (
+            f"{len(off.keys() - on.keys())} cells lost, "
+            f"{len(on.keys() - off.keys())} gained by the coverage prune"
+        )
+        for cell, v in off.items():
+            assert on[cell] == pytest.approx(v, rel=1e-9), cell
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("west", [-180.0, -170.0], ids=["standard", "shifted"])
+    def test_a_sparse_global_source_hexes_the_same_with_less_work(
+            self, temp_dir, monkeypatch, west):
+        """A global source skipped the bbox prune outright; a sparse one need not.
+
+        The shifted copy runs -170..190 (#295), so its pixels for -178..-174
+        sit at 182..186 and the tile test has to look in the right frame.
+        """
+        shift = int(west + 180)
+        path = self._sparse(temp_dir, f"g{shift}.tif", [west, 0.25, 0, 90.0, 0, -0.25],
+                            self._global_patches(west))
+        n_off, off = self._run(temp_dir, path, self.H0_SEAM, 3, f"g{shift}", monkeypatch, False)
+        n_on, on = self._run(temp_dir, path, self.H0_SEAM, 3, f"g{shift}", monkeypatch, True)
+        assert off, "fixture error: no cell of the h0 reaches the data"
+        self._assert_same(on, off)
+        assert n_on < n_off / 2, (n_on, n_off)
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    def test_a_sparse_regional_source_hexes_the_same_with_less_work(
+            self, temp_dir, monkeypatch):
+        """Inside the bbox, a cell over unwritten tiles is no longer kept wholesale."""
+        data = np.full((64, 64), -9999.0)
+        data[40:56, 8:24] = np.arange(256).reshape(16, 16)   # one tile of 16
+        path = self._sparse(temp_dir, "r.tif", [-125.0, 1 / 16, 0, 39.0, 0, -1 / 16], data)
+        n_off, off = self._run(temp_dir, path, self.H0_MID, 5, "r", monkeypatch, False)
+        n_on, on = self._run(temp_dir, path, self.H0_MID, 5, "r", monkeypatch, True)
+        assert off
+        self._assert_same(on, off)
+        assert n_on < n_off / 2, (n_on, n_off)
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_off_when_an_unwritten_tile_would_read_as_data(self, temp_dir):
+        """With no band nodata an unwritten tile reads as 0, a valid value here."""
+        from cng_datasets.raster import RasterProcessor
+        data = np.zeros((64, 64)); data[40:56, 8:24] = 5.0
+        path = self._sparse(temp_dir, "z.tif", [-125.0, 1 / 16, 0, 39.0, 0, -1 / 16],
+                            data, nodata=None)
+        proc = RasterProcessor(
+            input_path=path, output_parquet_path=os.path.join(temp_dir, "hex-z"),
+            h3_resolution=5, parent_resolutions=[0], value_column="v",
+            nodata_value="-1",
+        )
+        assert proc._coverage() is None
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_on_when_zero_is_among_the_nodata_values(self, temp_dir):
+        from cng_datasets.raster import RasterProcessor
+        data = np.zeros((64, 64)); data[40:56, 8:24] = 5.0
+        path = self._sparse(temp_dir, "z0.tif", [-125.0, 1 / 16, 0, 39.0, 0, -1 / 16],
+                            data, nodata=None)
+        proc = RasterProcessor(
+            input_path=path, output_parquet_path=os.path.join(temp_dir, "hex-z0"),
+            h3_resolution=5, parent_resolutions=[0], value_column="v",
+            nodata_value="0",
+        )
+        assert proc._coverage() is not None
+
+
 class TestFillCollapseWithoutARaster:
     """
     The fill-code collapse writes no pixels for an integer source (issue #209).
