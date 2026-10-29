@@ -365,16 +365,17 @@ def _needs_split_sql(geom_expr: str, res: str) -> str:
 def _piece_split_sql(carry_cols: str, source: str, res: str) -> str:
     """SQL for CTE bodies that cut large polygon parts into pieces (issue #125).
 
-    Returns the bodies of three CTEs, ``tbig``, ``twrap`` and ``tpieces``, to be
-    defined in that order under ``WITH RECURSIVE``; the leaves are the rows of
-    ``tpieces`` with ``NOT _split``. Each row carries ``_depth``, which is 0 for
-    a part that was not cut.
+    Returns the bodies of four CTEs, ``tbig``, ``tcross``, ``twrap`` and
+    ``tpieces``, to be defined in that order under ``WITH RECURSIVE``; the
+    leaves are the rows of ``tpieces`` with ``NOT _split``. Each row carries
+    ``_depth``, which is 0 for a part that was not cut.
 
     Only valid polygon parts are cut, because clipping an invalid one can
     throw; lines (already ~1 cm slivers) and invalid parts are filled whole, as
     before. A large antimeridian crosser is first read in a 0..360 longitude
     frame and cut at 180, and its eastern half is moved back by -360, so that it
-    becomes two ordinary parts that the bbox cuts below can handle.
+    becomes two ordinary parts that the bbox cuts below can handle. Its validity
+    is judged in that frame, since the ring as stored crosses itself planarly.
     """
     split = _needs_split_sql("geom", res)
     j = _PIECE_CUT_JITTER
@@ -387,15 +388,23 @@ def _piece_split_sql(carry_cols: str, source: str, res: str) -> str:
         f"ST_MakeEnvelope({mx}, {my}, ST_XMax(geom), ST_YMax(geom))]"
     )
     wgs84 = "+proj=longlat +datum=WGS84 +no_defs"
+    crosser = _dateline_crosser_sql("geom")
     tbig = f"""
             SELECT {carry_cols}, geom,
-                   CASE WHEN NOT _is_line AND ST_GeometryType(geom) = 'POLYGON' AND {split}
-                        THEN ST_IsValid(geom) ELSE FALSE END AS _split
+                   CASE WHEN NOT _is_line AND ST_GeometryType(geom) = 'POLYGON'
+                        THEN {split} ELSE FALSE END AS _split
             FROM {source}
     """
+    tcross = f"""
+            SELECT {carry_cols}, geom,
+                   ST_Transform(geom, '{wgs84}', '{wgs84} +lon_wrap=180',
+                                always_xy := true) AS _wrapped
+            FROM tbig WHERE _split AND {crosser}
+    """
     twrap = f"""
-            SELECT {carry_cols}, geom, _split
-            FROM tbig WHERE NOT (_split AND {_dateline_crosser_sql('geom')})
+            SELECT {carry_cols}, geom,
+                   CASE WHEN _split THEN ST_IsValid(geom) ELSE FALSE END AS _split
+            FROM tbig WHERE NOT (_split AND {crosser})
             UNION ALL
             SELECT {carry_cols},
                    CASE WHEN ST_XMin(geom) >= 180 THEN ST_Translate(geom, -360, 0)
@@ -403,16 +412,16 @@ def _piece_split_sql(carry_cols: str, source: str, res: str) -> str:
                    TRUE AS _split
             FROM (
                 SELECT {carry_cols},
-                       UNNEST(ST_Dump(ST_Intersection(
-                           ST_Transform(geom, '{wgs84}', '{wgs84} +lon_wrap=180',
-                                        always_xy := true),
-                           _half))).geom AS geom
-                FROM tbig,
+                       UNNEST(ST_Dump(ST_Intersection(_wrapped, _half))).geom AS geom
+                FROM tcross,
                      (VALUES (ST_MakeEnvelope(0, -90, 180, 90)),
                              (ST_MakeEnvelope(180, -90, 360, 90))) AS _halves(_half)
-                WHERE _split AND {_dateline_crosser_sql('geom')}
+                WHERE ST_IsValid(_wrapped)
             )
             WHERE ST_GeometryType(geom) = 'POLYGON' AND NOT ST_IsEmpty(geom)
+            UNION ALL
+            SELECT {carry_cols}, geom, FALSE AS _split
+            FROM tcross WHERE NOT ST_IsValid(_wrapped)
     """
     tpieces = f"""
             SELECT {carry_cols}, geom, 0 AS _depth,
@@ -431,7 +440,7 @@ def _piece_split_sql(carry_cols: str, source: str, res: str) -> str:
             )
             WHERE ST_GeometryType(geom) = 'POLYGON' AND NOT ST_IsEmpty(geom)
     """
-    return tbig, twrap, tpieces
+    return tbig, tcross, twrap, tpieces
 
 
 def identify_id_column(
@@ -605,7 +614,7 @@ def geom_to_h3_cells(
     # original single-`zoom` path below is used unchanged.
     if resolution_by_area is not None:
         native_res_case = _native_res_case_sql(resolution_by_area, geom_col)
-        tbig_ba, twrap_ba, tpieces_ba = _piece_split_sql(
+        tbig_ba, tcross_ba, twrap_ba, tpieces_ba = _piece_split_sql(
             f'{col_list}, native_res, _is_line', 't1', 'native_res')
         return f'''
         WITH RECURSIVE tbase AS (
@@ -633,6 +642,7 @@ def geom_to_h3_cells(
             FROM tsplit
         ),
         tbig AS ({tbig_ba}),
+        tcross AS ({tcross_ba}),
         twrap AS ({twrap_ba}),
         tpieces AS ({tpieces_ba}),
         t2 AS (
@@ -673,7 +683,7 @@ def geom_to_h3_cells(
     # #125; see _PIECE_MAX_CELLS). The fallback above applies to a part as a
     # whole, so a piece of a cut part never takes it, and a piece that holds no
     # cell centre is dropped rather than kept as an empty list.
-    tbig, twrap, tpieces = _piece_split_sql(f'{col_list}, _is_line', 't1', str(zoom))
+    tbig, tcross, twrap, tpieces = _piece_split_sql(f'{col_list}, _is_line', 't1', str(zoom))
     sql = f'''
         WITH RECURSIVE t0 AS (
             SELECT {col_list},
@@ -694,6 +704,7 @@ def geom_to_h3_cells(
             FROM tsplit
         ),
         tbig AS ({tbig}),
+        tcross AS ({tcross}),
         twrap AS ({twrap}),
         tpieces AS ({tpieces}),
         t2 AS (
