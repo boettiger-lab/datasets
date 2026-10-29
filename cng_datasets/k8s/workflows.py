@@ -297,6 +297,60 @@ def _normalize_h0_subset(h0_subset: Optional[List[int]]) -> Optional[List[int]]:
     return cells
 
 
+def parse_years(spec: Union[str, List[int], None]) -> Optional[List[int]]:
+    """Parse a ``--years`` list such as "1985,1990,2015-2025" (issue #172).
+
+    Ranges are inclusive. The result is sorted and de-duplicated, so the
+    completion index maps to the same year across regenerations.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        years = set()
+        for part in (p.strip() for p in spec.split(",")):
+            if not part:
+                continue
+            lo, sep, hi = part.partition("-")
+            try:
+                lo_y, hi_y = int(lo), int(hi) if sep else int(lo)
+            except ValueError:
+                raise ValueError(f"--years: {part!r} is not a year or a range like 2015-2025")
+            if hi_y < lo_y:
+                raise ValueError(f"--years: range {part!r} runs backwards")
+            years.update(range(lo_y, hi_y + 1))
+    else:
+        years = {int(y) for y in spec}
+    if not years:
+        raise ValueError("--years was given but lists no years")
+    return sorted(years)
+
+
+def _year_template(value: str) -> str:
+    """*value* with its ``{year}`` placeholder in shell form, for a manifest
+    that sets YEAR from the completion index (issue #172)."""
+    return value.replace("{year}", "${YEAR}")
+
+
+def _year_preamble(years: List[int], per_year: int) -> str:
+    """Bash that sets YEAR, and UNIT (the index within that year's block of
+    *per_year* completions), from the completion index (issue #172).
+
+    Indexes run year-major, so the years finish in order. The index is written
+    as ``${JOB_COMPLETION_INDEX}`` so the Armada converter, which rewrites that
+    spelling to a literal, still produces valid arithmetic.
+    """
+    fail = ('  echo "No year for completion index \'${JOB_COMPLETION_INDEX}\' in '
+            f'(${{YEARS[*]}}) x {per_year}" >&2\n  exit 1\nfi\n')
+    return (
+        f"# Completions run year by year, {per_year} per year (#172).\n"
+        f"YEARS=({' '.join(str(y) for y in years)})\n"
+        'if [ -z "${JOB_COMPLETION_INDEX}" ]; then\n' + fail +
+        f"YEAR=${{YEARS[$(( ${{JOB_COMPLETION_INDEX}} / {per_year} ))]}}\n"
+        f"UNIT=$(( ${{JOB_COMPLETION_INDEX}} % {per_year} ))\n"
+        'if [ -z "$YEAR" ]; then\n' + fail + "\n"
+    )
+
+
 # Default cells per exact_extract call in the hex step; mirrors
 # cng_datasets.raster.cog's CNG_HEX_CHUNK_SIZE default. Generated manifests
 # pin it explicitly rather than inherit it, so a pod's peak memory is a
@@ -1153,6 +1207,7 @@ def generate_raster_workflow(
     target_resolution: Optional[float] = None,
     band: Optional[int] = None,
     output_cog_name: Optional[str] = None,
+    years: Union[str, List[int], None] = None,
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
     armada_queue: Optional[str] = None,
@@ -1251,7 +1306,14 @@ def generate_raster_workflow(
         target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step
         target_resolution: Output pixel size in degrees for mosaic step
         band: Extract single band from multi-band sources (1-indexed) for mosaic step
-        output_cog_name: S3 key for intermediate COG (default: "{k8s_name}-cog.tif")
+        output_cog_name: S3 key for intermediate COG (default: "{dataset_name}-cog.tif",
+            or "{dataset_name}-{year}-cog.tif" with years)
+        years: Build one raster per year (issue #172): a list, or a spec like
+            "1985,1990,2015-2025". Every source URL holding a ``{year}``
+            placeholder is read once per year. Each year gets its own COG,
+            and the hex output is one collection partitioned by year,
+            ``hex/year=<year>/h0=<cell>/data_0.parquet``, so a query filters
+            on ``year`` and a cross-year change is a self-join on the cell.
         armada_priority_class: Armada priority class for the `armada` backend —
             a literal name ("armada-default") or a shorthand ("default",
             "preemptible", "high"). Defaults to non-preemptible (issue #183).
@@ -1295,6 +1357,25 @@ def generate_raster_workflow(
 
     h0_subset = _normalize_h0_subset(h0_subset)
 
+    # A multi-year build reads each year from its own source (issue #172). A
+    # template without the placeholder would hex one raster N times over, and
+    # a placeholder without --years would be read literally.
+    years = parse_years(years)
+    templated = [u for u in source_urls if "{year}" in u]
+    if years and not templated:
+        raise ValueError(
+            "--years needs a {year} placeholder in --source-url, e.g. "
+            "'s3://bucket/Annual_NLCD_LndCov_{year}_CU_C1V2.tif'; without one "
+            "every year would read the same raster.")
+    if templated and not years:
+        raise ValueError(
+            f"--source-url {templated[0]!r} has a {{year}} placeholder; pass "
+            "--years to say which years to build.")
+    if years and output_cog_name and "{year}" not in output_cog_name:
+        raise ValueError(
+            "--output-cog-name needs a {year} placeholder with --years, or every "
+            "year would write the same COG.")
+
     # Resolve the hex pod's sizing before anything is written, so an unusable
     # knob fails the generation outright rather than leaving a partial workflow
     # on disk for the next kubectl apply to pick up (issue #195).
@@ -1330,12 +1411,15 @@ def generate_raster_workflow(
     # (e.g. GHS-POP 10.9 GB stalled 32+ hours per pod vs 25 min after COG conversion).
     if not needs_preprocess:
         from cng_datasets.raster.cog import is_cog
-        if not is_cog(source_urls[0]):
+        # One year stands for the series: opening every year's source would
+        # make generation slow, and a series is one product in one format.
+        if not is_cog(source_urls[0].replace("{year}", str(years[0]) if years else "")):
             print("  ⚠ Source raster is not a COG — adding preprocess-cog step to convert before hex tiling")
             needs_preprocess = True
 
     if needs_preprocess:
-        cog_key = output_cog_name or f"{dataset_name}-cog.tif"
+        cog_key = output_cog_name or (
+            f"{dataset_name}-{{year}}-cog.tif" if years else f"{dataset_name}-cog.tif")
         cog_s3_url = f"s3://{bucket}/{cog_key}"
         hex_input_url = cog_s3_url
     else:
@@ -1356,6 +1440,9 @@ def generate_raster_workflow(
             hex_resampling=hex_resampling,
             cog_storage=cog_storage,
             config=config,
+            years=years,
+            max_parallelism=max_parallelism,
+            max_failed_indexes=max_failed_indexes,
         )
 
     # The hex job excludes nodata. When a preprocess-cog step runs it has
@@ -1375,13 +1462,16 @@ def generate_raster_workflow(
         hex_workers=hex_workers, hex_chunk_size=hex_chunk_size, hex_cpu=hex_cpu,
         chunk_resolution=chunk_resolution, chunk_count=chunk_count,
         hex_retries=hex_retries, max_failed_indexes=max_failed_indexes,
+        years=years,
     )
+    per_year = chunk_count if chunk_resolution else (len(h0_subset) if h0_subset else 122)
+    hex_completions = per_year * (len(years) if years else 1)
 
     if chunk_resolution:
         _generate_raster_merge_job(
             manager, k8s_name, bucket, output_path, s3_dataset=dataset_name,
             merge_memory=merge_memory, merge_storage=merge_storage, config=config,
-            expect_chunks=chunk_count,
+            expect_chunks=chunk_count, years=years,
         )
 
     # Generate workflow RBAC
@@ -1393,12 +1483,15 @@ def generate_raster_workflow(
     gen_command = (f"cng-datasets raster-workflow --dataset {dataset_name} "
                    f"{source_flags} --bucket {bucket} "
                    f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
+    if years:
+        gen_command += f" --years {','.join(str(y) for y in years)}"
 
     # Generate ConfigMap and orchestrator workflow
     _generate_raster_configmap(k8s_name, namespace, output_path, gen_command,
                                needs_preprocess, needs_merge=bool(chunk_resolution))
     _generate_raster_argo_workflow(k8s_name, namespace, output_path, output_dir,
-                                   needs_preprocess, needs_merge=bool(chunk_resolution))
+                                   needs_preprocess, needs_merge=bool(chunk_resolution),
+                                   wait_scale=len(years) if years else 1)
 
     # The hex pod's memory profile, stated at generation time. Peak RSS tracks
     # workers × chunk size, and both are now pinned in the manifest; printing
@@ -1428,14 +1521,15 @@ def generate_raster_workflow(
     # Fine chunking is what makes an external queue necessary: an indexed Job of
     # thousands of completions is past the namespace pod guideline, and small
     # uniform pods schedule on any node (issue #173 lever D, #39).
+    # A multi-year build multiplies the fan-out by its year count (#172), so
+    # the guideline is checked against the Job's completions, not the chunks.
     if backend == "auto":
-        backend = "armada" if (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE else "k8s"
-        print(f"  Backend: {backend} (--backend auto; "
-              f"{chunk_count if chunk_count else 'no sub-h0'} chunks vs the "
-              f"{K8S_CHUNK_COUNT_GUIDELINE}-pod k8s guideline)")
-    elif (backend == "k8s" and (chunk_count or 0) > K8S_CHUNK_COUNT_GUIDELINE):
-        print(f"  ⚠ {chunk_count} chunks exceeds the ~{K8S_CHUNK_COUNT_GUIDELINE}-pod "
-              f"namespace guideline for a single indexed Job.")
+        backend = "armada" if hex_completions > K8S_CHUNK_COUNT_GUIDELINE else "k8s"
+        print(f"  Backend: {backend} (--backend auto; {hex_completions} hex "
+              f"completions vs the {K8S_CHUNK_COUNT_GUIDELINE}-pod k8s guideline)")
+    elif backend == "k8s" and hex_completions > K8S_CHUNK_COUNT_GUIDELINE:
+        print(f"  ⚠ {hex_completions} hex completions exceeds the "
+              f"~{K8S_CHUNK_COUNT_GUIDELINE}-pod namespace guideline for a single indexed Job.")
         print("    Consider --backend armada (or --backend auto), which has no pod cap.")
 
     if backend == "armada":
@@ -1481,6 +1575,10 @@ def generate_raster_workflow(
         else:
             print("  Hex completions: 122 (every h0 cell) — pass --h0-subset "
                   "or --h0-cells to skip the ones the source does not cover")
+        if years:
+            print(f"  Years: {len(years)} ({years[0]}–{years[-1]}), so {hex_completions} "
+                  f"hex completions in all, written to "
+                  f"s3://{bucket}/{dataset_name}/hex/year=<year>/")
         print(hex_profile)
         print(hex_profile_hint)
         print(f"\nFiles created in {output_dir}:")
@@ -1502,14 +1600,23 @@ def _generate_cog_preprocess_job(
     manager, dataset_name, source_urls, output_cog_url, output_path,
     target_extent=None, target_resolution=None, band=None, nodata_value=None,
     hex_resampling="mean", cog_storage="50Gi", config: ClusterConfig = None,
+    years: Optional[List[int]] = None, max_parallelism: int = 61,
+    max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
 ):
-    """Generate a k8s job that mosaics multiple raster tiles into a single COG on S3."""
+    """Generate a k8s job that mosaics multiple raster tiles into a single COG on S3.
+
+    With *years* (issue #172) it is an indexed Job, one year per completion,
+    and the source URLs and output COG URL hold a ``{year}`` placeholder.
+    """
     if config is None:
         config = ClusterConfig()
     # Assemble all CLI flags as a list and join with " \\\n  " so the line
     # continuations are always well-formed and the final flag carries no
     # trailing backslash (a missing/extra backslash silently breaks the
     # multi-line shell command).
+    if years:
+        source_urls = [_year_template(u) for u in source_urls]
+        output_cog_url = _year_template(output_cog_url)
     flags = [f'--input "{u}"' for u in source_urls]
     flags.append(f'--output-cog "{output_cog_url}"')
     flags.append("--target-crs EPSG:4326")
@@ -1536,9 +1643,10 @@ def _generate_cog_preprocess_job(
     # (cog._configure_proj picks the highest-version proj.db, MINOR>=7). A bash
     # `find ... | head -1` here would be non-deterministic and could export a
     # stale PROJ_DATA — see issue #91.
+    year_preamble = _year_preamble(years, 1) if years else ""
     command_str = f"""set -e
 
-echo "Mosaicking {len(source_urls)} tiles → {output_cog_url}"
+{year_preamble}echo "Mosaicking {len(source_urls)} tiles → {output_cog_url}"
 
 cng-datasets raster \\
   {flag_block}
@@ -1571,14 +1679,23 @@ echo "✓ Preprocess COG complete: {output_cog_url}"
         }],
     }
     _apply_scheduling(pod_spec, config)
+    if years:
+        # One year per index, each with its own retry budget, so one year's
+        # transient failure does not abort the others (#172, #201).
+        run_spec = {
+            "completions": len(years),
+            "parallelism": min(max_parallelism, len(years)),
+            "completionMode": "Indexed",
+            **_indexed_retry_spec(1, max_failed_indexes),
+        }
+    else:
+        run_spec = {"completions": 1, "parallelism": 1, "backoffLimit": 1}
     job_spec = {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": _job_metadata(manager, f"{dataset_name}-preprocess-cog"),
         "spec": {
-            "completions": 1,
-            "parallelism": 1,
-            "backoffLimit": 1,
+            **run_spec,
             "ttlSecondsAfterFinished": 86400,
             "template": {
                 "metadata": {"labels": {"k8s-app": f"{dataset_name}-preprocess-cog"}},
@@ -1873,9 +1990,12 @@ def generate_mdim_workflow(
 def _generate_raster_merge_job(
     manager, dataset_name, bucket, output_path, s3_dataset=None,
     merge_memory="16Gi", merge_storage="50Gi", config: ClusterConfig = None,
-    expect_chunks: Optional[int] = None,
+    expect_chunks: Optional[int] = None, years: Optional[List[int]] = None,
 ):
     """Generate the job that consolidates sub-h0 chunks into one file per h0.
+
+    With *years* (issue #172) it merges each ``year=`` partition in turn, each
+    against the same expected chunk count.
 
     Only emitted when --chunk-resolution > 0. Sub-h0 chunks each write their own
     part file, but `h0={cell}/data_0.parquet` is a literal path published in
@@ -1899,7 +2019,18 @@ def _generate_raster_merge_job(
     # fan-out fails the merge instead of publishing its survivors (issue #173).
     expect_flag = (f" \\\n  --expect-chunks {expect_chunks}"
                    if expect_chunks is not None else "")
-    command_str = f"""set -e
+    if years:
+        command_str = f"""set -e
+
+for YEAR in {' '.join(str(y) for y in years)}; do
+  echo "Merging year=$YEAR"
+  cng-datasets merge-chunks \\
+    --chunks-dir s3://{bucket}/{s3_dataset}/hex-chunks/year=$YEAR \\
+    --output-dir s3://{bucket}/{s3_dataset}/hex/year=$YEAR{expect_flag.replace(chr(10) + "  ", chr(10) + "    ")}
+done
+"""
+    else:
+        command_str = f"""set -e
 
 cng-datasets merge-chunks \\
   --chunks-dir s3://{bucket}/{s3_dataset}/hex-chunks \\
@@ -1958,10 +2089,16 @@ cng-datasets merge-chunks \\
 
 
 def _hex_fanout(bucket: str, s3_dataset: str, chunk_resolution: int,
-                chunk_count: Optional[int], h0_subset: Optional[List[int]]):
+                chunk_count: Optional[int], h0_subset: Optional[List[int]],
+                index_var: str = "JOB_COMPLETION_INDEX", partition: str = ""):
     """(completions, shell preamble, chunk selector flags, output URL) for an
     indexed hex Job. Shared by the raster and mdim hex jobs (#181), so both
-    fan out over the same chunk list and write where `merge-chunks` reads."""
+    fan out over the same chunk list and write where `merge-chunks` reads.
+
+    *index_var* names the shell variable holding the unit index, and
+    *partition* is a hive path segment such as "year=${YEAR}/" under the
+    output; a multi-year build sets both (#172). Completions are per partition.
+    """
     # One completion per unit of work: the chunk list at chunk_resolution, or
     # the h0 fan-out as before. Emitting fewer than the chunk list holds would
     # drop whole chunks with a clean exit, so this number and the list a pod
@@ -1980,7 +2117,7 @@ def _hex_fanout(bucket: str, s3_dataset: str, chunk_resolution: int,
     # every raster fans out over all 122 base cells, so a regional source
     # starts a large majority of pods that localize the whole COG, find no
     # overlap with their h0 and exit (issue #191).
-    h0_index = "${JOB_COMPLETION_INDEX}"
+    h0_index = "${" + index_var + "}"
     h0_preamble = ""
     if h0_subset and not chunk_resolution:
         h0_index = "${H0}"
@@ -1995,7 +2132,7 @@ def _hex_fanout(bucket: str, s3_dataset: str, chunk_resolution: int,
             "# Positions in the h0 grid's own ordering, not H3 base cell numbers\n"
             "# (--h0-subset / --h0-cells). The completion index selects one.\n"
             f"H0S=({' '.join(str(h) for h in h0_subset)})\n"
-            "H0=${H0S[$JOB_COMPLETION_INDEX]}\n"
+            f"H0=${{H0S[${index_var}]}}\n"
             'if [ -z "${JOB_COMPLETION_INDEX}" ] || [ -z "$H0" ]; then\n'
             '  echo "No h0 cell for completion index '
             "'${JOB_COMPLETION_INDEX}' in (${H0S[*]}) — completions must match "
@@ -2007,12 +2144,12 @@ def _hex_fanout(bucket: str, s3_dataset: str, chunk_resolution: int,
     if chunk_resolution:
         # Sub-h0 chunks are staged outside the published tree and merged back by
         # the merge step, so a reader globbing hex/ mid-build never sees parts.
-        out_url = f"s3://{bucket}/{s3_dataset}/hex-chunks/"
+        out_url = f"s3://{bucket}/{s3_dataset}/hex-chunks/{partition}"
         selector = f"--chunk-resolution {chunk_resolution} --chunk-index {h0_index}"
         if h0_subset:
             selector += f" --h0-subset \"{','.join(str(h) for h in h0_subset)}\""
     else:
-        out_url = f"s3://{bucket}/{s3_dataset}/hex/"
+        out_url = f"s3://{bucket}/{s3_dataset}/hex/{partition}"
         selector = f"--h0-index {h0_index}"
     return completions, h0_preamble, selector, out_url
 
@@ -2075,8 +2212,14 @@ def _generate_raster_hex_job(
     chunk_count: Optional[int] = None,
     hex_retries: int = DEFAULT_HEX_RETRIES,
     max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
+    years: Optional[List[int]] = None,
 ):
-    """Generate raster H3 hex tiling job."""
+    """Generate raster H3 hex tiling job.
+
+    With *years* (issue #172), *source_url* holds a ``{year}`` placeholder and
+    the Job runs the whole fan-out once per year, writing ``year=<year>/``
+    partitions under the output.
+    """
     if config is None:
         config = ClusterConfig()
     hex_cpu = str(hex_cpu).strip()
@@ -2085,8 +2228,16 @@ def _generate_raster_hex_job(
 
     s3_dataset = s3_dataset or dataset_name
     parent_res_str = ','.join(map(str, parent_resolutions))
-    completions, h0_preamble, selector, out_url = _hex_fanout(
-        bucket, s3_dataset, chunk_resolution, chunk_count, h0_subset)
+    if years:
+        per_year, h0_preamble, selector, out_url = _hex_fanout(
+            bucket, s3_dataset, chunk_resolution, chunk_count, h0_subset,
+            index_var="UNIT", partition="year=${YEAR}/")
+        completions = per_year * len(years)
+        h0_preamble = _year_preamble(years, per_year) + h0_preamble
+        source_url = _year_template(source_url)
+    else:
+        completions, h0_preamble, selector, out_url = _hex_fanout(
+            bucket, s3_dataset, chunk_resolution, chunk_count, h0_subset)
     cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet {out_url} {selector} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
     nodata_cli = _nodata_cli_value(nodata_value)
     if nodata_cli is not None:
@@ -2179,8 +2330,14 @@ def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command
 
 
 def _generate_raster_argo_workflow(dataset_name, namespace, output_path, output_dir,
-                                   needs_preprocess=False, needs_merge=False):
-    """Generate orchestrator job for raster workflow."""
+                                   needs_preprocess=False, needs_merge=False,
+                                   wait_scale: int = 1):
+    """Generate orchestrator job for raster workflow.
+
+    *wait_scale* multiplies each step's timeout: a multi-year build (#172)
+    runs every step once per year.
+    """
+    step_timeout = 7200 * wait_scale
     import yaml
 
     configmap_name = f"{dataset_name}-yamls"
@@ -2194,7 +2351,7 @@ echo "Step 1: Preprocessing COG mosaic..."
 kubectl apply -f /yamls/{dataset_name}-preprocess-cog.yaml -n {namespace}
 
 echo "Waiting for preprocess-cog (may take 30-60 min for large tile sets)..."
-wait_job {dataset_name}-preprocess-cog {namespace} 7200
+wait_job {dataset_name}-preprocess-cog {namespace} {step_timeout}
 """
         hex_step_num = "2"
         cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-preprocess-cog {dataset_name}-hex {dataset_name}-workflow"
@@ -2209,7 +2366,7 @@ wait_job {dataset_name}-preprocess-cog {namespace} 7200
 # Step {int(hex_step_num) + 1}: Merge sub-h0 chunks into one file per h0 partition
 echo "Step {int(hex_step_num) + 1}: Merging hex chunks..."
 kubectl apply -f /yamls/{dataset_name}-merge.yaml -n {namespace}
-wait_job {dataset_name}-merge {namespace} 7200
+wait_job {dataset_name}-merge {namespace} {step_timeout}
 """
         cleanup_jobs = cleanup_jobs.replace(
             f"{dataset_name}-workflow", f"{dataset_name}-merge {dataset_name}-workflow"
@@ -2243,7 +2400,7 @@ wait_job {dataset_name}-setup-bucket {namespace} 600
 # Step {hex_step_num}: H3 hexagonal tiling
 echo "Step {hex_step_num}: H3 hexagonal tiling..."
 kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
-wait_job {dataset_name}-hex {namespace} 7200
+wait_job {dataset_name}-hex {namespace} {step_timeout}
 {merge_steps}
 echo "✓ Workflow complete!"
 echo "Clean up with:"
