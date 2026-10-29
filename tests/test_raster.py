@@ -3592,11 +3592,18 @@ class TestCoveragePrune:
         return data
 
     def _grid(self, temp_dir, h0):
+        """A one-row h0 grid holding the cell's own boundary."""
         import geopandas as gpd
-        from shapely.geometry import box
+        from shapely import wkt as shapely_wkt
+        con = duckdb.connect()
+        try:
+            con.execute("LOAD h3")
+        except duckdb.Error:
+            con.execute("INSTALL h3 FROM community"); con.execute("LOAD h3")
+        ring = con.execute(f"SELECT h3_cell_to_boundary_wkt({h0})").fetchall()[0][0]
         grid = os.path.join(temp_dir, f"grid-{h0}.parquet")
         gpd.GeoDataFrame(
-            {"i": [0], "h0": [h0], "geometry": [box(-180, -90, 180, 90)]},
+            {"i": [0], "h0": [h0], "geometry": [shapely_wkt.loads(ring)]},
             crs="EPSG:4326",
         ).rename_geometry("geom").to_parquet(grid)
         return grid
