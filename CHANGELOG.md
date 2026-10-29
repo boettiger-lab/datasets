@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-29
+
 ### Fixed
 - **A merged sub-h0 build keeps its `h0` column** (#172). `merge-chunks` read the parts with hive partitioning and excluded the `h0` key it read from the folder name, but DuckDB gives a folder key precedence over a file column of the same name, so the parts' own `h0` column was dropped as well. A `--chunk-resolution` build therefore published files without the `h0` column that an unchunked build writes. A read with hive partitioning hid this by filling `h0` back in from the folder name, which is also why the schema test passed. The merge now copies exactly the parts' columns. That also keeps a `year=` folder above the chunks from becoming a `year` column inside a multi-year build's files.
 - **`merge-chunks` succeeds on a fan-out that ran completely and found no data** (#299). An h0 with no valid pixels writes no parts, so the merge raised `No parquet parts found` and a correct build ended `Failed`. When `--expect-chunks` has confirmed that every chunk ran and no marker claims data, the merge now exits 0, writes no partition and says the result is empty. It still fails when markers are missing, when no expected count is given, or when a chunk claims data but left no part.
@@ -341,6 +343,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.12.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.0
 [0.11.4]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.4
 [0.11.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.3
 [0.11.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.2
