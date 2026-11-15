@@ -12,6 +12,7 @@ Simple workflow:
 """
 
 import argparse
+import functools
 import sys
 import tempfile
 import os
@@ -584,6 +585,91 @@ def detect_crs(source_input: str, layer: Optional[str] = None, verbose: bool = F
 _GEOM_COLUMN_NAMES = {'geom', 'geometry', 'shape', 'wkb_geometry'}
 
 
+def unique_column_names(names: List[str]) -> List[str]:
+    """Make repeated names unique: the second ``A`` becomes ``A_2`` (issue #314).
+
+    DuckDB compares column names case-insensitively, so ``a`` and ``A``
+    count as one name. A suffix that is itself taken moves on to the next
+    number. The first occurrence always keeps its name.
+    """
+    taken = {n.lower() for n in names}
+    seen = set()
+    out = []
+    for name in names:
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            out.append(name)
+            continue
+        k = 2
+        while f"{name}_{k}".lower() in taken:
+            k += 1
+        new = f"{name}_{k}"
+        taken.add(new.lower())
+        out.append(new)
+    return out
+
+
+def _quote_ident(name: str) -> str:
+    """Quote a SQL identifier, doubling any embedded double quote."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+@functools.lru_cache(maxsize=64)
+def st_read_sql(source: str, layer: Optional[str] = None) -> str:
+    """The ``ST_Read(...)`` table expression for a source (issue #314).
+
+    A source whose attribute table repeats a field name is common in
+    shapefiles exported from ArcInfo coverages, which truncate names to 10
+    characters. DuckDB refuses to bind it. In that case the columns are
+    renamed with a positional alias, ``ST_Read(...) AS _src(a, b, ...)``,
+    the repeats made unique by :func:`unique_column_names`. A source without
+    repeats, or one OGR cannot describe, gets a bare ``ST_Read``.
+
+    ST_Read's columns are the layer's FID (``OGC_FID`` unless the format
+    names its own, such as ``fid`` in a GeoPackage), then the attribute
+    fields in OGR's order, then the geometry. The alias covers the FID and
+    the fields. The aliased result is checked, so that a different layout
+    stops the conversion instead of putting values under the wrong names.
+    """
+    layer_param = f", layer='{layer}'" if layer else ""
+    plain = f"ST_Read('{source}'{layer_param})"
+    try:
+        from osgeo import ogr
+        ogr.UseExceptions()
+        ds = ogr.Open(source)
+        lyr = ds.GetLayerByName(layer) if layer else ds.GetLayer(0)
+        defn = lyr.GetLayerDefn()
+        fields = [defn.GetFieldDefn(i).GetName() for i in range(defn.GetFieldCount())]
+        fid = lyr.GetFIDColumn() or "OGC_FID"
+        n_geom = defn.GetGeomFieldCount()
+        del lyr, ds
+    except Exception:
+        return plain
+    if len({f.lower() for f in fields}) == len(fields):
+        return plain
+
+    renamed = unique_column_names([fid] + fields)
+    changes = [f"{old} -> {new}" for old, new in zip([fid] + fields, renamed) if old != new]
+    print(f"  Source repeats column names; renaming {', '.join(changes)}")
+    aliased = f"{plain} AS _src({', '.join(_quote_ident(n) for n in renamed)})"
+
+    con = duckdb.connect(':memory:')
+    try:
+        con.load_extension("spatial")
+        cols = con.execute(f"DESCRIBE SELECT * FROM {aliased}").fetchall()
+    finally:
+        con.close()
+    rest = cols[len(renamed):]
+    if (len(rest) != n_geom
+            or any(t.split("(")[0] not in ("GEOMETRY", "BLOB") for _, t, *_ in rest)):
+        raise ValueError(
+            f"Cannot rename the repeated columns of {source}: ST_Read returned "
+            f"{[c[0] for c in cols]} for the fields {fields} (FID {fid}), not the "
+            f"FID, the fields and {n_geom} geometry column(s) in that order. "
+            f"Rename the fields first (e.g. ogr2ogr to GeoPackage).")
+    return aliased
+
+
 def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: bool = False) -> Tuple[str, bool]:
     """
     Get the name of the geometry column as seen by DuckDB.
@@ -609,8 +695,7 @@ def get_geometry_column(source_url: str, layer: Optional[str] = None, verbose: b
     con.execute("SET arrow_large_buffer_size=true")
 
     try:
-        layer_param = f", layer='{layer}'" if layer else ""
-        query = f"DESCRIBE SELECT * FROM ST_Read('{source_url}'{layer_param}) LIMIT 0"
+        query = f"DESCRIBE SELECT * FROM {st_read_sql(source_url, layer)} LIMIT 0"
 
         columns = con.execute(query).fetchall()
 
@@ -676,9 +761,8 @@ def check_id_column(source_url: str, layer: Optional[str] = None, id_column: Opt
     con.execute("SET arrow_large_buffer_size=true")
 
     try:
-        layer_param = f", layer='{layer}'" if layer else ""
         columns = con.execute(f"""
-            DESCRIBE SELECT * FROM ST_Read('{source_url}'{layer_param}) LIMIT 0
+            DESCRIBE SELECT * FROM {st_read_sql(source_url, layer)} LIMIT 0
         """).fetchall()
 
         column_names = [col[0].lower() for col in columns]
@@ -753,9 +837,8 @@ def get_string_columns(source_url: str, layer: Optional[str] = None,
     con.execute("SET arrow_large_buffer_size=true")
 
     try:
-        layer_param = f", layer='{layer}'" if layer else ""
         columns = con.execute(
-            f"DESCRIBE SELECT * FROM ST_Read('{source_url}'{layer_param}) LIMIT 0"
+            f"DESCRIBE SELECT * FROM {st_read_sql(source_url, layer)} LIMIT 0"
         ).fetchall()
         string_cols = string_columns_from_describe(columns)
         if verbose:
@@ -827,6 +910,13 @@ def split_dateline_wkb(wkb: bytes) -> bytes:
 
     DuckDB spatial has no antimeridian split, and GDAL's WRAPDATELINE leaves
     some projections unsplit (EPSG:3338, Alaska Albers), so this is done here.
+
+    An invalid feature (a self-intersecting ring, say) is repaired before the
+    cut, because GEOS's intersection raises on it and would abort the whole
+    conversion (issue #315). Validity is judged in the shifted frame, where
+    the feature has its true shape. The repair is ``make_valid``, the same
+    GEOS routine as the ST_MakeValid that every other feature gets after
+    reprojection, so a crosser comes out as it would anywhere else.
     """
     import numpy as np
     import shapely
@@ -835,6 +925,8 @@ def split_dateline_wkb(wkb: bytes) -> bytes:
     geom = shapely.from_wkb(wkb)
     shifted = shapely.transform(
         geom, lambda c: np.where(c[:, :1] < 0, c + [360.0, 0.0], c))
+    if not shapely.is_valid(shifted):
+        shifted = shapely.make_valid(shifted)
     xmin, _, xmax, _ = shifted.bounds
     if xmax - xmin >= 180:
         return wkb
@@ -929,8 +1021,6 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
 
     geom_expr = f"ST_MakeValid({geom_inner}) AS {geom_col}"
 
-    layer_param = f", layer='{layer}'" if layer else ""
-
     # Trim string attributes in place (issue #180). REPLACE cannot name the
     # geometry column, which the star already excludes, so it is filtered out.
     replace_clause = trim_replace_clause(trim_columns, exclude=[geom_col])
@@ -941,7 +1031,7 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
         SELECT
             * EXCLUDE ({geom_col}){replace_clause},
             {geom_expr}
-        FROM ST_Read('{src}'{layer_param})
+        FROM {st_read_sql(src, layer)}
         """
 
     if isinstance(source_inputs, list):

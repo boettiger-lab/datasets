@@ -2258,6 +2258,51 @@ class TestAntimeridianSplit:
         assert split_dateline_wkb(wide) == wide
 
 
+    @staticmethod
+    def _bowtie(lon0):
+        """A self-intersecting ring from lon0 to lon0 + 1 (may run past 180)."""
+        return [(lon0, 52.0), (lon0 + 1, 52.6), (lon0 + 1, 52.0), (lon0, 52.6), (lon0, 52.0)]
+
+    def test_an_invalid_crosser_is_repaired_not_raised(self):
+        """GEOS's intersection raises on an invalid crosser (issue #315)."""
+        import shapely
+        from cng_datasets.vector.convert_to_parquet import split_dateline_wkb
+        wrapped = [((x + 180) % 360 - 180, y) for x, y in self._bowtie(179.5)]
+        out = shapely.from_wkb(split_dateline_wkb(shapely.to_wkb(shapely.Polygon(wrapped))))
+        assert out.is_valid
+        assert out.bounds[0] == pytest.approx(-180) and out.bounds[2] == pytest.approx(180)
+        # Same area as the repaired bow-tie, measured where it is continuous
+        repaired = shapely.make_valid(shapely.Polygon(self._bowtie(179.5)))
+        assert out.area == pytest.approx(repaired.area)
+
+    @pytest.mark.timeout(30)
+    def test_an_invalid_crosser_converts_like_any_invalid_feature(self, tmp_path):
+        """The #315 MRE: a bow-tie in EPSG:3338, one across 180° and one west of it."""
+        import geopandas as gpd
+        import shapely
+        from pyproj import Transformer
+        from shapely.geometry import Polygon
+        to_albers = Transformer.from_crs(4326, 3338, always_xy=True)
+        polys = [Polygon([to_albers.transform((x + 180) % 360 - 180, y) for x, y in self._bowtie(lon0)])
+                 for lon0 in (179.5, 170.5)]
+        assert not any(p.is_valid for p in polys)
+        src, out = str(tmp_path / "bowtie.gpkg"), str(tmp_path / "out.parquet")
+        gpd.GeoDataFrame({"name": ["crosser", "west"]}, geometry=polys, crs=3338).to_file(src)
+        convert_to_parquet(source_url=src, destination=out, progress=False)
+
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        con.execute("SET geometry_always_xy = true")
+        rows = {name: shapely.from_wkb(bytes(wkb)) for name, wkb in con.execute(
+            f"SELECT name, ST_AsWKB(geom) FROM '{out}'").fetchall()}
+        crosser, west = rows["crosser"], rows["west"]
+        assert crosser.is_valid and west.is_valid
+        assert crosser.bounds[0] < -179.4 and crosser.bounds[2] > 179.4
+        assert max(p.bounds[2] - p.bounds[0] for p in crosser.geoms) < 1
+        # Shifted 9 degrees east, the crosser has the same shape as the other one
+        assert crosser.area == pytest.approx(west.area, rel=0.01)
+
+
 class TestSpatialOrder:
     """Rows are written in Hilbert order, with _cng_fid numbered in it (issue #276)."""
 
@@ -2353,3 +2398,61 @@ class TestSpatialOrder:
         assert [r[1] for r in rows] == list(range(1, len(self.POINTS) + 1))
         clusters = [r[2] % 2 for r in rows]
         assert sum(a != b for a, b in zip(clusters, clusters[1:])) == 1
+
+
+class TestRepeatedColumnNames:
+    """A source whose attribute table repeats a field name converts, with the
+    repeats renamed (issue #314). ArcInfo coverage exports truncate names to
+    10 characters, so shapefiles carry such repeats, and DuckDB will not bind
+    them.
+    """
+
+    @staticmethod
+    def _shapefile(tmp_path):
+        """Three fields, the third renamed in the DBF header to repeat the first."""
+        import geopandas as gpd
+        from shapely.geometry import Point
+        path = tmp_path / "dup.shp"
+        gpd.GeoDataFrame(
+            {"C_FINT_LEN": [1, 2, 3], "name": ["a", "b", "c"], "C_FINT_LXX": [10, 20, 30]},
+            geometry=[Point(i, i) for i in range(3)], crs=4326,
+        ).to_file(path)
+        dbf = tmp_path / "dup.dbf"
+        raw = bytearray(dbf.read_bytes())
+        # Field descriptors are 32 bytes each, from byte 32; the name is the first 11
+        for off in range(32, raw.index(0x0D), 32):
+            if raw[off:off + 10] == b"C_FINT_LXX":
+                raw[off:off + 10] = b"C_FINT_LEN"
+        dbf.write_bytes(bytes(raw))
+        return str(path)
+
+    def test_unique_column_names(self):
+        from cng_datasets.vector.convert_to_parquet import unique_column_names
+        assert unique_column_names(["a", "B", "b", "A", "a_2"]) == ["a", "B", "b_2", "A_3", "a_2"]
+        assert unique_column_names(["x", "y"]) == ["x", "y"]
+
+    @pytest.mark.timeout(30)
+    def test_repeats_are_renamed_and_keep_their_values(self, tmp_path):
+        src = self._shapefile(tmp_path)
+        from osgeo import ogr
+        ds = ogr.Open(src)
+        defn = ds.GetLayer(0).GetLayerDefn()
+        assert [defn.GetFieldDefn(i).GetName() for i in range(defn.GetFieldCount())] == \
+            ["C_FINT_LEN", "name", "C_FINT_LEN"]
+        del defn, ds
+
+        out = str(tmp_path / "out.parquet")
+        convert_to_parquet(source_url=src, destination=out, progress=False)
+        con = duckdb.connect()
+        rows = con.execute(
+            f"SELECT C_FINT_LEN, name, C_FINT_LEN_2 FROM '{out}' ORDER BY name").fetchall()
+        assert rows == [(1, "a", 10), (2, "b", 20), (3, "c", 30)]
+
+    def test_a_source_without_repeats_reads_plainly(self, tmp_path):
+        import geopandas as gpd
+        from shapely.geometry import Point
+        from cng_datasets.vector.convert_to_parquet import st_read_sql
+        path = str(tmp_path / "plain.gpkg")
+        gpd.GeoDataFrame({"a": [1]}, geometry=[Point(0, 0)], crs=4326).to_file(path)
+        assert st_read_sql(path, None) == f"ST_Read('{path}')"
+        assert st_read_sql("missing.gpkg", "x") == "ST_Read('missing.gpkg', layer='x')"
