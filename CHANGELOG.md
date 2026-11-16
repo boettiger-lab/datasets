@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-11-16
+
 ### Fixed
 - **`k8s` and `sync-job` use the same namespace as the workflow generators** (#312). Both still defaulted to `biodiversity`, so a sync job generated alongside a workflow landed in a different namespace, one capped at 200 pods. They now default to `geo-workflows`, through `--profile` like `workflow`, and `--namespace` still overrides it. `K8sJobManager` and `generate_sync_job` default to the same namespace.
 - **`workflow` passes `--no-spatial-order` and `--csv-sample-size` to its convert step** (#311). Without them, the way out of a Hilbert sort that does not fit the convert pod (#276) and the CSV type-inference sample (#188) could only be reached by editing the generated YAML.
@@ -367,6 +369,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.12.4]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.4
 [0.12.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.3
 [0.12.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.2
 [0.12.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.1
