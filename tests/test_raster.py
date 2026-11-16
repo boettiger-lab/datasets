@@ -1365,7 +1365,7 @@ class TestSeamFrame:
     def test_an_interior_h0_hexes_the_same_on_a_global_and_a_regional_source(self, temp_dir):
         """The #313 comparison: the global source and a crop around the h0 agree."""
         import geopandas as gpd
-        from shapely.geometry import box
+        from shapely import wkt as shapely_wkt
         from cng_datasets.raster import RasterProcessor
 
         data = self._by_true_longitude()
@@ -1374,9 +1374,13 @@ class TestSeamFrame:
         gdal.Translate(regional, sources["global"], projWin=[-40, 60, 80, -40])
         sources["regional"] = regional
         h0 = self._h0_at(10, 20)
+        con = duckdb.connect()
+        con.execute("LOAD h3")
+        boundary = shapely_wkt.loads(
+            con.execute(f"SELECT h3_cell_to_boundary_wkt({h0})").fetchone()[0])
         grid = os.path.join(temp_dir, "grid.parquet")
         gpd.GeoDataFrame(
-            {"i": [0], "h0": [h0], "geometry": [box(-180, -90, 180, 90)]},
+            {"i": [0], "h0": [h0], "geometry": [boundary]},
             crs="EPSG:4326",
         ).rename_geometry("geom").to_parquet(grid)
 
