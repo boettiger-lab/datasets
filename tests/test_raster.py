@@ -1319,6 +1319,85 @@ class TestSeamFrame:
         assert xmin < 180 < xmax or xmin < -180 < xmax, (xmin, xmax)
 
 
+    def _h0_at(self, lat, lon):
+        con = duckdb.connect()
+        try:
+            con.execute("LOAD h3")
+        except duckdb.Error:
+            con.execute("INSTALL h3 FROM community")
+            con.execute("LOAD h3")
+        return con.execute(f"SELECT h3_latlng_to_cell({lat}, {lon}, 0)").fetchone()[0]
+
+    @requires_gdal
+    @pytest.mark.timeout(120)
+    def test_a_chunk_away_from_the_edge_reads_the_source_itself(self, temp_dir):
+        """Issue #313: the wrapped read is for windows that cross the edge only."""
+        from shapely import wkt as shapely_wkt
+        from cng_datasets.raster import RasterProcessor
+        from cng_datasets.raster.cog import _H3_PROTRUSION_MARGIN
+
+        src = self._global(temp_dir, "src.tif", -180.0, self._by_true_longitude())
+        proc = RasterProcessor(
+            input_path=src, output_parquet_path=os.path.join(temp_dir, "hex"),
+            h3_resolution=3, value_column="v", window_reads="always",
+        )
+        h0 = self._h0_at(10, 20)
+        geom = proc.con.execute(f"SELECT h3_cell_to_boundary_wkt({h0})").fetchone()[0]
+        _, miny, _, maxy = shapely_wkt.loads(geom).bounds
+        path = proc._windowed_source_for(geom, _H3_PROTRUSION_MARGIN * (maxy - miny), h0)
+        assert path and os.path.exists(path)
+        assert proc._read_source_cache is None, "the wrapped source was built for an interior chunk"
+        ds = gdal.Open(path)
+        gt = ds.GetGeoTransform()
+        ds = None
+        # On the source's own grid: whole degrees from -180
+        assert gt[0] == pytest.approx(round(gt[0])) and -180 <= gt[0] < 180
+
+        # The straddling h0 still takes the wrapped read
+        seam = proc.con.execute(f"SELECT h3_cell_to_boundary_wkt({self.H0})").fetchone()[0]
+        _, miny, _, maxy = shapely_wkt.loads(seam).bounds
+        proc._windowed_source_for(seam, _H3_PROTRUSION_MARGIN * (maxy - miny), self.H0)
+        assert proc._read_source_cache is not None
+        assert proc._read_source_cache[0] != src
+
+    @requires_gdal
+    @pytest.mark.timeout(300)
+    def test_an_interior_h0_hexes_the_same_on_a_global_and_a_regional_source(self, temp_dir):
+        """The #313 comparison: the global source and a crop around the h0 agree."""
+        import geopandas as gpd
+        from shapely.geometry import box
+        from cng_datasets.raster import RasterProcessor
+
+        data = self._by_true_longitude()
+        sources = {"global": self._global(temp_dir, "global.tif", -180.0, data)}
+        regional = os.path.join(temp_dir, "regional.tif")
+        gdal.Translate(regional, sources["global"], projWin=[-40, 60, 80, -40])
+        sources["regional"] = regional
+        h0 = self._h0_at(10, 20)
+        grid = os.path.join(temp_dir, "grid.parquet")
+        gpd.GeoDataFrame(
+            {"i": [0], "h0": [h0], "geometry": [box(-180, -90, 180, 90)]},
+            crs="EPSG:4326",
+        ).rename_geometry("geom").to_parquet(grid)
+
+        values = {}
+        for name, path in sources.items():
+            proc = RasterProcessor(
+                input_path=path, output_parquet_path=os.path.join(temp_dir, f"hex-{name}"),
+                h3_resolution=3, parent_resolutions=[0], h0_grid_path=grid,
+                value_column="v", hex_resampling="mean", window_reads="always",
+            )
+            out = proc.process_h0_region(0)
+            assert out, name
+            values[name] = dict(duckdb.connect().execute(
+                f"SELECT h3, v FROM read_parquet('{out}')").fetchall())
+            if name == "global":
+                assert proc._read_source_cache is None
+        assert values["global"] and set(values["global"]) == set(values["regional"])
+        for cell, v in values["global"].items():
+            assert values["regional"][cell] == pytest.approx(v, rel=1e-9), cell
+
+
 class TestAntimeridianSplit:
     """Issue #88(B): h3_cell_to_boundary_wkt returns, for a cell touching
     +/-180, a planar polygon whose vertices on each side are joined the long
