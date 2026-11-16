@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-11-16
+
 ### Fixed
 - **PMTiles keep every point at low zoom** (#319). The generated tippecanoe command set no drop rate, so tippecanoe thinned points 2.5× per zoom below the max zoom: of 1,733 points across the contiguous US, z0 showed 1, z4 10 and z6 97, and a national view of a point dataset was nearly empty. The command now passes `-r1`. The rate applies only to points, so line and polygon tiles are unchanged (checked tile for tile with tippecanoe 2.79), and `--drop-densest-as-needed` still bounds tile size for a very dense point layer. Regenerate a point dataset's workflow to pick this up.
 
@@ -351,6 +353,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 ### Fixed
 - H3 edge length accuracy (using official values)
 - Resolution override behavior with helpful messages
+[0.12.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.2
 - Memory efficiency for large polygon processing
 
 [0.12.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.1
