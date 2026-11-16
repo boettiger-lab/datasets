@@ -2939,6 +2939,19 @@ class RasterProcessor:
         return any(sxmin <= lo and sxmax >= hi
                    for sxmin, sxmax in self._source_lon_ranges())
 
+    def _direct_source(self):
+        """`(path, (xmin, xmax))` — the source itself, in its own frame.
+
+        What `_read_source` returns for any source that does not span 360
+        deg. For one that does, it is the unpadded source, which a chunk
+        window inside it reads directly (#313).
+        """
+        sxmin, _, sxmax, _ = self._src_bounds_4326
+        native = _raster_lon_frame(self.input_path)
+        if native is not None and _spans_globe(*native):
+            sxmin, sxmax = native[:2]
+        return self.input_path, (sxmin, sxmax)
+
     def _read_source(self):
         """`(path, (xmin, xmax))` — the raster every chunk reads, and its frame.
 
@@ -3332,8 +3345,10 @@ class RasterProcessor:
 
         A chunk that straddles +/-180 is unwrapped into one longitude range and
         placed in the read source's frame, the same way its cells are
-        (`_place_in_frame`). A 360-deg source is read wrapped
-        (`_read_source`), so that range is one contiguous window too. Reading
+        (`_place_in_frame`). A window that runs past the edge of a 360-deg
+        source is read from its wrapped copy (`_read_source`), so that range
+        is one contiguous window too; any other window is read from the
+        source itself (#313). Reading
         such a chunk from the whole source instead cost ~15x per cell (#295).
 
         Returns a local path; None to fall back to reading the source directly
@@ -3346,7 +3361,7 @@ class RasterProcessor:
 
         poly = shapely_wkt.loads(geom_wkt)
         minx, miny, maxx, maxy = poly.bounds
-        read_path, (fxmin, fxmax) = self._read_source()
+        read_path, (fxmin, fxmax) = self._direct_source()
         if maxx - minx > 180:
             if _raster_lon_frame(self.input_path) is None:
                 # A projected source's cells stay on [-180, 180], so no single
@@ -3360,12 +3375,20 @@ class RasterProcessor:
                 print("  ℹ chunk surrounds a pole; reading the source directly")
                 return None
 
-        shift = _frame_shift((fxmin + fxmax) / 2, (minx + maxx) / 2)
-        minx, maxx = minx + shift, maxx + shift
-
         _, symin, _, symax = self._src_bounds_4326
         lat = min(max(abs(miny), abs(maxy)), 89.0)
         lon_margin = min(margin_deg / max(math.cos(math.radians(lat)), 1e-6), 180.0)
+
+        # A 360-deg source needs its wrapped read (`_read_source`) only for a
+        # window that runs past its edge. Any other window lies inside the
+        # source and is read there directly: through the wrapped VRT the same
+        # window took ~2.7x as long, for identical cells (#313).
+        nshift = _frame_shift((fxmin + fxmax) / 2, (minx + maxx) / 2)
+        if (minx + nshift - lon_margin < fxmin or maxx + nshift + lon_margin > fxmax):
+            read_path, (fxmin, fxmax) = self._read_source()
+
+        shift = _frame_shift((fxmin + fxmax) / 2, (minx + maxx) / 2)
+        minx, maxx = minx + shift, maxx + shift
 
         # Clamp to the read source's own extent: projWin outside it either
         # errors or pads with nodata, and either way costs more than it reads.
