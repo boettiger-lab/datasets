@@ -1431,7 +1431,10 @@ def process_parquet_input(
                 print(f"  Source CRS: {shown} -> Reprojecting to {target_crs}")
                 reproject_from = source_crs
             split_dateline = reproject_from is not None and is_geographic_target(target_crs)
-            geographic = source_crs is not None and is_geographic_target(target_crs)
+            # A file with no CRS reads as OGC:CRS84 too, so CRS84 is no proof of
+            # lon/lat coordinates. Order over the lon/lat plane only when this
+            # step reprojected the data there itself.
+            geographic = split_dateline
             if simplify_tolerance is not None:
                 print(f"  Simplifying geometry with tolerance {simplify_tolerance} (target-CRS units)")
             geom_sql = geometry_sql(base_geom, reproject_from, target_crs,
@@ -1442,8 +1445,8 @@ def process_parquet_input(
             cols_expr = f"*{trim_clause}"
 
         # Build query to read, cast geometry, and optionally add ID. The
-        # Hilbert curve spans the lon/lat plane when the output is lon/lat,
-        # and the data's own extent otherwise (issue #276).
+        # Hilbert curve spans the lon/lat plane when this step reprojected to
+        # lon/lat, and the data's own extent otherwise (issue #276).
         if spatial_order and geom_name:
             print("  Ordering rows along a Hilbert curve"
                   + (f" and numbering {id_col_name} in that order" if needs_id else ""))
