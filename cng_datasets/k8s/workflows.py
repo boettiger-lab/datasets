@@ -860,6 +860,8 @@ def generate_dataset_workflow(
     lat_column: Optional[str] = None,
     lon_column: Optional[str] = None,
     expect_features: Optional[int] = None,
+    spatial_order: bool = True,
+    csv_sample_size: Optional[int] = None,
     pmtiles_max_zoom: Optional[int] = None,
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
@@ -924,6 +926,13 @@ def generate_dataset_workflow(
             so a silently truncated source fails the workflow rather than
             flowing into the hex and PMTiles steps (issue #186). Also sizes the
             hex job when the source can't be counted from here (issue #235).
+        spatial_order: False passes ``--no-spatial-order`` to the convert
+            step, which then keeps source row order instead of sorting along a
+            Hilbert curve. The way out for a dataset whose sort does not fit
+            the convert pod (issues #276, #311).
+        csv_sample_size: Rows the convert step samples for CSV type inference
+            (``--csv-sample-size``, issue #188). None leaves the convert
+            default, the whole file.
         armada_priority_class: Armada priority class for the `armada` backend —
             a literal name ("armada-default") or a shorthand ("default",
             "preemptible", "high"). Defaults to non-preemptible, since a
@@ -1053,7 +1062,7 @@ def generate_dataset_workflow(
     _generate_setup_bucket_job(manager, k8s_name, bucket, output_path, git_repo, config)
 
     # Generate conversion job
-    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=convert_memory or hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config, simplify_tolerance=simplify_tolerance, trim_strings=trim_strings, lat_column=lat_column, lon_column=lon_column, expect_features=expect_features)
+    _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=convert_memory or hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config, simplify_tolerance=simplify_tolerance, trim_strings=trim_strings, lat_column=lat_column, lon_column=lon_column, expect_features=expect_features, spatial_order=spatial_order, csv_sample_size=csv_sample_size)
 
     # Generate pmtiles job (uses converted parquet, not source)
     _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config, h3_resolution=h3_resolution, max_zoom=pmtiles_max_zoom)
@@ -2499,7 +2508,7 @@ echo "Bucket setup complete!"
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-setup-bucket.yaml"))
 
 
-def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None, config: ClusterConfig = None, simplify_tolerance=None, trim_strings=False, lat_column=None, lon_column=None, expect_features=None):
+def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_path, git_repo, layer=None, memory="8Gi", row_group_size=100000, s3_dataset=None, config: ClusterConfig = None, simplify_tolerance=None, trim_strings=False, lat_column=None, lon_column=None, expect_features=None, spatial_order=True, csv_sample_size=None):
     """Generate GeoParquet conversion job."""
     if config is None:
         config = ClusterConfig()
@@ -2535,11 +2544,18 @@ def _generate_convert_job(manager, dataset_name, source_urls, bucket, output_pat
         f" \\\n  --expect-features {int(expect_features)}"
         if expect_features is not None else ""
     )
+    # The way out of a Hilbert sort that will not fit the pod (#276), and the
+    # CSV type-inference sample (#188), passed through from `workflow` (#311).
+    order_flag = "" if spatial_order else " \\\n  --no-spatial-order"
+    sample_flag = (
+        f" \\\n  --csv-sample-size {int(csv_sample_size)}"
+        if csv_sample_size is not None else ""
+    )
     convert_cmd = f"""set -e
 cng-convert-to-parquet \\
   {sources_str} \\
   s3://{bucket}/{s3_dataset}.parquet \\
-  --row-group-size {row_group_size}{layer_flag}{simplify_flag}{trim_flag}{latlon_flags}{expect_flag}
+  --row-group-size {row_group_size}{layer_flag}{simplify_flag}{trim_flag}{latlon_flags}{expect_flag}{order_flag}{sample_flag}
 """
 
     pod_spec = {
@@ -3136,7 +3152,7 @@ def generate_sync_job(
     source: str,
     destination: str,
     output_file: str = "sync-job.yaml",
-    namespace: str = "biodiversity",
+    namespace: Optional[str] = None,
     image: str = "ghcr.io/boettiger-lab/datasets:latest",
     cpu: str = "2",
     memory: str = "4Gi",
@@ -3150,7 +3166,8 @@ def generate_sync_job(
         source: Source path in rclone remote format (e.g., 'remote1:bucket/path')
         destination: Destination path in rclone remote format (e.g., 'remote2:bucket/path')
         output_file: Path to save the generated YAML file
-        namespace: Kubernetes namespace (default: biodiversity)
+        namespace: Kubernetes namespace (default: ClusterConfig's, geo-workflows,
+            the same as the workflow generators; issue #312)
         image: Container image with rclone (default: ghcr.io/boettiger-lab/datasets:latest)
         cpu: CPU request/limit (default: 2)
         memory: Memory request/limit (default: 4Gi)
@@ -3167,6 +3184,7 @@ def generate_sync_job(
         ...     output_file="k8s/sync-job.yaml"
         ... )
     """
+    namespace = namespace or ClusterConfig().namespace
     dry_run_flag = "--dry-run" if dry_run else ""
 
     job_spec = {

@@ -308,7 +308,8 @@ def main():
     k8s_parser.add_argument("--cmd", nargs="+", required=True, help="Container command", dest="container_command")
     k8s_parser.add_argument("--output", default="job.yaml", help="Output YAML file")
     k8s_parser.add_argument("--chunks", type=int, help="Number of chunks for indexed job")
-    k8s_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
+    k8s_parser.add_argument("--namespace", default=None, help="Kubernetes namespace (default from profile, or 'geo-workflows', as for workflow)")
+    k8s_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file, for the namespace. --namespace overrides it.")
 
     # Workflow generation command
     workflow_parser = subparsers.add_parser("workflow", help="Generate complete dataset workflow")
@@ -346,6 +347,8 @@ def main():
     workflow_parser.add_argument("--row-group-size", type=int, default=100000, help="Number of rows per group in convert job (default: 100000)")
     workflow_parser.add_argument("--simplify-tolerance", type=float, default=None, help="Simplify geometry to this tolerance in target-CRS units (degrees for EPSG:4326; e.g. 0.0001 ~ 10m) during the convert step. Right-sizes high-vertex sources for tiling/hex (issue #132).")
     workflow_parser.add_argument("--trim-strings", action="store_true", help="Strip leading/trailing whitespace from every string column during the convert step. Off by default; opt in for sources whose categorical fields carry stray whitespace, which silently breaks equality filters (issue #180).")
+    workflow_parser.add_argument("--no-spatial-order", dest="spatial_order", action="store_false", help="Have the convert step keep source row order instead of writing rows in Hilbert order. Use it when the sort does not fit the convert pod (issues #276, #311).")
+    workflow_parser.add_argument("--csv-sample-size", type=int, default=None, metavar="ROWS", help="Rows the convert step samples for CSV type inference (default: the whole file, issue #188).")
     workflow_parser.add_argument("--hex-retries", type=int, default=2, metavar="N",
                                  help="Per-index retry budget for the hex fan-out (backoffLimitPerIndex, "
                                       "default 2). A preemption is already retried; this covers an OOM, a "
@@ -497,7 +500,8 @@ def main():
     sync_job_parser.add_argument("--source", required=True, help="Source path (e.g., 'remote1:bucket/path')")
     sync_job_parser.add_argument("--destination", required=True, help="Destination path (e.g., 'remote2:bucket/path')")
     sync_job_parser.add_argument("--output", default="sync-job.yaml", help="Output YAML file (default: sync-job.yaml)")
-    sync_job_parser.add_argument("--namespace", default="biodiversity", help="Kubernetes namespace (default: biodiversity)")
+    sync_job_parser.add_argument("--namespace", default=None, help="Kubernetes namespace (default from profile, or 'geo-workflows', as for workflow)")
+    sync_job_parser.add_argument("--profile", default=None, metavar="NAME_OR_PATH", help="Cluster profile name (e.g. 'nrp') or path to a YAML profile file, for the namespace. --namespace overrides it.")
     sync_job_parser.add_argument("--cpu", default="2", help="CPU request/limit (default: 2)")
     sync_job_parser.add_argument("--memory", default="4Gi", help="Memory request/limit (default: 4Gi)")
     sync_job_parser.add_argument("--dry-run", action="store_true", help="Dry run mode (show what would be synced)")
@@ -765,7 +769,10 @@ def _dispatch(args):
 
     elif args.command == "k8s":
         from .k8s import K8sJobManager
-        manager = K8sJobManager(namespace=getattr(args, 'namespace', 'biodiversity'))
+        from .k8s.workflows import cluster_config_from_args
+        # Same namespace as the workflow generators, from --profile (#312).
+        manager = K8sJobManager(namespace=cluster_config_from_args(
+            args.profile, namespace=args.namespace).namespace)
         if args.chunks:
             job_spec = manager.generate_chunked_job(
                 job_name=args.job_name,
@@ -781,12 +788,15 @@ def _dispatch(args):
 
     elif args.command == "sync-job":
         from .k8s import generate_sync_job
+        from .k8s.workflows import cluster_config_from_args
         generate_sync_job(
             job_name=args.job_name,
             source=args.source,
             destination=args.destination,
             output_file=args.output,
-            namespace=args.namespace,
+            # Same namespace as the workflow generators, from --profile (#312).
+            namespace=cluster_config_from_args(
+                args.profile, namespace=args.namespace).namespace,
             cpu=args.cpu,
             memory=args.memory,
             dry_run=args.dry_run,
@@ -828,6 +838,8 @@ def _dispatch(args):
             lat_column=args.lat_column,
             lon_column=args.lon_column,
             expect_features=args.expect_features,
+            spatial_order=args.spatial_order,
+            csv_sample_size=args.csv_sample_size,
             backend=args.backend,
             armada_priority_class=args.armada_priority_class,
             armada_queue=args.armada_queue,
