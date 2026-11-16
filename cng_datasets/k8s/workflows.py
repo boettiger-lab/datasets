@@ -2650,7 +2650,11 @@ export TIPPECANOE_MAX_THREADS=$(python3 -c "from cng_datasets.raster.cog import 
 # container's default soft nofile limit (often 1024) and aborts with
 # "Too many open files". `|| true` keeps going if the limit can't be raised.
 ulimit -n 65536 || true
-tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET --coalesce-densest-as-needed --drop-densest-as-needed -z {_pmtiles_max_zoom(h3_resolution, max_zoom)} --force /tmp/$DATASET.geojsonl
+# -r1: keep every point at every zoom (issue #319). Without it tippecanoe thins
+# points 2.5x per zoom below the max zoom, so a national view of 1,733 points
+# showed 1 at z0 and 97 at z6. The rate applies only to points, so lines and
+# polygons tile identically; --drop-densest-as-needed still bounds tile size.
+tippecanoe -o /tmp/$DATASET.pmtiles -l $DATASET -r1 --coalesce-densest-as-needed --drop-densest-as-needed -z {_pmtiles_max_zoom(h3_resolution, max_zoom)} --force /tmp/$DATASET.geojsonl
 
 # Upload to S3 using rclone
 rclone copy /tmp/$DATASET.pmtiles {config.rclone_remote}:{bucket}/{s3_parent_dir}

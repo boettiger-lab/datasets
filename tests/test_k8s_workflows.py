@@ -280,6 +280,23 @@ class TestWorkflowGeneration:
             assert "-wrapdateline" in command_str
             assert "-datelineoffset 15" in command_str
 
+    @pytest.mark.timeout(5)
+    def test_pmtiles_job_keeps_every_point_at_low_zoom(self):
+        """tippecanoe must not thin points by rate below the max zoom (#319)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="test-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+            )
+            with open(Path(tmpdir) / "test-ds-pmtiles.yaml") as f:
+                job = yaml.safe_load(f)
+            script = job["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+            line = next(ln for ln in script.splitlines() if ln.startswith("tippecanoe "))
+            assert " -r1 " in line
+            assert "--drop-densest-as-needed" in line
+
     def test_pmtiles_job_exports_tippecanoe_max_threads(self):
         """TIPPECANOE_MAX_THREADS must be exported so the child tippecanoe sees it (#77)."""
         with tempfile.TemporaryDirectory() as tmpdir:
