@@ -353,9 +353,9 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 ### Fixed
 - H3 edge length accuracy (using official values)
 - Resolution override behavior with helpful messages
-[0.12.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.2
 - Memory efficiency for large polygon processing
 
+[0.12.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.2
 [0.12.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.1
 [0.12.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.0
 [0.11.4]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.4
