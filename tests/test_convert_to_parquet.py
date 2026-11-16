@@ -2400,6 +2400,99 @@ class TestSpatialOrder:
         assert sum(a != b for a, b in zip(clusters, clusters[1:])) == 1
 
 
+class TestPolarPolygons:
+    """A polygon that contains a pole, written in a polar CRS, converts to a
+    (lon, lat) polygon that still contains the pole and keeps its area
+    (issue #322). ST_Transform writes its ring with a vertex at every
+    longitude; before the fix ST_MakeValid reduced it to lines."""
+
+    @staticmethod
+    def _lat_circle(lat, n=360):
+        return [(-180 + 360 * i / n, lat) for i in range(n)]
+
+    @staticmethod
+    def _geodesic_circle(lat, lon, radius_km, n=360):
+        from pyproj import Geod
+        geod = Geod(ellps="WGS84")
+        return [geod.fwd(lon, lat, 360 * i / n, radius_km * 1000)[:2] for i in range(n)]
+
+    @staticmethod
+    def _km2(ring):
+        from pyproj import Geod
+        lons, lats = zip(*ring)
+        return abs(Geod(ellps="WGS84").polygon_area_perimeter(lons, lats)[0]) / 1e6
+
+    def _convert(self, tmp_path, crs, shell, holes=()):
+        import geopandas as gpd
+        from pyproj import Transformer
+        from shapely.geometry import Polygon
+        to_polar = Transformer.from_crs(4326, crs, always_xy=True)
+        poly = Polygon([to_polar.transform(x, y) for x, y in shell],
+                       [[to_polar.transform(x, y) for x, y in h] for h in holes])
+        assert poly.is_valid
+        src, out = str(tmp_path / "src.gpkg"), str(tmp_path / "out.parquet")
+        gpd.GeoDataFrame({"name": ["f"]}, geometry=[poly], crs=crs).to_file(src)
+        convert_to_parquet(source_url=src, destination=out, progress=False)
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        con.execute("SET geometry_always_xy = true")
+        import shapely
+        wkb, km2 = con.execute(
+            f"SELECT ST_AsWKB(geom), ST_Area_Spheroid(geom) / 1e6 FROM '{out}'").fetchone()
+        con.close()
+        return shapely.from_wkb(bytes(wkb)), km2, out
+
+    CASES = {
+        # name: (crs, shell, holes, a point inside, points outside)
+        "cap at 80 N": (3413, ("circle", 80), [], (0, 89), [(0, 70)]),
+        "cap at 80 S": (3031, ("circle", -80), [], (100, -89), [(100, -70)]),
+        "Antarctica-sized cap at 70 S": (3031, ("circle", -70), [], (45, -85), [(45, -60)]),
+        "cap off the pole, N": (3413, ("geodesic", 87, 30, 600), [], (0, 89.9),
+                                [(-150, 80), (30, 80)]),
+        "cap off the pole, S": (3031, ("geodesic", -86, 120, 700), [], (0, -89.9),
+                                [(-60, -80), (120, -78)]),
+        "ring with the pole as its hole": (3031, ("circle", -70), [("circle", -80)],
+                                           (10, -75), [(10, -85), (10, -65)]),
+    }
+
+    def _ring(self, spec):
+        return self._lat_circle(spec[1]) if spec[0] == "circle" else self._geodesic_circle(*spec[1:])
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("case", list(CASES))
+    def test_pole_containing_polygon_keeps_the_pole_and_its_area(self, tmp_path, case):
+        import shapely
+        crs, shell_spec, hole_specs, inside, outsides = self.CASES[case]
+        shell, holes = self._ring(shell_spec), [self._ring(h) for h in hole_specs]
+        g, km2, _ = self._convert(tmp_path, crs, shell, holes)
+
+        assert g.geom_type in ("Polygon", "MultiPolygon"), g.geom_type
+        expected = self._km2(shell) - sum(self._km2(h) for h in holes)
+        assert km2 == pytest.approx(expected, rel=0.01)
+        assert g.contains(shapely.Point(inside))
+        for p in outsides:
+            assert not g.contains(shapely.Point(p)), p
+        assert -180 <= g.bounds[0] and g.bounds[2] <= 180
+
+    @pytest.mark.timeout(60)
+    def test_a_converted_polar_cap_hexes_over_the_pole(self, tmp_path):
+        from cng_datasets.vector.h3_tiling import geom_to_h3_cells, setup_duckdb_connection
+        _, _, out = self._convert(tmp_path, 3413, self._lat_circle(80))
+        con = setup_duckdb_connection()
+        con.execute(f"CREATE TABLE feats AS SELECT name, geom FROM '{out}'")
+        sql = geom_to_h3_cells(con, "feats", zoom=2, keep_cols=["name"])
+        lats = [r[0] for r in con.execute(f"""
+            SELECT h3_cell_to_lat(cell) FROM (SELECT UNNEST(h3id) AS cell FROM ({sql}))
+        """).fetchall()]
+        pole = con.execute("SELECT h3_latlng_to_cell(90, 0, 2)").fetchone()[0]
+        cells = {r[0] for r in con.execute(
+            f"SELECT UNNEST(h3id) FROM ({sql})").fetchall()}
+        con.close()
+        assert pole in cells, "the cell at the pole is filled"
+        assert min(lats) > 79, "no cell south of the cap"
+        assert len(lats) > 30, f"the cap fills its area, got {len(lats)} cells"
+
+
 class TestRepeatedColumnNames:
     """A source whose attribute table repeats a field name converts, with the
     repeats renamed (issue #314). ArcInfo coverage exports truncate names to

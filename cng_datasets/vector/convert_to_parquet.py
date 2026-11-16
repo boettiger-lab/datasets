@@ -917,12 +917,19 @@ def split_dateline_wkb(wkb: bytes) -> bytes:
     the feature has its true shape. The repair is ``make_valid``, the same
     GEOS routine as the ST_MakeValid that every other feature gets after
     reprojection, so a crosser comes out as it would anywhere else.
+
+    A polygon that contains a pole (from a polar CRS such as EPSG:3413 or
+    EPSG:3031) has a ring that winds all the way round in longitude, and no
+    shift makes it continuous. It is closed along the pole and cut into
+    -180..180 instead (issue #322; see _split_polar).
     """
     import numpy as np
     import shapely
     from shapely import affinity
 
     geom = shapely.from_wkb(wkb)
+    if _winds_round_a_pole(geom):
+        return shapely.to_wkb(_split_polar(geom))
     shifted = shapely.transform(
         geom, lambda c: np.where(c[:, :1] < 0, c + [360.0, 0.0], c))
     if not shapely.is_valid(shifted):
@@ -934,6 +941,86 @@ def split_dateline_wkb(wkb: bytes) -> bytes:
     east = affinity.translate(
         shifted.intersection(shapely.box(180, -90, xmax, 90)), xoff=-360)
     return shapely.to_wkb(shapely.union(west, east))
+
+
+def _polygon_parts(geom) -> list:
+    """The polygons of a Polygon or MultiPolygon; empty for any other type."""
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type == "MultiPolygon":
+        return list(geom.geoms)
+    return []
+
+
+def _unwrap_ring(ring):
+    """A ring's (lon, lat) coordinates with each step taken the short way
+    round, so longitude runs continuously past ±180, and the ring's net
+    change in longitude: 0 for an ordinary ring, ±360 for one round a pole."""
+    import numpy as np
+    import shapely
+    xy = shapely.get_coordinates(ring)
+    steps = (np.diff(xy[:, 0]) + 180.0) % 360.0 - 180.0
+    lon = xy[0, 0] + np.concatenate([[0.0], np.cumsum(steps)])
+    return np.column_stack([lon, xy[:, 1]]), lon[-1] - lon[0]
+
+
+def _winds_round_a_pole(geom) -> bool:
+    """Whether any ring of a (lon, lat) polygon goes all the way round in
+    longitude, which in a valid source means it encloses a pole."""
+    return any(abs(_unwrap_ring(r)[1]) > 180
+               for p in _polygon_parts(geom)
+               for r in [p.exterior, *p.interiors])
+
+
+def _ring_as_polygon(ring):
+    """A ring as a polygon in an unwrapped longitude frame. A ring round a
+    pole becomes the cap it bounds: its path from lon0 to lon0 ± 360 is closed
+    along the pole on the side of its own latitudes (issue #322)."""
+    import numpy as np
+    import shapely
+    xy, winding = _unwrap_ring(ring)
+    if abs(winding) > 180:
+        pole = 90.0 if xy[:, 1].mean() > 0 else -90.0
+        xy = np.vstack([xy, [[xy[-1, 0], pole], [xy[0, 0], pole], xy[0]]])
+    poly = shapely.Polygon(xy)
+    return poly if poly.is_valid else shapely.make_valid(poly)
+
+
+def _wrap_to_world(geom):
+    """Cut a geometry in an unwrapped longitude frame into -180..180."""
+    import math
+    import shapely
+    from shapely import affinity
+    xmin, _, xmax, _ = geom.bounds
+    pieces = []
+    for k in range(math.floor((xmin + 180) / 360), math.ceil((xmax - 180) / 360) + 1):
+        piece = geom.intersection(shapely.box(360 * k - 180, -90, 360 * k + 180, 90))
+        if not piece.is_empty:
+            pieces.append(affinity.translate(piece, xoff=-360 * k))
+    return shapely.union_all(pieces)
+
+
+def _split_polar(geom):
+    """A (lon, lat) polygon with a ring round a pole, as valid -180..180
+    polygons.
+
+    ST_Transform out of a polar CRS writes a pole-containing polygon as a
+    ring with a vertex at every longitude. Read flat, that ring encloses
+    nothing, and ST_MakeValid reduced it to lines (a cap at 80° N came out
+    with zero area, issue #322). Here each ring is unwrapped, a ring round a
+    pole is closed along that pole, and every ring is cut into -180..180 on
+    its own before the holes are taken out, so rings never have to share a
+    longitude frame. The pole is the one on the side of the ring's own
+    latitudes, which is the enclosed one for any ring that lies in a single
+    hemisphere.
+    """
+    import shapely
+    parts = []
+    for poly in _polygon_parts(geom):
+        shell = _wrap_to_world(_ring_as_polygon(poly.exterior))
+        holes = [_wrap_to_world(_ring_as_polygon(r)) for r in poly.interiors]
+        parts.append(shell.difference(shapely.union_all(holes)) if holes else shell)
+    return shapely.union_all(parts)
 
 
 def register_dateline_split(con) -> None:
