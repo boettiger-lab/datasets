@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-16
+
 ### Fixed
 - **Convert repairs an invalid feature that crosses 180° instead of failing** (#315). The antimeridian split (#274) cuts each crosser with a box, and GEOS raises on invalid input, so one self-intersecting ring across 180° aborted the whole conversion; the same feature anywhere else converts, because `ST_MakeValid` repairs it after reprojection. The split now runs GEOS `make_valid` first, in the shifted frame where the feature has its true shape, so a crosser is repaired the same way as any other feature. This blocked PAD-US 4.1 `Combined`, whose Alaska Maritime NWR proclamation is invalid in the source.
 - **Convert reads a source whose attribute table repeats a field name** (#314). Shapefiles exported from ArcInfo coverages truncate names to 10 characters and can carry the same name twice, which DuckDB refused to bind. A repeated name now gets a numeric suffix (`C_FINT_LEN`, `C_FINT_LEN_2`), which the log reports. The check runs once per source and changes nothing for a source without repeats.
@@ -348,6 +350,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.12.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.1
 [0.12.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.0
 [0.11.4]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.4
 [0.11.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.11.3
