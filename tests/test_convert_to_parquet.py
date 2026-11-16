@@ -22,6 +22,8 @@ from cng_datasets.vector.convert_to_parquet import (
     trim_replace_clause,
     get_string_columns,
     detect_crs,
+    parquet_type_crs,
+    same_crs,
     FeatureCountMismatch,
 )
 
@@ -2491,6 +2493,97 @@ class TestPolarPolygons:
         assert pole in cells, "the cell at the pole is filled"
         assert min(lats) > 79, "no cell south of the cap"
         assert len(lats) > 30, f"the cap fills its area, got {len(lats)} cells"
+
+
+class TestGeoParquetSource:
+    """A GeoParquet source is reprojected, split at the antimeridian and
+    repaired like any other source (issue #327). It used to be passed
+    through, so a projected file kept its metres."""
+
+    @staticmethod
+    def _read(out):
+        import json
+        import pyarrow.parquet as pq
+        import shapely
+        geo = json.loads(pq.read_schema(out).metadata[b"geo"])
+        col = geo["primary_column"]
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        con.execute("SET geometry_always_xy = true")
+        rows = con.execute(f"""
+            SELECT name, ST_AsWKB("{col}"), ST_IsValid("{col}"), ST_Area_Spheroid("{col}") / 1e6
+            FROM '{out}' ORDER BY name""").fetchall()
+        con.close()
+        return {n: (shapely.from_wkb(bytes(w)), v, a) for n, w, v, a in rows}
+
+    def _convert(self, tmp_path, gdf, ext):
+        src, out = str(tmp_path / f"src{ext}"), str(tmp_path / f"out{ext}.parquet")
+        gdf.to_parquet(src) if ext == ".parquet" else gdf.to_file(src)
+        convert_to_parquet(source_url=src, destination=out, progress=False)
+        return self._read(out)
+
+    @pytest.mark.timeout(60)
+    def test_a_projected_geoparquet_converts_like_a_geopackage(self, tmp_path):
+        import geopandas as gpd
+        from pyproj import Transformer
+        from shapely.geometry import Polygon
+        to_albers = Transformer.from_crs(4326, 3338, always_xy=True)
+        box_ll = TestAntimeridianSplit._lonlat_box
+        polys = [Polygon([to_albers.transform(x, y) for x, y in box_ll(*b)])
+                 for b in ((178, 182, 52, 54), (170, 172, 52, 54))]
+        gdf = gpd.GeoDataFrame({"name": ["crosser", "west"]}, geometry=polys, crs=3338)
+        from_gpkg = self._convert(tmp_path, gdf, ".gpkg")
+        from_parquet = self._convert(tmp_path, gdf, ".parquet")
+
+        g, valid, km2 = from_parquet["crosser"]
+        assert valid and g.geom_type == "MultiPolygon", "the crosser is split at 180"
+        assert max(p.bounds[2] - p.bounds[0] for p in g.geoms) < 5
+        assert g.bounds[0] < -177.9 and g.bounds[2] > 177.9
+        assert km2 == pytest.approx(from_gpkg["crosser"][2], rel=1e-6)
+        g, valid, _ = from_parquet["west"]
+        assert 169.9 < g.bounds[0] and g.bounds[2] < 172.1, "reprojected to lon/lat"
+
+    @pytest.mark.timeout(60)
+    def test_a_crs_without_a_code_is_read_from_its_projjson(self, tmp_path):
+        import geopandas as gpd
+        from shapely.geometry import box
+        # ESRI:102003 (USA Contiguous Albers) has no EPSG code, so DuckDB
+        # carries it as PROJJSON. Its origin is 96 W, 37.5 N.
+        gdf = gpd.GeoDataFrame({"name": ["origin"]}, geometry=[box(-1000, -1000, 1000, 1000)],
+                               crs="ESRI:102003")
+        g, valid, _ = self._convert(tmp_path, gdf, ".parquet")["origin"]
+        assert valid
+        assert g.centroid.x == pytest.approx(-96, abs=0.01)
+        assert g.centroid.y == pytest.approx(37.5, abs=0.01)
+
+    @pytest.mark.timeout(60)
+    def test_an_invalid_feature_is_repaired(self, tmp_path):
+        import geopandas as gpd
+        from shapely.geometry import Polygon, box
+        bowtie = Polygon([(10, 10), (12, 12), (12, 10), (10, 12), (10, 10)])
+        gdf = gpd.GeoDataFrame({"name": ["bowtie", "ok"]},
+                               geometry=[bowtie, box(20, 20, 21, 21)], crs=4326)
+        rows = self._convert(tmp_path, gdf, ".parquet")
+        assert all(valid for _, valid, _ in rows.values())
+        assert rows["bowtie"][0].area == pytest.approx(2.0)
+
+    @pytest.mark.timeout(60)
+    def test_a_lon_lat_geoparquet_keeps_its_coordinates(self, tmp_path):
+        import geopandas as gpd
+        from shapely.geometry import box
+        gdf = gpd.GeoDataFrame({"name": ["a"]}, geometry=[box(-122.5, 37.5, -122.0, 38.0)], crs=4326)
+        g, _, _ = self._convert(tmp_path, gdf, ".parquet")["a"]
+        assert g.bounds == pytest.approx((-122.5, 37.5, -122.0, 38.0))
+
+    def test_parquet_type_crs(self):
+        assert parquet_type_crs("GEOMETRY('EPSG:3338')") == "EPSG:3338"
+        assert parquet_type_crs("GEOMETRY('{\"name\":\"O''Brien\"}')") == '{"name":"O\'Brien"}'
+        assert parquet_type_crs("GEOMETRY") is None
+        assert parquet_type_crs("BLOB") is None
+
+    def test_same_crs_ignores_axis_order(self):
+        assert same_crs("OGC:CRS84", "EPSG:4326")
+        assert not same_crs("EPSG:3338", "EPSG:4326")
 
 
 class TestRepeatedColumnNames:
