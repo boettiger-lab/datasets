@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-11-16
+
 ### Fixed
 - **Convert keeps a polygon that contains a pole** (#322). Out of a polar CRS such as EPSG:3413 or EPSG:3031, `ST_Transform` writes a pole-containing polygon as a ring with a vertex at every longitude. The antimeridian split left it unchanged, because it is genuinely wider than 180°, and `ST_MakeValid` then reduced it to lines: a cap at 80° N came out with zero area, and an Antarctica-sized ring at 70° S as 24 km². A ring that winds all the way round in longitude is now closed along its pole and cut into -180..180, so the polygon keeps its area and still contains the pole, and its hexes fill over the pole. Polygons that cross 180° without containing a pole convert as before.
 
@@ -358,6 +360,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.12.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.3
 [0.12.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.2
 [0.12.1]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.1
 [0.12.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.0
