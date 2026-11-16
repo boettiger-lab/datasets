@@ -18,7 +18,7 @@ class K8sJobManager:
 
     def __init__(
         self,
-        namespace: str = "biodiversity",
+        namespace: str = "geo-workflows",
         image: str = "python:3.12-slim",
         service_account: Optional[str] = None,
         secrets: Optional[List[str]] = None,
@@ -27,7 +27,8 @@ class K8sJobManager:
         Initialize the K8s job manager.
 
         Args:
-            namespace: Kubernetes namespace for jobs
+            namespace: Kubernetes namespace for jobs (default geo-workflows, the
+                same as ClusterConfig; issue #312)
             image: Container image to use
             service_account: Service account name for jobs
             secrets: List of secret names to mount

@@ -46,7 +46,14 @@ cng-convert-to-parquet https://example.com/parks.gdb s3://my-bucket/parks.parque
 | `--no-spatial-order` | off | Keep source row order instead of Hilbert order (see [Output Format](#output-format)) |
 
 `cng-datasets workflow` exposes the same options for its convert step, except
-`--no-spatial-order`, `--target-crs` and `--csv-sample-size` (#311).
+`--target-crs`, because the hex step expects EPSG:4326.
+
+A shapefile or GeoPackage source also gives the GeoParquet its OGR feature id,
+as `OGC_FID` for a shapefile or `fid` for a GeoPackage, beside `_cng_fid`.
+DuckDB spatial's `ST_Read` adds it since DuckDB 2.0, unless the layer already
+has an attribute of that name. It is the source's own row id, so it can be
+used to match a feature back to the source file. `_cng_fid` remains the id
+that the hex output joins on.
 
 ### H3 tiling from Python
 
@@ -255,8 +262,9 @@ Each hex file contains:
 
 Join back to the GeoParquet on the id for feature attributes. Rows are in spatial
 (Hilbert) order and `_cng_fid` is numbered in that order, so **`_cng_fid` values
-change when a dataset is rebuilt**. Pass `--no-spatial-order` to `cng-convert-to-parquet`
-(or `spatial_order=False` to `convert_to_parquet`) to keep source order.
+change when a dataset is rebuilt**. Pass `--no-spatial-order` to `cng-datasets workflow`
+or `cng-convert-to-parquet` (or `spatial_order=False` to `convert_to_parquet`) to keep
+source order.
 
 ## Examples
 

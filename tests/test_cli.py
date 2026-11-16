@@ -105,7 +105,7 @@ class TestCLI:
                 "--source-url", "https://dsl.richmond.edu/panorama/redlining/static/mappinginequality.gpkg",
                 "--bucket", "bucket",
                 "--output-dir", tmpdir
-                # namespace defaults to "biodiversity"
+                # namespace defaults to the profile's, geo-workflows
             ]
             
             with patch.object(sys, 'argv', test_args):
@@ -417,3 +417,67 @@ class TestWorkflowChunkSize:
         captured = self._captured(tmp_path, "--cells-per-chunk", "2e6")
         assert captured["cells_per_chunk"] == 2e6
         assert self._captured(tmp_path)["cells_per_chunk"] is None
+
+
+class TestConvertFlagsFromWorkflow:
+    """`workflow` passes --no-spatial-order and --csv-sample-size to its
+    convert step (issue #311)."""
+
+    def _convert_cmd(self, tmp_path, monkeypatch, *extra):
+        import yaml
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        test_args = ["cng-datasets", "workflow", "--dataset", "flags-ds",
+                     "--source-url", "https://example.com/points.gpkg",
+                     "--bucket", "b", "--output-dir", str(tmp_path),
+                     "--h3-resolution", "10", *extra]
+        with patch.object(sys, "argv", test_args):
+            main()
+        job = yaml.safe_load(open(tmp_path / "flags-ds-convert.yaml"))
+        return job["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+
+    @pytest.mark.timeout(10)
+    def test_flags_reach_the_convert_command(self, tmp_path, monkeypatch):
+        cmd = self._convert_cmd(tmp_path, monkeypatch,
+                                "--no-spatial-order", "--csv-sample-size", "50000")
+        assert "--no-spatial-order" in cmd
+        assert "--csv-sample-size 50000" in cmd
+
+    @pytest.mark.timeout(10)
+    def test_convert_defaults_are_left_alone(self, tmp_path, monkeypatch):
+        cmd = self._convert_cmd(tmp_path, monkeypatch)
+        assert "--no-spatial-order" not in cmd
+        assert "--csv-sample-size" not in cmd
+
+
+class TestSingleJobNamespace:
+    """`k8s` and `sync-job` take their namespace from the profile, like the
+    workflow generators, not a hard-coded `biodiversity` (issue #312)."""
+
+    def _namespace(self, tmp_path, command, *extra):
+        import yaml
+        out = tmp_path / "job.yaml"
+        if command == "k8s":
+            args = ["cng-datasets", "k8s", "--job-name", "j", "--output", str(out),
+                    *extra, "--cmd", "echo", "hi"]
+        else:
+            args = ["cng-datasets", "sync-job", "--job-name", "j", "--output", str(out),
+                    "--source", "nrp:a/b", "--destination", "aws:c/d", *extra]
+        with patch.object(sys, "argv", args):
+            main()
+        return yaml.safe_load(open(out))["metadata"]["namespace"]
+
+    @pytest.mark.timeout(5)
+    @pytest.mark.parametrize("command", ["k8s", "sync-job"])
+    def test_default_matches_the_workflow_generators(self, tmp_path, command):
+        from cng_datasets.k8s import ClusterConfig
+        assert self._namespace(tmp_path, command) == ClusterConfig().namespace == "geo-workflows"
+
+    @pytest.mark.timeout(5)
+    @pytest.mark.parametrize("command", ["k8s", "sync-job"])
+    def test_profile_sets_it_and_the_flag_overrides(self, tmp_path, command):
+        profile = tmp_path / "cluster.yaml"
+        profile.write_text("namespace: from-profile\n")
+        assert self._namespace(tmp_path, command, "--profile", str(profile)) == "from-profile"
+        assert self._namespace(tmp_path, command, "--profile", str(profile),
+                               "--namespace", "explicit") == "explicit"

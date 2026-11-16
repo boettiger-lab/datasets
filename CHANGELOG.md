@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`k8s` and `sync-job` use the same namespace as the workflow generators** (#312). Both still defaulted to `biodiversity`, so a sync job generated alongside a workflow landed in a different namespace, one capped at 200 pods. They now default to `geo-workflows`, through `--profile` like `workflow`, and `--namespace` still overrides it. `K8sJobManager` and `generate_sync_job` default to the same namespace.
+- **`workflow` passes `--no-spatial-order` and `--csv-sample-size` to its convert step** (#311). Without them, the way out of a Hilbert sort that does not fit the convert pod (#276) and the CSV type-inference sample (#188) could only be reached by editing the generated YAML.
+
+### Documentation
+- A shapefile or GeoPackage source's GeoParquet carries the OGR feature id (`OGC_FID` or `fid`) beside `_cng_fid`, which DuckDB spatial's `ST_Read` adds since DuckDB 2.0. The vector guide now says so.
+
 ## [0.12.3] - 2026-11-16
 
 ### Fixed
