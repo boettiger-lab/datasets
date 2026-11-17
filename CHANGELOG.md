@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.7] - 2026-11-17
+
 ### Fixed
 - **Hex fills a feature already split at 180° in full** (#328). A band round the globe or a polar cap whose only vertices away from ±180 were few and far apart, such as a box from -180 to 180, or a feature convert split at 180°, was taken for an antimeridian crosser and handed to H3 whole. H3 read its edges the short way and filled a single cell. A feature with vertices on both -180 and +180 that is valid read flat is now band-split like any other wide feature. A ring that really runs across 180° doubles back on itself read flat, so it is still filled the short way.
 
@@ -382,6 +384,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.12.7]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.7
 [0.12.6]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.6
 [0.12.5]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.5
 [0.12.4]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.4
