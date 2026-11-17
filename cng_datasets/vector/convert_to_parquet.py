@@ -1029,6 +1029,61 @@ def register_dateline_split(con) -> None:
                         side_effects=False)
 
 
+def geometry_sql(raw_geom: str, source_crs: Optional[str], target_crs: str,
+                 wrap_dateline: bool = False,
+                 simplify_tolerance: Optional[float] = None) -> str:
+    """SQL for a source geometry as written to the output: reprojected to
+    target_crs when source_crs differs, split at the antimeridian when
+    wrap_dateline (issue #274), simplified when asked (issue #132), and
+    repaired with ST_MakeValid.
+
+    Every source goes through this, whether read with ST_Read or, for a
+    GeoParquet source, with read_parquet (issue #327), so the two paths
+    cannot drift apart.
+    """
+    # Determine geometry transformation
+    if source_crs and source_crs != target_crs:
+        # Need to reproject. DuckDB's ST_Transform honours each CRS's *authority* axis
+        # order by default (e.g. EPSG:4326 is latitude-first), but GeoParquet — and
+        # DuckDB's own ST_Read — always store coordinates as (longitude, latitude).
+        # Passing always_xy := true forces ST_Transform to read AND write (lon, lat)
+        # regardless of either CRS's declared axis order, so the output is always
+        # (lon, lat) and no ST_FlipCoordinates correction is needed.
+        #
+        # This replaces an earlier is_geographic_crs() heuristic that decided whether
+        # to flip based on a numeric EPSG-code range. That heuristic mis-handled
+        # axis-order edge cases — geographic CRSs that are longitude-first (OGC:CRS84)
+        # and geographic compound/3D CRSs with codes >= 5000 (EPSG:5498
+        # "NAD83 + NAVD88 height", EPSG:4979) — swapping lat/lon for them (see #128).
+        # The source CRS may now be a full WKT definition rather than a short
+        # "EPSG:4326" token (issue #187), and a definition can carry a quote in
+        # a datum or projection name, so both operands are escaped before they
+        # reach the query.
+        geom_inner = (
+            f"ST_Transform({raw_geom}, {_sql_string(source_crs)}, "
+            f"{_sql_string(target_crs)}, always_xy := true)"
+        )
+        if wrap_dateline:
+            # A crosser comes out of ST_Transform wider than 180°. The split
+            # leaves a feature that is genuinely that wide alone, so the bbox
+            # test only decides which features take the slower path.
+            geom_inner = (
+                f"(CASE WHEN ST_XMax({geom_inner}) - ST_XMin({geom_inner}) > 180 "
+                f"THEN ST_GeomFromWKB({DATELINE_UDF}(ST_AsWKB({geom_inner}))) "
+                f"ELSE {geom_inner} END)"
+            )
+    else:
+        # No reprojection needed; DuckDB ST_Read and read_parquet return (lon, lat)
+        geom_inner = raw_geom
+
+    # Simplify after reprojection (tolerance is in target-CRS units, issue #132).
+    # PreserveTopology avoids collapsing polygons into invalid/empty geometry.
+    if simplify_tolerance is not None:
+        geom_inner = f"ST_SimplifyPreserveTopology({geom_inner}, {simplify_tolerance})"
+
+    return f"ST_MakeValid({geom_inner})"
+
+
 def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs: Optional[str],
                                target_crs: str, geom_col: str = "geom", layer: Optional[str] = None,
                                verbose: bool = False, geom_is_blob: bool = False,
@@ -1066,47 +1121,10 @@ def build_read_reproject_query(source_inputs: Union[str, List[str]], source_crs:
     # and DuckDB writes proper GeoParquet metadata.
     raw_geom = f"ST_GeomFromWKB({geom_col})" if geom_is_blob else geom_col
 
-    # Determine geometry transformation
-    if source_crs and source_crs != target_crs:
-        # Need to reproject. DuckDB's ST_Transform honours each CRS's *authority* axis
-        # order by default (e.g. EPSG:4326 is latitude-first), but GeoParquet — and
-        # DuckDB's own ST_Read — always store coordinates as (longitude, latitude).
-        # Passing always_xy := true forces ST_Transform to read AND write (lon, lat)
-        # regardless of either CRS's declared axis order, so the output is always
-        # (lon, lat) and no ST_FlipCoordinates correction is needed.
-        #
-        # This replaces an earlier is_geographic_crs() heuristic that decided whether
-        # to flip based on a numeric EPSG-code range. That heuristic mis-handled
-        # axis-order edge cases — geographic CRSs that are longitude-first (OGC:CRS84)
-        # and geographic compound/3D CRSs with codes >= 5000 (EPSG:5498
-        # "NAD83 + NAVD88 height", EPSG:4979) — swapping lat/lon for them (see #128).
-        # The source CRS may now be a full WKT definition rather than a short
-        # "EPSG:4326" token (issue #187), and a definition can carry a quote in
-        # a datum or projection name, so both operands are escaped before they
-        # reach the query.
-        geom_inner = (
-            f"ST_Transform({raw_geom}, {_sql_string(source_crs)}, "
-            f"{_sql_string(target_crs)}, always_xy := true)"
-        )
-        if wrap_dateline:
-            # A crosser comes out of ST_Transform wider than 180°. The split
-            # leaves a feature that is genuinely that wide alone, so the bbox
-            # test only decides which features take the slower path.
-            geom_inner = (
-                f"(CASE WHEN ST_XMax({geom_inner}) - ST_XMin({geom_inner}) > 180 "
-                f"THEN ST_GeomFromWKB({DATELINE_UDF}(ST_AsWKB({geom_inner}))) "
-                f"ELSE {geom_inner} END)"
-            )
-    else:
-        # No reprojection needed; DuckDB ST_Read returns (lon, lat) for all formats
-        geom_inner = raw_geom
-
-    # Simplify after reprojection (tolerance is in target-CRS units, issue #132).
-    # PreserveTopology avoids collapsing polygons into invalid/empty geometry.
-    if simplify_tolerance is not None:
-        geom_inner = f"ST_SimplifyPreserveTopology({geom_inner}, {simplify_tolerance})"
-
-    geom_expr = f"ST_MakeValid({geom_inner}) AS {geom_col}"
+    geom_expr = (
+        f"{geometry_sql(raw_geom, source_crs, target_crs, wrap_dateline=wrap_dateline, simplify_tolerance=simplify_tolerance)} "
+        f"AS {geom_col}"
+    )
 
     # Trim string attributes in place (issue #180). REPLACE cannot name the
     # geometry column, which the star already excludes, so it is filtered out.
@@ -1199,6 +1217,31 @@ def spatial_order_query(base_query: str, geom_col: str, id_column: Optional[str]
     """
 
 
+def parquet_type_crs(column_type: str) -> Optional[str]:
+    """The CRS DuckDB attached to a GEOMETRY column type read from GeoParquet:
+    ``GEOMETRY('EPSG:3338')`` gives ``EPSG:3338``, and a CRS with no code
+    gives its PROJJSON. None for a plain GEOMETRY or a BLOB (issue #327)."""
+    t = column_type.strip()
+    if not (t.upper().startswith("GEOMETRY('") and t.endswith("')")):
+        return None
+    return t[len("GEOMETRY('"):-2].replace("''", "'") or None
+
+
+def same_crs(a: str, b: str) -> bool:
+    """Whether two CRS strings name the same CRS, ignoring axis order, which
+    ST_Transform's always_xy makes irrelevant (so OGC:CRS84 is EPSG:4326)."""
+    if a == b:
+        return True
+    from osgeo import osr
+    sa, sb = osr.SpatialReference(), osr.SpatialReference()
+    try:
+        sa.SetFromUserInput(a)
+        sb.SetFromUserInput(b)
+    except RuntimeError:
+        return False
+    return bool(sa.IsSame(sb, ["CRITERION=EQUIVALENT_EXCEPT_AXIS_ORDER_GEOGCRS"]))
+
+
 def process_parquet_input(
     source_url: str,
     destination: str,
@@ -1220,7 +1263,9 @@ def process_parquet_input(
 
     When the input is already parquet, we use DuckDB to read it directly
     without using ST_Read, ensuring we have an ID column and applying
-    GeoParquet optimizations.
+    GeoParquet optimizations. Its geometry is reprojected from the CRS in its
+    GeoParquet metadata, split at the antimeridian and repaired exactly as for
+    any other source (issue #327).
 
     Args:
         source_url: Source parquet URL (supports s3://, http://, file paths)
@@ -1235,8 +1280,8 @@ def process_parquet_input(
         progress: Show progress during conversion
         target_crs: Target CRS for output (default: EPSG:4326)
         verbose: Print detailed debug information
-        simplify_tolerance: Optional geometry simplification tolerance in the
-            parquet's own CRS units (issue #132)
+        simplify_tolerance: Optional geometry simplification tolerance in
+            target-CRS units, applied after reprojection (issue #132)
         trim_strings: Strip leading/trailing whitespace from every VARCHAR column
             (issue #180)
         expect_features: Row count this conversion is expected to produce, known
@@ -1361,30 +1406,53 @@ def process_parquet_input(
             )
             print(f"  Trimming whitespace from {len(string_cols)} string column(s)")
 
-        # Build the geometry projection: cast a BLOB WKB column to GEOMETRY, and/or
-        # apply simplification (issue #132). Tolerance is in the parquet's own CRS
-        # units (assumed target_crs — this path does not reproject).
+        # Build the geometry the same way as for any other source (issue #327):
+        # reproject to target_crs, split at the antimeridian, simplify, and
+        # repair with ST_MakeValid. A BLOB WKB column is cast to GEOMETRY first.
         geom_name = geom_blob_col or geom_native_col
-        if geom_name and (geom_blob_col or simplify_tolerance is not None):
-            base_geom = f'ST_GeomFromWKB("{geom_name}")' if geom_blob_col else f'"{geom_name}"'
+        split_dateline = False
+        geographic = False
+        if geom_name:
             if geom_blob_col:
                 print(f"  Casting BLOB geometry column to GEOMETRY: {geom_name}")
+            base_geom = f'ST_GeomFromWKB("{geom_name}")' if geom_blob_col else f'"{geom_name}"'
+            # DuckDB reads a GeoParquet column's CRS into its type. A file that
+            # names none reads as OGC:CRS84, as the GeoParquet spec says. A
+            # BLOB column has no GeoParquet metadata, so no CRS.
+            geom_type = next(t for n, t, *_ in columns if n == geom_name)
+            source_crs = parquet_type_crs(geom_type)
+            reproject_from = None
+            if source_crs is None:
+                print(f"  Warning: geometry column declares no CRS, assuming {target_crs}")
+            elif same_crs(source_crs, target_crs):
+                print(f"  Source already in {target_crs}")
+            else:
+                shown = source_crs if len(source_crs) < 60 else "a PROJJSON definition"
+                print(f"  Source CRS: {shown} -> Reprojecting to {target_crs}")
+                reproject_from = source_crs
+            split_dateline = reproject_from is not None and is_geographic_target(target_crs)
+            # A file with no CRS reads as OGC:CRS84 too, so CRS84 is no proof of
+            # lon/lat coordinates. Order over the lon/lat plane only when this
+            # step reprojected the data there itself.
+            geographic = split_dateline
             if simplify_tolerance is not None:
                 print(f"  Simplifying geometry with tolerance {simplify_tolerance} (target-CRS units)")
-                base_geom = f'ST_SimplifyPreserveTopology({base_geom}, {simplify_tolerance})'
-            cols_expr = f'* EXCLUDE ("{geom_name}"){trim_clause}, {base_geom} AS "{geom_name}"'
+            geom_sql = geometry_sql(base_geom, reproject_from, target_crs,
+                                    wrap_dateline=split_dateline,
+                                    simplify_tolerance=simplify_tolerance)
+            cols_expr = f'* EXCLUDE ("{geom_name}"){trim_clause}, {geom_sql} AS "{geom_name}"'
         else:
             cols_expr = f"*{trim_clause}"
 
         # Build query to read, cast geometry, and optionally add ID. The
-        # geometry is ordered over its own extent: this path does not
-        # reproject, so nothing guarantees lon/lat coordinates (issue #276).
+        # Hilbert curve spans the lon/lat plane when this step reprojected to
+        # lon/lat, and the data's own extent otherwise (issue #276).
         if spatial_order and geom_name:
             print("  Ordering rows along a Hilbert curve"
                   + (f" and numbering {id_col_name} in that order" if needs_id else ""))
             query = spatial_order_query(
                 f"SELECT {cols_expr} FROM read_parquet('{read_url}')", geom_name,
-                id_col_name if needs_id else None, geographic=False)
+                id_col_name if needs_id else None, geographic=geographic)
         elif needs_id:
             query = f"""
             SELECT
@@ -1410,7 +1478,7 @@ def process_parquet_input(
                     print(f"  Writing to temporary file: {tmp_path}")
 
                 rows_written = write_with_duckdb(query, tmp_path, compression, compression_level,
-                                row_group_size, verbose)
+                                row_group_size, verbose, split_dateline=split_dateline)
                 # Checked before the upload, so a short read never reaches the
                 # bucket to be consumed by anything downstream (issue #186).
                 _report_row_count(rows_written, expect_features)
@@ -1424,7 +1492,7 @@ def process_parquet_input(
         else:
             # Write directly to destination
             rows_written = write_with_duckdb(query, destination, compression, compression_level,
-                            row_group_size, verbose)
+                            row_group_size, verbose, split_dateline=split_dateline)
             _report_row_count(rows_written, expect_features)
 
         print("✓ Parquet processing completed successfully!")
