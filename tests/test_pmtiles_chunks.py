@@ -192,7 +192,7 @@ def lines_parquet(tmp_path):
                ST_GeomFromText('LINESTRING(' || (
                    SELECT string_agg((i + j / 1000.0)::VARCHAR || ' ' || (sin(j) / 1e4)::VARCHAR, ',')
                    FROM range(200) t(j)) || ')') AS geom
-        FROM range(30) s(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4)""")
+        FROM range(30) s(i) ORDER BY i) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4)""")
     return path
 
 
@@ -207,8 +207,13 @@ class TestExtractChunk:
         from cng_datasets.vector.pmtiles_chunks import extract_chunk
         out = tmp_path / "c.parquet"
         assert extract_chunk(str(lines_parquet), str(out), n_chunks=3, index=1) == 10
+        import duckdb
+        # Rows 10..19 of the file, in the file's own order.
+        expected = [r[0] for r in duckdb.sql(
+            f"SELECT _cng_fid FROM read_parquet('{lines_parquet}', file_row_number = true) "
+            f"WHERE file_row_number BETWEEN 10 AND 19 ORDER BY file_row_number").fetchall()]
         rows = self._read(out)
-        assert [r[0] for r in rows] == list(range(10, 20))
+        assert [r[0] for r in rows] == expected
         assert all(n == 200 for _, n in rows)
 
     def test_simplify_drops_vertices_but_keeps_features(self, lines_parquet, tmp_path):
@@ -221,7 +226,8 @@ class TestExtractChunk:
     def test_an_empty_range_writes_nothing(self, lines_parquet, tmp_path):
         from cng_datasets.vector.pmtiles_chunks import extract_chunk
         out = tmp_path / "e.parquet"
-        assert extract_chunk(str(lines_parquet), str(out), n_chunks=40, index=1) == 0
+        # 30 rows in 40 chunks: index 0 is rows 0..0, an empty range.
+        assert extract_chunk(str(lines_parquet), str(out), n_chunks=40, index=0) == 0
         assert not out.exists()
 
 
@@ -239,7 +245,7 @@ def _generate(tmpdir, **kwargs):
                               bucket="b", output_dir=tmpdir, **kwargs)
     out = {}
     for path in Path(tmpdir).glob("*.yaml"):
-        out[path.name] = yaml.safe_load(path.read_text())
+        out[path.name] = next(yaml.safe_load_all(path.read_text()))
     return out
 
 
