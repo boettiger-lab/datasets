@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Hex pass 1 no longer fails on a chunk of several very large features** (#329). Pass 1 writes a chunk's cell lists in one parquet COPY, and DuckDB put a whole vector of lists in one page, which is capped at 2 GB. A chunk holding several features of tens of millions of cells each, such as the repeated monuments in the PAD-US combined layer, failed with "uncompressed page size out of range". Pass 1 now bounds its row groups at 256 MB, which also ends the page.
+
 ## [0.12.5] - 2026-11-17
 
 ### Fixed

@@ -2276,3 +2276,47 @@ class TestPolygonPieces:
             assert cut == whole
             assert len(cut) == len(set(cut))
             assert sum(1 for r in cut if r[0] == 2) == 1
+
+
+class TestPass1RowGroups:
+    """Issue #329: pass 1 wrote all of a chunk's cell lists in one parquet page
+    when the row group was not cut first, and a page over 2 GB failed. The row
+    group is now bounded in bytes. Shrinking the bound makes a small fixture
+    take the path a multi-GB chunk does."""
+
+    @pytest.mark.timeout(120)
+    def test_cell_lists_span_row_groups_and_all_reach_pass_2(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('AWS_ACCESS_KEY_ID', '')
+        monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', '')
+        from cng_datasets.vector import h3_tiling
+        monkeypatch.setattr(h3_tiling, "_PIECE_MAX_CELLS", 1_000)
+        monkeypatch.setattr(h3_tiling, "_PASS1_ROW_GROUP_BYTES", "64KB")
+        box = "POLYGON((10 44, 11 44, 11 45, 10 45, 10 44))"
+        src = tmp_path / "in.parquet"
+        con = setup_duckdb_connection()
+        con.execute(f"""COPY (SELECT i::INTEGER AS id, ST_GeomFromText('{box}') AS geom
+                        FROM range(3) t(i)) TO '{src}' (FORMAT PARQUET)""")
+        whole = set(con.execute(
+            f"SELECT h3_polygon_wkb_to_cells(ST_AsWKB(ST_GeomFromText('{box}')), 8)").fetchone()[0])
+        con.close()
+        out = tmp_path / "out"
+        out.mkdir()
+        processor = H3VectorProcessor(
+            input_url=str(src), output_url=str(out), h3_resolution=8,
+            parent_resolutions=[0], chunk_size=3, intermediate_chunk_size=4)
+        intermediate = processor._process_pass1(0)
+        try:
+            groups, biggest = processor.con.execute(
+                f"SELECT count(DISTINCT row_group_id), max(total_uncompressed_size) "
+                f"FROM parquet_metadata('{intermediate}') WHERE path_in_schema LIKE 'h3id%'"
+            ).fetchone()
+            assert groups > 1
+            assert biggest < 1_000_000
+            output = processor._process_pass2(0, intermediate)
+        finally:
+            os.remove(intermediate)
+        rows = processor.con.execute(
+            f"SELECT id, h8 FROM read_parquet('{output}')").fetchall()
+        processor.con.close()
+        for i in range(3):
+            assert {c for f, c in rows if f == i} == whole
