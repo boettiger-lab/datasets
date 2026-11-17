@@ -2320,3 +2320,63 @@ class TestPass1RowGroups:
         processor.con.close()
         for i in range(3):
             assert {c for f, c in rows if f == i} == whole
+
+
+class TestSplitAt180:
+    """Issue #328: a feature already split at the antimeridian, with parts that
+    end exactly on -180 and +180, is what convert writes (#274, #322). With few
+    vertices away from +-180 it left a > 180-deg gap round 0 and was taken for
+    a crosser, so H3 read its edges the short way and filled one cell. It is
+    band-split now. The truth is the feature cut into four 90-deg strips, each
+    filled on its own."""
+
+    _STRIPS = [(-180, -90), (-90, 0), (0, 90), (90, 180)]
+
+    @staticmethod
+    def _fill(con, wkt, res):
+        con.execute(f"CREATE OR REPLACE TABLE t AS SELECT 1 AS id, ST_GeomFromText('{wkt}') AS geom")
+        sql = geom_to_h3_cells(con, "t", zoom=res, keep_cols=["id"])
+        return {r[0] for r in con.execute(f"SELECT DISTINCT UNNEST(h3id) FROM ({sql})").fetchall()}
+
+    def _truth(self, con, wkt, res):
+        cells = set()
+        for lo, hi in self._STRIPS:
+            parts = con.execute(f"""
+                SELECT ST_AsText(UNNEST(ST_Dump(ST_Intersection(
+                    ST_GeomFromText('{wkt}'), ST_MakeEnvelope({lo}, -90, {hi}, 90)))).geom)
+            """).fetchall()
+            for (part,) in parts:
+                if part.startswith("POLYGON") and not part.endswith("EMPTY"):
+                    cells |= set(con.execute(
+                        f"SELECT h3_polygon_wkt_to_cells('{part}', {res})").fetchone()[0])
+        return cells
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("wkt, res", [
+        ("POLYGON((-180 -78,-100 -78,100 -78,180 -78,180 -50,100 -50,-100 -50,-180 -50,-180 -78))", 3),
+        ("POLYGON((-180 -78,-170 -78,170 -78,180 -78,180 -50,170 -50,-170 -50,-180 -50,-180 -78))", 3),
+        ("POLYGON((-180 80,-100 80,100 80,180 80,180 90,-180 90,-180 80))", 3),
+        ("POLYGON((-180 -78,180 -78,180 -50,-180 -50,-180 -78))", 3),
+        ("MULTIPOLYGON(((170 50,180 50,180 55,170 55,170 50)),"
+         "((-180 50,-170 50,-170 55,-180 55,-180 50)))", 4),
+    ], ids=["band-at-100", "band-at-170", "cap-at-100", "band-dense", "crosser-split-at-180"])
+    def test_split_feature_fills_its_strips(self, wkt, res):
+        con = setup_duckdb_connection()
+        got, truth = self._fill(con, wkt, res), self._truth(con, wkt, res)
+        con.close()
+        assert len(truth) > 100
+        assert got == truth
+
+    @pytest.mark.timeout(60)
+    def test_a_ring_across_180_with_vertices_on_both_sides_is_still_a_crosser(self):
+        """Written with explicit vertices on -180 and +180, a ring that really
+        runs across 180 doubles back on itself in the plane. It is invalid
+        there, so it stays a crosser and fills the short way."""
+        ring = ("POLYGON((170 50,180 50,-180 50,-170 50,-170 55,"
+                "-180 55,180 55,170 55,170 50))")
+        split = ("MULTIPOLYGON(((170 50,180 50,180 55,170 55,170 50)),"
+                 "((-180 50,-170 50,-170 55,-180 55,-180 50)))")
+        con = setup_duckdb_connection()
+        got, truth = self._fill(con, ring, 4), self._truth(con, split, 4)
+        con.close()
+        assert got == truth

@@ -197,6 +197,29 @@ _TRANSMERIDIAN_BANDS = [(-180, -90), (-90, 0), (0, 90), (90, 180)]
 _DEG2_TO_M2 = 111_320.0 ** 2
 
 
+def _lons_sql(geom_expr: str) -> str:
+    """SQL for the list of a geometry's vertex longitudes."""
+    return f"list_transform(ST_Dump(ST_Points({geom_expr})), lambda s: ST_X(s.geom))"
+
+
+def _split_at_180_sql(geom_expr: str) -> str:
+    """SQL predicate: is this feature already split at the antimeridian?
+
+    Convert's split (#274) and its pole closure (#322) write a feature as
+    planar parts that end exactly on -180 and +180, the GeoParquet convention.
+    Read planarly such a feature is valid, and the plane is what it means, so
+    it is band-split like any wide feature (#328). A ring that really runs
+    across 180, even one written with explicit vertices on both -180 and +180,
+    doubles back on itself when read planarly and is invalid, so it stays a
+    crosser for H3 to fill the short way.
+    """
+    lons = _lons_sql(geom_expr)
+    return (
+        f"(list_contains({lons}, -180.0) AND list_contains({lons}, 180.0) "
+        f"AND ST_IsValid({geom_expr}))"
+    )
+
+
 def _lon_gap_sql(geom_expr: str) -> str:
     """SQL for the vertex-free longitude gap that spans the prime meridian.
 
@@ -212,7 +235,7 @@ def _lon_gap_sql(geom_expr: str) -> str:
     POLYGON((-180 -78, 180 -78, 180 -50, -180 -50, -180 -78)), whose remaining
     vertex set is empty (NULL gap), so it is still band-split.
     """
-    lons = f"list_transform(ST_Dump(ST_Points({geom_expr})), lambda s: ST_X(s.geom))"
+    lons = _lons_sql(geom_expr)
     return (
         f"(list_min(list_filter({lons}, lambda x: x >= 0 AND x < 180)) "
         f"- list_max(list_filter({lons}, lambda x: x < 0 AND x > -180)))"
@@ -230,13 +253,17 @@ def _dateline_crosser_sql(geom_expr: str) -> str:
 
     Checked against ``public-high-seas/rfmo/rfb`` (the #145 layer): CCAMLR, IWC,
     ACAP and CCSBT are circumpolar and still split; IPHC (288-deg gap) and APFIC
-    (237-deg gap) are crossers and left to H3. The vertex list is built only for
+    (237-deg gap) are crossers and left to H3. A feature already split at 180
+    is not a crosser, however few its vertices (see _split_at_180_sql, #328):
+    a band whose only other vertices are at +-100 leaves a 200-deg gap, but it
+    runs through 0. The vertex list is built only for
     rows already wider than the span threshold, since DuckDB evaluates a CASE
     branch on just the rows that select it.
     """
     return f"""COALESCE(
         CASE WHEN ST_XMax({geom_expr}) - ST_XMin({geom_expr}) > {_TRANSMERIDIAN_MAX_SPAN_DEG}
              THEN {_lon_gap_sql(geom_expr)} > {_TRANSMERIDIAN_MAX_SPAN_DEG}
+                  AND NOT {_split_at_180_sql(geom_expr)}
              ELSE FALSE
         END, FALSE)"""
 
