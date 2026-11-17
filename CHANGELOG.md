@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Chunked PMTiles for very large vector datasets** (#83). `workflow --pmtiles-chunks N` builds PMTiles in N parallel parts plus one low-zoom overview, merged with `tile-join`, instead of in one pod whose GeoJSONSeq outgrew its disk at tens of millions of features (NWI, 38M; NFHL, 5.6M). The parts are contiguous row ranges of the converted GeoParquet, which convert writes in Hilbert order, and build zooms from `--pmtiles-split-zoom` (default 7) up. The overview builds the zooms below from the whole dataset, simplified to half a pixel. The merge passes `tile-join -pk`: without it, tile-join silently drops a merged tile over 500 KB and exits 0, which lost two z5 tiles on a test fixture. The new `cng-datasets pmtiles-check` reads every tile's size from a PMTiles directory and reports the tiles over the limit, and the merge runs it. The single pod stays the default.
+
 ## [0.12.7] - 2026-11-17
 
 ### Fixed

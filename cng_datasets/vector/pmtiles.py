@@ -136,3 +136,114 @@ def pmtiles_table_columns(source: str, layer: Optional[str] = None) -> List[Dict
             if name not in columns:
                 columns[name] = _TIPPECANOE_TYPE_TO_STAC.get(ttype, "string")
     return [{"name": name, "type": stac_type} for name, stac_type in columns.items()]
+
+
+# --- Tile sizes from the PMTiles directory (issue #83) -----------------------
+#
+# A chunked PMTiles build merges its parts with `tile-join -pk`, which keeps a
+# merged tile even when it exceeds tippecanoe's 500 KB limit. Without -pk,
+# tile-join silently drops such a tile and still exits 0. Keeping it means no
+# features are lost, but an oversized tile is slow to render, so the merge step
+# reads every tile's size from the archive's directories and reports the ones
+# over the limit. Only the directories are read, never the tile data.
+
+_ROOT_DIR_OFFSET_POS = 8     # uint64 LE, then root length at 16
+_LEAF_DIRS_OFFSET_POS = 40   # uint64 LE
+_TILE_DATA_OFFSET_POS = 56   # uint64 LE
+
+#: tippecanoe's and tile-join's default maximum tile size in bytes.
+TILE_SIZE_LIMIT = 500_000
+
+
+def _read_varint(buf: bytes, pos: int):
+    value = shift = 0
+    while True:
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def _decode_directory(buf: bytes) -> List[tuple]:
+    """Decode one PMTiles v3 directory into (tile_id, run_length, offset, length)."""
+    n, pos = _read_varint(buf, 0)
+    tile_ids, run_lengths, lengths, offsets = [], [], [], []
+    last = 0
+    for _ in range(n):
+        delta, pos = _read_varint(buf, pos)
+        last += delta
+        tile_ids.append(last)
+    for _ in range(n):
+        value, pos = _read_varint(buf, pos)
+        run_lengths.append(value)
+    for _ in range(n):
+        value, pos = _read_varint(buf, pos)
+        lengths.append(value)
+    for i in range(n):
+        value, pos = _read_varint(buf, pos)
+        # 0 means "directly after the previous entry"; otherwise offset + 1.
+        offsets.append(offsets[i - 1] + lengths[i - 1] if value == 0 and i > 0 else value - 1)
+    return list(zip(tile_ids, run_lengths, offsets, lengths))
+
+
+def tile_zoom(tile_id: int) -> int:
+    """Zoom level of a PMTiles tile id (ids count up through z0, z1, ... in order)."""
+    zoom, first = 0, 0
+    while tile_id >= first + 4 ** zoom:
+        first += 4 ** zoom
+        zoom += 1
+    return zoom
+
+
+def iter_tile_sizes(source: str):
+    """Yield ``(tile_id, run_length, length)`` for every tile entry in *source*.
+
+    Walks the root directory and every leaf directory. *length* is the stored
+    (compressed) size of the tile, which is what the 500 KB limit applies to.
+    """
+    header = _read_range(source, 0, _PMTILES_HEADER_LEN)
+    if header[:7] != b"PMTiles" or header[7] != 3:
+        raise ValueError(f"{source!r} is not a PMTiles v3 archive.")
+    root_offset, root_length = struct.unpack_from("<QQ", header, _ROOT_DIR_OFFSET_POS)
+    leaf_base = struct.unpack_from("<Q", header, _LEAF_DIRS_OFFSET_POS)[0]
+    compression = header[_INTERNAL_COMPRESSION_POS]
+
+    def read_dir(offset: int, length: int):
+        blob = _read_range(source, offset, length)
+        if compression == 2:
+            blob = gzip.decompress(blob)
+        elif compression != 1:
+            raise ValueError(f"{source!r} uses internal compression {compression}; "
+                             f"only none(1) and gzip(2) are supported.")
+        return _decode_directory(blob)
+
+    stack = [(root_offset, root_length)]
+    while stack:
+        for tile_id, run_length, offset, length in read_dir(*stack.pop()):
+            if run_length == 0:          # a leaf directory, not a tile
+                stack.append((leaf_base + offset, length))
+            else:
+                yield tile_id, run_length, length
+
+
+def oversized_tiles(source: str, limit: int = TILE_SIZE_LIMIT) -> Dict[str, object]:
+    """Summarise the tiles in *source* over *limit* bytes, by zoom.
+
+    Returns ``{"tiles": <tile entries>, "oversized": <count>,
+    "by_zoom": {zoom: count}, "largest": (tile_id, zoom, bytes) or None}``.
+    """
+    total = over = 0
+    by_zoom: Dict[int, int] = {}
+    largest = None
+    for tile_id, run_length, length in iter_tile_sizes(source):
+        total += run_length
+        if length > limit:
+            zoom = tile_zoom(tile_id)
+            over += run_length
+            by_zoom[zoom] = by_zoom.get(zoom, 0) + run_length
+            if largest is None or length > largest[2]:
+                largest = (tile_id, zoom, length)
+    return {"tiles": total, "oversized": over,
+            "by_zoom": dict(sorted(by_zoom.items())), "largest": largest}

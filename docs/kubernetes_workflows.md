@@ -26,6 +26,22 @@ The steps all call the same Python functions documented in the [API reference](a
 | `workflow-rbac.yaml` | ServiceAccount, Role and RoleBinding, shared by every workflow in a namespace |
 | `workflow.yaml` | Orchestrator Job: setup-bucket → convert → plan → (pmtiles ∥ hex) → repartition |
 
+### Large vector datasets: chunked PMTiles
+
+The PMTiles step runs in one pod by default. It writes the whole dataset as GeoJSONSeq to local disk and tiles it with one tippecanoe, which stops working at tens of millions of features: the intermediate outgrows the pod's disk and tippecanoe runs for hours. `--pmtiles-chunks N` replaces it with three jobs (#83):
+
+| File | Purpose |
+|------|---------|
+| `<name>-pmtiles-parts.yaml` | Indexed Job. Pod *i* tiles the *i*-th of N contiguous row ranges at zooms `--pmtiles-split-zoom` (default 7) and up |
+| `<name>-pmtiles-overview.yaml` | One pod tiles every zoom below the split zoom from the whole dataset, simplified to half a pixel at its top zoom |
+| `<name>-pmtiles-merge.yaml` | `tile-join -pk` of the overview and the parts, after both finish |
+
+Convert writes rows in Hilbert order, so each row range is a compact patch of the map and the parts seldom share a tile. The low zooms, where every part would land in the same few tiles, come from the overview instead. The merge refuses to run unless every part and the overview are present.
+
+The merge passes `-pk` on purpose. Without it, `tile-join` drops any merged tile over 500 KB, features and all, and still exits 0. With it, such a tile is kept whole, and the merge's `cng-datasets pmtiles-check` step reports how many tiles are over the limit and at which zooms. If it reports any, raise `--pmtiles-split-zoom` or use fewer chunks. `--pmtiles-storage` sets each pod's ephemeral storage (default 50Gi).
+
+Inputs with `--no-spatial-order` still work, but their row ranges are not compact, so neighbouring parts overlap more and oversized tiles are more likely.
+
 The plan step runs only when chunks are planned by cells (the default). With `--chunk-size` the hex Job is cut into a fixed number of features per chunk and there is no plan step. When there is a plan, the hex manifest holds only an upper bound on completions and the orchestrator resizes it to the plan, so always apply the hex step through `workflow.yaml` rather than on its own.
 
 ### Raster and mdim pipelines

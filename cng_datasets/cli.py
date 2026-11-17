@@ -374,6 +374,16 @@ def main():
                                       "hex job when the source can't be counted from here "
                                       "(e.g. not uploaded yet); without it, an uncountable "
                                       "source is an error")
+    workflow_parser.add_argument("--pmtiles-chunks", type=int, default=None, metavar="N",
+                                 help="Build PMTiles in N parallel parts plus a low-zoom overview, merged "
+                                      "with tile-join, instead of in one pod (#83). For datasets whose "
+                                      "single-pod GeoJSONSeq outgrows the pod's disk or whose tippecanoe "
+                                      "runs for hours (tens of millions of features). Default: one pod.")
+    workflow_parser.add_argument("--pmtiles-split-zoom", type=int, default=None, metavar="Z",
+                                 help="With --pmtiles-chunks: the first zoom the parts build; the overview "
+                                      "builds every zoom below it (default 7)")
+    workflow_parser.add_argument("--pmtiles-storage", type=str, default="50Gi",
+                                 help="With --pmtiles-chunks: ephemeral storage per PMTiles pod (default: 50Gi)")
     workflow_parser.add_argument("--backend", choices=["k8s", "armada"], default="k8s", help="Job backend: 'k8s' for standard Kubernetes Jobs (default), 'armada' for Armada queue submission")
     workflow_parser.add_argument("--armada-queue", default=None, metavar="QUEUE", help="Armada queue when --backend armada/auto. Defaults to --namespace: NRP maps queues one-to-one onto namespaces, but they are separate fields in a job set, so set this to submit to a queue that is not named after the namespace the pods land in.")
     workflow_parser.add_argument("--armada-priority-class", default=None, metavar="CLASS", help="Armada priority class when --backend armada: a shorthand ('default', 'preemptible', 'high') or a literal class name. Default is non-preemptible 'armada-default' — preempted Armada jobs are not rescheduled and k8s Job-level retry settings do not survive conversion")
@@ -534,6 +544,24 @@ def main():
     pmtiles_cols_parser.add_argument("--layer", default=None, help="Restrict to a single vector layer id")
     pmtiles_cols_parser.add_argument("--full-metadata", action="store_true",
                                      help="Print the full PMTiles metadata JSON instead of table:columns")
+
+    # Chunked PMTiles (issue #83): one row range of the converted GeoParquet
+    chunk_pm_parser = subparsers.add_parser(
+        "pmtiles-chunk",
+        help="Write one row range of a GeoParquet to a local parquet for tippecanoe (#83)")
+    chunk_pm_parser.add_argument("--input", required=True, help="The converted GeoParquet")
+    chunk_pm_parser.add_argument("--output", required=True, help="Local parquet to write (not written for an empty range)")
+    chunk_pm_parser.add_argument("--chunks", type=int, default=1, help="How many row ranges the file is cut into")
+    chunk_pm_parser.add_argument("--index", type=int, default=0, help="Which range to write (0-based)")
+    chunk_pm_parser.add_argument("--simplify", type=float, default=None, metavar="TOL",
+                                 help="Simplify geometry to this tolerance in its own units (the overview pod)")
+
+    check_pm_parser = subparsers.add_parser(
+        "pmtiles-check",
+        help="Report PMTiles tiles over the 500 KB tile size limit (#83)")
+    check_pm_parser.add_argument("source", help="Path / http(s):// / s3:// to a .pmtiles archive")
+    check_pm_parser.add_argument("--limit", type=int, default=None, metavar="BYTES",
+                                 help="Tile size limit in bytes (default 500000, tippecanoe's)")
 
     args = parser.parse_args()
 
@@ -846,6 +874,9 @@ def _dispatch(args):
             hex_storage=args.hex_storage,
             repartition_storage=args.repartition_storage,
             repartition_memory=args.repartition_memory,
+            pmtiles_chunks=args.pmtiles_chunks,
+            pmtiles_split_zoom=args.pmtiles_split_zoom,
+            pmtiles_storage=args.pmtiles_storage,
             profile=args.profile,
             s3_endpoint=args.s3_endpoint,
             s3_public_endpoint=args.s3_public_endpoint,
@@ -948,6 +979,24 @@ def _dispatch(args):
                 print(json.dumps(results, indent=2))
 
             sys.exit(0 if success else 1)
+
+    elif args.command == "pmtiles-chunk":
+        from .vector.pmtiles_chunks import extract_chunk
+        extract_chunk(args.input, args.output, n_chunks=args.chunks, index=args.index,
+                      simplify=args.simplify)
+
+    elif args.command == "pmtiles-check":
+        from .vector.pmtiles import oversized_tiles, TILE_SIZE_LIMIT
+        limit = args.limit or TILE_SIZE_LIMIT
+        report = oversized_tiles(args.source, limit=limit)
+        print(f"{report['tiles']:,} tiles; {report['oversized']:,} over {limit:,} bytes")
+        if report["oversized"]:
+            zooms = ", ".join(f"z{z}: {n:,}" for z, n in report["by_zoom"].items())
+            tile_id, zoom, size = report["largest"]
+            print(f"  ⚠ oversized tiles by zoom: {zooms}")
+            print(f"  ⚠ largest: tile id {tile_id} at z{zoom}, {size:,} bytes. These tiles are "
+                  f"kept whole, so no features are lost, but they render slowly. Raise "
+                  f"--pmtiles-split-zoom or use fewer --pmtiles-chunks.")
 
     elif args.command == "pmtiles-columns":
         from .vector.pmtiles import read_pmtiles_metadata, pmtiles_table_columns

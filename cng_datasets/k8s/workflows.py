@@ -863,6 +863,9 @@ def generate_dataset_workflow(
     spatial_order: bool = True,
     csv_sample_size: Optional[int] = None,
     pmtiles_max_zoom: Optional[int] = None,
+    pmtiles_chunks: Optional[int] = None,
+    pmtiles_split_zoom: Optional[int] = None,
+    pmtiles_storage: str = "50Gi",
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
     armada_queue: Optional[str] = None,
@@ -951,6 +954,13 @@ def generate_dataset_workflow(
             at this budget (never more than the fixed rule's features per
             chunk), and the workflow sizes the hex Job to the plan (#124).
         intermediate_chunk_size: Number of rows to process in pass 2 (unnesting arrays) - reduce if hitting OOM (default: 10)
+        pmtiles_chunks: Build PMTiles in this many parallel parts plus a
+            low-zoom overview, merged with tile-join, instead of in one pod
+            (#83). None (the default) keeps the single pod.
+        pmtiles_split_zoom: With pmtiles_chunks, the first zoom the parts
+            build; the overview builds every zoom below it (default 7).
+        pmtiles_storage: With pmtiles_chunks, ephemeral storage for each
+            PMTiles pod (default 50Gi, the house norm).
         source_url: (Deprecated) Use source_urls instead. Kept for backwards compatibility.
     """
     # Handle backwards compatibility for source_url parameter
@@ -1064,8 +1074,22 @@ def generate_dataset_workflow(
     # Generate conversion job
     _generate_convert_job(manager, k8s_name, source_urls, bucket, output_path, git_repo, layer, memory=convert_memory or hex_memory, row_group_size=row_group_size, s3_dataset=dataset_name, config=config, simplify_tolerance=simplify_tolerance, trim_strings=trim_strings, lat_column=lat_column, lon_column=lon_column, expect_features=expect_features, spatial_order=spatial_order, csv_sample_size=csv_sample_size)
 
-    # Generate pmtiles job (uses converted parquet, not source)
-    _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config, h3_resolution=h3_resolution, max_zoom=pmtiles_max_zoom)
+    # Generate pmtiles job(s) (uses converted parquet, not source)
+    if pmtiles_chunks is not None:
+        if pmtiles_chunks > max_completions:
+            raise ValueError(
+                f"--pmtiles-chunks {pmtiles_chunks} is past --max-completions "
+                f"{max_completions}, the per-Job completions guideline.")
+        _generate_pmtiles_chunked_jobs(
+            manager, k8s_name, bucket, output_path, chunks=pmtiles_chunks,
+            parallelism=min(pmtiles_chunks, max_parallelism), memory=hex_memory,
+            storage=pmtiles_storage, s3_dataset=dataset_name, config=config,
+            h3_resolution=h3_resolution, max_zoom=pmtiles_max_zoom,
+            split_zoom=pmtiles_split_zoom)
+    else:
+        if pmtiles_split_zoom is not None:
+            raise ValueError("--pmtiles-split-zoom applies only with --pmtiles-chunks.")
+        _generate_pmtiles_job(manager, k8s_name, None, bucket, output_path, git_repo, memory=hex_memory, s3_dataset=dataset_name, config=config, h3_resolution=h3_resolution, max_zoom=pmtiles_max_zoom)
 
     print(f"  H3 resolution: {h3_resolution}")
     print(f"  Parent resolutions: {parent_resolutions}")
@@ -1107,7 +1131,8 @@ def generate_dataset_workflow(
 
     # Generate Argo workflow with ConfigMap-based approach
     _generate_argo_workflow(k8s_name, namespace, output_path, output_dir,
-                            planned=planned, max_parallelism=max_parallelism)
+                            planned=planned, max_parallelism=max_parallelism,
+                            pmtiles_chunked=pmtiles_chunks is not None)
 
     if backend == "armada":
         armada_files = convert_workflow_to_armada(
@@ -1129,7 +1154,8 @@ def generate_dataset_workflow(
         for f in armada_files:
             print(f"  - {Path(f).name}")
         print("\nTo run (submit each step in order):")
-        steps = ["setup-bucket", "convert", "plan", "pmtiles", "hex", "repartition"]
+        steps = ["setup-bucket", "convert", "plan", "pmtiles", "pmtiles-parts",
+                 "pmtiles-overview", "hex", "repartition", "pmtiles-merge"]
         for step in steps:
             armada_file = output_path / f"armada-{k8s_name}-{step}.yaml"
             if armada_file.exists():
@@ -1142,7 +1168,12 @@ def generate_dataset_workflow(
         print(f"  - {k8s_name}-convert.yaml")
         if planned:
             print(f"  - {k8s_name}-plan.yaml")
-        print(f"  - {k8s_name}-pmtiles.yaml")
+        if pmtiles_chunks is not None:
+            print(f"  - {k8s_name}-pmtiles-parts.yaml")
+            print(f"  - {k8s_name}-pmtiles-overview.yaml")
+            print(f"  - {k8s_name}-pmtiles-merge.yaml")
+        else:
+            print(f"  - {k8s_name}-pmtiles.yaml")
         print(f"  - {k8s_name}-hex.yaml" + (" (upper bound; the workflow sizes it to the plan)" if planned else ""))
         print(f"  - {k8s_name}-repartition.yaml")
         print("  - workflow-rbac.yaml (generic, reusable)")
@@ -2610,6 +2641,28 @@ def _pmtiles_max_zoom(h3_resolution: Optional[int], max_zoom: Optional[int]) -> 
     return 13  # default matches res-10
 
 
+# Shell that prepares the environment for tippecanoe, shared by the single-pod
+# PMTiles job and the chunked parts and overview (#83).
+_TIPPECANOE_SETUP_SH = """# TIPPECANOE_MAX_THREADS must be a power of 2; Kubernetes nodes can expose
+# non-power-of-2 logical CPU counts which triggers an internal assertion
+# failure "N shards not a power of 2" (felt/tippecanoe#216).
+# Size from the pod's cgroup CPU quota, not os.cpu_count() (the node's cores),
+# round down to a power of 2, and cap at 128: at 256+ threads tippecanoe caps
+# its shards at 745, not a power of 2, and aborts anyway (issue #273).
+# Must be `export`ed: tippecanoe is a child process and reads this from the
+# environment, not the shell. A plain assignment is invisible to it, so it
+# falls back to the raw (non-power-of-2) CPU count and crashes (issue #77).
+export TIPPECANOE_MAX_THREADS=$(python3 -c "from cng_datasets.raster.cog import _cgroup_cpu_count as c; n=min(c() or 4, 128); print(1<<(n.bit_length()-1))")
+
+# Raise the soft open-file limit before tippecanoe (issue #154). It opens many
+# temp files (per-thread x per-tile shards); on high-core nodes os.cpu_count()
+# reports the node's full core count, so the thread/shard count blows past the
+# container's default soft nofile limit (often 1024) and aborts with
+# "Too many open files". `|| true` keeps going if the limit can't be raised.
+ulimit -n 65536 || true
+"""
+
+
 def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path, git_repo, memory="8Gi", s3_dataset=None, config: ClusterConfig = None, h3_resolution: Optional[int] = None, max_zoom: Optional[int] = None):
     """Generate PMTiles job.
 
@@ -2649,24 +2702,7 @@ def _generate_pmtiles_job(manager, dataset_name, source_url, bucket, output_path
 ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$DATASET.geojsonl /vsicurl/{geoparquet_url} -progress
 
 # Generate PMTiles from GeoJSONSeq
-# TIPPECANOE_MAX_THREADS must be a power of 2; Kubernetes nodes can expose
-# non-power-of-2 logical CPU counts which triggers an internal assertion
-# failure "N shards not a power of 2" (felt/tippecanoe#216).
-# Size from the pod's cgroup CPU quota, not os.cpu_count() (the node's cores),
-# round down to a power of 2, and cap at 128: at 256+ threads tippecanoe caps
-# its shards at 745, not a power of 2, and aborts anyway (issue #273).
-# Must be `export`ed: tippecanoe is a child process and reads this from the
-# environment, not the shell. A plain assignment is invisible to it, so it
-# falls back to the raw (non-power-of-2) CPU count and crashes (issue #77).
-export TIPPECANOE_MAX_THREADS=$(python3 -c "from cng_datasets.raster.cog import _cgroup_cpu_count as c; n=min(c() or 4, 128); print(1<<(n.bit_length()-1))")
-
-# Raise the soft open-file limit before tippecanoe (issue #154). It opens many
-# temp files (per-thread x per-tile shards); on high-core nodes os.cpu_count()
-# reports the node's full core count, so the thread/shard count blows past the
-# container's default soft nofile limit (often 1024) and aborts with
-# "Too many open files". `|| true` keeps going if the limit can't be raised.
-ulimit -n 65536 || true
-# -r1: keep every point at every zoom (issue #319). Without it tippecanoe thins
+{_TIPPECANOE_SETUP_SH}# -r1: keep every point at every zoom (issue #319). Without it tippecanoe thins
 # points 2.5x per zoom below the max zoom, so a national view of 1,733 points
 # showed 1 at z0 and 97 at z6. The rate applies only to points, so lines and
 # polygons tile identically; --drop-densest-as-needed still bounds tile size.
@@ -2702,6 +2738,168 @@ rm /tmp/$DATASET.geojsonl /tmp/$DATASET.pmtiles
         }
     }
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-pmtiles.yaml"))
+
+
+def _generate_pmtiles_chunked_jobs(manager, dataset_name, bucket, output_path, chunks: int,
+                                   parallelism: int, memory="8Gi", storage="50Gi",
+                                   s3_dataset=None, config: ClusterConfig = None,
+                                   h3_resolution: Optional[int] = None,
+                                   max_zoom: Optional[int] = None,
+                                   split_zoom: Optional[int] = None,
+                                   retries: int = DEFAULT_HEX_RETRIES):
+    """Generate the three jobs of a chunked PMTiles build (#83).
+
+    * ``<name>-pmtiles-parts``: an indexed Job. Pod *i* tiles the *i*-th of
+      *chunks* contiguous row ranges of the converted GeoParquet at zooms
+      ``split_zoom`` and up. Convert writes rows in Hilbert order (#276), so
+      each range is a compact patch of the map.
+    * ``<name>-pmtiles-overview``: one pod tiles every zoom below
+      ``split_zoom`` from the whole dataset, simplified to half a pixel at its
+      highest zoom so its disk stays bounded.
+    * ``<name>-pmtiles-merge``: ``tile-join -pk`` of the overview and the parts.
+
+    The merge passes ``-pk``. Without it, tile-join drops a merged tile over
+    500 KB, printing one stderr line and exiting 0, which on a fixture lost two
+    z5 tiles (measured on #83). Kept whole, such a tile loses no features; the
+    merge reports any with ``pmtiles-check`` instead. Every part leaves a
+    marker (its tiles, or ``.empty`` for an empty range), and the merge refuses
+    to run unless all *chunks* markers are there.
+    """
+    from ..vector.pmtiles_chunks import DEFAULT_SPLIT_ZOOM, overview_tolerance
+
+    if config is None:
+        config = ClusterConfig()
+    s3_dataset = s3_dataset or dataset_name
+    split_zoom = DEFAULT_SPLIT_ZOOM if split_zoom is None else split_zoom
+    top_zoom = _pmtiles_max_zoom(h3_resolution, max_zoom)
+    if not 1 <= split_zoom <= top_zoom:
+        raise ValueError(
+            f"--pmtiles-split-zoom {split_zoom} must be between 1 and the max zoom "
+            f"{top_zoom}: the overview builds z0..{split_zoom - 1} and the parts "
+            f"z{split_zoom}..z{top_zoom}.")
+    if chunks < 1:
+        raise ValueError(f"--pmtiles-chunks must be at least 1, got {chunks}")
+
+    input_url = f"s3://{bucket}/{s3_dataset}.parquet"
+    parts_dir = f"{config.rclone_remote}:{bucket}/{s3_dataset}/pmtiles-parts"
+    s3_parent_dir = ('/'.join(s3_dataset.split('/')[:-1]) + '/') if '/' in s3_dataset else ''
+    s3_basename = s3_dataset.split('/')[-1]
+    tippecanoe_flags = "-l $DATASET -r1 --coalesce-densest-as-needed --drop-densest-as-needed --force"
+
+    def pod_spec(name, script):
+        spec = {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": name,
+                "image": "ghcr.io/boettiger-lab/datasets:latest",
+                "imagePullPolicy": "Always",
+                "env": _s3_env_vars(config) + [
+                    {"name": "TMPDIR", "value": "/tmp"},
+                    {"name": "BUCKET", "value": bucket},
+                    {"name": "DATASET", "value": s3_basename},
+                    {"name": "DUCKDB_MEMORY_LIMIT", "value": _duckdb_memory_limit(memory)},
+                ],
+                "volumeMounts": [
+                    {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
+                ],
+                "command": ["bash", "-c", script],
+                "resources": {
+                    "requests": {"cpu": "4", "memory": memory, "ephemeral-storage": storage},
+                    "limits": {"cpu": "4", "memory": memory, "ephemeral-storage": storage},
+                },
+            }],
+            "volumes": [
+                {"name": "rclone-config", "secret": {"secretName": config.rclone_secret_name}}
+            ],
+        }
+        _apply_scheduling(spec, config)
+        return spec
+
+    def job(suffix, spec, **extra):
+        return {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": _job_metadata(manager, f"{dataset_name}-{suffix}"),
+            "spec": {
+                **extra,
+                "ttlSecondsAfterFinished": 10800,
+                "template": {
+                    "metadata": {"labels": {"k8s-app": f"{dataset_name}-{suffix}"}},
+                    "spec": spec,
+                },
+            },
+        }
+
+    parts_script = f"""set -eo pipefail
+PART=part-$(printf %05d $JOB_COMPLETION_INDEX)
+# Leave no stale marker from an earlier attempt of this index.
+rclone deletefile {parts_dir}/$PART.empty 2>/dev/null || true
+cng-datasets pmtiles-chunk --input {input_url} --output /tmp/$PART.parquet \\
+  --chunks {chunks} --index $JOB_COMPLETION_INDEX
+if [ ! -f /tmp/$PART.parquet ]; then
+  # More chunks than rows: record that this index ran and had nothing to tile.
+  touch /tmp/$PART.empty
+  rclone copyto /tmp/$PART.empty {parts_dir}/$PART.empty
+  exit 0
+fi
+ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /tmp/$PART.geojsonl /tmp/$PART.parquet
+rm /tmp/$PART.parquet
+{_TIPPECANOE_SETUP_SH}# -r1 and the drop flags match the single-pod job (#319). -Z: the parts build
+# only the high zooms; the overview pod builds the rest (#83).
+tippecanoe -o /tmp/$PART.pmtiles {tippecanoe_flags} -Z {split_zoom} -z {top_zoom} /tmp/$PART.geojsonl
+rclone copyto /tmp/$PART.pmtiles {parts_dir}/$PART.pmtiles
+"""
+    parts = job("pmtiles-parts", pod_spec("pmtiles-part", parts_script),
+                completions=chunks, parallelism=parallelism, completionMode="Indexed",
+                **_indexed_retry_spec(retries, 1),
+                podFailurePolicy={"rules": [{
+                    "action": "Ignore",
+                    "onPodConditions": [{"type": "DisruptionTarget"}]}]})
+    manager.save_job_yaml(parts, str(output_path / f"{dataset_name}-pmtiles-parts.yaml"))
+
+    tolerance = overview_tolerance(split_zoom)
+    overview_script = f"""set -eo pipefail
+# The whole dataset, simplified to half a pixel at z{split_zoom - 1}, so the
+# overview's input and tippecanoe's temporary files stay small (#83).
+cng-datasets pmtiles-chunk --input {input_url} --output /tmp/overview.parquet --simplify {tolerance!r}
+{_TIPPECANOE_SETUP_SH}ogr2ogr -wrapdateline -datelineoffset 15 -f GeoJSONSeq /vsistdout/ /tmp/overview.parquet \\
+  | tippecanoe -o /tmp/overview.pmtiles {tippecanoe_flags} -z {split_zoom - 1}
+rclone copyto /tmp/overview.pmtiles {parts_dir}/overview.pmtiles
+"""
+    overview = job("pmtiles-overview", pod_spec("pmtiles-overview", overview_script),
+                   completions=1, parallelism=1, backoffLimit=retries)
+    manager.save_job_yaml(overview, str(output_path / f"{dataset_name}-pmtiles-overview.yaml"))
+
+    merge_script = f"""set -eo pipefail
+mkdir -p /tmp/parts
+rclone copy {parts_dir}/ /tmp/parts/
+# Every index must have left its tiles or an .empty marker, and the overview
+# must be there; a merge of what happens to be present would publish a map
+# with holes (#83).
+# Only indexes 0..{chunks - 1} are joined, so leftovers of an earlier run cut
+# into a different number of parts cannot slip in.
+MISSING=0
+PARTS=""
+for i in $(seq 0 {chunks - 1}); do
+  P=/tmp/parts/part-$(printf %05d $i)
+  if [ -f $P.pmtiles ]; then PARTS="$PARTS $P.pmtiles"
+  elif [ ! -f $P.empty ]; then echo "✗ missing part $i"; MISSING=$((MISSING + 1)); fi
+done
+if [ ! -f /tmp/parts/overview.pmtiles ]; then echo "✗ missing overview"; MISSING=$((MISSING + 1)); fi
+if [ "$MISSING" -gt 0 ]; then echo "✗ $MISSING of {chunks + 1} PMTiles inputs missing; not merging."; exit 1; fi
+# -pk keeps a merged tile over 500 KB. Without it tile-join drops the tile,
+# features and all, and still exits 0 (#83).
+tile-join -pk --force -o /tmp/$DATASET.pmtiles /tmp/parts/overview.pmtiles $PARTS
+cng-datasets pmtiles-check /tmp/$DATASET.pmtiles
+rclone copy /tmp/$DATASET.pmtiles {config.rclone_remote}:{bucket}/{s3_parent_dir}
+rclone purge {parts_dir}
+"""
+    merge = job("pmtiles-merge", pod_spec("pmtiles-merge", merge_script),
+                completions=1, parallelism=1, backoffLimit=retries)
+    manager.save_job_yaml(merge, str(output_path / f"{dataset_name}-pmtiles-merge.yaml"))
+    print(f"  PMTiles: {chunks} parts at z{split_zoom}-z{top_zoom} "
+          f"(parallelism {parallelism}), overview at z0-z{split_zoom - 1}, "
+          f"merged with tile-join")
 
 
 def _hex_plan_url(bucket: str, s3_dataset: str) -> str:
@@ -2964,7 +3162,7 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     import yaml
 
     # Read all job YAML files
-    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-convert.yaml", f"{dataset_name}-plan.yaml", f"{dataset_name}-pmtiles.yaml", f"{dataset_name}-hex.yaml", f"{dataset_name}-repartition.yaml"]
+    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-convert.yaml", f"{dataset_name}-plan.yaml", f"{dataset_name}-pmtiles.yaml", f"{dataset_name}-pmtiles-parts.yaml", f"{dataset_name}-pmtiles-overview.yaml", f"{dataset_name}-pmtiles-merge.yaml", f"{dataset_name}-hex.yaml", f"{dataset_name}-repartition.yaml"]
     data = {}
 
     for job_file in job_files:
@@ -3032,7 +3230,8 @@ wait_job() {
 
 
 def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir,
-                            planned: bool = False, max_parallelism: int = 50):
+                            planned: bool = False, max_parallelism: int = 50,
+                            pmtiles_chunked: bool = False):
     """Generate K8s Job that orchestrates the workflow using a ConfigMap.
 
     Args:
@@ -3043,6 +3242,9 @@ def _generate_argo_workflow(dataset_name, namespace, output_path, output_dir,
         planned: Run the #124 plan step and size the hex Job from its chunk
             count, rather than applying the hex Job as generated.
         max_parallelism: Cap on the hex Job's parallelism when it is resized.
+        pmtiles_chunked: Run the chunked PMTiles parts and overview beside the
+            hex step, then merge them once both finish (#83), instead of one
+            PMTiles Job left running in the background.
     """
     import yaml
 
@@ -3070,6 +3272,25 @@ kubectl patch --local -f /yamls/{dataset_name}-hex.yaml --type merge \\
 """
     else:
         hex_apply = f"kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}\n"
+
+    if pmtiles_chunked:
+        pmtiles_apply = (f"kubectl apply -f /yamls/{dataset_name}-pmtiles-parts.yaml -n {namespace}\n"
+                         f"kubectl apply -f /yamls/{dataset_name}-pmtiles-overview.yaml -n {namespace}\n")
+        pmtiles_finish = f"""
+echo "Step 4: Merging PMTiles parts..."
+wait_job {dataset_name}-pmtiles-overview {namespace} 172800
+wait_job {dataset_name}-pmtiles-parts {namespace} 172800
+kubectl apply -f /yamls/{dataset_name}-pmtiles-merge.yaml -n {namespace}
+wait_job {dataset_name}-pmtiles-merge {namespace} 14400
+"""
+        pmtiles_jobs = (f"{dataset_name}-pmtiles-parts {dataset_name}-pmtiles-overview "
+                        f"{dataset_name}-pmtiles-merge")
+        pmtiles_note = ""
+    else:
+        pmtiles_apply = f"kubectl apply -f /yamls/{dataset_name}-pmtiles.yaml -n {namespace}\n"
+        pmtiles_finish = ""
+        pmtiles_jobs = f"{dataset_name}-pmtiles"
+        pmtiles_note = 'echo "Note: PMTiles job may still be running in the background"\n'
 
     workflow_job = {
         "apiVersion": "batch/v1",
@@ -3108,8 +3329,7 @@ wait_job {dataset_name}-convert {namespace} 3600
 
 # Step 2: Run pmtiles and hex tiling in parallel (both use the converted geoparquet)
 echo "Step 2: H3 hexagonal tiling and PMTiles generation (parallel)..."
-kubectl apply -f /yamls/{dataset_name}-pmtiles.yaml -n {namespace}
-{hex_apply}
+{pmtiles_apply}{hex_apply}
 echo "Waiting for hex tiling to complete (PMTiles continues in background)..."
 echo "Timeout set to 48 hours (172800s)..."
 wait_job {dataset_name}-hex {namespace} 172800
@@ -3119,12 +3339,11 @@ kubectl apply -f /yamls/{dataset_name}-repartition.yaml -n {namespace}
 
 echo "Waiting for repartition to complete..."
 wait_job {dataset_name}-repartition {namespace} 3600
-
+{pmtiles_finish}
 echo "✓ Workflow complete!"
-echo "Note: PMTiles job may still be running in the background"
-echo ""
+{pmtiles_note}echo ""
 echo "Clean up with:"
-echo "  kubectl delete jobs {dataset_name}-setup-bucket {dataset_name}-convert{' ' + dataset_name + '-plan' if planned else ''} {dataset_name}-pmtiles {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace} --ignore-not-found"
+echo "  kubectl delete jobs {dataset_name}-setup-bucket {dataset_name}-convert{' ' + dataset_name + '-plan' if planned else ''} {pmtiles_jobs} {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace} --ignore-not-found"
 echo "  kubectl delete configmap {configmap_name} -n {namespace}"
 """],
                         "resources": {
