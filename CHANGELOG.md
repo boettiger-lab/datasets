@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Hex fills a feature already split at 180° in full** (#328). A band round the globe or a polar cap whose only vertices away from ±180 were few and far apart, such as a box from -180 to 180, or a feature convert split at 180°, was taken for an antimeridian crosser and handed to H3 whole. H3 read its edges the short way and filled a single cell. A feature with vertices on both -180 and +180 that is valid read flat is now band-split like any other wide feature. A ring that really runs across 180° doubles back on itself read flat, so it is still filled the short way.
+
 ## [0.12.6] - 2026-11-17
 
 ### Fixed
