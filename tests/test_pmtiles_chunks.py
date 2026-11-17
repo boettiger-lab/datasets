@@ -176,6 +176,11 @@ class TestRealArchives:
                         str(tmp_path / "e.pmtiles")], check=True)
         zooms = {tile_zoom(t) for t, _, _ in iter_tile_sizes(str(merged))}
         assert zooms == set(range(0, 9))
+        # tile-join warns "mismatched maxzooms" when the overview and the parts
+        # cover different zooms. The header must still span all of them, or a
+        # map client never asks for the parts' zooms.
+        header = merged.read_bytes()[:127]
+        assert (header[100], header[101]) == (0, 8)
 
 
 # --- Extracting a row range --------------------------------------------------
