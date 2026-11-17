@@ -54,6 +54,15 @@ _DEFAULT_MAX_CELLS_PER_FEATURE = 1_000_000_000
 # 4-vertex box. And a piece above _PIECE_MAX_CELLS is split so that each cell
 # list stays small, however large the feature.
 _PIECE_MAX_CELLS = 1_000_000
+
+# Pass 1 writes its cell lists in one COPY, and DuckDB's parquet writer puts a
+# whole 2,048-row vector of lists in one page unless a row group ends first. A
+# page is capped at 2 GB, so a chunk holding several very large features (each
+# cut into ~1M-cell pieces, but together billions of bytes) failed with
+# "uncompressed page size out of range" (#329). ROW_GROUP_SIZE in rows cannot
+# go below one vector; a cap in bytes ends the row group, and its page, well
+# before that.
+_PASS1_ROW_GROUP_BYTES = "256MB"
 _PIECE_MAX_WORK = 100_000_000
 _PIECE_MAX_DEPTH = 16
 _PIECE_CUT_JITTER = 3.14159e-9
@@ -1115,7 +1124,8 @@ class H3VectorProcessor:
         self.con.execute(f"""
             COPY ({h3_sql})
             TO '{intermediate_file}'
-            (FORMAT PARQUET, COMPRESSION 'ZSTD')
+            (FORMAT PARQUET, COMPRESSION 'ZSTD',
+             ROW_GROUP_SIZE_BYTES '{_PASS1_ROW_GROUP_BYTES}')
         """)
 
         # Check for features that produced 0 H3 cells despite having polygon area.
