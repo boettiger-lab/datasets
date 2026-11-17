@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.6] - 2026-11-17
+
 ### Fixed
 - **Hex pass 1 no longer fails on a chunk of several very large features** (#329). Pass 1 writes a chunk's cell lists in one parquet COPY, and DuckDB put a whole vector of lists in one page, which is capped at 2 GB. A chunk holding several features of tens of millions of cells each, such as the repeated monuments in the PAD-US combined layer, failed with "uncompressed page size out of range". Pass 1 now bounds its row groups at 256 MB, which also ends the page.
 
@@ -377,6 +379,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.12.6]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.6
 [0.12.5]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.5
 [0.12.4]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.4
 [0.12.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.3
