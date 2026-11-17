@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-11-17
+
 ### Fixed
 - **Convert reprojects and repairs a GeoParquet source** (#327). A GeoParquet source took a separate path that only added `_cng_fid` and sorted the rows. It was not reprojected, split at the antimeridian or repaired, so a file in EPSG:3338 came out in metres, and an invalid feature stayed invalid, although the same data as a GeoPackage converted correctly. The CRS is now read from the file's GeoParquet metadata (DuckDB carries it in the column type), and the geometry goes through the same reproject, split and `ST_MakeValid` expression as every other source. A GeoParquet already in EPSG:4326 or OGC:CRS84 keeps its coordinates. `--simplify-tolerance` on a GeoParquet source is now in target-CRS units, as for other sources.
 
@@ -372,6 +374,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.12.5]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.5
 [0.12.4]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.4
 [0.12.3]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.3
 [0.12.2]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.2
