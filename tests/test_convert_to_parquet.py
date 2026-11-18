@@ -977,14 +977,16 @@ class TestGeoParquetCRS:
             if 'output_path' in locals() and os.path.exists(output_path):
                 os.remove(output_path)
 
-    def test_no_bbox_struct_column_in_output(self):
+    def test_bbox_column_is_the_declared_covering(self):
         """
-        Verify output does NOT contain a bbox struct column.
+        The only bbox struct column is the GeoParquet 1.1 covering (#340).
 
-        DuckDB 1.5 uses native parquet row-group statistics for spatial filtering
-        via the && operator, making the bbox struct column unnecessary. The bbox
-        column causes friction in downstream tools (e.g., must be dropped for
-        GeoJSON export).
+        This test used to forbid a bbox column (#53), on the belief that DuckDB
+        wrote per-row-group spatial statistics for the WKB column. It does not:
+        rashid found none, and Portolan requires them (PORTO-FMT-007). The
+        friction #53 removed, a bbox attribute in GeoJSON exports, is answered
+        by declaring the column a covering, which GDAL hides, and by dropping
+        it from the hex and PMTiles outputs (tests/test_geoparquet.py).
         """
         import json
 
@@ -1018,10 +1020,12 @@ class TestGeoParquetCRS:
             ).fetchdf()['column_name'].tolist()
             con.close()
 
-            assert 'bbox' not in cols, (
-                "Output contains a 'bbox' struct column. DuckDB 1.5 uses native "
-                "parquet row-group statistics instead — the bbox column should not be added."
-            )
+            assert cols.count('bbox') == 1
+            import pyarrow.parquet as pq
+            geo = json.loads(pq.read_schema(output_path).metadata[b'geo'])
+            assert geo['version'] == '1.1.0'
+            covering = geo['columns'][geo['primary_column']]['covering']['bbox']
+            assert {path[0] for path in covering.values()} == {'bbox'}
 
         finally:
             for p in [src_path, output_path]:
