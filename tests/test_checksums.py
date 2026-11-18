@@ -265,9 +265,9 @@ class TestWorkflowStep:
         import cng_datasets.raster.cog as cog
         monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
         with tempfile.TemporaryDirectory() as tmpdir:
-            generate_raster_workflow(dataset_name="r", source_urls="https://e.com/x.tif",
+            generate_raster_workflow(dataset_name="ras", source_urls="https://e.com/x.tif",
                                      bucket="b", output_dir=tmpdir, chunk_resolution=1)
-            cmd = _command(tmpdir, "r")
+            cmd = _command(tmpdir, "ras")
             script = _script(tmpdir)
-        assert "checksums s3://b/r/hex/ --output s3://b/r.checksums.json" in cmd
-        assert script.index("wait_job r-merge ") < script.index("-f /yamls/r-checksums.yaml")
+        assert "checksums s3://b/ras/hex/ --output s3://b/ras.checksums.json" in cmd
+        assert script.index("wait_job ras-merge ") < script.index("-f /yamls/ras-checksums.yaml")
