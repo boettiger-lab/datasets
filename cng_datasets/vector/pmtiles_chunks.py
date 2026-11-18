@@ -79,6 +79,7 @@ def extract_chunk(input_url: str, output_path: str, n_chunks: int = 1, index: in
         The number of rows written (0 for an empty range, with no file written).
     """
     from .h3_tiling import setup_duckdb_connection, find_geometry_column
+    from .geoparquet import covering_columns
     from ..storage.s3 import configure_s3_credentials
 
     con = setup_duckdb_connection()
@@ -97,12 +98,16 @@ def extract_chunk(input_url: str, output_path: str, n_chunks: int = 1, index: in
         SELECT * FROM read_parquet('{input_url}', file_row_number = true)
         WHERE file_row_number >= {start} AND file_row_number < {stop}""")
     geom = find_geometry_column(con, "chunk_source")
+    # The GeoParquet bbox covering column (#340) is not an attribute: left in,
+    # it would become a property on every tile feature.
+    drop = ", ".join(['file_row_number'] + [
+        '"' + c.replace('"', '""') + '"' for c in covering_columns(con, input_url)])
     if simplify is not None:
-        select = (f'SELECT * EXCLUDE (file_row_number, "{geom}"), '
+        select = (f'SELECT * EXCLUDE ({drop}, "{geom}"), '
                   f'ST_SimplifyPreserveTopology("{geom}", {float(simplify)!r}) AS "{geom}" '
                   f'FROM chunk_source')
     else:
-        select = "SELECT * EXCLUDE (file_row_number) FROM chunk_source"
+        select = f"SELECT * EXCLUDE ({drop}) FROM chunk_source"
     # Row order is kept by DuckDB's default preserve_insertion_order, so the
     # chunk stays in the file's Hilbert order without a sort.
     con.execute("SET preserve_insertion_order = true")

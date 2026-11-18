@@ -26,7 +26,7 @@ neither was answerable after the fact from the dataset alone.
 
 import os
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, Optional
 
 
 def build_metadata() -> Dict[str, str]:
@@ -66,17 +66,24 @@ def _duckdb_version():
         return None
 
 
-def kv_metadata_sql() -> str:
+def kv_metadata_sql(extra: Optional[Dict[str, str]] = None) -> str:
     """A `, KV_METADATA {...}` fragment for a DuckDB `COPY ... (FORMAT PARQUET)`.
 
-    Returns an empty string if the metadata cannot be built, so a stamp that
+    The provenance stamp is left out if it cannot be built, so a stamp that
     fails can never be the reason a dataset does not get written.
+
+    Args:
+        extra: Further keys to write, such as the GeoParquet ``geo`` key
+            (#340). Unlike the stamp, these are part of the format, so they
+            are always written.
     """
     try:
-        pairs = ", ".join(
-            f"{key}: '{str(value).replace(chr(39), chr(39) * 2)}'"
-            for key, value in build_metadata().items()
-        )
+        meta = dict(build_metadata())
     except Exception:
-        return ""
+        meta = {}
+    meta.update(extra or {})
+    pairs = ", ".join(
+        f"{key}: '{str(value).replace(chr(39), chr(39) * 2)}'"
+        for key, value in meta.items()
+    )
     return f", KV_METADATA {{{pairs}}}" if pairs else ""
