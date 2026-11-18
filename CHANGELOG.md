@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-18
+
 ### Added
 - **COGs carry their band statistics inside the file** (#340). Portolan requires min/max/mean/stddev and the valid percentage on every band of a COG (PORTO-FMT-026 to 029), embedded rather than in an `.aux.xml` sidecar, and rashid 0.4.0 found none on our COGs. Both COG writers, `create_cog` and the mosaic path, now pass the COG driver's `STATISTICS=YES`, which computes them from the full-resolution data, excluding nodata, and stores them in the TIFF's `GDAL_METADATA` tag.
 
@@ -395,6 +397,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.14.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.14.0
 [0.13.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.13.0
 [0.12.7]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.7
 [0.12.6]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.6
