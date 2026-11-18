@@ -563,6 +563,17 @@ def main():
     check_pm_parser.add_argument("--limit", type=int, default=None, metavar="BYTES",
                                  help="Tile size limit in bytes (default 500000, tippecanoe's)")
 
+    checksums_parser = subparsers.add_parser(
+        "checksums",
+        help="Write file:size and file:checksum of a dataset's outputs, for its STAC assets (#340)")
+    checksums_parser.add_argument(
+        "targets", nargs="+",
+        help="s3:// URLs in one bucket, or local paths; one ending in / is a prefix")
+    checksums_parser.add_argument("--output", required=True,
+                                  help="Where to write the JSON (s3:// or local)")
+    checksums_parser.add_argument("--workers", type=int, default=8,
+                                  help="Objects read at once (default 8)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -997,6 +1008,12 @@ def _dispatch(args):
             print(f"  ⚠ largest: tile id {tile_id} at z{zoom}, {size:,} bytes. These tiles are "
                   f"kept whole, so no features are lost, but they render slowly. Raise "
                   f"--pmtiles-split-zoom or use fewer --pmtiles-chunks.")
+
+    elif args.command == "checksums":
+        from .storage.checksums import write_checksums
+        doc = write_checksums(args.targets, args.output, workers=args.workers)
+        total = sum(f["file:size"] for f in doc["files"].values())
+        print(f"✓ {len(doc['files']):,} files, {total:,} bytes: wrote {args.output}")
 
     elif args.command == "pmtiles-columns":
         from .vector.pmtiles import read_pmtiles_metadata, pmtiles_table_columns

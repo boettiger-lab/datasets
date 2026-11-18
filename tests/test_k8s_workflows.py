@@ -1725,6 +1725,7 @@ class TestStepManifestNamespace:
                 "ns-raster-setup-bucket.yaml",
                 "ns-raster-preprocess-cog.yaml",
                 "ns-raster-hex.yaml",
+                "ns-raster-checksums.yaml",  # #340
                 "workflow.yaml",   # the orchestrator, which already had it
             }
             assert set(found) == expected, found
@@ -1752,6 +1753,7 @@ class TestStepManifestNamespace:
                 "ns-vector-pmtiles.yaml",
                 "ns-vector-hex.yaml",
                 "ns-vector-repartition.yaml",
+                "ns-vector-checksums.yaml",  # #340
                 "workflow.yaml",   # the orchestrator, which already had it
             }
             assert set(found) == expected, found
@@ -2879,9 +2881,9 @@ class TestOrchestratorStopsOnFailedStep:
             generate_dataset_workflow(dataset_name="vec-ds", source_urls="https://example.com/x.gdb",
                                       bucket="b", output_dir=tmpdir, h3_resolution=8)
             script = self._script(tmpdir)
-        # pmtiles is deliberately left running in the background.
-        self._check(script, ["setup-bucket", "convert", "plan", "hex", "repartition"],
-                    background=["vec-ds-pmtiles"])
+        # The checksums step reads the PMTiles, so they are waited for (#340).
+        self._check(script, ["setup-bucket", "convert", "plan", "hex", "repartition",
+                             "pmtiles", "checksums"])
         assert "wait_job vec-ds-hex geo-workflows 172800" in script
 
     @pytest.mark.timeout(10)
@@ -2890,7 +2892,7 @@ class TestOrchestratorStopsOnFailedStep:
             generate_raster_workflow(dataset_name="ras-ds", source_urls="https://example.com/x.tif",
                                      bucket="b", output_dir=tmpdir)
             script = self._script(tmpdir)
-        self._check(script, ["setup-bucket", "hex"])
+        self._check(script, ["setup-bucket", "hex", "checksums"])
 
 
 class TestMultiYearRasterWorkflow:

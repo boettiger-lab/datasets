@@ -228,6 +228,7 @@ bucket/
 ├── dataset/
 │   └── hex/
 │       └── h0={cell}/data_0.parquet   # H3-indexed, hive-partitioned
+├── dataset.checksums.json       # file:size and file:checksum of each output, for STAC
 ├── README.md
 └── stac-collection.json
 ```

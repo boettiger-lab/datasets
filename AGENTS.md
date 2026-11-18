@@ -72,7 +72,7 @@ kubectl apply -f catalog/<dataset>/k8s/<name>/<name>-setup-bucket.yaml \
               -f catalog/<dataset>/k8s/<name>/workflow.yaml
 ```
 
-The workflow orchestrator handles the rest: setup-bucket → convert → plan → pmtiles + hex (parallel) → repartition. The plan step cuts the GeoParquet into hex chunks by estimated H3 cells, and the orchestrator sizes the hex Job to it. The hex YAML as generated holds only an upper bound, so apply it through `workflow.yaml` rather than by hand.
+The workflow orchestrator handles the rest: setup-bucket → convert → plan → pmtiles + hex (parallel) → repartition → checksums. The checksums step reads every output back and writes `dataset.checksums.json`, the `file:size` and `file:checksum` the STAC assets need. The plan step cuts the GeoParquet into hex chunks by estimated H3 cells, and the orchestrator sizes the hex Job to it. The hex YAML as generated holds only an upper bound, so apply it through `workflow.yaml` rather than by hand.
 
 ### Step 4: Monitor
 
@@ -157,6 +157,7 @@ bucket/
 ├── dataset/
 │   └── hex/
 │       └── h0={cell}/data_0.parquet
+├── dataset.checksums.json       # file:size + file:checksum of each output, for the STAC assets
 ├── README.md
 └── stac-collection.json
 ```

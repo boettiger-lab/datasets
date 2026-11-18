@@ -22,9 +22,40 @@ The steps all call the same Python functions documented in the [API reference](a
 | `<name>-pmtiles.yaml` | Build PMTiles vector tiles |
 | `<name>-hex.yaml` | H3 tiling as an indexed Job, one completion per chunk |
 | `<name>-repartition.yaml` | Consolidate the chunks into `hex/h0=<cell>/data_0.parquet` |
+| `<name>-checksums.yaml` | Write `<dataset>.checksums.json`: the size and sha2-256 checksum of every output, for its STAC assets |
 | `configmap.yaml` | The step manifests above, packaged for the orchestrator |
 | `workflow-rbac.yaml` | ServiceAccount, Role and RoleBinding, shared by every workflow in a namespace |
-| `workflow.yaml` | Orchestrator Job: setup-bucket → convert → plan → (pmtiles ∥ hex) → repartition |
+| `workflow.yaml` | Orchestrator Job: setup-bucket → convert → plan → (pmtiles ∥ hex) → repartition → checksums |
+
+### Sizes and checksums
+
+Portolan asks every data asset for `file:size` and `file:checksum` (PORTO-CORE-028/029). The last step of `workflow` and `raster-workflow` reads each output back from S3 and writes `s3://<bucket>/<dataset>.checksums.json` (#340):
+
+```json
+{
+  "bucket": "public-census",
+  "generator": "cng-datasets 0.15.0",
+  "created": "2026-11-18T20:00:00Z",
+  "files": {
+    "census-2024/county.parquet": {"file:size": 1234, "file:checksum": "1220…", "created": "2026-11-18T19:40:12Z"},
+    "census-2024/county/hex/h0=8029fffffffffff/data_0.parquet": {"…": "…"}
+  },
+  "prefixes": {
+    "census-2024/county/hex/": {"file:size": 98765, "file_count": 122}
+  }
+}
+```
+
+Keys are object keys relative to the bucket. A `files` entry merges into a STAC asset as it is: the checksum is a sha2-256 multihash in hex, and `created` is the object's last-modified time. The hex directory is one STAC asset with a glob href, which a single checksum cannot describe, so it also gets a total size and file count under `prefixes`. The PMTiles step now finishes before the workflow does, since its output is read here. A raster workflow lists the COGs it wrote, not a source that was already a COG.
+
+The same command backfills a dataset built before this step existed:
+
+```bash
+cng-datasets checksums s3://<bucket>/<ds>.parquet s3://<bucket>/<ds>.pmtiles s3://<bucket>/<ds>/hex/ \
+  --output s3://<bucket>/<ds>.checksums.json
+```
+
+A target ending in `/` is a prefix. A named object that is missing fails the command rather than being left out.
 
 ### Large vector datasets: chunked PMTiles
 

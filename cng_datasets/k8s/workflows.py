@@ -1108,6 +1108,13 @@ def generate_dataset_workflow(
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory, config=config)
 
+    # Sizes and checksums of the outputs, for their STAC assets (#340)
+    _generate_checksums_job(
+        manager, k8s_name, bucket, output_path,
+        [f"s3://{bucket}/{dataset_name}.parquet", f"s3://{bucket}/{dataset_name}.pmtiles",
+         f"s3://{bucket}/{dataset_name}/hex/"],
+        s3_dataset=dataset_name, config=config)
+
     # Generate workflow RBAC (generic for all cng-datasets workflows)
     _generate_workflow_rbac(namespace, output_path)
 
@@ -1524,6 +1531,17 @@ def generate_raster_workflow(
             merge_memory=merge_memory, merge_storage=merge_storage, config=config,
             expect_chunks=chunk_count, years=years,
         )
+
+    # Sizes and checksums of the outputs, for their STAC assets (#340). A
+    # source that was already a COG is not an output, so only a COG this
+    # workflow wrote is listed.
+    checksum_targets = []
+    if cog_key:
+        checksum_targets += ([f"s3://{bucket}/{cog_key.replace('{year}', str(y))}" for y in years]
+                             if years else [f"s3://{bucket}/{cog_key}"])
+    checksum_targets.append(f"s3://{bucket}/{dataset_name}/hex/")
+    _generate_checksums_job(manager, k8s_name, bucket, output_path, checksum_targets,
+                            s3_dataset=dataset_name, config=config)
 
     # Generate workflow RBAC
     _generate_workflow_rbac(namespace, output_path)
@@ -2364,6 +2382,7 @@ def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command
         # The orchestrator applies this from /yamls, so leaving it out of the
         # ConfigMap fails the build at the merge step rather than at generation.
         job_files.append(f"{dataset_name}-merge.yaml")
+    job_files.append(f"{dataset_name}-checksums.yaml")
 
     data = {}
     for job_file in job_files:
@@ -2402,7 +2421,7 @@ def _generate_raster_argo_workflow(dataset_name, namespace, output_path, output_
     configmap_name = f"{dataset_name}-yamls"
 
     preprocess_steps = ""
-    cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-hex {dataset_name}-workflow"
+    cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-hex {dataset_name}-checksums {dataset_name}-workflow"
     if needs_preprocess:
         preprocess_steps = f"""
 # Step 1: Preprocess — mosaic tiles into a single COG on S3
@@ -2413,7 +2432,7 @@ echo "Waiting for preprocess-cog (may take 30-60 min for large tile sets)..."
 wait_job {dataset_name}-preprocess-cog {namespace} {step_timeout}
 """
         hex_step_num = "2"
-        cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-preprocess-cog {dataset_name}-hex {dataset_name}-workflow"
+        cleanup_jobs = f"{dataset_name}-setup-bucket {dataset_name}-preprocess-cog {dataset_name}-hex {dataset_name}-checksums {dataset_name}-workflow"
     else:
         hex_step_num = "1"
 
@@ -2461,6 +2480,10 @@ echo "Step {hex_step_num}: H3 hexagonal tiling..."
 kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
 wait_job {dataset_name}-hex {namespace} {step_timeout}
 {merge_steps}
+echo "Sizes and checksums of the outputs..."
+kubectl apply -f /yamls/{dataset_name}-checksums.yaml -n {namespace}
+wait_job {dataset_name}-checksums {namespace} {step_timeout}
+
 echo "✓ Workflow complete!"
 echo "Clean up with:"
 echo "  kubectl delete jobs {cleanup_jobs} -n {namespace}"
@@ -3115,6 +3138,56 @@ cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-repartition.yaml"))
 
 
+def checksums_url(bucket: str, s3_dataset: str) -> str:
+    """Where a dataset's sizes and checksums are written (#340)."""
+    return f"s3://{bucket}/{s3_dataset}.checksums.json"
+
+
+def _generate_checksums_job(manager, dataset_name, bucket, output_path, targets: List[str],
+                            s3_dataset: str, config: ClusterConfig = None):
+    """Generate the Job that writes file:size and file:checksum of every output (#340).
+
+    It reads each output back from S3, so the orchestrator applies it last,
+    once every step that writes to the bucket has finished.
+    """
+    if config is None:
+        config = ClusterConfig()
+    target_args = " ".join(shlex.quote(t) for t in targets)
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "checksums-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config),
+            "command": ["bash", "-c", f"""set -e
+cng-datasets checksums {target_args} --output {shlex.quote(checksums_url(bucket, s3_dataset))} --workers 8
+"""],
+            "resources": {
+                "requests": {"cpu": "4", "memory": "2Gi"},
+                "limits": {"cpu": "4", "memory": "2Gi"},
+            },
+        }],
+    }
+    _apply_scheduling(pod_spec, config)
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": _job_metadata(manager, f"{dataset_name}-checksums"),
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 2,
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-checksums"}},
+                "spec": pod_spec,
+            },
+        },
+    }
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-checksums.yaml"))
+
+
 def _generate_workflow_rbac(namespace, output_path):
     """Generate generic workflow RBAC configuration for cng-datasets package."""
     import yaml
@@ -3162,7 +3235,7 @@ def _generate_configmap(dataset_name, namespace, output_path, gen_command):
     import yaml
 
     # Read all job YAML files
-    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-convert.yaml", f"{dataset_name}-plan.yaml", f"{dataset_name}-pmtiles.yaml", f"{dataset_name}-pmtiles-parts.yaml", f"{dataset_name}-pmtiles-overview.yaml", f"{dataset_name}-pmtiles-merge.yaml", f"{dataset_name}-hex.yaml", f"{dataset_name}-repartition.yaml"]
+    job_files = [f"{dataset_name}-setup-bucket.yaml", f"{dataset_name}-convert.yaml", f"{dataset_name}-plan.yaml", f"{dataset_name}-pmtiles.yaml", f"{dataset_name}-pmtiles-parts.yaml", f"{dataset_name}-pmtiles-overview.yaml", f"{dataset_name}-pmtiles-merge.yaml", f"{dataset_name}-hex.yaml", f"{dataset_name}-repartition.yaml", f"{dataset_name}-checksums.yaml"]
     data = {}
 
     for job_file in job_files:
@@ -3285,12 +3358,14 @@ wait_job {dataset_name}-pmtiles-merge {namespace} 14400
 """
         pmtiles_jobs = (f"{dataset_name}-pmtiles-parts {dataset_name}-pmtiles-overview "
                         f"{dataset_name}-pmtiles-merge")
-        pmtiles_note = ""
     else:
         pmtiles_apply = f"kubectl apply -f /yamls/{dataset_name}-pmtiles.yaml -n {namespace}\n"
-        pmtiles_finish = ""
+        # The checksums step reads the PMTiles, so it waits for them here.
+        pmtiles_finish = f"""
+echo "Step 4: Waiting for PMTiles..."
+wait_job {dataset_name}-pmtiles {namespace} 172800
+"""
         pmtiles_jobs = f"{dataset_name}-pmtiles"
-        pmtiles_note = 'echo "Note: PMTiles job may still be running in the background"\n'
 
     workflow_job = {
         "apiVersion": "batch/v1",
@@ -3340,10 +3415,14 @@ kubectl apply -f /yamls/{dataset_name}-repartition.yaml -n {namespace}
 echo "Waiting for repartition to complete..."
 wait_job {dataset_name}-repartition {namespace} 3600
 {pmtiles_finish}
+echo "Step 5: Sizes and checksums of the outputs..."
+kubectl apply -f /yamls/{dataset_name}-checksums.yaml -n {namespace}
+wait_job {dataset_name}-checksums {namespace} 14400
+
 echo "✓ Workflow complete!"
-{pmtiles_note}echo ""
+echo ""
 echo "Clean up with:"
-echo "  kubectl delete jobs {dataset_name}-setup-bucket {dataset_name}-convert{' ' + dataset_name + '-plan' if planned else ''} {pmtiles_jobs} {dataset_name}-hex {dataset_name}-repartition {dataset_name}-workflow -n {namespace} --ignore-not-found"
+echo "  kubectl delete jobs {dataset_name}-setup-bucket {dataset_name}-convert{' ' + dataset_name + '-plan' if planned else ''} {pmtiles_jobs} {dataset_name}-hex {dataset_name}-repartition {dataset_name}-checksums {dataset_name}-workflow -n {namespace} --ignore-not-found"
 echo "  kubectl delete configmap {configmap_name} -n {namespace}"
 """],
                         "resources": {
