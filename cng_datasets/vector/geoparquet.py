@@ -82,11 +82,14 @@ def crs_projjson(column_type: str) -> Optional[Dict]:
     label = match.group(1).replace("''", "'")
     from osgeo import osr
     srs = osr.SpatialReference()
+    # An unreadable label: claiming CRS84 would be a guess, and a wrong one
+    # moves every coordinate. Fail the write instead. osr raises or returns an
+    # error code depending on whether GDAL exceptions are on.
     try:
-        srs.SetFromUserInput(label)
+        failed = srs.SetFromUserInput(label) != 0
     except RuntimeError:
-        # An unreadable label: claiming CRS84 would be a guess, and a wrong
-        # one moves every coordinate. Fail the write instead.
+        failed = True
+    if failed:
         raise ValueError(f"Cannot write GeoParquet CRS for geometry type {column_type!r}")
     wgs84 = osr.SpatialReference()
     wgs84.SetFromUserInput("OGC:CRS84")
