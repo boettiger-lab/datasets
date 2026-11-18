@@ -31,6 +31,15 @@ from cng_datasets.h3_chunks import (  # shared with mdim (#181)
 )
 
 
+# Band statistics stored inside every COG, in its GDAL_METADATA tag (#340).
+# Portolan requires min/max/mean/stddev on each band (PORTO-FMT-026..029,
+# rashid PTL-DAT-009) and the valid percentage (PTL-DAT-010), embedded rather
+# than in an .aux.xml sidecar, which a reader over HTTP never sees. The COG
+# driver computes them from the full-resolution data, excluding nodata, while
+# it writes the file.
+COG_STATISTICS_OPTION = "STATISTICS=YES"
+
+
 def _split_antimeridian(geom):
     """Split a cell polygon that wraps the antimeridian into a MultiPolygon.
 
@@ -2070,6 +2079,7 @@ def create_mosaic_cog(
                 f"OVERVIEW_RESAMPLING={overview_resampling.upper()}",
                 "BIGTIFF=IF_SAFER",
                 "NUM_THREADS=ALL_CPUS",
+                COG_STATISTICS_OPTION,
             ],
         )
         result = gdal.Translate(cog_output, tmp_tif, options=translate_opts)
@@ -2581,6 +2591,7 @@ class RasterProcessor:
             'BIGTIFF=IF_SAFER',
             'NUM_THREADS=ALL_CPUS',
             'SPARSE_OK=TRUE',
+            COG_STATISTICS_OPTION,
         ]
 
         # Reproject to EPSG:4326 if needed

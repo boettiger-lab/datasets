@@ -5326,3 +5326,66 @@ class TestChunkUsageReport:
         assert report_chunk_usage(str(tmp_path / "old")) is None
         empty = dict.fromkeys(self._usage(1, 1, 1))
         assert report_chunk_usage(self._markers(tmp_path, monkeypatch, [empty])) is None
+
+
+@requires_gdal
+class TestCogStatistics:
+    """Every COG carries its band statistics inside the file (#340).
+
+    Portolan requires min/max/mean/stddev on each band (PTL-DAT-009) and the
+    valid percentage (PTL-DAT-010), embedded rather than in an .aux.xml
+    sidecar that an HTTP reader never fetches. Both COG writers are covered.
+    """
+
+    NODATA = -9999.0
+
+    @pytest.fixture
+    def temp_dir(self):
+        d = tempfile.mkdtemp()
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _source(self, path, x0=-121.0):
+        rng = np.random.default_rng(7)
+        data = rng.uniform(0, 100, (300, 300)).astype(np.float32)
+        data[:60, :] = self.NODATA  # 20% nodata
+        ds = gdal.GetDriverByName("GTiff").Create(path, 300, 300, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([x0, 0.001, 0, 38.0, 0, -0.001])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        band.SetNoDataValue(self.NODATA)
+        band.WriteArray(data)
+        ds = None
+        return path, data
+
+    def _assert_embedded(self, cog, data):
+        assert not os.path.exists(cog + ".aux.xml"), "statistics must not be in a sidecar"
+        gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
+        try:
+            meta = gdal.Open(cog).GetRasterBand(1).GetMetadata()
+        finally:
+            gdal.SetConfigOption("GDAL_PAM_ENABLED", None)
+        valid = data[data != self.NODATA].astype(np.float64)
+        assert float(meta["STATISTICS_MINIMUM"]) == pytest.approx(valid.min(), rel=1e-5)
+        assert float(meta["STATISTICS_MAXIMUM"]) == pytest.approx(valid.max(), rel=1e-5)
+        assert float(meta["STATISTICS_MEAN"]) == pytest.approx(valid.mean(), rel=1e-4)
+        assert float(meta["STATISTICS_STDDEV"]) == pytest.approx(valid.std(), rel=1e-3)
+        assert float(meta["STATISTICS_VALID_PERCENT"]) == pytest.approx(80.0, abs=0.01)
+
+    @pytest.mark.timeout(60)
+    def test_create_cog_embeds_band_statistics(self, temp_dir):
+        from cng_datasets.raster import create_cog
+        src, data = self._source(os.path.join(temp_dir, "src.tif"))
+        out = os.path.join(temp_dir, "out.tif")
+        create_cog(input_path=src, output_path=out, nodata_value=self.NODATA)
+        self._assert_embedded(out, data)
+
+    @pytest.mark.timeout(60)
+    def test_mosaic_cog_embeds_band_statistics(self, temp_dir):
+        from cng_datasets.raster.cog import create_mosaic_cog
+        src, data = self._source(os.path.join(temp_dir, "src.tif"))
+        out = os.path.join(temp_dir, "mosaic.tif")
+        create_mosaic_cog([src], out, nodata=self.NODATA, resampling="nearest")
+        self._assert_embedded(out, data)
