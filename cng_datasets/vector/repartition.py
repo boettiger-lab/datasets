@@ -13,6 +13,7 @@ from cng_datasets.duckdb_memory import to_duckdb_memory_limit
 from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
 from ..provenance import kv_metadata_sql
+from .geoparquet import covering_columns
 
 
 def repartition_by_h0(
@@ -121,8 +122,10 @@ def repartition_by_h0(
         if chunk_id_col not in source_cols:
             raise ValueError(f"Chunk ID column '{chunk_id_col}' not found in source parquet. Source columns: {source_cols}")
 
-        # Select all columns except geometry
-        attr_cols = [c for c in source_cols if c != geom_col]
+        # Select all columns except geometry, and except the GeoParquet bbox
+        # covering column (#340), which describes the geometry and leaves with it
+        covering = set(covering_columns(con, source_parquet))
+        attr_cols = [c for c in source_cols if c != geom_col and c not in covering]
 
         print(f'  Joining on column: {chunk_id_col}')
         print(f'  Adding {len(attr_cols) - 1} attribute columns')

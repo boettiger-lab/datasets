@@ -7,7 +7,7 @@ Simple workflow:
 2. Read data with DuckDB ST_Read
 3. Add ID column if needed
 4. Reproject if needed (ST_Transform + ST_FlipCoordinates)
-5. Write GeoParquet with DuckDB COPY (DuckDB 1.5+ writes geo metadata natively)
+5. Write GeoParquet 1.1 with DuckDB COPY, plus a bbox covering column (#340)
 6. Upload to S3 via rclone if needed
 """
 
@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import zipfile
 import re
+import json
 from typing import NamedTuple, Optional, Tuple, List, Union
 import duckdb
 import geopandas as gpd
@@ -27,6 +28,7 @@ from urllib.request import urlretrieve
 from urllib.parse import urlparse
 from ..duckdb_memory import to_duckdb_memory_limit
 from ..provenance import kv_metadata_sql
+from .geoparquet import GEOPARQUET_VERSION, covering_columns, plan_covering
 
 
 # Curved geometry types that DuckDB's WKB parser cannot handle
@@ -1440,7 +1442,13 @@ def process_parquet_input(
             geom_sql = geometry_sql(base_geom, reproject_from, target_crs,
                                     wrap_dateline=split_dateline,
                                     simplify_tolerance=simplify_tolerance)
-            cols_expr = f'* EXCLUDE ("{geom_name}"){trim_clause}, {geom_sql} AS "{geom_name}"'
+            # A source's own bbox covering column (an Overture file, or one
+            # converted here before) describes the geometry as it was, before
+            # reprojection and repair. Drop it; the write adds a fresh one (#340).
+            stale = "".join(f', "{c}"' for c in covering_columns(con, read_url)
+                            if c != geom_name)
+            cols_expr = (f'* EXCLUDE ("{geom_name}"{stale}){trim_clause}, '
+                         f'{geom_sql} AS "{geom_name}"')
         else:
             cols_expr = f"*{trim_clause}"
 
@@ -1748,6 +1756,24 @@ def write_with_duckdb(query: str, output_path: str,
             print(f"  Writing with DuckDB to {output_path}...")
             print(f"    row group cap: {row_group_size:,} rows / {row_group_bytes} bytes")
 
+        # GeoParquet 1.1 with a bbox covering column, so every row group has
+        # spatial statistics (Portolan PORTO-FMT-007/012, issue #340). DESCRIBE
+        # only binds the query, so the sort below it is not run twice.
+        covering = plan_covering(con.execute(f"DESCRIBE ({query})").fetchall())
+        geo_options = ""
+        extra_kv = None
+        if covering is not None:
+            # A projection over the ordered query keeps its Hilbert order.
+            query = (f'SELECT *, {covering.select} AS "{covering.column}" '
+                     f'FROM ({query}) AS _cng_covered')
+            # V1 keeps the geometry as plain WKB; the geo key below replaces
+            # the 1.0.0 key DuckDB would write.
+            geo_options = ",\n             GEOPARQUET_VERSION 'V1'"
+            extra_kv = {"geo": json.dumps(covering.geo, separators=(",", ":"))}
+            if verbose:
+                print(f"    GeoParquet {GEOPARQUET_VERSION}, bbox covering column "
+                      f"\"{covering.column}\" on \"{covering.primary}\"")
+
         # Use COPY - it works!  It also reports how many rows it wrote, which
         # costs nothing extra and is the only count the caller needs: the query
         # is row-preserving, so this is the source feature count as well.
@@ -1757,7 +1783,7 @@ def write_with_duckdb(query: str, output_path: str,
             (FORMAT PARQUET,
              COMPRESSION {compression},
              ROW_GROUP_SIZE {row_group_size},
-             ROW_GROUP_SIZE_BYTES '{row_group_bytes}'{kv_metadata_sql()})
+             ROW_GROUP_SIZE_BYTES '{row_group_bytes}'{geo_options}{kv_metadata_sql(extra_kv)})
         """).fetchone()
         rows_written = int(written[0]) if written else 0
 
