@@ -5364,7 +5364,9 @@ class TestCogStatistics:
         assert not os.path.exists(cog + ".aux.xml"), "statistics must not be in a sidecar"
         gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
         try:
-            meta = gdal.Open(cog).GetRasterBand(1).GetMetadata()
+            ds = gdal.Open(cog)  # held: a band outlives no dataset
+            meta = ds.GetRasterBand(1).GetMetadata()
+            ds = None
         finally:
             gdal.SetConfigOption("GDAL_PAM_ENABLED", None)
         valid = data[data != self.NODATA].astype(np.float64)
