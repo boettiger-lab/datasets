@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Convert writes GeoParquet 1.1 with a bbox covering column** (#340). Portolan requires GeoParquet 1.1 or 2.x and spatial statistics on every row group (PORTO-FMT-007/012), and rashid 0.4.0 failed convert output on both: DuckDB wrote GeoParquet 1.0.0, whose WKB column has no spatial statistics. The flat GeoParquet now carries a `bbox` struct column (`xmin`, `ymin`, `xmax`, `ymax`; `<geometry>_bbox` if the data already has a `bbox`), declared as the geometry's covering in a 1.1.0 `geo` key, so every row group has min/max statistics a reader can prune on. The geometry stays plain WKB rather than the native Parquet `GEOMETRY` type, which DuckDB 2.0 can also write but which changes the column type for every downstream reader. The `geo` key lists `geometry_types` as `[]` ("unknown") and has no file `bbox`, since both would need a second pass over the data. The covering column stays in the GeoParquet: hex partitions and PMTiles carry the same attributes as before, and a GeoParquet source's own covering is replaced rather than kept alongside the new one.
+
 ## [0.13.0] - 2026-11-17
 
 ### Added

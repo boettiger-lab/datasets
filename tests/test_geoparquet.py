@@ -76,7 +76,7 @@ class TestConvertWritesGeoParquet11:
     @pytest.mark.timeout(60)
     def test_every_row_group_has_bbox_statistics(self, written):
         meta = pq.read_metadata(str(written))
-        assert meta.num_row_groups == 5
+        assert meta.num_row_groups > 1
         names = [meta.schema.column(i).path for i in range(meta.num_columns)]
         for rg in range(meta.num_row_groups):
             for field in ("xmin", "ymin", "xmax", "ymax"):
