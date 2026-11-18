@@ -271,3 +271,41 @@ class TestWorkflowStep:
             script = _script(tmpdir)
         assert "checksums s3://b/ras/hex/ --output s3://b/ras.checksums.json" in cmd
         assert script.index("wait_job ras-merge ") < script.index("-f /yamls/ras-checksums.yaml")
+
+
+class TestEveryAppliedStepIsShipped:
+    """The orchestrator applies each step from the ConfigMap, so a step it
+    applies but the generator did not write fails the build at that step."""
+
+    @staticmethod
+    def _check(tmpdir):
+        import re
+        shipped = set(yaml.safe_load((Path(tmpdir) / "configmap.yaml").read_text())["data"])
+        applied = re.findall(r"-f /yamls/(\S+\.yaml)", _script(tmpdir))
+        assert applied
+        for name in applied:
+            assert name in shipped and (Path(tmpdir) / name).exists(), name
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize("chunks", [None, 4])
+    def test_vector(self, monkeypatch, chunks):
+        from cng_datasets.k8s.workflows import generate_dataset_workflow
+        import cng_datasets.k8s.workflows as wf
+        monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(dataset_name="v", source_urls="https://e.com/x.gpkg",
+                                      bucket="b", output_dir=tmpdir, h3_resolution=8,
+                                      pmtiles_chunks=chunks)
+            self._check(tmpdir)
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize("is_cog,chunk_resolution", [(True, 0), (False, 0), (True, 1)])
+    def test_raster(self, monkeypatch, is_cog, chunk_resolution):
+        from cng_datasets.k8s.workflows import generate_raster_workflow
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: is_cog)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_raster_workflow(dataset_name="ras", source_urls="https://e.com/x.tif",
+                                     bucket="b", output_dir=tmpdir,
+                                     chunk_resolution=chunk_resolution)
+            self._check(tmpdir)

@@ -414,6 +414,15 @@ class TestMdimWorkflow:
         assert env["DUCKDB_MEMORY_LIMIT"] == "13GiB"           # 85% of 16Gi (#255)
         script = self._load(out / "workflow.yaml")["spec"]["template"]["spec"]["containers"][0]["args"][0]
         assert "wait_job cube-loca-hex" in script and "condition=complete" not in script
+        # The orchestrator is shared with raster-workflow; every step it applies
+        # must be generated and shipped in the ConfigMap (#340).
+        import re
+        shipped = set(self._load(out / "configmap.yaml")["data"])
+        for applied in re.findall(r"-f /yamls/(\S+\.yaml)", script):
+            assert applied in shipped and (out / applied).exists(), applied
+        checksums = self._load(out / "cube-loca-checksums.yaml")
+        assert ("cng-datasets checksums s3://b/cube/loca/hex/ --output s3://b/cube/loca.checksums.json"
+                in checksums["spec"]["template"]["spec"]["containers"][0]["command"][2])
 
     @pytest.mark.timeout(60)
     def test_the_pod_command_parses_through_the_cli(self, tmp_path, cube):

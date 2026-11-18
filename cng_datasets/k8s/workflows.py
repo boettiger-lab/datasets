@@ -2031,6 +2031,11 @@ def generate_mdim_workflow(
             merge_memory=merge_memory, merge_storage=merge_storage, config=config,
             expect_chunks=merge_chunks,
         )
+    # Sizes and checksums of the hex output (#340). The orchestrator shared
+    # with raster-workflow applies this step, so it must exist here too.
+    _generate_checksums_job(manager, k8s_name, bucket, output_path,
+                            [f"s3://{bucket}/{dataset_name}/hex/"],
+                            s3_dataset=dataset_name, config=config)
     _generate_workflow_rbac(namespace, output_path)
     gen_command = (f"cng-datasets mdim-workflow --dataset {dataset_name} "
                    + " ".join(f"--input {shlex.quote(i)}" for i in inputs) + " "
