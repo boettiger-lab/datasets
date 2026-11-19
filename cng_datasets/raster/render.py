@@ -50,6 +50,7 @@ CYCLIC = {"twilight", "twilight_shifted", "hsv"}
 PERCENTILES = (2, 98)
 THUMBNAIL_SIZE = 512
 STATS_SIZE = 1024  # pixels on the longer side of the overview the percentiles come from
+CLASS_SAMPLE_SIZE = 2048  # and the one a color table's used values come from
 
 
 def _open(path: str):
@@ -101,10 +102,17 @@ def cog_render(path: str, colormap: Optional[str] = None,
     if colormap_json:
         out = {"colormap": {str(k): v for k, v in colormap_json.items()}, "resampling": "nearest"}
     elif table is not None and not colormap:
+        # GDAL pads a color table to 256 entries with opaque black. An entry
+        # that is that padding and whose value is absent from an overview is
+        # not a class; any other entry is kept, even a class too rare to
+        # appear in the overview.
+        present = set(np.unique(_sample(band, CLASS_SAMPLE_SIZE)).astype(int).tolist())
         classes = {}
         for i in range(table.GetCount()):
             entry = table.GetColorEntry(i)
             if (nodata is not None and i == nodata) or entry[3] == 0:
+                continue
+            if tuple(entry) == (0, 0, 0, 255) and i not in present:
                 continue
             classes[str(i)] = _hex(entry)
         if not classes:

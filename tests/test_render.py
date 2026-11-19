@@ -90,6 +90,14 @@ class TestRender:
         assert r == {"colormap": {"1": "#ff0000", "2": "#008000", "3": "#0000ff"},
                      "resampling": "nearest", "nodata": 0}
 
+    def test_black_classes_in_the_data_are_kept(self, tmp_path):
+        """Padding is opaque black; a real black class is too, and is kept when used."""
+        data = np.array([[1, 4], [3, 0]], dtype=np.uint8).repeat(50, 0).repeat(50, 1)
+        table = {1: (255, 0, 0, 255), 3: (0, 0, 255, 255), 4: (0, 0, 0, 255),
+                 9: (10, 20, 30, 255)}  # 9: a class with a colour but no pixels
+        r = cog_render(_tif(tmp_path / "c.tif", data, nodata=0, table=table))
+        assert r["colormap"] == {"1": "#ff0000", "3": "#0000ff", "4": "#000000", "9": "#0a141e"}
+
     def test_one_value_throughout_has_no_render(self, tmp_path):
         assert cog_render(_tif(tmp_path / "k.tif", np.full((50, 50), 7, np.float32))) is None
 
