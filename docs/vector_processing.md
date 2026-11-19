@@ -266,6 +266,30 @@ change when a dataset is rebuilt**. Pass `--no-spatial-order` to `cng-datasets w
 or `cng-convert-to-parquet` (or `spatial_order=False` to `convert_to_parquet`) to keep
 source order.
 
+## Default MapLibre styles
+
+A PMTiles file needs a default style that shows its main variable. Choosing that column, and whether to show it as categories or a ramp, is a judgement about what the dataset is for, made by whoever writes its STAC. Everything after the choice is computed here from the data:
+
+```bash
+# 1. What can be drawn: each layer's attributes from the PMTiles tilestats,
+#    with the column descriptions from the STAC collection if given.
+cng-datasets style-profile s3://<bucket>/<dataset>.pmtiles --collection <collection.json>
+
+# 2. The style for the chosen column.
+cng-datasets style s3://<bucket>/<dataset>.pmtiles --parquet s3://<bucket>/<dataset>.parquet \
+  --column ZONE --kind categorical --collection <collection.json> --asset <dataset>-pmtiles \
+  --title "Parcels" --why "Zoning is what planners look up." \
+  --output s3://<bucket>/<dataset>/styles/<dataset>-zone.json
+```
+
+- **`--kind categorical`** colours the most frequent values, counted in the GeoParquet, up to `--max-classes` (default 10), with the rest grey as Other. Numeric codes are listed in order. Labels come from `CODE=meaning` in the column's description in `--collection`, or from `--labels`. `--colors` names exactly the classes to show and their colours. `--palette` spreads a sequential ramp over ordered classes.
+- **`--kind continuous`** shades six classes at quantile breaks of the real values, rounded to the fewest significant figures that keep them distinct, or at `--breaks`. A missing or non-numeric value is drawn as no data, as is any `--nodata` sentinel. `--column A/B` shows a ratio of two columns.
+- **`--single-colour REASON`** draws one colour, for data with no variable worth showing. The reason is recorded as `glen:single_colour_reason`.
+
+Without `--parquet`, classes and breaks come from the sample of values in the PMTiles tilestats.
+
+The style is MapLibre v8: one source `data`, whose `pmtiles://` URL is relative to the style's `--output` when both are in one bucket. It has one layer named after the source layer, plus an outline for polygons, and metadata with `description`, `glen:legend` and `glen:tooltip_fields`. This is the algorithm and output of data-workflows' `scripts/default-style.py`. Built from the same inputs, the two produce identical JSON. The command writes only the style. Adding it to the collection as a `style` asset is the STAC author's step.
+
 ## Examples
 
 See the following directories for complete examples:
