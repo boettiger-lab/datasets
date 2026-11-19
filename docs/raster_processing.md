@@ -197,6 +197,33 @@ When the hex reducer is categorical (`mode` or `fractions`), the warp to EPSG:43
 `nearest` resampling, so no class code is invented along a class boundary. Continuous
 sources warp with `bilinear`.
 
+### Default render and thumbnail
+
+Every COG carries its band statistics inside the file (`STATISTICS_MINIMUM`, `_MAXIMUM`, `_MEAN`, `_STDDEV`, `_VALID_PERCENT`), with no `.aux.xml` sidecar, as Portolan requires.
+
+When `raster-workflow` writes the COG, a `render` step after the hex step draws each one and writes `s3://<bucket>/<dataset>.render.json`, plus `<cog stem>.thumbnail.png` beside each COG:
+
+```json
+{"bucket": "public-lc", "generator": "cng-datasets x.y.z", "created": "...",
+ "renders": {"lc/nlcd-2001-cog.tif": {"colormap_name": "viridis", "rescale": [[0.4, 95.0]],
+                                      "nodata": 255, "thumbnail": "lc/nlcd-2001-cog.thumbnail.png"}}}
+```
+
+Each entry holds STAC render-extension fields. The STAC author adds `title` and `assets` and puts it under the collection's `renders`. The `thumbnail` key names the PNG for the collection's thumbnail asset.
+
+- A band with a color table is drawn with it: each entry is a `colormap` class, resampled `nearest`.
+- Any other band gets `viridis` stretched over its 2nd to 98th percentile, read from an overview. The stretch is in real units when the band has a scale or offset, because a map app unscales before applying `rescale`. Min to max would leave skewed data such as population or carbon at the bottom of the ramp.
+- A band with one value throughout gets no render.
+
+The automatic render is a default, not the answer. Diverging data needs a symmetric range and a diverging map, a categorical raster without a color table needs a class map, and log-scaled data needs a transform. Rerun the command with overrides:
+
+```bash
+cng-datasets cog-render s3://<bucket>/<dataset>-cog.tif --output s3://<bucket>/<dataset>.render.json \
+  --colormap rdbu_r --rescale -5,5          # or --colormap-json '{"1": "#1b9e77", "2": "#d95f02"}'
+```
+
+The thumbnail is drawn with GDAL from the COG's overviews, with nodata transparent, so it needs no browser or tile server. It can draw a color table, `--colormap-json`, and `viridis` or `rdbu` (and their `_r` reverses). For any other `--colormap` it writes the render without a thumbnail and says so.
+
 ## H3 Processing by h0 Regions
 
 For global rasters, process by h0 regions (0-121) for memory efficiency:

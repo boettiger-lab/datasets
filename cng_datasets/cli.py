@@ -574,6 +574,20 @@ def main():
     checksums_parser.add_argument("--workers", type=int, default=8,
                                   help="Objects read at once (default 8)")
 
+    render_parser = subparsers.add_parser(
+        "cog-render",
+        help="Write the default render and a thumbnail for each COG, for its STAC collection (#340)")
+    render_parser.add_argument("cogs", nargs="+", help="COGs: s3:// URLs in one bucket, or local paths")
+    render_parser.add_argument("--output", required=True, help="Where to write the JSON (s3:// or local)")
+    render_parser.add_argument("--colormap", default=None,
+                               help="TiTiler colormap name instead of viridis (or the color table)")
+    render_parser.add_argument("--rescale", default=None, metavar="LO,HI",
+                               help="Stretch range in real units instead of the 2nd-98th percentile")
+    render_parser.add_argument("--colormap-json", default=None, metavar="JSON",
+                               help='Classes instead of the color table, e.g. \'{"1": "#1b9e77"}\'')
+    render_parser.add_argument("--no-thumbnails", action="store_true", help="Write the JSON only")
+    render_parser.add_argument("--size", type=int, default=512, help="Thumbnail's longer side in pixels")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1014,6 +1028,17 @@ def _dispatch(args):
         doc = write_checksums(args.targets, args.output, workers=args.workers)
         total = sum(f["file:size"] for f in doc["files"].values())
         print(f"✓ {len(doc['files']):,} files, {total:,} bytes: wrote {args.output}")
+
+    elif args.command == "cog-render":
+        import json
+        from .raster.render import write_renders
+        rescale = [float(x) for x in args.rescale.split(",")] if args.rescale else None
+        if rescale is not None and len(rescale) != 2:
+            raise ValueError("--rescale takes LO,HI")
+        doc = write_renders(args.cogs, args.output, thumbnails=not args.no_thumbnails,
+                            size=args.size, colormap=args.colormap, rescale=rescale,
+                            colormap_json=json.loads(args.colormap_json) if args.colormap_json else None)
+        print(f"✓ {len(doc['renders'])} of {len(args.cogs)} COGs rendered: wrote {args.output}")
 
     elif args.command == "pmtiles-columns":
         from .vector.pmtiles import read_pmtiles_metadata, pmtiles_table_columns
