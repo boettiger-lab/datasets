@@ -1725,6 +1725,7 @@ class TestStepManifestNamespace:
                 "ns-raster-setup-bucket.yaml",
                 "ns-raster-preprocess-cog.yaml",
                 "ns-raster-hex.yaml",
+                "ns-raster-render.yaml",     # #340
                 "ns-raster-checksums.yaml",  # #340
                 "workflow.yaml",   # the orchestrator, which already had it
             }

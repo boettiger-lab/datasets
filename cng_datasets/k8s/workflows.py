@@ -1537,8 +1537,12 @@ def generate_raster_workflow(
     # workflow wrote is listed.
     checksum_targets = []
     if cog_key:
-        checksum_targets += ([f"s3://{bucket}/{cog_key.replace('{year}', str(y))}" for y in years]
-                             if years else [f"s3://{bucket}/{cog_key}"])
+        cogs = ([f"s3://{bucket}/{cog_key.replace('{year}', str(y))}" for y in years]
+                if years else [f"s3://{bucket}/{cog_key}"])
+        checksum_targets += cogs
+        # Default render and thumbnail of each COG this workflow wrote (#340).
+        _generate_render_job(manager, k8s_name, bucket, output_path, cogs,
+                             s3_dataset=dataset_name, config=config)
     checksum_targets.append(f"s3://{bucket}/{dataset_name}/hex/")
     _generate_checksums_job(manager, k8s_name, bucket, output_path, checksum_targets,
                             s3_dataset=dataset_name, config=config)
@@ -2387,6 +2391,8 @@ def _generate_raster_configmap(dataset_name, namespace, output_path, gen_command
         # The orchestrator applies this from /yamls, so leaving it out of the
         # ConfigMap fails the build at the merge step rather than at generation.
         job_files.append(f"{dataset_name}-merge.yaml")
+    if needs_preprocess:
+        job_files.append(f"{dataset_name}-render.yaml")
     job_files.append(f"{dataset_name}-checksums.yaml")
 
     data = {}
@@ -2441,6 +2447,16 @@ wait_job {dataset_name}-preprocess-cog {namespace} {step_timeout}
     else:
         hex_step_num = "1"
 
+    render_steps = ""
+    if needs_preprocess:
+        render_steps = f"""
+echo "Default render and thumbnail of each COG..."
+kubectl apply -f /yamls/{dataset_name}-render.yaml -n {namespace}
+wait_job {dataset_name}-render {namespace} {step_timeout}
+"""
+        cleanup_jobs = cleanup_jobs.replace(
+            f"{dataset_name}-checksums", f"{dataset_name}-render {dataset_name}-checksums")
+
     merge_steps = ""
     if needs_merge:
         # Sub-h0 chunks land outside the published tree; nothing reads hex/
@@ -2484,7 +2500,7 @@ wait_job {dataset_name}-setup-bucket {namespace} 600
 echo "Step {hex_step_num}: H3 hexagonal tiling..."
 kubectl apply -f /yamls/{dataset_name}-hex.yaml -n {namespace}
 wait_job {dataset_name}-hex {namespace} {step_timeout}
-{merge_steps}
+{merge_steps}{render_steps}
 echo "Sizes and checksums of the outputs..."
 kubectl apply -f /yamls/{dataset_name}-checksums.yaml -n {namespace}
 wait_job {dataset_name}-checksums {namespace} {step_timeout}
@@ -3191,6 +3207,52 @@ cng-datasets checksums {target_args} --output {shlex.quote(checksums_url(bucket,
         },
     }
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-checksums.yaml"))
+
+
+def render_url(bucket: str, s3_dataset: str) -> str:
+    """Where a raster dataset's default renders are written (#340)."""
+    return f"s3://{bucket}/{s3_dataset}.render.json"
+
+
+def _generate_render_job(manager, dataset_name, bucket, output_path, cogs: List[str],
+                         s3_dataset: str, config: ClusterConfig = None):
+    """Generate the Job that writes each COG's default render and thumbnail (#340)."""
+    if config is None:
+        config = ClusterConfig()
+    cog_args = " ".join(shlex.quote(c) for c in cogs)
+    pod_spec = {
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "render-task",
+            "image": "ghcr.io/boettiger-lab/datasets:latest",
+            "imagePullPolicy": "Always",
+            "env": _s3_env_vars(config),
+            "command": ["bash", "-c", f"""set -e
+cng-datasets cog-render {cog_args} --output {shlex.quote(render_url(bucket, s3_dataset))}
+"""],
+            "resources": {
+                "requests": {"cpu": "2", "memory": "4Gi"},
+                "limits": {"cpu": "2", "memory": "4Gi"},
+            },
+        }],
+    }
+    _apply_scheduling(pod_spec, config)
+    job_spec = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": _job_metadata(manager, f"{dataset_name}-render"),
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "backoffLimit": 2,
+            "ttlSecondsAfterFinished": 10800,
+            "template": {
+                "metadata": {"labels": {"k8s-app": f"{dataset_name}-render"}},
+                "spec": pod_spec,
+            },
+        },
+    }
+    manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-render.yaml"))
 
 
 def _generate_workflow_rbac(namespace, output_path):
