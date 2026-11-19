@@ -263,6 +263,7 @@ Raster workflows chunk by H3 cell instead: one h0 base cell per pod by default, 
 s3://bucket/
 ├── <dataset>.parquet         # GeoParquet with all attributes
 ├── <dataset>.pmtiles         # PMTiles vector tiles
+├── <dataset>.checksums.json  # size and checksum of each output (see Sizes and checksums)
 └── <dataset>/
     └── hex/                  # H3-indexed parquet, partitioned by h0
         ├── h0=<cell>/data_0.parquet   # <cell> is the h0 cell id as an integer
@@ -270,6 +271,35 @@ s3://bucket/
 ```
 
 Hex files carry one column per resolution (`h10`, `h9`, `h8`, `h0`) alongside the feature id. The GeoParquet and hex files record the cng-datasets and DuckDB versions that built them in their Parquet key-value metadata.
+
+### Hex partitions in STAC
+
+Portolan describes a partitioned dataset with the partition extension v1.0.0 (PORTO-FMT-017): the collection declares the extension and sets `partition:scheme`, `partition:keys` and `partition:glob`. The glob must be an absolute URL a client can list, such as `s3://`, because HTTPS cannot be listed (PORTO-FMT-064). Every hex output this tool writes is a hive layout with one file per partition:
+
+| Workflow | `partition:keys` | `partition:glob` |
+|---|---|---|
+| `workflow` (vector) | `["h0"]` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
+| `raster-workflow` | `["h0"]` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
+| `raster-workflow --years` | `["year", "h0"]` | `s3://<bucket>/<dataset>/hex/year=*/h0=*/data_0.parquet` |
+| `mdim-workflow` | `["h0"]` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
+
+`partition:scheme` is `hive` in every case. A collection with a vector hex output then carries:
+
+```json
+{
+  "stac_extensions": ["https://schemas.portolan-sdi.org/incubating/partition/v1.0.0/schema.json"],
+  "partition:scheme": "hive",
+  "partition:keys": ["h0"],
+  "partition:glob": "s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet"
+}
+```
+
+Notes for the STAC author:
+
+- The `h0` value in a path is the cell id as a decimal integer (`h0=577199624117288959`), the same value as the `h0` column inside the file, not the hex-string form `8029fffffffffff`. `year` is the four-digit year.
+- `--h0-subset`, `--h0-cells` and a regional source write only the partitions that hold data, so the glob matches fewer than 122 files. Nothing is written for an empty partition.
+- The glob names the same files as the hex asset's HTTPS href; only the scheme and host differ. The bucket is on NRP's Ceph, not AWS, so a client reading the `s3://` URL also needs the endpoint `https://s3-west.nrp-nautilus.io`. Portolan has no field for a custom endpoint yet; that is raised upstream from data-workflows#761.
+- `<dataset>.checksums.json` gives the hex prefix's total size and file count under `prefixes`, for the asset that carries the glob.
 
 ## Monitoring & Debugging
 
