@@ -18,8 +18,18 @@ jobs:
     - name: Install package and test dependencies
       run: |
         uv pip install -e ".[dev,raster]"
+
+    # rashid, the Portolan validator, in its own virtualenv: it needs rasterio,
+    # pyproj and shapely, which the image builds against its one GDAL (#285),
+    # and installing it beside them could replace them with wheels (#340).
+    - name: Install rashid for the conformance test
+      run: |
+        uv venv /opt/rashid
+        uv pip install --python /opt/rashid/bin/python rashid==0.4.0
     
     - name: Run tests
+      env:
+        RASHID: /opt/rashid/bin/rashid
       run: |
         pytest tests/ -v --cov=cng_datasets --cov-report=term
     

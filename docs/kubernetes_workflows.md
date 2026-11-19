@@ -46,7 +46,7 @@ Portolan asks every data asset for `file:size` and `file:checksum` (PORTO-CORE-0
 }
 ```
 
-Keys are object keys relative to the bucket. A `files` entry merges into a STAC asset as it is: the checksum is a sha2-256 multihash in hex, and `created` is the object's last-modified time. The hex directory is one STAC asset with a glob href, which a single checksum cannot describe, so it also gets a total size and file count under `prefixes`. The PMTiles step now finishes before the workflow does, since its output is read here. A raster workflow lists the COGs it wrote, not a source that was already a COG.
+Keys are object keys relative to the bucket. A `files` entry merges into a STAC asset as it is: the checksum is a sha2-256 multihash in hex, and `created` is the object's last-modified time. The hex directory is a glob, which a single checksum cannot describe, so it gets a total size and file count under `prefixes` instead (see Hex partitions in STAC). The PMTiles step now finishes before the workflow does, since its output is read here. A raster workflow lists the COGs it wrote, not a source that was already a COG.
 
 The same command backfills a dataset built before this step existed:
 
@@ -278,28 +278,32 @@ Portolan describes a partitioned dataset with the partition extension v1.0.0 (PO
 
 | Workflow | `partition:keys` | `partition:glob` |
 |---|---|---|
-| `workflow` (vector) | `["h0"]` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
-| `raster-workflow` | `["h0"]` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
-| `raster-workflow --years` | `["year", "h0"]` | `s3://<bucket>/<dataset>/hex/year=*/h0=*/data_0.parquet` |
-| `mdim-workflow` | `["h0"]` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
+| `workflow` (vector) | `h0` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
+| `raster-workflow` | `h0` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
+| `raster-workflow --years` | `year`, then `h0` | `s3://<bucket>/<dataset>/hex/year=*/h0=*/data_0.parquet` |
+| `mdim-workflow` | `h0` | `s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet` |
 
-`partition:scheme` is `hive` in every case. A collection with a vector hex output then carries:
+Each key is an object with a `name` and a `type`: `h0` is `int64` and `year` is `int32`. `partition:scheme` is `hive` and `partition:strategy` is `h3`. A collection with a vector hex output then carries:
 
 ```json
 {
   "stac_extensions": ["https://schemas.portolan-sdi.org/incubating/partition/v1.0.0/schema.json"],
   "partition:scheme": "hive",
-  "partition:keys": ["h0"],
+  "partition:strategy": "h3",
+  "partition:keys": [{"name": "h0", "type": "int64", "description": "H3 resolution-0 cell id"}],
   "partition:glob": "s3://<bucket>/<dataset>/hex/h0=*/data_0.parquet"
 }
 ```
 
 Notes for the STAC author:
 
+- Add these fields beside the hex asset, not instead of it. Consumers find hex by its asset key, one collection can hold several hex outputs, and the asset carries what a collection-level field cannot: `h3:*` resolutions, its own `table:columns`, `created`. rashid 0.4.0 models a partitioned collection as having no data asset for the partition files, so it still reports the hex asset's glob href (PTL-AST-012, an error) and its missing `file:checksum` (PTL-AST-003). Whether to accept that as a documented deviation or raise it with Portolan is undecided (#340).
 - The `h0` value in a path is the cell id as a decimal integer (`h0=577199624117288959`), the same value as the `h0` column inside the file, not the hex-string form `8029fffffffffff`. `year` is the four-digit year.
 - `--h0-subset`, `--h0-cells` and a regional source write only the partitions that hold data, so the glob matches fewer than 122 files. Nothing is written for an empty partition.
-- The glob names the same files as the hex asset's HTTPS href; only the scheme and host differ. The bucket is on NRP's Ceph, not AWS, so a client reading the `s3://` URL also needs the endpoint `https://s3-west.nrp-nautilus.io`. Portolan has no field for a custom endpoint yet; that is raised upstream from data-workflows#761.
-- `<dataset>.checksums.json` gives the hex prefix's total size and file count under `prefixes`, for the asset that carries the glob.
+- The bucket is on NRP's Ceph, not AWS, so a client reading the `s3://` URL also needs the endpoint `https://s3-west.nrp-nautilus.io`. Portolan has no field for a custom endpoint yet; that is raised upstream from data-workflows#761.
+- `<dataset>.checksums.json` lists every hex file, and gives the hex prefix's total size and file count under `prefixes`; the count can go in `partition:file_count`.
+
+`tests/test_portolan_conformance.py` runs rashid over fixture outputs in CI. Its fixture collection has no hex asset, so the data pass reaches the hex files through the glob alone; that is a choice for testing the files, not the catalog contract.
 
 ## Monitoring & Debugging
 

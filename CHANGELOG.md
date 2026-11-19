@@ -8,8 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **CI checks the emitted files against Portolan** (#340). `tests/test_portolan_conformance.py` builds a GeoParquet, its hex partitions and a COG with the workflow code, writes their sizes and checksums with the checksums step, wraps them in the smallest Portolan catalog, and runs rashid 0.4.0's metadata and data passes. It fails on any error or warning from the rules about the files themselves (PTL-DAT-*, PTL-AST-003/004, PTL-PRT-*). A second test breaks a checksum and a hex file and expects both to be caught, so a data pass that read nothing cannot pass. CI installs rashid in its own virtualenv, because it would otherwise replace the image's GDAL-linked rasterio, pyproj and shapely.
+
 ### Documentation
-- **Hex partitions in STAC** (#340). The Kubernetes workflows guide now gives the Portolan partition extension fields for each hex layout the tool writes (PORTO-FMT-017): `partition:scheme` `hive`, `partition:keys` `["h0"]` (or `["year", "h0"]` with `--years`) and an `s3://` `partition:glob`, with a STAC snippet. It also notes that the `h0` value in a path is the integer cell id and that the NRP endpoint has to be configured to read the glob.
+- **Hex partitions in STAC** (#340). The Kubernetes workflows guide gives the Portolan partition extension fields for each hex layout the tool writes (PORTO-FMT-017): `partition:scheme` `hive`, `partition:strategy` `h3`, `partition:keys` as objects with a `name` and a `type` (`h0` as `int64`, then `year` as `int32` with `--years`), and an `s3://` `partition:glob`, with a STAC snippet. The fields go beside the hex asset, which consumers look up by key. rashid 0.4.0 still reports that asset's glob href (PTL-AST-012) and missing checksum (PTL-AST-003); whether to accept that or raise it with Portolan is open on #340. It also notes that the `h0` value in a path is the integer cell id and that the NRP endpoint has to be configured to read the glob.
 
 ## [0.15.0] - 2026-11-18
 
