@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-19
+
 ### Added
 - **Vector thumbnails drawn with the default style** (#340). `cng-datasets vector-thumbnail --style --parquet --output` draws the GeoParquet with a MapLibre style as a 512 × 384 PNG, using GDAL instead of a browser. It draws each fill, line and circle layer, applies the layer filters (so placeholder features hidden by a filter stay out of the picture and out of the frame), frames the drawn features in Web Mercator, and blends overlapping features at their opacity as MapLibre does. The thumbnail evaluates the expressions styles here use, and any other operator is an error, not ignored. On the published SGCN ranges collection it draws California with its filtered placeholders left out, in 6 seconds.
 - **Default MapLibre styles built from a PMTiles file's data** (#340). `cng-datasets style-profile` lists a PMTiles layer's drawable attributes beside the STAC column descriptions. `cng-datasets style` builds the default style for a chosen column: categorical (the most frequent values, counted in the GeoParquet, the rest as Other, labels from the column's `CODE=meaning` description) or continuous (six classes at rounded quantile breaks, or given breaks, with no data in grey), or a single colour with its reason. It is data-workflows' `scripts/default-style.py` moved here, reading the GeoParquet with DuckDB instead of the MCP server. On a published collection the two produce identical JSON. The column is still chosen by the STAC author; everything after that choice is now deterministic and tested here.
@@ -411,6 +413,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.16.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.16.0
 [0.15.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.15.0
 [0.14.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.14.0
 [0.13.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.13.0
