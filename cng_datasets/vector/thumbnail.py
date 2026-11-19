@@ -343,7 +343,7 @@ def _geometry_column(con, parquet: str) -> str:
 def render_thumbnail(style: dict, parquet: str, size: int = SIZE,
                      background: str = BACKGROUND) -> bytes:
     """A PNG of ``parquet`` drawn with ``style``, ``size`` x ``3/4 size`` pixels."""
-    from osgeo import gdal, ogr, osr
+    from osgeo import gdal, osr
     gdal.UseExceptions()
     width, height = size, round(size * 3 / 4)
     layers = _layers(style)
@@ -385,6 +385,8 @@ def render_thumbnail(style: dict, parquet: str, size: int = SIZE,
                 continue
             c = parse_color(evaluate(colour, props))
             a = c[3] * float(evaluate(opacity, props) if opacity is not None else 1.0)
+            if lay["type"] == "line":  # a line under a pixel wide covers part of it
+                a *= min(1.0, float(width_px))
             if a <= 0:
                 continue
             key = (round(c[0]), round(c[1]), round(c[2]), round(a, 3))
@@ -435,17 +437,20 @@ def render_thumbnail(style: dict, parquet: str, size: int = SIZE,
                 f"COPY (SELECT cls.cls, {shape} AS geom FROM read_parquet({_sql(src)}) p "
                 f"JOIN cls USING (rid) WHERE NOT ST_IsEmpty(p.geom)) TO {_sql(fgb)} "
                 f"(FORMAT GDAL, DRIVER 'FlatGeobuf', SRS 'EPSG:3857')")
-            mem = gdal.GetDriverByName("MEM").Create("", width, height, 1, gdal.GDT_UInt16)
-            mem.SetGeoTransform([bounds[0], px, 0, bounds[3], 0, -px])
-            mem.SetProjection(srs.ExportToWkt())
-            vec = ogr.Open(fgb)
-            gdal.RasterizeLayer(mem, [1], vec.GetLayer(0), options=["ATTRIBUTE=cls", "ALL_TOUCHED=TRUE"])
-            vec = None
-            cls = mem.GetRasterBand(1).ReadAsArray()
+            # One pass per colour, adding 1 per feature, so each pixel knows how
+            # many features of that colour cover it. MapLibre blends every
+            # overlapping feature, so n layers at opacity a cover 1-(1-a)^n.
             for (r, gr, b, a), k in colours.items():
-                hit = cls == k
+                mem = gdal.GetDriverByName("MEM").Create("", width, height, 1, gdal.GDT_UInt16)
+                mem.SetGeoTransform([bounds[0], px, 0, bounds[3], 0, -px])
+                mem.SetProjection(srs.ExportToWkt())
+                gdal.Rasterize(mem, fgb, burnValues=[1], where=f"cls = {k}", add=True, allTouched=True)
+                count = mem.GetRasterBand(1).ReadAsArray().astype(float)
+                mem = None
+                hit = count > 0
                 if hit.any():
-                    canvas[hit] = canvas[hit] * (1 - a) + np.array([r, gr, b]) * a
+                    cover = (1 - (1 - a) ** count[hit])[:, None]
+                    canvas[hit] = canvas[hit] * (1 - cover) + np.array([r, gr, b]) * cover
     con.close()
 
     rgb = canvas.round().clip(0, 255).astype(np.uint8)
