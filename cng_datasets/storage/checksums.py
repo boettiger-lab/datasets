@@ -24,10 +24,10 @@ per dataset that a STAC author merges into the assets:
 
 Keys are object keys relative to the bucket. Each ``files`` value can be
 merged into a STAC asset as it is: ``created`` is the object's last-modified
-time. A hex directory is described in STAC by the collection's
-``partition:glob`` rather than by an asset, so each prefix asked for also gets
-a total size and file count under ``prefixes``, with no checksum; the count
-can go in ``partition:file_count``.
+time. A hex directory is a glob (its STAC asset's href and the collection's
+``partition:glob``), which a per-file checksum cannot describe, so each prefix
+asked for also gets a total size and file count under ``prefixes``, with no
+checksum; the count can go in ``partition:file_count``.
 
 The checksums are taken from the stored objects, read back after every step
 has finished, rather than from local files as they are written. One code path

@@ -46,7 +46,7 @@ Portolan asks every data asset for `file:size` and `file:checksum` (PORTO-CORE-0
 }
 ```
 
-Keys are object keys relative to the bucket. A `files` entry merges into a STAC asset as it is: the checksum is a sha2-256 multihash in hex, and `created` is the object's last-modified time. The hex directory is described by the collection's `partition:glob`, not by an asset (see Hex partitions in STAC), so it gets a total size and file count under `prefixes`, with no checksum. The PMTiles step now finishes before the workflow does, since its output is read here. A raster workflow lists the COGs it wrote, not a source that was already a COG.
+Keys are object keys relative to the bucket. A `files` entry merges into a STAC asset as it is: the checksum is a sha2-256 multihash in hex, and `created` is the object's last-modified time. The hex directory is a glob, which a single checksum cannot describe, so it gets a total size and file count under `prefixes` instead (see Hex partitions in STAC). The PMTiles step now finishes before the workflow does, since its output is read here. A raster workflow lists the COGs it wrote, not a source that was already a COG.
 
 The same command backfills a dataset built before this step existed:
 
@@ -297,13 +297,13 @@ Each key is an object with a `name` and a `type`: `h0` is `int64` and `year` is 
 
 Notes for the STAC author:
 
-- The glob is the only description of the hex files. Portolan gives a partitioned collection no data asset for them: an asset whose href is a glob fails PTL-AST-012, and a glob asset can carry no `file:checksum` (PTL-AST-003). The flat GeoParquet and the PMTiles stay ordinary assets beside it. Validators read the hex files through the glob, with the same GeoParquet checks as a flat file.
+- Add these fields beside the hex asset, not instead of it. Consumers find hex by its asset key, one collection can hold several hex outputs, and the asset carries what a collection-level field cannot: `h3:*` resolutions, its own `table:columns`, `created`. rashid 0.4.0 models a partitioned collection as having no data asset for the partition files, so it still reports the hex asset's glob href (PTL-AST-012, an error) and its missing `file:checksum` (PTL-AST-003). Whether to accept that as a documented deviation or raise it with Portolan is undecided (#340).
 - The `h0` value in a path is the cell id as a decimal integer (`h0=577199624117288959`), the same value as the `h0` column inside the file, not the hex-string form `8029fffffffffff`. `year` is the four-digit year.
 - `--h0-subset`, `--h0-cells` and a regional source write only the partitions that hold data, so the glob matches fewer than 122 files. Nothing is written for an empty partition.
 - The bucket is on NRP's Ceph, not AWS, so a client reading the `s3://` URL also needs the endpoint `https://s3-west.nrp-nautilus.io`. Portolan has no field for a custom endpoint yet; that is raised upstream from data-workflows#761.
 - `<dataset>.checksums.json` lists every hex file, and gives the hex prefix's total size and file count under `prefixes`; the count can go in `partition:file_count`.
 
-`tests/test_portolan_conformance.py` builds a collection this way from fixture outputs and runs rashid over it in CI.
+`tests/test_portolan_conformance.py` runs rashid over fixture outputs in CI. Its fixture collection has no hex asset, so the data pass reaches the hex files through the glob alone; that is a choice for testing the files, not the catalog contract.
 
 ## Monitoring & Debugging
 

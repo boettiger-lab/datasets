@@ -145,8 +145,10 @@ def catalog(tmp_path_factory):
 
     doc = _files(vec, ["vec.parquet"])
     flat = doc["files"][str(vec / "vec.parquet")]
-    # The hex files are published through partition:glob alone: Portolan
-    # gives a partitioned collection no data asset for them (PTL-AST-012).
+    # The fixture reaches the hex files through partition:glob alone, which is
+    # how rashid's data pass reads partitions. The published catalog also keeps
+    # a hex asset that consumers look up by key; rashid reports its glob href
+    # (PTL-AST-012), which is a catalog decision open on #340, not a file defect.
     hex_file = next((vec / "vec" / "hex").glob("h0=*/data_0.parquet"))
     vec_json = _collection(
         "vec", [-124.0, 33.0, -119.0, 36.0],
