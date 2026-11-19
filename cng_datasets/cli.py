@@ -588,6 +588,45 @@ def main():
     render_parser.add_argument("--no-thumbnails", action="store_true", help="Write the JSON only")
     render_parser.add_argument("--size", type=int, default=512, help="Thumbnail's longer side in pixels")
 
+    sprof = subparsers.add_parser(
+        "style-profile",
+        help="List a PMTiles file's drawable attributes, to choose a default style's column (#340)")
+    sprof.add_argument("pmtiles", help="The PMTiles file (local, http(s):// or s3://)")
+    sprof.add_argument("--collection", default=None,
+                       help="STAC collection (path or URL) whose table:columns describe the columns")
+
+    style_parser = subparsers.add_parser(
+        "style", help="Build a default MapLibre style for a PMTiles file from its data (#340)")
+    style_parser.add_argument("pmtiles", help="The PMTiles file (local, http(s):// or s3://)")
+    style_parser.add_argument("--output", required=True,
+                              help="Where to write the style JSON (s3:// or local); the PMTiles "
+                                   "href is written relative to it")
+    style_parser.add_argument("--parquet", default=None,
+                              help="The GeoParquet with the same features, to measure classes in "
+                                   "(default: the PMTiles tilestats sample)")
+    style_parser.add_argument("--column", default=None, help="Column to show, or A/B for a ratio")
+    style_parser.add_argument("--kind", choices=["categorical", "continuous"], default=None)
+    style_parser.add_argument("--single-colour", default=None, metavar="REASON",
+                              help="One colour instead of a column, for this reason")
+    style_parser.add_argument("--layer", default=None, help="PMTiles layer (default: the first)")
+    style_parser.add_argument("--collection", default=None,
+                              help="STAC collection whose table:columns give CODE=meaning labels")
+    style_parser.add_argument("--asset", default=None, help="The PMTiles asset key in --collection")
+    style_parser.add_argument("--title", default=None, help="The data's name for the style title")
+    style_parser.add_argument("--label", default=None, help="Human name of the column")
+    style_parser.add_argument("--why", default=None, help="One sentence on why this column")
+    style_parser.add_argument("--palette", default=None, help="Sequential palette for ordered data")
+    style_parser.add_argument("--reverse", action="store_true")
+    style_parser.add_argument("--colors", default=None, help='JSON {"value": "#hex"}: exactly these classes')
+    style_parser.add_argument("--labels", default=None, help='JSON {"value": "legend label"}')
+    style_parser.add_argument("--breaks", default=None, help="Class breaks, comma-separated")
+    style_parser.add_argument("--unit", default=None)
+    style_parser.add_argument("--nodata", action="append", default=None,
+                              help="A sentinel value drawn as no data (repeatable)")
+    style_parser.add_argument("--color", default=None, help="The colour of a --single-colour style")
+    style_parser.add_argument("--max-classes", type=int, default=10)
+    style_parser.add_argument("--tooltip", default=None, help="Comma-separated tooltip fields")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1039,6 +1078,32 @@ def _dispatch(args):
                             size=args.size, colormap=args.colormap, rescale=rescale,
                             colormap_json=json.loads(args.colormap_json) if args.colormap_json else None)
         print(f"✓ {len(doc['renders'])} of {len(args.cogs)} COGs rendered: wrote {args.output}")
+
+    elif args.command == "style-profile":
+        import json
+        from .vector.style import load_collection, profile
+        print(json.dumps(profile(args.pmtiles, load_collection(args.collection)), indent=2))
+
+    elif args.command == "style":
+        import json
+        from .raster.render import _put
+        from .vector.style import build_style, load_collection
+        sty, report = build_style(
+            args.pmtiles, parquet=args.parquet, column=args.column, kind=args.kind,
+            single_colour=args.single_colour, layer=args.layer,
+            collection=load_collection(args.collection), asset_key=args.asset,
+            output=args.output, title=args.title, label=args.label, why=args.why,
+            palette=args.palette, reverse=args.reverse,
+            colors=json.loads(args.colors) if args.colors else None,
+            labels=json.loads(args.labels) if args.labels else None,
+            breaks=[float(x) for x in args.breaks.split(",")] if args.breaks else None,
+            unit=args.unit, nodata=args.nodata, color=args.color,
+            max_classes=args.max_classes,
+            tooltip=[c for c in (args.tooltip or "").split(",") if c])
+        _put(args.output, (json.dumps(sty, indent=2) + "\n").encode(), "application/vnd.mapbox.style+json")
+        for line in report:
+            print(line)
+        print(f"✓ wrote {args.output}")
 
     elif args.command == "pmtiles-columns":
         from .vector.pmtiles import read_pmtiles_metadata, pmtiles_table_columns
