@@ -54,6 +54,8 @@ def _style(colour, flt=None, outline=False):
     if outline:
         layers.append({"id": "grid-outline", "type": "line", "source": "data", "source-layer": "grid",
                        "paint": {"line-color": "#000000", "line-width": 1, "line-opacity": 1}})
+        if flt is not None:
+            layers[-1]["filter"] = flt
     layers.append({"id": "labels", "type": "symbol", "source": "data", "source-layer": "grid",
                    "layout": {"text-field": ["get", "kind"]}})
     return {"version": 8, "sources": {"data": {"type": "vector", "url": "pmtiles://grid.pmtiles"}},
