@@ -46,7 +46,7 @@ Portolan asks every data asset for `file:size` and `file:checksum` (PORTO-CORE-0
 }
 ```
 
-Keys are object keys relative to the bucket. A `files` entry merges into a STAC asset as it is: the checksum is a sha2-256 multihash in hex, and `created` is the object's last-modified time. The hex directory is one STAC asset with a glob href, which a single checksum cannot describe, so it also gets a total size and file count under `prefixes`. The PMTiles step now finishes before the workflow does, since its output is read here. A raster workflow lists the COGs it wrote, not a source that was already a COG.
+Keys are object keys relative to the bucket. A `files` entry merges into a STAC asset as it is: the checksum is a sha2-256 multihash in hex, and `created` is the object's last-modified time. The hex directory is described by the collection's `partition:glob`, not by an asset (see Hex partitions in STAC), so it gets a total size and file count under `prefixes`, with no checksum. The PMTiles step now finishes before the workflow does, since its output is read here. A raster workflow lists the COGs it wrote, not a source that was already a COG.
 
 The same command backfills a dataset built before this step existed:
 
