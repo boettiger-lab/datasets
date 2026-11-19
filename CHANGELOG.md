@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **CI checks the emitted files against Portolan** (#340). `tests/test_portolan_conformance.py` builds a GeoParquet, its hex partitions and a COG with the workflow code, writes their sizes and checksums with the checksums step, wraps them in the smallest Portolan catalog, and runs rashid 0.4.0's metadata and data passes. It fails on any error or warning from the rules about the files themselves (PTL-DAT-*, PTL-AST-003/004, PTL-PRT-*). A second test breaks a checksum and a hex file and expects both to be caught, so a data pass that read nothing cannot pass. CI installs rashid in its own virtualenv, because it would otherwise replace the image's GDAL-linked rasterio, pyproj and shapely.
+
+### Documentation
+- **Hex partitions in STAC, corrected** (#340). `partition:keys` entries are objects with a `name` and a `type` (`h0` is `int64`, `year` is `int32`), not bare names as the 0.15.0 docs said, and `partition:strategy` is `h3`. The hex files are described by `partition:glob` alone, with no data asset, since Portolan refuses a glob href on an asset (PTL-AST-012).
+
 ### Documentation
 - **Hex partitions in STAC** (#340). The Kubernetes workflows guide now gives the Portolan partition extension fields for each hex layout the tool writes (PORTO-FMT-017): `partition:scheme` `hive`, `partition:keys` `["h0"]` (or `["year", "h0"]` with `--years`) and an `s3://` `partition:glob`, with a STAC snippet. It also notes that the `h0` value in a path is the integer cell id and that the NRP endpoint has to be configured to read the glob.
 
