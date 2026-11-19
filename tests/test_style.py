@@ -59,7 +59,7 @@ class TestHelpers:
         assert nice_breaks([1.01, 1.02], 0, 2) == [1.01, 1.02]
 
     def test_code_labels(self):
-        col = {"description": "Zone code. Values: A=Agricultural land; B=Built up, dense. C=Coast."}
+        col = {"description": "Zone code. Values: A=Agricultural land; B=Built up, dense; C=Coast."}
         assert code_labels(col, ["A", "B", "C"]) == {
             "A": "Agricultural land", "B": "Built up, dense", "C": "Coast"}
 
@@ -137,7 +137,7 @@ class TestContinuous:
         expr = sty["layers"][0]["paint"]["fill-color"]
         assert expr[0] == "case" and expr[2][0] == "step" and expr[-1] == NO_DATA
         # the breaks are the rounded quantiles of i*i over 600 features
-        q = duckdb.sql(f"SELECT quantile_cont(pop, 0.5) FROM '{data['parquet']}'").fetchone()[0]
+        q = duckdb.sql(f"SELECT quantile_cont(pop, 0.5) FROM '{data['parquet']}'").fetchall()[0][0]
         assert any(abs(b - q) / q < 0.1 for b in expr[2][3::2])
 
     def test_ratio_of_two_columns(self, data):
