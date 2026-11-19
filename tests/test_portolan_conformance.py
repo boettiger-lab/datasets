@@ -126,7 +126,9 @@ def _collection(cid, bbox, assets, **extra):
 def _table_columns(path):
     """name and type of each column, as a STAC author writes them from the file."""
     import pyarrow.parquet as pq
-    return [{"name": f.name, "type": str(f.type)} for f in pq.read_schema(str(path))]
+    # Descriptions are the STAC author's (PTL-DAT-020); the fixture has stand-ins.
+    return [{"name": f.name, "type": str(f.type), "description": f"The {f.name} column."}
+            for f in pq.read_schema(str(path))]
 
 
 def _asset(href, media, title, entry):
@@ -172,8 +174,7 @@ def catalog(tmp_path_factory):
     return root / "cat"
 
 
-@pytest.fixture(scope="module")
-def findings(catalog):
+def _rashid(catalog):
     run = subprocess.run([RASHID, "check", str(catalog), "--data-scope", "local", "--json", "--all"],
                          capture_output=True, text=True, timeout=600)
     try:
@@ -183,6 +184,11 @@ def findings(catalog):
     for f in report["findings"]:  # in the log, for whoever reads a failure
         print(f"{f.get('rule_id')} [{f.get('severity')}] {f.get('message', '')[:200]}")
     return report["findings"]
+
+
+@pytest.fixture(scope="module")
+def findings(catalog):
+    return _rashid(catalog)
 
 
 @pytest.mark.timeout(900)
@@ -200,3 +206,22 @@ def test_no_errors_or_warnings_on_the_files(findings):
            and f.get("rule_id") not in ACCEPTED]
     assert not bad, "\n".join(
         f"{f['rule_id']} [{f['severity']}] {f.get('message')}" for f in bad)
+
+
+@pytest.mark.timeout(900)
+def test_a_broken_file_is_caught(catalog, tmp_path):
+    """The check can fail: a wrong checksum on the flat file and an unreadable
+    hex file each draw an error. Without this, a data pass that silently read
+    nothing, such as a glob that matched no files, would pass."""
+    broken = tmp_path / "cat"
+    shutil.copytree(catalog, broken)
+    coll = json.loads((broken / "vec" / "collection.json").read_text())
+    coll["assets"]["vec-parquet"]["file:checksum"] = "1220" + "00" * 32
+    (broken / "vec" / "collection.json").write_text(json.dumps(coll))
+    next((broken / "vec" / "vec" / "hex").glob("h0=*/data_0.parquet")).write_bytes(b"not parquet")
+
+    errors = {f["rule_id"]: f for f in _rashid(broken)
+              if f.get("rule_id", "").startswith("PTL-DAT-") and f.get("severity") == "error"}
+    assert "PTL-DAT-001" in errors, "the checksum mismatch was not caught"
+    partition = [f for f in errors.values() if "partition" in (f.get("message") or "")]
+    assert partition, f"the unreadable hex file was not caught: {sorted(errors)}"
