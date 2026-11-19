@@ -33,6 +33,10 @@ FILE_RULES = ("PTL-DAT-", "PTL-AST-003", "PTL-AST-004", "PTL-PRT-")
 # Findings in those families that are known and accepted, with the reason.
 # Keep this short: each entry is a rule the tool does not yet meet.
 ACCEPTED = {
+    # The fixture's glob is relative, so the data pass matches it on disk and
+    # reads every hex file. A published collection uses s3://, which this
+    # rule asks for; listing a bucket is not something a unit test can do.
+    "PTL-PRT-002": "relative partition:glob in the local fixture",
 }
 
 FILE_EXT = "https://stac-extensions.github.io/file/v2.1.0/schema.json"
@@ -119,6 +123,12 @@ def _collection(cid, bbox, assets, **extra):
     }
 
 
+def _table_columns(path):
+    """name and type of each column, as a STAC author writes them from the file."""
+    import pyarrow.parquet as pq
+    return [{"name": f.name, "type": str(f.type)} for f in pq.read_schema(str(path))]
+
+
 def _asset(href, media, title, entry):
     return {"href": href, "type": media, "roles": ["data"], "title": title,
             "description": title, "file:size": entry["file:size"],
@@ -133,14 +143,18 @@ def catalog(tmp_path_factory):
 
     doc = _files(vec, ["vec.parquet"])
     flat = doc["files"][str(vec / "vec.parquet")]
+    # The hex files are published through partition:glob alone: Portolan
+    # gives a partitioned collection no data asset for them (PTL-AST-012).
+    hex_file = next((vec / "vec" / "hex").glob("h0=*/data_0.parquet"))
     vec_json = _collection(
         "vec", [-124.0, 33.0, -119.0, 36.0],
-        {"vec-parquet": _asset("./vec.parquet", PARQUET, "GeoParquet", flat),
-         "vec-hex": {"href": "./vec/hex/h0=*/data_0.parquet", "type": PARQUET,
-                     "roles": ["data"], "title": "H3 hex", "description": "H3 hex"}},
-        extensions=[PARTITION_EXT],
-        **{"partition:scheme": "hive", "partition:keys": ["h0"],
-           "partition:glob": "s3://conformance/vec/hex/h0=*/data_0.parquet"})
+        {"vec-parquet": _asset("./vec.parquet", PARQUET, "GeoParquet", flat)},
+        extensions=[PARTITION_EXT, "https://stac-extensions.github.io/table/v1.2.0/schema.json"],
+        **{"partition:scheme": "hive", "partition:strategy": "h3",
+           "partition:keys": [{"name": "h0", "type": "int64"}],
+           "partition:glob": "./vec/hex/h0=*/data_0.parquet",
+           "table:columns": _table_columns(vec / "vec.parquet") + [
+               c for c in _table_columns(hex_file) if c["name"].startswith("h")]})
     (vec / "collection.json").write_text(json.dumps(vec_json, indent=2))
 
     doc = _files(ras, ["ras-cog.tif"])
