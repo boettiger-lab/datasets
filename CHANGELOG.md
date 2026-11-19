@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **Hex partitions in STAC** (#340). The Kubernetes workflows guide now gives the Portolan partition extension fields for each hex layout the tool writes (PORTO-FMT-017): `partition:scheme` `hive`, `partition:keys` `["h0"]` (or `["year", "h0"]` with `--years`) and an `s3://` `partition:glob`, with a STAC snippet. It also notes that the `h0` value in a path is the integer cell id and that the NRP endpoint has to be configured to read the glob.
+
 ## [0.15.0] - 2026-11-18
 
 ### Added
