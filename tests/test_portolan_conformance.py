@@ -220,8 +220,10 @@ def test_a_broken_file_is_caught(catalog, tmp_path):
     (broken / "vec" / "collection.json").write_text(json.dumps(coll))
     next((broken / "vec" / "vec" / "hex").glob("h0=*/data_0.parquet")).write_bytes(b"not parquet")
 
-    errors = {f["rule_id"]: f for f in _rashid(broken)
-              if f.get("rule_id", "").startswith("PTL-DAT-") and f.get("severity") == "error"}
-    assert "PTL-DAT-001" in errors, "the checksum mismatch was not caught"
-    partition = [f for f in errors.values() if "partition" in (f.get("message") or "")]
-    assert partition, f"the unreadable hex file was not caught: {sorted(errors)}"
+    found = _rashid(broken)
+    assert any(f.get("rule_id") == "PTL-DAT-001" and f.get("severity") == "error"
+               for f in found), "the checksum mismatch was not caught"
+    # rashid reports a file it cannot read as PTL-DAT-000 on that partition
+    # file, which is what shows the glob was matched and each file opened.
+    assert any(f.get("rule_id") == "PTL-DAT-000" and "partition file" in (f.get("message") or "")
+               for f in found), "the unreadable hex file was not caught"
