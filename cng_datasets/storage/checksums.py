@@ -15,7 +15,7 @@ per dataset that a STAC author merges into the assets:
       "files": {
         "census-2024/county.parquet": {"file:size": 1234, "file:checksum": "1220...",
                                        "created": "2026-11-18T19:40:12Z"},
-        "census-2024/county/hex/h0=8029fffffffffff/data_0.parquet": {...}
+        "census-2024/county/hex/h0=577199624117288959/data_0.parquet": {...}
       },
       "prefixes": {
         "census-2024/county/hex/": {"file:size": 98765, "file_count": 122}
