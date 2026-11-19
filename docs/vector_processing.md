@@ -290,6 +290,22 @@ Without `--parquet`, classes and breaks come from the sample of values in the PM
 
 The style is MapLibre v8: one source `data`, whose `pmtiles://` URL is relative to the style's `--output` when both are in one bucket. It has one layer named after the source layer, plus an outline for polygons, and metadata with `description`, `glen:legend` and `glen:tooltip_fields`. This is the algorithm and output of data-workflows' `scripts/default-style.py`. Built from the same inputs, the two produce identical JSON. The command writes only the style. Adding it to the collection as a `style` asset is the STAC author's step.
 
+### Thumbnail
+
+```bash
+cng-datasets vector-thumbnail --style s3://<bucket>/<dataset>/styles/<dataset>-zone.json \
+  --parquet s3://<bucket>/<dataset>.parquet --output s3://<bucket>/<dataset>/thumbnail.png
+```
+
+This draws the GeoParquet with the style as a 512 × 384 PNG for the collection's thumbnail asset, using GDAL, with no browser or tile server.
+
+- **What is drawn:** each `fill`, `line` and `circle` layer in order, keeping only the features its `filter` keeps. Symbol layers are left out.
+- **Frame:** the extent of the drawn features, in Web Mercator like the map apps. A filter that hides placeholder features therefore also keeps them out of the frame.
+- **Blending:** overlapping features blend as MapLibre blends them. Lines thinner than a pixel are drawn lighter in proportion.
+- **Expressions:** the thumbnail evaluates the expressions styles use (`get`, `has`, comparisons, `all`, `any`, `in`, `case`, `match`, `step`, linear `interpolate`, `coalesce`, type conversions and arithmetic, and the legacy filter form). Any other operator is an error rather than being ignored.
+
+It is a gallery preview: classes, colours, opacities and filters match the map, but antialiasing and labels do not.
+
 ## Examples
 
 See the following directories for complete examples:
