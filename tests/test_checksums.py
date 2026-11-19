@@ -293,7 +293,7 @@ class TestEveryAppliedStepIsShipped:
         import cng_datasets.k8s.workflows as wf
         monkeypatch.setattr(wf, "_count_source_features", lambda *a, **k: 5000)
         with tempfile.TemporaryDirectory() as tmpdir:
-            generate_dataset_workflow(dataset_name="v", source_urls="https://e.com/x.gpkg",
+            generate_dataset_workflow(dataset_name="vec", source_urls="https://e.com/x.gpkg",
                                       bucket="b", output_dir=tmpdir, h3_resolution=8,
                                       pmtiles_chunks=chunks)
             self._check(tmpdir)
