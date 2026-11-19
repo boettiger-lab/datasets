@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-18
+
 ### Added
 - **Workflows write the size and checksum of every output** (#340). Portolan asks each data asset for `file:size` and a multihash `file:checksum` (PORTO-CORE-028/029), which the STAC author in data-workflows cannot get without reading every byte again. The last step of `workflow` and `raster-workflow` now reads each output back from S3 and writes `s3://<bucket>/<dataset>.checksums.json`. Each file gets its size, its sha2-256 multihash and its last-modified time, keyed by object key, ready to merge into its STAC asset. The hex directory, one asset with a glob href, also gets a total size and file count. The new `cng-datasets checksums` command does the same for datasets built before this step existed. The vector workflow now waits for the single-pod PMTiles step, which it used to leave running after the workflow finished, because the checksums read its output.
 
@@ -400,6 +402,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.15.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.15.0
 [0.14.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.14.0
 [0.13.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.13.0
 [0.12.7]: https://github.com/boettiger-lab/datasets/releases/tag/v0.12.7
