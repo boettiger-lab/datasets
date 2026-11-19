@@ -627,6 +627,14 @@ def main():
     style_parser.add_argument("--max-classes", type=int, default=10)
     style_parser.add_argument("--tooltip", default=None, help="Comma-separated tooltip fields")
 
+    vthumb = subparsers.add_parser(
+        "vector-thumbnail",
+        help="Draw a vector dataset with its style as a PNG thumbnail, for its STAC collection (#340)")
+    vthumb.add_argument("--style", required=True, help="The style JSON (local, http(s):// or s3://)")
+    vthumb.add_argument("--parquet", required=True, help="The GeoParquet the style's PMTiles were built from")
+    vthumb.add_argument("--output", required=True, help="Where to write the PNG (s3:// or local)")
+    vthumb.add_argument("--size", type=int, default=512, help="Width in pixels; the height is 3/4 of it")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1104,6 +1112,11 @@ def _dispatch(args):
         for line in report:
             print(line)
         print(f"✓ wrote {args.output}")
+
+    elif args.command == "vector-thumbnail":
+        from .vector.thumbnail import write_thumbnail
+        n = write_thumbnail(args.style, args.parquet, args.output, size=args.size)
+        print(f"✓ wrote {args.output} ({n:,} bytes)")
 
     elif args.command == "pmtiles-columns":
         from .vector.pmtiles import read_pmtiles_metadata, pmtiles_table_columns
