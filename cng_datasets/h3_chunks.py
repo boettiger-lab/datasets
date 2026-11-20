@@ -139,11 +139,13 @@ def enumerate_chunk_cells(chunk_resolution: int,
 
         # Expanded one h0 at a time with the cell as a literal. The obvious
         # single query — UNNEST(h3_cell_to_children(h0, N)) selected alongside
-        # i and h0 over a parquet scan — is not merely slow, it aborts DuckDB
+        # i and h0 over a parquet scan — was not merely slow, it aborted DuckDB
         # with "INTERNAL Error: Calling GetValueInternal on a value that is
-        # NULL" and invalidates the connection, so every later query in the
-        # process fails too. The literal form is the one already proven in
-        # _native_cells_for_h0, and there are at most 122 of these.
+        # NULL" and invalidated the connection, so every later query in the
+        # process failed too (h3-duckdb #120, #136). It no longer reproduces on
+        # DuckDB 2.0.0 with h3 v1.5.6 (checked 2026-11-20), but the literal form
+        # costs at most 122 small queries, so it stays. It is the same form
+        # _native_cells_for_h0 uses.
         cells = []
         for i, h0 in base:
             children = con.execute(
