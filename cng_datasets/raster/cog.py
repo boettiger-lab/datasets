@@ -1175,6 +1175,18 @@ def total_units(value_units: str) -> str:
     return text.strip() or f"{value_units} x area"
 
 
+# Two implementations of the raster → H3 hex aggregation step.
+# - "exact-extract" (default): polyfill h0 → cells, exact_extract per-cell.
+#   Mass-conserving by construction; one row per cell; slow at very fine
+#   resolutions because per-cell polygon coverage is exact.
+# - "warp-centroid": gdal.Warp source raster to a grid at the H3 edge
+#   pitch, emit one parquet row per warped pixel with its centroid mapped
+#   to a hex cell. Fast and memory-light; emits N rows per hex (consumers
+#   need GROUP BY h<res>); accurate only when warp pitch is finer than
+#   source pitch (per the analysis in issue #84).
+VALID_METHODS = ("exact-extract", "warp-centroid")
+
+
 def gdal_supports_cutline_wkt() -> bool:
     """
     Whether this GDAL's Python bindings accept ``gdal.WarpOptions(cutlineWKT=)``.
