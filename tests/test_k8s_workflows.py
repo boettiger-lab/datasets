@@ -3134,3 +3134,54 @@ class TestFractionsBesideMode:
             out, _ = self._build(root, monkeypatch, "fractions", backend="armada")
             names = {f.name for f in out.glob("armada-*.yaml")}
             assert "armada-worldcover-2021-peru-fractions-hex.yaml" in names
+
+
+class TestRasterCutlineWorkflow:
+    """`raster-workflow --cutline` adds the preprocess-cog step and passes the
+    polygon through, quoted (#344)."""
+
+    def _gen(self, tmpdir, monkeypatch, **kwargs):
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+        generate_raster_workflow(
+            dataset_name="worldcover-2021/peru", source_urls="s3://b/worldcover.tif",
+            bucket="public-land-cover", output_dir=tmpdir, nodata_value=0,
+            hex_resampling="mode", **kwargs)
+        return Path(tmpdir)
+
+    @pytest.mark.timeout(10)
+    def test_cutline_adds_preprocess_for_one_cog(self, monkeypatch):
+        import shlex
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._gen(tmpdir, monkeypatch, cutline="s3://b/boundaries.parquet",
+                            cutline_where="iso3 = 'PER'")
+            job = yaml.safe_load(open(out / "worldcover-2021-peru-preprocess-cog.yaml"))
+            cmd = job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            args = shlex.split(cmd.split("cng-datasets raster", 1)[1].split("\n\necho")[0]
+                               .replace("\\\n", " "))
+            assert args[args.index("--cutline") + 1] == "s3://b/boundaries.parquet"
+            assert args[args.index("--cutline-where") + 1] == "iso3 = 'PER'"
+            assert args[args.index("--resampling") + 1] == "nearest"
+            hex_job = yaml.safe_load(open(out / "worldcover-2021-peru-hex.yaml"))
+            assert "worldcover-2021/peru-cog.tif" in str(hex_job)
+
+    @pytest.mark.timeout(10)
+    def test_without_a_clip_a_cog_is_read_directly(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._gen(tmpdir, monkeypatch)
+            assert not (out / "worldcover-2021-peru-preprocess-cog.yaml").exists()
+
+    @pytest.mark.timeout(10)
+    def test_target_resolution_adds_preprocess_for_one_cog(self, monkeypatch):
+        """It used to be dropped for a single COG source."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._gen(tmpdir, monkeypatch, target_resolution=0.001)
+            assert (out / "worldcover-2021-peru-preprocess-cog.yaml").exists()
+
+    @pytest.mark.timeout(10)
+    def test_bad_combinations_fail_at_generation(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="Pass one"):
+                self._gen(tmpdir, monkeypatch, cutline="c.gpkg", target_extent=(0, 0, 1, 1))
+            with pytest.raises(ValueError, match="needs --cutline"):
+                self._gen(tmpdir, monkeypatch, cutline_where="x = 1")

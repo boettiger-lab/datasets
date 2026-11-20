@@ -1889,6 +1889,69 @@ def h3_resolution_join_warning(
     )
 
 
+def _cutline_path(cutline: str) -> str:
+    """A GDAL path for a cutline given as a local path or URL (#344)."""
+    path = _ensure_vsi_path(cutline)
+    if cutline.lower().endswith(".zip") and not path.startswith("/vsizip/"):
+        path = f"/vsizip/{path}"
+    return path
+
+
+def _cutline_bounds(cutline_path: str, where: Optional[str], target_crs: str) -> tuple:
+    """(xmin, ymin, xmax, ymax) of the cutline features in *target_crs* (#344).
+
+    Read feature by feature rather than with GetExtent, which some drivers
+    answer from file metadata without applying the attribute filter.
+    """
+    ds = gdal.OpenEx(cutline_path, gdal.OF_VECTOR)
+    if ds is None:
+        raise ValueError(f"Could not open --cutline {cutline_path!r}: {gdal.GetLastErrorMsg()}")
+    layer = ds.GetLayer(0)
+    if where:
+        if layer.SetAttributeFilter(where) != 0:
+            raise ValueError(f"--cutline-where {where!r} is not a valid filter on {cutline_path!r}")
+    xmin = ymin = math.inf
+    xmax = ymax = -math.inf
+    n = 0
+    for feature in layer:
+        geom = feature.GetGeometryRef()
+        if geom is None or geom.IsEmpty():
+            continue
+        gx0, gx1, gy0, gy1 = geom.GetEnvelope()
+        xmin, xmax = min(xmin, gx0), max(xmax, gx1)
+        ymin, ymax = min(ymin, gy0), max(ymax, gy1)
+        n += 1
+    if n == 0:
+        raise ValueError(
+            f"--cutline {cutline_path!r} has no features with a geometry"
+            + (f" matching --cutline-where {where!r}" if where else ""))
+    src = layer.GetSpatialRef()
+    dst = osr.SpatialReference()
+    dst.SetFromUserInput(target_crs)
+    if src is not None and not src.IsSame(dst):
+        for ref in (src, dst):
+            ref.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        xmin, ymin, xmax, ymax = osr.CoordinateTransformation(src, dst).TransformBounds(
+            xmin, ymin, xmax, ymax, 21)
+    print(f"  Cutline: {n} feature(s), bounds {xmin:.6f},{ymin:.6f},{xmax:.6f},{ymax:.6f}")
+    return xmin, ymin, xmax, ymax
+
+
+def _snap_to_grid(bounds: tuple, gt: tuple, size: tuple) -> Optional[tuple]:
+    """*bounds* snapped outward to the pixel grid *gt* and cut to the raster's
+    own extent (*size* is its pixel width and height), or None when the two do
+    not overlap. Same grid in, same grid out: no pixel is resampled (#344)."""
+    x0, dx, _, y0, _, dy = gt          # dy < 0 for a north-up raster
+    xmin, ymin, xmax, ymax = bounds
+    c0 = max(0, math.floor((xmin - x0) / dx + 1e-9))
+    c1 = min(size[0], math.ceil((xmax - x0) / dx - 1e-9))
+    r0 = max(0, math.floor((ymax - y0) / dy + 1e-9))
+    r1 = min(size[1], math.ceil((ymin - y0) / dy - 1e-9))
+    if c1 <= c0 or r1 <= r0:
+        return None
+    return (x0 + c0 * dx, y0 + r1 * dy, x0 + c1 * dx, y0 + r0 * dy)
+
+
 def create_mosaic_cog(
     source_urls: List[str],
     output_path: str,
@@ -1900,6 +1963,8 @@ def create_mosaic_cog(
     resampling: str = "bilinear",
     compression: str = "deflate",
     overview_resampling: str = "average",
+    cutline: Optional[str] = None,
+    cutline_where: Optional[str] = None,
 ) -> str:
     """
     Mosaic multiple raster tiles (potentially in different CRS) into a single COG.
@@ -1928,12 +1993,24 @@ def create_mosaic_cog(
         compression: COG compression (deflate, lzw, zstd).
         overview_resampling: Resampling for COG overviews. Use "mode"/"nearest"
                 for categorical sources — "average" corrupts class codes.
+        cutline: A polygon layer (local path or URL; GeoParquet, GPKG,
+                GeoJSON, a zipped shapefile, ...) to clip to (#344). Pixels
+                whose centre falls outside it become nodata. Tiles already on
+                the target grid keep it: the extent is the polygon's bounds
+                snapped outward to the source pixels, cut to the source, and
+                the warp is nearest, so values pass through unchanged.
+        cutline_where: An attribute filter on the cutline, e.g. "iso3 = 'PER'".
 
     Returns:
         output_path (echoed back for chaining)
     """
     if not source_urls:
         raise ValueError("source_urls must not be empty")
+    if cutline_where and not cutline:
+        raise ValueError("cutline_where needs a cutline")
+    if cutline and target_extent is not None:
+        raise ValueError(
+            "cutline and target_extent both given; the cutline sets the extent. Pass one.")
 
     nodata_values = _parse_nodata_values(nodata)
 
@@ -1962,6 +2039,23 @@ def create_mosaic_cog(
 
     if not crs_groups:
         raise RuntimeError("No readable source tiles found")
+
+    cut_path = cut_bounds = None
+    if cutline:
+        cut_path = _cutline_path(cutline)
+        cut_bounds = _cutline_bounds(cut_path, cutline_where, target_crs)
+        # Outside the polygon becomes nodata, so there has to be one. Without
+        # it GDAL writes 0, which a hex step would count as data.
+        if not nodata_values:
+            first = next(iter(crs_groups.values()))[0]
+            ds = gdal.Open(first)
+            source_nodata = ds.GetRasterBand(band or 1).GetNoDataValue()
+            ds = None
+            if source_nodata is None:
+                raise ValueError(
+                    "--cutline sets every pixel outside the polygon to nodata, but the "
+                    "source declares no nodata value. Pass --nodata with a value the "
+                    "data never takes.")
 
     print(f"  CRS groups: { {k: len(v) for k, v in crs_groups.items()} }")
 
@@ -1997,13 +2091,32 @@ def create_mosaic_cog(
             vrt_path = os.path.join(workdir, f"group_{i}.vrt")
             # Tiles already on one grid in the target CRS need no warp: the VRT
             # is the mosaic (issue #277). A clip or a new resolution still warps.
-            no_warp = (target_extent is None and target_resolution is None
-                       and _shares_target_grid(tiles, target_crs))
+            on_grid = target_resolution is None and _shares_target_grid(tiles, target_crs)
+            no_warp = on_grid and target_extent is None and cutline is None
             vrt_ds = gdal.BuildVRT(vrt_path, tiles, bandList=[band] if band else None,
                                    **(build_vrt_opts if no_warp else {}))
             if vrt_ds is None:
                 raise RuntimeError(f"gdal.BuildVRT failed for CRS group {crs_key}")
+            vrt_gt, vrt_size = vrt_ds.GetGeoTransform(), (vrt_ds.RasterXSize, vrt_ds.RasterYSize)
             vrt_ds = None  # flush
+
+            group_kwargs = warp_kwargs
+            if cutline:
+                group_kwargs = dict(warp_kwargs, cutlineDSName=cut_path)
+                if cutline_where:
+                    group_kwargs["cutlineWhere"] = cutline_where
+                if on_grid:
+                    snapped = _snap_to_grid(cut_bounds, vrt_gt, vrt_size)
+                    if snapped is None:
+                        print(f"  {crs_key} does not overlap the cutline; skipping")
+                        continue
+                    group_kwargs.update(outputBounds=snapped, outputBoundsSRS=target_crs,
+                                        xRes=vrt_gt[1], yRes=-vrt_gt[5], resampleAlg="near")
+                    print(f"  {crs_key} is on the target grid; clipping on it, nearest")
+                else:
+                    group_kwargs.update(outputBounds=cut_bounds, outputBoundsSRS=target_crs)
+                    if target_resolution is not None:
+                        group_kwargs["targetAlignedPixels"] = True
 
             if no_warp:
                 print(f"  {crs_key} is already on the target grid; not warping")
@@ -2014,11 +2127,14 @@ def create_mosaic_cog(
             print(f"  Warping {crs_key} → {target_crs}...")
             result = gdal.Warp(warped_path, vrt_path,
                                creationOptions=_scratch_gtiff_options(vrt_path),
-                               **warp_kwargs)
+                               **group_kwargs)
             if result is None:
                 raise RuntimeError(f"gdal.Warp failed for CRS group {crs_key}: {gdal.GetLastErrorMsg()}")
             result = None
             warped_paths.append(warped_path)
+
+        if not warped_paths:
+            raise RuntimeError(f"No source tile overlaps the cutline {cutline!r}")
 
         # Merge all warped groups into a final VRT
         print(f"  Merging {len(warped_paths)} warped group(s)...")
@@ -2129,6 +2245,8 @@ class RasterProcessor:
         target_resolution: Optional[float] = None,
         band: Optional[int] = None,
         local_cache_dir: Optional[str] = "/tmp/cng-raster-cache",
+        cutline: Optional[str] = None,
+        cutline_where: Optional[str] = None,
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
     ):
@@ -2197,6 +2315,8 @@ class RasterProcessor:
             target_extent: Clip extent (xmin, ymin, xmax, ymax) in target_crs; used when mosaicking
             target_resolution: Output pixel size in target_crs units; used when mosaicking
             band: Extract a single band from multi-band sources (1-indexed); used when mosaicking
+            cutline: Polygon layer to clip to, as in create_mosaic_cog (#344).
+            cutline_where: Attribute filter on the cutline.
             read_credentials: Dict with AWS credentials for reading
             write_credentials: Dict with AWS credentials for writing
         """
@@ -2206,15 +2326,23 @@ class RasterProcessor:
         # A mosaic selects the band while it builds, so the single-band view
         # already exists by the time the selection below runs.
         band_applied_by_mosaic = False
+        # A clip or a new resolution goes through the mosaic step even for one
+        # input: the single-input path below has no clip, and used to ignore
+        # target_extent without a word (#344).
+        clipped = (target_extent is not None or target_resolution is not None
+                   or cutline is not None)
+        if clipped and isinstance(input_path, str):
+            input_path = [input_path]
         if isinstance(input_path, list):
-            if len(input_path) == 1:
+            if len(input_path) == 1 and not clipped:
                 input_path = input_path[0]
             else:
                 band_applied_by_mosaic = band is not None
                 import tempfile
                 self._mosaic_tmpdir = tempfile.mkdtemp(prefix="raster_processor_")
                 mosaic_path = os.path.join(self._mosaic_tmpdir, "mosaic.tif")
-                print(f"Multiple input tiles detected ({len(input_path)}), mosaicking to temp COG...")
+                print(f"Mosaicking {len(input_path)} input(s) to a temp COG"
+                      + (" (clipped)" if clipped else "") + "...")
                 create_mosaic_cog(
                     source_urls=input_path,
                     output_path=mosaic_path,
@@ -2225,6 +2353,8 @@ class RasterProcessor:
                     nodata=nodata_value,
                     resampling=resampling,
                     compression=compression,
+                    cutline=cutline,
+                    cutline_where=cutline_where,
                 )
                 input_path = mosaic_path
 
