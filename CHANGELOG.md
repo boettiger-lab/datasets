@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-20
+
 ### Added
 - **`--hex-resampling total` for per-area densities** (#105). `sum` adds pixel values, which for a density in Mg/ha is a sum of densities: the carbon rasters came out 6–7 times below their published totals. `total` multiplies each pixel by its true area on the sphere (exactextract's `area_spherical_km2` weight) before adding, so each cell holds the amount (Mg) and `SUM()` over the table is the grand total, correct at every latitude and at nodata edges. It needs the new `--value-units`, whose per-area denominator sets the scale (`/ha` ×100, `/km2` ×1, `/m2` ×10⁶). `sum` with a per-area `--value-units` is refused, `sum` without one prints a warning at generation, and the hex pod warns when the band's own units are per-area. `--value-units` is recorded as `value_units` in each partition's metadata.
 - **CI requires a changelog entry** (#114). A pull request that changes `cng_datasets/` now fails the `changelog` check unless it adds a line to `CHANGELOG.md` or carries the `no-changelog` label. Releases had been reconciled against the changelog by hand, and #296 merged without an entry.
@@ -430,6 +432,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.18.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.18.0
 [0.17.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.17.0
 [0.16.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.16.0
 [0.15.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.15.0
