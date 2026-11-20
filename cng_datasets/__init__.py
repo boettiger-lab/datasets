@@ -11,4 +11,3 @@ __version__ = "0.17.0"
 # or we can keep these commented out to allow core usage without all dependencies.
 # from . import vector, raster, k8s, storage
 # __all__ = ["vector", "raster", "k8s", "storage", "__version__"]
-# temporary: checks the changelog workflow (#359); reverted before merge

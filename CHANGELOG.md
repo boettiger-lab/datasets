@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **CI requires a changelog entry** (#114). A pull request that changes `cng_datasets/` now fails the `changelog` check unless it adds a line to `CHANGELOG.md` or carries the `no-changelog` label. Releases had been reconciled against the changelog by hand, and #296 merged without an entry.
+
 ## [0.17.0] - 2026-11-20
 
 ### Added
