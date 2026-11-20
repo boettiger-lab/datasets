@@ -1410,6 +1410,19 @@ def generate_raster_workflow(
     k8s_name = dataset_name.replace('_', '-').replace('/', '-').lower()
     _validate_k8s_name(k8s_name, dataset_name)
 
+    # A categorical layer is usually built twice from one COG, once as `mode`
+    # and once as `fractions`. The two tables have different schemas, so they
+    # get their own hex tree, job names and checksums file; with shared ones,
+    # the second build overwrote the first and its `kubectl apply` collided
+    # with the first build's jobs (issue #343). The COG and its render are
+    # the same for both (both resample it with `mode`), so those stay shared.
+    hex_dir = hex_dir_name(hex_resampling)
+    if hex_resampling == "fractions":
+        k8s_name = f"{k8s_name}-fractions"
+        checksums_stem = f"{dataset_name}-fractions"
+    else:
+        checksums_stem = dataset_name
+
     if parent_resolutions is None:
         parent_resolutions = [0]
 
@@ -1520,7 +1533,7 @@ def generate_raster_workflow(
         hex_workers=hex_workers, hex_chunk_size=hex_chunk_size, hex_cpu=hex_cpu,
         chunk_resolution=chunk_resolution, chunk_count=chunk_count,
         hex_retries=hex_retries, max_failed_indexes=max_failed_indexes,
-        years=years,
+        years=years, hex_dir=hex_dir,
     )
     per_year = chunk_count if chunk_resolution else (len(h0_subset) if h0_subset else 122)
     hex_completions = per_year * (len(years) if years else 1)
@@ -1529,7 +1542,7 @@ def generate_raster_workflow(
         _generate_raster_merge_job(
             manager, k8s_name, bucket, output_path, s3_dataset=dataset_name,
             merge_memory=merge_memory, merge_storage=merge_storage, config=config,
-            expect_chunks=chunk_count, years=years,
+            expect_chunks=chunk_count, years=years, hex_dir=hex_dir,
         )
 
     # Sizes and checksums of the outputs, for their STAC assets (#340). A
@@ -1543,9 +1556,9 @@ def generate_raster_workflow(
         # Default render and thumbnail of each COG this workflow wrote (#340).
         _generate_render_job(manager, k8s_name, bucket, output_path, cogs,
                              s3_dataset=dataset_name, config=config)
-    checksum_targets.append(f"s3://{bucket}/{dataset_name}/hex/")
+    checksum_targets.append(f"s3://{bucket}/{dataset_name}/{hex_dir}/")
     _generate_checksums_job(manager, k8s_name, bucket, output_path, checksum_targets,
-                            s3_dataset=dataset_name, config=config)
+                            s3_dataset=checksums_stem, config=config)
 
     # Generate workflow RBAC
     _generate_workflow_rbac(namespace, output_path)
@@ -1558,6 +1571,7 @@ def generate_raster_workflow(
                    f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
     if years:
         gen_command += f" --years {','.join(str(y) for y in years)}"
+    gen_command += f" --hex-resampling {hex_resampling}"
 
     # Generate ConfigMap and orchestrator workflow
     _generate_raster_configmap(k8s_name, namespace, output_path, gen_command,
@@ -1587,8 +1601,8 @@ def generate_raster_workflow(
             f"\n    Estimated peak per pod ≈ {est / 2 ** 30:.1f} GiB against a "
             f"{hex_memory} request. This models the cell enumeration, which is the "
             f"term that scales with chunk size — it is a floor, not a guarantee."
-            f"\n  Merge: {k8s_name}-merge consolidates hex-chunks/ into "
-            f"hex/h0=*/data_0.parquet"
+            f"\n  Merge: {k8s_name}-merge consolidates {hex_dir}-chunks/ into "
+            f"{hex_dir}/h0=*/data_0.parquet"
         )
 
     # Fine chunking is what makes an external queue necessary: an indexed Job of
@@ -1653,7 +1667,9 @@ def generate_raster_workflow(
         if years:
             print(f"  Years: {len(years)} ({years[0]}–{years[-1]}), so {hex_completions} "
                   f"hex completions in all, written to "
-                  f"s3://{bucket}/{dataset_name}/hex/year=<year>/")
+                  f"s3://{bucket}/{dataset_name}/{hex_dir}/year=<year>/")
+        elif hex_dir != "hex":
+            print(f"  Hex output: s3://{bucket}/{dataset_name}/{hex_dir}/")
         print(hex_profile)
         print(hex_profile_hint)
         print(f"\nFiles created in {output_dir}:")
@@ -2074,6 +2090,7 @@ def _generate_raster_merge_job(
     manager, dataset_name, bucket, output_path, s3_dataset=None,
     merge_memory="16Gi", merge_storage="50Gi", config: ClusterConfig = None,
     expect_chunks: Optional[int] = None, years: Optional[List[int]] = None,
+    hex_dir: str = "hex",
 ):
     """Generate the job that consolidates sub-h0 chunks into one file per h0.
 
@@ -2108,16 +2125,16 @@ def _generate_raster_merge_job(
 for YEAR in {' '.join(str(y) for y in years)}; do
   echo "Merging year=$YEAR"
   cng-datasets merge-chunks \\
-    --chunks-dir s3://{bucket}/{s3_dataset}/hex-chunks/year=$YEAR \\
-    --output-dir s3://{bucket}/{s3_dataset}/hex/year=$YEAR{expect_flag.replace(chr(10) + "  ", chr(10) + "    ")}
+    --chunks-dir s3://{bucket}/{s3_dataset}/{hex_dir}-chunks/year=$YEAR \\
+    --output-dir s3://{bucket}/{s3_dataset}/{hex_dir}/year=$YEAR{expect_flag.replace(chr(10) + "  ", chr(10) + "    ")}
 done
 """
     else:
         command_str = f"""set -e
 
 cng-datasets merge-chunks \\
-  --chunks-dir s3://{bucket}/{s3_dataset}/hex-chunks \\
-  --output-dir s3://{bucket}/{s3_dataset}/hex{expect_flag}
+  --chunks-dir s3://{bucket}/{s3_dataset}/{hex_dir}-chunks \\
+  --output-dir s3://{bucket}/{s3_dataset}/{hex_dir}{expect_flag}
 """
 
     pod_spec = {
@@ -2173,7 +2190,8 @@ cng-datasets merge-chunks \\
 
 def _hex_fanout(bucket: str, s3_dataset: str, chunk_resolution: int,
                 chunk_count: Optional[int], h0_subset: Optional[List[int]],
-                index_var: str = "JOB_COMPLETION_INDEX", partition: str = ""):
+                index_var: str = "JOB_COMPLETION_INDEX", partition: str = "",
+                hex_dir: str = "hex"):
     """(completions, shell preamble, chunk selector flags, output URL) for an
     indexed hex Job. Shared by the raster and mdim hex jobs (#181), so both
     fan out over the same chunk list and write where `merge-chunks` reads.
@@ -2181,6 +2199,8 @@ def _hex_fanout(bucket: str, s3_dataset: str, chunk_resolution: int,
     *index_var* names the shell variable holding the unit index, and
     *partition* is a hive path segment such as "year=${YEAR}/" under the
     output; a multi-year build sets both (#172). Completions are per partition.
+    *hex_dir* is the published hex tree's folder, staged in ``<hex_dir>-chunks``
+    (``hex-fractions`` for a fractions build, #343).
     """
     # One completion per unit of work: the chunk list at chunk_resolution, or
     # the h0 fan-out as before. Emitting fewer than the chunk list holds would
@@ -2227,12 +2247,12 @@ def _hex_fanout(bucket: str, s3_dataset: str, chunk_resolution: int,
     if chunk_resolution:
         # Sub-h0 chunks are staged outside the published tree and merged back by
         # the merge step, so a reader globbing hex/ mid-build never sees parts.
-        out_url = f"s3://{bucket}/{s3_dataset}/hex-chunks/{partition}"
+        out_url = f"s3://{bucket}/{s3_dataset}/{hex_dir}-chunks/{partition}"
         selector = f"--chunk-resolution {chunk_resolution} --chunk-index {h0_index}"
         if h0_subset:
             selector += f" --h0-subset \"{','.join(str(h) for h in h0_subset)}\""
     else:
-        out_url = f"s3://{bucket}/{s3_dataset}/hex/{partition}"
+        out_url = f"s3://{bucket}/{s3_dataset}/{hex_dir}/{partition}"
         selector = f"--h0-index {h0_index}"
     return completions, h0_preamble, selector, out_url
 
@@ -2296,6 +2316,7 @@ def _generate_raster_hex_job(
     hex_retries: int = DEFAULT_HEX_RETRIES,
     max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
     years: Optional[List[int]] = None,
+    hex_dir: str = "hex",
 ):
     """Generate raster H3 hex tiling job.
 
@@ -2314,13 +2335,14 @@ def _generate_raster_hex_job(
     if years:
         per_year, h0_preamble, selector, out_url = _hex_fanout(
             bucket, s3_dataset, chunk_resolution, chunk_count, h0_subset,
-            index_var="UNIT", partition="year=${YEAR}/")
+            index_var="UNIT", partition="year=${YEAR}/", hex_dir=hex_dir)
         completions = per_year * len(years)
         h0_preamble = _year_preamble(years, per_year) + h0_preamble
         source_url = _year_template(source_url)
     else:
         completions, h0_preamble, selector, out_url = _hex_fanout(
-            bucket, s3_dataset, chunk_resolution, chunk_count, h0_subset)
+            bucket, s3_dataset, chunk_resolution, chunk_count, h0_subset,
+            hex_dir=hex_dir)
     cng_cmd = f"cng-datasets raster --input \"{source_url}\" --output-parquet {out_url} {selector} --resolution {h3_resolution} --parent-resolutions {parent_res_str} --value-column {value_column} --hex-resampling {hex_resampling}"
     nodata_cli = _nodata_cli_value(nodata_value)
     if nodata_cli is not None:
@@ -3157,6 +3179,16 @@ cng-datasets repartition --chunks-dir s3://{bucket}/{s3_dataset}/chunks --output
         }
     }
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-repartition.yaml"))
+
+
+def hex_dir_name(hex_resampling: str) -> str:
+    """The folder a raster build's hex tree is published under (#343).
+
+    A `fractions` table has one row per class per cell, a different schema
+    from the one-row-per-cell tables every other reducer writes, so it lives
+    beside them as ``hex-fractions/`` rather than in ``hex/``.
+    """
+    return "hex-fractions" if hex_resampling == "fractions" else "hex"
 
 
 def checksums_url(bucket: str, s3_dataset: str) -> str:

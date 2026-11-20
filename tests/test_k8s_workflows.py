@@ -3039,3 +3039,98 @@ def test_hex_manifest_states_its_cpu_request(monkeypatch):
         env = {e["name"]: e.get("value") for e in
                job["spec"]["template"]["spec"]["containers"][0]["env"]}
         assert env["CNG_POD_CPU"] == "6"
+
+
+class TestFractionsBesideMode:
+    """A `fractions` build writes beside the `mode` build of the same layer
+    instead of over it (issue #343): its own hex tree, job names, ConfigMap
+    and checksums file, sharing only the COG both read."""
+
+    COMMON = dict(dataset_name="worldcover-2021/peru", bucket="public-land-cover",
+                  h3_resolution=10, parent_resolutions=[9, 8, 0],
+                  value_column="lc_class", nodata_value=0,
+                  h0_subset=[51, 69, 71, 89], chunk_resolution=2)
+
+    def _build(self, root, monkeypatch, resampling, cog=False, **kwargs):
+        import cng_datasets.raster.cog as cogmod
+        monkeypatch.setattr(cogmod, "is_cog", lambda *a, **k: cog)
+        out = Path(root) / resampling
+        generate_raster_workflow(
+            source_urls="s3://public-land-cover/raw/worldcover-peru.tif",
+            output_dir=str(out), hex_resampling=resampling, **{**self.COMMON, **kwargs})
+        docs = {}
+        for f in out.glob("*.yaml"):
+            for doc in yaml.safe_load_all(open(f)):
+                if doc:
+                    docs[f.name] = doc
+        return out, docs
+
+    @staticmethod
+    def _names(docs):
+        return {d["metadata"]["name"] for d in docs.values()
+                if d.get("kind") in ("Job", "ConfigMap")}
+
+    @staticmethod
+    def _text(out):
+        return "\n".join(f.read_text() for f in out.glob("*.yaml"))
+
+    @pytest.mark.timeout(30)
+    def test_no_shared_job_names(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as root:
+            _, mode = self._build(root, monkeypatch, "mode")
+            _, frac = self._build(root, monkeypatch, "fractions")
+            assert not self._names(mode) & self._names(frac)
+            assert "worldcover-2021-peru-fractions-hex" in self._names(frac)
+            assert "worldcover-2021-peru-fractions-workflow" in self._names(frac)
+            assert "worldcover-2021-peru-fractions-yamls" in self._names(frac)
+
+    @pytest.mark.timeout(30)
+    def test_fractions_writes_its_own_hex_tree(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as root:
+            mode_out, _ = self._build(root, monkeypatch, "mode")
+            frac_out, _ = self._build(root, monkeypatch, "fractions")
+            base = "s3://public-land-cover/worldcover-2021/peru"
+            mode_txt, frac_txt = self._text(mode_out), self._text(frac_out)
+            for suffix in ("hex-fractions-chunks/", "hex-fractions"):
+                assert f"{base}/{suffix}" in frac_txt
+            assert f"{base}/hex/" not in frac_txt and f"{base}/hex-chunks" not in frac_txt
+            assert f"{base}/hex-chunks" in mode_txt and "hex-fractions" not in mode_txt
+            assert f"{base}-fractions.checksums.json" in frac_txt
+            assert f"{base}.checksums.json" in mode_txt
+            # The COG is the same file for both, warped with nearest.
+            assert f"{base}-cog.tif" in frac_txt and f"{base}-cog.tif" in mode_txt
+
+    @pytest.mark.timeout(30)
+    def test_orchestrator_applies_the_fractions_jobs(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as root:
+            out, docs = self._build(root, monkeypatch, "fractions")
+            wf = docs["workflow.yaml"]
+            script = wf["spec"]["template"]["spec"]["containers"][0]["args"][0]
+            cm = docs["configmap.yaml"]
+            for step in ("setup-bucket", "preprocess-cog", "hex", "merge", "render", "checksums"):
+                name = f"worldcover-2021-peru-fractions-{step}"
+                assert f"/yamls/{name}.yaml" in script
+                assert f"{name}.yaml" in cm["data"]
+            assert wf["spec"]["template"]["spec"]["volumes"][0]["configMap"]["name"] == \
+                "worldcover-2021-peru-fractions-yamls"
+
+    @pytest.mark.timeout(30)
+    def test_unchunked_and_multi_year_fractions(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as root:
+            out, docs = self._build(root, monkeypatch, "fractions", cog=True,
+                                    chunk_resolution=0)
+            cmd = docs["worldcover-2021-peru-fractions-hex.yaml"]["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "--output-parquet s3://public-land-cover/worldcover-2021/peru/hex-fractions/ " in cmd
+        with tempfile.TemporaryDirectory() as root:
+            out, docs = self._build(root, monkeypatch, "fractions", cog=True,
+                                    source_urls="s3://src/wc_{year}.tif", years="2020-2021")
+            merge = docs["worldcover-2021-peru-fractions-merge.yaml"]["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            assert "peru/hex-fractions-chunks/year=$YEAR" in merge
+            assert "peru/hex-fractions/year=$YEAR" in merge
+
+    @pytest.mark.timeout(30)
+    def test_armada_conversion_follows_the_suffix(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as root:
+            out, _ = self._build(root, monkeypatch, "fractions", backend="armada")
+            names = {f.name for f in out.glob("armada-*.yaml")}
+            assert "armada-worldcover-2021-peru-fractions-hex.yaml" in names

@@ -418,7 +418,9 @@ def main():
                                              "counts (population, carbon); 'mean' for intensities; "
                                              "'mode' for categorical (single dominant class); "
                                              "'fractions' for categorical area accounting (one "
-                                             "(value, frac) row per class per cell); 'max'/'min' "
+                                             "(value, frac) row per class per cell, written to "
+                                             "<dataset>/hex-fractions/ by jobs named <name>-fractions-*, "
+                                             "so it can run beside a mode build); 'max'/'min' "
                                              "for peak/extremum (species richness). Default: mean.")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")

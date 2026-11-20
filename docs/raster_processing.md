@@ -197,6 +197,24 @@ When the hex reducer is categorical (`mode` or `fractions`), the warp to EPSG:43
 `nearest` resampling, so no class code is invented along a class boundary. Continuous
 sources warp with `bilinear`.
 
+### Mode and fractions builds of one layer
+
+A categorical layer is usually built twice from the same COG: `--hex-resampling mode` for the
+dominant class in each cell, and `--hex-resampling fractions` for the share of every class.
+The two tables have different schemas, so a `fractions` build writes beside the other rather
+than over it:
+
+| | `mode` (and every other reducer) | `fractions` |
+|---|---|---|
+| Hex table | `<dataset>/hex/` | `<dataset>/hex-fractions/` |
+| Sub-h0 staging | `<dataset>/hex-chunks/` | `<dataset>/hex-fractions-chunks/` |
+| Job names | `<name>-hex`, `<name>-workflow`, ... | `<name>-fractions-hex`, `<name>-fractions-workflow`, ... |
+| Sizes and checksums | `<dataset>.checksums.json` | `<dataset>-fractions.checksums.json` |
+
+Both builds read and write the same `<dataset>-cog.tif` and `<dataset>.render.json`, since both
+warp with `nearest` and so produce the same COG. Generate them into separate `--output-dir`s,
+because `workflow.yaml` and `configmap.yaml` keep fixed file names.
+
 ### Default render and thumbnail
 
 Every COG carries its band statistics inside the file (`STATISTICS_MINIMUM`, `_MAXIMUM`, `_MEAN`, `_STDDEV`, `_VALID_PERCENT`), with no `.aux.xml` sidecar, as Portolan requires.

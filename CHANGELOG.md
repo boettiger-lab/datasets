@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A `fractions` build no longer overwrites the `mode` build of the same layer** (#343). `raster-workflow --hex-resampling fractions` wrote to the same `hex/` and `hex-chunks/` paths, and emitted the same job names, as a `mode` build of the same `--dataset`. A categorical layer usually wants both, so running both replaced the first table with the second and the second `kubectl apply` collided with the first build's jobs. A `fractions` build now writes `<dataset>/hex-fractions/` (staged in `hex-fractions-chunks/`), its jobs and ConfigMap are named `<name>-fractions-*`, and its sizes and checksums go to `<dataset>-fractions.checksums.json`. The COG and its render are shared, since both builds warp with `nearest` and write the same file. Every other reducer is unchanged. A workflow that worked around this with `--dataset <name>/fractions` now writes `<name>/fractions/hex-fractions/`; drop the `/fractions` suffix to get `<name>/hex-fractions/`, the layout data-workflows already uses by hand.
+
 ## [0.16.0] - 2026-11-19
 
 ### Added
