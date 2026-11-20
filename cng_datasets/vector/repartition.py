@@ -82,6 +82,16 @@ def repartition_by_h0(
         con.execute(f"SET memory_limit='{effective_limit}'")
     else:
         effective_limit = None
+    # DuckDB counts the host's cores, not the pod's: 48 threads in a 4-cpu pod.
+    # Every thread holds its own sort and join buffers, so under a small
+    # memory_limit the same COPY passes or runs out of memory by chance; at
+    # the pod's own count it passes every time (measured on the #339 MRE at
+    # memory_limit 3GiB). No quota readable, DuckDB's default stands.
+    from cng_datasets.raster.cog import _cgroup_cpu_count
+    pod_cpus = _cgroup_cpu_count()
+    if pod_cpus:
+        print(f"Setting DuckDB threads={pod_cpus} (the pod's cpu limit)")
+        con.execute(f"SET threads={pod_cpus}")
     con.execute('SET http_timeout=1200')
     con.execute('SET http_retries=30')
     con.execute('SET arrow_large_buffer_size=true')
