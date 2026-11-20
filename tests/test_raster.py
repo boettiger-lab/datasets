@@ -5391,3 +5391,175 @@ class TestCogStatistics:
         out = os.path.join(temp_dir, "mosaic.tif")
         create_mosaic_cog([src], out, nodata=self.NODATA, resampling="nearest")
         self._assert_embedded(out, data)
+
+
+class TestCutline:
+    """`--cutline` clips the COG to a polygon (#344): outside becomes nodata,
+    and a source already on the target grid keeps its grid and its values."""
+
+    # A 0.01° EPSG:4326 grid, 100 × 80 pixels, origin (-80, -2): class codes
+    # 1..9 with nodata 0. The polygons are two triangles in it.
+    GT = (-80.0, 0.01, 0, -2.0, 0, -0.01)
+    PER = "POLYGON((-79.735 -2.105,-79.305 -2.105,-79.735 -2.555,-79.735 -2.105))"
+    ECU = "POLYGON((-79.2 -2.1,-79.05 -2.1,-79.05 -2.3,-79.2 -2.1))"
+
+    def _raster(self, path, nodata=0, epsg=4326, gt=None):
+        data = (np.arange(100 * 80).reshape(80, 100) % 9 + 1).astype(np.uint8)
+        ds = gdal.GetDriverByName("GTiff").Create(path, 100, 80, 1, gdal.GDT_Byte)
+        ds.SetGeoTransform(gt or self.GT)
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(epsg)
+        ds.SetProjection(srs.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        band.WriteArray(data)
+        if nodata is not None:
+            band.SetNoDataValue(nodata)
+        ds = None
+        return data
+
+    def _polygons(self, path, epsg=4326):
+        import json
+        feats = [{"type": "Feature", "properties": {"iso3": iso},
+                  "geometry": json.loads(ogr_geom.ExportToJson())}
+                 for iso, ogr_geom in (("PER", self._geom(self.PER, epsg)),
+                                       ("ECU", self._geom(self.ECU, epsg)))]
+        crs = {"type": "name", "properties": {"name": f"urn:ogc:def:crs:EPSG::{epsg}"}}
+        with open(path, "w") as f:
+            json.dump({"type": "FeatureCollection", "crs": crs, "features": feats}, f)
+
+    @staticmethod
+    def _geom(wkt, epsg):
+        from osgeo import ogr
+        g = ogr.CreateGeometryFromWkt(wkt)
+        if epsg != 4326:
+            src = osr.SpatialReference(); src.ImportFromEPSG(4326)
+            dst = osr.SpatialReference(); dst.ImportFromEPSG(epsg)
+            for r in (src, dst):
+                r.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            g.Transform(osr.CoordinateTransformation(src, dst))
+        return g
+
+    def _cog(self, tmp, **kwargs):
+        from cng_datasets.raster.cog import create_mosaic_cog
+        out = os.path.join(tmp, "out.tif")
+        create_mosaic_cog([os.path.join(tmp, "src.tif")], out,
+                          overview_resampling="mode", resampling="bilinear", **kwargs)
+        ds = gdal.Open(out)
+        result = ds.GetGeoTransform(), ds.GetRasterBand(1).ReadAsArray(), \
+            ds.GetRasterBand(1).GetNoDataValue()
+        ds = None
+        return result
+
+    @pytest.mark.timeout(60)
+    def test_values_pass_through_on_the_source_grid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._raster(os.path.join(tmp, "src.tif"))
+            self._polygons(os.path.join(tmp, "cut.geojson"))
+            gt, arr, nodata = self._cog(tmp, cutline=os.path.join(tmp, "cut.geojson"),
+                                        cutline_where="iso3 = 'PER'")
+            assert nodata == 0
+            # Same pixel size, origin on the source grid, bounds snapped outward
+            # from the triangle's -79.735..-79.305, -2.555..-2.105.
+            assert gt[1] == pytest.approx(0.01) and gt[5] == pytest.approx(-0.01)
+            assert gt[0] == pytest.approx(-79.74) and gt[3] == pytest.approx(-2.10)
+            assert arr.shape == (46, 44)
+            col0, row0 = round((gt[0] - self.GT[0]) / 0.01), round((self.GT[3] - gt[3]) / 0.01)
+            source = data[row0:row0 + arr.shape[0], col0:col0 + arr.shape[1]]
+            inside = arr != 0
+            # Bilinear was asked for, but on the source grid nothing is
+            # resampled: every kept pixel is the source pixel, codes unchanged.
+            assert inside.sum() > 0.3 * arr.size
+            assert (arr[inside] == source[inside]).all()
+            # The triangle's far corner is outside: nodata.
+            assert arr[-1, -1] == 0 and arr[1, 1] != 0
+
+    @pytest.mark.timeout(60)
+    def test_where_selects_the_polygon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._raster(os.path.join(tmp, "src.tif"))
+            self._polygons(os.path.join(tmp, "cut.geojson"))
+            gt, arr, _ = self._cog(tmp, cutline=os.path.join(tmp, "cut.geojson"),
+                                   cutline_where="iso3 = 'ECU'")
+            assert gt[0] == pytest.approx(-79.20) and arr.shape == (20, 15)
+            from cng_datasets.raster.cog import create_mosaic_cog
+            with pytest.raises(ValueError, match="no features"):
+                create_mosaic_cog([os.path.join(tmp, "src.tif")], os.path.join(tmp, "x.tif"),
+                                  cutline=os.path.join(tmp, "cut.geojson"),
+                                  cutline_where="iso3 = 'BOL'")
+
+    @pytest.mark.timeout(60)
+    def test_cutline_in_another_crs(self):
+        """A projected cutline is reprojected for its bounds and by GDAL."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._raster(os.path.join(tmp, "src.tif"))
+            self._polygons(os.path.join(tmp, "cut.geojson"), epsg=32717)
+            gt, arr, _ = self._cog(tmp, cutline=os.path.join(tmp, "cut.geojson"),
+                                   cutline_where="iso3 = 'PER'")
+            assert gt[1] == pytest.approx(0.01)
+            assert abs(gt[0] - -79.74) < 0.015 and abs(arr.shape[1] - 44) <= 2
+
+    @pytest.mark.timeout(60)
+    def test_projected_source_is_warped_and_clipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The same grid laid out in UTM 17S metres, so it must be warped.
+            self._raster(os.path.join(tmp, "src.tif"), epsg=32717,
+                         gt=(620000.0, 1000.0, 0, 9790000.0, 0, -1000.0))
+            self._polygons(os.path.join(tmp, "cut.geojson"))
+            gt, arr, nodata = self._cog(tmp, cutline=os.path.join(tmp, "cut.geojson"),
+                                        cutline_where="iso3 = 'PER'")
+            assert nodata == 0
+            assert gt[0] >= -79.74 and gt[0] + gt[1] * arr.shape[1] <= -79.30 + gt[1]
+            assert (arr != 0).any() and (arr == 0).any()
+
+    @pytest.mark.timeout(30)
+    def test_no_nodata_is_refused(self):
+        from cng_datasets.raster.cog import create_mosaic_cog
+        with tempfile.TemporaryDirectory() as tmp:
+            self._raster(os.path.join(tmp, "src.tif"), nodata=None)
+            self._polygons(os.path.join(tmp, "cut.geojson"))
+            with pytest.raises(ValueError, match="nodata"):
+                create_mosaic_cog([os.path.join(tmp, "src.tif")], os.path.join(tmp, "x.tif"),
+                                  cutline=os.path.join(tmp, "cut.geojson"))
+            # With --nodata it runs.
+            create_mosaic_cog([os.path.join(tmp, "src.tif")], os.path.join(tmp, "x.tif"),
+                              cutline=os.path.join(tmp, "cut.geojson"), nodata=255)
+
+    @pytest.mark.timeout(30)
+    def test_cutline_and_extent_exclude_each_other(self):
+        from cng_datasets.raster.cog import create_mosaic_cog
+        with pytest.raises(ValueError, match="Pass one"):
+            create_mosaic_cog(["a.tif"], "b.tif", cutline="c.geojson",
+                              target_extent=(0, 0, 1, 1))
+
+    @pytest.mark.timeout(60)
+    def test_cli_clips_a_single_input(self):
+        """One --input with --target-extent or --cutline is clipped. The
+        single-input path used to drop --target-extent without a word."""
+        import subprocess, sys
+        with tempfile.TemporaryDirectory() as tmp:
+            self._raster(os.path.join(tmp, "src.tif"))
+            self._polygons(os.path.join(tmp, "cut.geojson"))
+            for flags, cols in ((["--target-extent", "-79.5,-2.5,-79.3,-2.3"], 20),
+                                (["--cutline", os.path.join(tmp, "cut.geojson"),
+                                  "--cutline-where", "iso3 = 'ECU'"], 15)):
+                out = os.path.join(tmp, "cli.tif")
+                run = subprocess.run(
+                    [sys.executable, "-m", "cng_datasets.cli", "raster", "--input",
+                     os.path.join(tmp, "src.tif"), "--output-cog", out,
+                     "--hex-resampling", "mode", "--resampling", "nearest", *flags],
+                    capture_output=True, text=True)
+                assert run.returncode == 0, run.stderr[-2000:]
+                ds = gdal.Open(out)
+                assert ds.RasterXSize == cols
+                ds = None
+
+    @pytest.mark.timeout(60)
+    def test_processor_clips_a_single_input(self):
+        from cng_datasets.raster.cog import RasterProcessor
+        with tempfile.TemporaryDirectory() as tmp:
+            self._raster(os.path.join(tmp, "src.tif"))
+            p = RasterProcessor(os.path.join(tmp, "src.tif"),
+                                target_extent=(-79.5, -2.5, -79.3, -2.3),
+                                local_cache_dir=None, h3_resolution=8)
+            ds = gdal.Open(p.input_path)
+            assert ds.RasterXSize == 20
+            ds = None

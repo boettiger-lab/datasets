@@ -1266,6 +1266,8 @@ def generate_raster_workflow(
     band: Optional[int] = None,
     output_cog_name: Optional[str] = None,
     years: Union[str, List[int], None] = None,
+    cutline: Optional[str] = None,
+    cutline_where: Optional[str] = None,
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
     armada_queue: Optional[str] = None,
@@ -1362,6 +1364,11 @@ def generate_raster_workflow(
             the Job stops (default 1). Keeps a systematic failure from burning
             hours on the remaining chunks.
         target_extent: Clip bbox (xmin, ymin, xmax, ymax) in EPSG:4326 for mosaic step
+        cutline: Polygon layer (path or URL) the COG step clips to, e.g. a
+            country boundary (#344). Adds the preprocess-cog step even for one
+            source. Pixels outside become nodata; a source already in
+            EPSG:4326 keeps its grid and its values. Excludes target_extent.
+        cutline_where: Attribute filter on the cutline, e.g. "iso3 = 'PER'".
         target_resolution: Output pixel size in degrees for mosaic step
         band: Extract single band from multi-band sources (1-indexed) for mosaic step
         output_cog_name: S3 key for intermediate COG (default: "{dataset_name}-cog.tif",
@@ -1474,8 +1481,17 @@ def generate_raster_workflow(
     # they cannot disagree — a Job narrower than the chunk list would drop whole
     # chunks with a clean exit (issue #173).
     chunk_count = _count_chunks(chunk_resolution, h0_subset)
-    # Decide whether a preprocess-cog step is needed
-    needs_preprocess = len(source_urls) > 1 or target_extent is not None or band is not None
+    if cutline_where and not cutline:
+        raise ValueError("--cutline-where needs --cutline")
+    if cutline and target_extent is not None:
+        raise ValueError("--cutline and --target-extent both given; the cutline sets "
+                         "the extent. Pass one.")
+
+    # Decide whether a preprocess-cog step is needed. A clip or a new
+    # resolution always needs it, even for one source that is already a COG.
+    needs_preprocess = (len(source_urls) > 1 or target_extent is not None
+                        or target_resolution is not None or band is not None
+                        or cutline is not None)
 
     # For single-source case, check if the source is already a COG.  Non-COG rasters
     # force GDAL to scan the entire file for every hex pod, causing catastrophic slowdowns
@@ -1510,6 +1526,8 @@ def generate_raster_workflow(
             nodata_value=nodata_value,
             hex_resampling=hex_resampling,
             cog_storage=cog_storage,
+            cutline=cutline,
+            cutline_where=cutline_where,
             config=config,
             years=years,
             max_parallelism=max_parallelism,
@@ -1571,6 +1589,10 @@ def generate_raster_workflow(
                    f"--h3-resolution {h3_resolution} --parent-resolutions \"{parent_res_str}\"")
     if years:
         gen_command += f" --years {','.join(str(y) for y in years)}"
+    if cutline:
+        gen_command += f" --cutline {shlex.quote(cutline)}"
+    if cutline_where:
+        gen_command += f" --cutline-where {shlex.quote(cutline_where)}"
     gen_command += f" --hex-resampling {hex_resampling}"
 
     # Generate ConfigMap and orchestrator workflow
@@ -1693,6 +1715,7 @@ def _generate_cog_preprocess_job(
     hex_resampling="mean", cog_storage="50Gi", config: ClusterConfig = None,
     years: Optional[List[int]] = None, max_parallelism: int = 61,
     max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
+    cutline: Optional[str] = None, cutline_where: Optional[str] = None,
 ):
     """Generate a k8s job that mosaics multiple raster tiles into a single COG on S3.
 
@@ -1720,6 +1743,10 @@ def _generate_cog_preprocess_job(
         flags.append(f'--target-extent "{xmin},{ymin},{xmax},{ymax}"')
     if target_resolution is not None:
         flags.append(f"--target-resolution {target_resolution}")
+    if cutline is not None:
+        flags.append(f"--cutline {shlex.quote(cutline)}")
+    if cutline_where:
+        flags.append(f"--cutline-where {shlex.quote(cutline_where)}")
     if band is not None:
         flags.append(f"--band {band}")
     nodata_cli = _nodata_cli_value(nodata_value)

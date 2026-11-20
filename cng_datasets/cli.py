@@ -245,8 +245,14 @@ def main():
                                     "(consumers GROUP BY h<res>) and is mass-conserving only "
                                     "when hex pitch is finer than source pixel pitch (see #84).")
     raster_parser.add_argument("--target-crs", default="EPSG:4326", help="Output CRS for mosaic (default: EPSG:4326)")
-    raster_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in target CRS (mosaic only)")
-    raster_parser.add_argument("--target-resolution", type=float, help="Output pixel size in target CRS units (mosaic only)")
+    raster_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in target CRS")
+    raster_parser.add_argument("--target-resolution", type=float, help="Output pixel size in target CRS units")
+    raster_parser.add_argument("--cutline", metavar="VECTOR",
+                               help="Clip to the polygons of this vector layer (path or URL). Pixels "
+                                    "outside become nodata; a source already on the target grid keeps "
+                                    "it, so values pass through unchanged. Needs a nodata value.")
+    raster_parser.add_argument("--cutline-where", metavar="SQL",
+                               help="Attribute filter on --cutline, e.g. \"iso3 = 'PER'\"")
     raster_parser.add_argument("--band", type=int,
                                help="Which band of a multi-band source to use, 1-indexed. Applies "
                                     "to the COG, the mosaic and the hex output alike — the band is "
@@ -465,8 +471,15 @@ def main():
                                              "the peak-memory product; lower it when fewer workers "
                                              "alone is too coarse a step.")
     raster_workflow_parser.add_argument("--cog-storage", type=str, default="50Gi", help="Ephemeral storage request/limit for COG preprocess job pod (default: 50Gi)")
-    raster_workflow_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in EPSG:4326 (multi-tile only)")
-    raster_workflow_parser.add_argument("--target-resolution", type=float, help="Output pixel size in degrees (multi-tile only)")
+    raster_workflow_parser.add_argument("--target-extent", help="Clip bbox 'xmin,ymin,xmax,ymax' in EPSG:4326 (adds the preprocess-cog step)")
+    raster_workflow_parser.add_argument("--target-resolution", type=float, help="Output pixel size in degrees (adds the preprocess-cog step)")
+    raster_workflow_parser.add_argument("--cutline", metavar="VECTOR",
+                                        help="Clip the COG to the polygons of this vector layer (path or "
+                                             "URL, e.g. a country boundary). Adds the preprocess-cog step. "
+                                             "Pixels outside become nodata; a source already in EPSG:4326 "
+                                             "keeps its grid, so values pass through unchanged.")
+    raster_workflow_parser.add_argument("--cutline-where", metavar="SQL",
+                                        help="Attribute filter on --cutline, e.g. \"iso3 = 'PER'\"")
     raster_workflow_parser.add_argument("--band", type=int,
                                         help="Which band of a multi-band source to use, 1-indexed. "
                                              "Giving it adds a preprocess-cog step that subsets the "
@@ -779,15 +792,19 @@ def _dispatch(args):
 
         input_path = args.inputs if len(args.inputs) > 1 else args.inputs[0]
 
-        # If multiple inputs and only --output-cog requested, use create_mosaic_cog directly
-        if isinstance(input_path, list) and args.output_cog and not args.output_parquet:
+        # Several inputs, or a clip of one, with only --output-cog requested:
+        # the mosaic step writes the COG directly (#344).
+        clipped = (target_extent is not None or args.target_resolution is not None
+                   or args.cutline is not None)
+        if ((isinstance(input_path, list) or clipped)
+                and args.output_cog and not args.output_parquet):
             # Categorical sources (--hex-resampling mode/fractions) must not
             # average class codes in the COG overviews (issue #108).
             overview_resampling = (
                 "mode" if args.hex_resampling in ("mode", "fractions") else "average"
             )
             create_mosaic_cog(
-                source_urls=input_path,
+                source_urls=input_path if isinstance(input_path, list) else [input_path],
                 output_path=args.output_cog,
                 target_crs=getattr(args, 'target_crs', 'EPSG:4326'),
                 target_extent=target_extent,
@@ -797,6 +814,8 @@ def _dispatch(args):
                 resampling=args.resampling,
                 compression=args.compression,
                 overview_resampling=overview_resampling,
+                cutline=args.cutline,
+                cutline_where=args.cutline_where,
             )
         else:
             processor = RasterProcessor(
@@ -822,6 +841,8 @@ def _dispatch(args):
                 target_resolution=getattr(args, 'target_resolution', None),
                 band=getattr(args, 'band', None),
                 local_cache_dir=getattr(args, 'local_cache_dir', '/tmp/cng-raster-cache'),
+                cutline=args.cutline,
+                cutline_where=args.cutline_where,
             )
 
             if args.output_cog:
@@ -1014,6 +1035,8 @@ def _dispatch(args):
             cog_storage=args.cog_storage,
             target_extent=target_extent,
             target_resolution=getattr(args, 'target_resolution', None),
+            cutline=args.cutline,
+            cutline_where=args.cutline_where,
             band=getattr(args, 'band', None),
             output_cog_name=getattr(args, 'output_cog_name', None),
             years=args.years,

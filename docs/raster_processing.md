@@ -197,6 +197,29 @@ When the hex reducer is categorical (`mode` or `fractions`), the warp to EPSG:43
 `nearest` resampling, so no class code is invented along a class boundary. Continuous
 sources warp with `bilinear`.
 
+### Clipping to a polygon
+
+`--cutline` clips the COG step to the polygons of a vector layer, such as a country
+boundary, and `--cutline-where` picks features from it:
+
+```bash
+cng-datasets raster-workflow --dataset worldcover-2021/peru \
+  --source-url s3://<bucket>/worldcover-2021.tif \
+  --cutline s3://<bucket>/country-boundaries.parquet --cutline-where "iso3 = 'PER'" \
+  --nodata 0 --hex-resampling mode ...
+```
+
+- Any vector GDAL reads works: GeoParquet, GeoPackage, GeoJSON, a zipped shapefile, local or
+  by URL. A cutline in another CRS is reprojected.
+- A pixel whose centre falls outside the polygons becomes nodata, so the step needs a nodata
+  value: `--nodata`, or the source's own. Without one it stops rather than writing 0.
+- A source already in EPSG:4326 keeps its grid. The extent is the polygons' bounds snapped
+  outward to the source pixels and cut to the source, and the warp is `nearest`, so every pixel
+  inside keeps its value. A source in another CRS is warped as usual, with the clip.
+- It adds the preprocess-cog step even for one source that is already a COG, as
+  `--target-extent` and `--target-resolution` now do. `--cutline` and `--target-extent` exclude
+  each other.
+
 ### Mode and fractions builds of one layer
 
 A categorical layer is usually built twice from the same COG: `--hex-resampling mode` for the
