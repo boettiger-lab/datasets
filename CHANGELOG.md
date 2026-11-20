@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-20
+
 ### Added
 - **`raster-workflow --cutline` clips to a polygon** (#344). `--target-extent` clips only to a box, so a build scoped to a country needed a hand-written `gdalwarp -cutline` step. `--cutline <vector>` (GeoParquet, GeoPackage, GeoJSON, zipped shapefile; path or URL; any CRS) and `--cutline-where` now clip the COG step on `raster-workflow` and `raster`. Pixels whose centre falls outside the polygons become nodata, and the step refuses to run without a nodata value rather than write 0. A source already in EPSG:4326 keeps its grid: the extent is the polygons' bounds snapped outward to the source pixels and cut to the source, and the warp is `nearest`, so values inside pass through unchanged, even for a continuous source warped otherwise with `bilinear`.
 
@@ -421,6 +423,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.17.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.17.0
 [0.16.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.16.0
 [0.15.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.15.0
 [0.14.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.14.0
