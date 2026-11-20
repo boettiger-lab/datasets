@@ -1,0 +1,43 @@
+name: Changelog
+
+# Every pull request that changes the package adds a line to CHANGELOG.md, or
+# carries the `no-changelog` label to say it needs none (a refactor, a comment,
+# a test-only fix inside the package). Releases were reconciled by hand, and
+# that hand check missed one: #296 merged without an entry (fixed in #297).
+
+on:
+  pull_request:
+    branches: [ main, master ]
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Check for a CHANGELOG entry
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+        HEAD: ${{ github.event.pull_request.head.sha }}
+        SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'no-changelog') }}
+      run: |
+        changed=$(git diff --name-only "$BASE"..."$HEAD")
+        echo "Changed files:"; echo "$changed" | sed 's/^/  /'
+        if ! echo "$changed" | grep -q '^cng_datasets/'; then
+          echo "No change under cng_datasets/, so no entry is needed."
+          exit 0
+        fi
+        added=$(git diff "$BASE"..."$HEAD" -- CHANGELOG.md | grep -c '^+[^+]' || true)
+        if [ "$added" -gt 0 ]; then
+          echo "CHANGELOG.md gains $added line(s)."
+          exit 0
+        fi
+        if [ "$SKIP" = "true" ]; then
+          echo "No CHANGELOG entry, and the pull request is labelled no-changelog."
+          exit 0
+        fi
+        echo "::error file=CHANGELOG.md::This pull request changes cng_datasets/ but adds nothing to CHANGELOG.md. Add an entry under [Unreleased], or label the pull request no-changelog if it changes no behaviour."
+        exit 1
