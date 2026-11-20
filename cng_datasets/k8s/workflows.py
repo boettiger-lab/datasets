@@ -1268,6 +1268,7 @@ def generate_raster_workflow(
     years: Union[str, List[int], None] = None,
     cutline: Optional[str] = None,
     cutline_where: Optional[str] = None,
+    value_units: Optional[str] = None,
     backend: str = "k8s",
     armada_priority_class: Optional[str] = None,
     armada_queue: Optional[str] = None,
@@ -1369,6 +1370,8 @@ def generate_raster_workflow(
             source. Pixels outside become nodata; a source already in
             EPSG:4326 keeps its grid and its values. Excludes target_extent.
         cutline_where: Attribute filter on the cutline, e.g. "iso3 = 'PER'".
+        value_units: Units of the source values, e.g. "Mg/ha" (#105). Required
+            by hex_resampling="total"; a per-area unit is refused with "sum".
         target_resolution: Output pixel size in degrees for mosaic step
         band: Extract single band from multi-band sources (1-indexed) for mosaic step
         output_cog_name: S3 key for intermediate COG (default: "{dataset_name}-cog.tif",
@@ -1481,6 +1484,16 @@ def generate_raster_workflow(
     # they cannot disagree — a Job narrower than the chunk list would drop whole
     # chunks with a clean exit (issue #173).
     chunk_count = _count_chunks(chunk_resolution, h0_subset)
+    # A reducer that contradicts the declared units fails here, before
+    # anything is written (#105).
+    from cng_datasets.raster.cog import check_value_units
+    check_value_units(hex_resampling, value_units)
+    if hex_resampling == "sum" and not value_units:
+        print("  ⚠ --hex-resampling sum adds the pixel values, which is right only for an "
+              "amount per pixel (persons, tonnes). For a per-area density (Mg/ha, "
+              "persons/km2) use total with --value-units, or mean. Pass --value-units "
+              "to declare which this is.")
+
     if cutline_where and not cutline:
         raise ValueError("--cutline-where needs --cutline")
     if cutline and target_extent is not None:
@@ -1551,7 +1564,7 @@ def generate_raster_workflow(
         hex_workers=hex_workers, hex_chunk_size=hex_chunk_size, hex_cpu=hex_cpu,
         chunk_resolution=chunk_resolution, chunk_count=chunk_count,
         hex_retries=hex_retries, max_failed_indexes=max_failed_indexes,
-        years=years, hex_dir=hex_dir,
+        years=years, hex_dir=hex_dir, value_units=value_units,
     )
     per_year = chunk_count if chunk_resolution else (len(h0_subset) if h0_subset else 122)
     hex_completions = per_year * (len(years) if years else 1)
@@ -1593,6 +1606,8 @@ def generate_raster_workflow(
         gen_command += f" --cutline {shlex.quote(cutline)}"
     if cutline_where:
         gen_command += f" --cutline-where {shlex.quote(cutline_where)}"
+    if value_units:
+        gen_command += f" --value-units {shlex.quote(value_units)}"
     gen_command += f" --hex-resampling {hex_resampling}"
 
     # Generate ConfigMap and orchestrator workflow
@@ -2344,6 +2359,7 @@ def _generate_raster_hex_job(
     max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES,
     years: Optional[List[int]] = None,
     hex_dir: str = "hex",
+    value_units: Optional[str] = None,
 ):
     """Generate raster H3 hex tiling job.
 
@@ -2374,6 +2390,8 @@ def _generate_raster_hex_job(
     nodata_cli = _nodata_cli_value(nodata_value)
     if nodata_cli is not None:
         cng_cmd += f' --nodata "{nodata_cli}"'
+    if value_units:
+        cng_cmd += f" --value-units {shlex.quote(value_units)}"
 
     # PROJ database selection is handled deterministically inside the CLI
     # (cog._configure_proj picks the highest-version proj.db, MINOR>=7). A bash

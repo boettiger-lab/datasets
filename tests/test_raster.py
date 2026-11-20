@@ -5563,3 +5563,113 @@ class TestCutline:
             ds = gdal.Open(p.input_path)
             assert ds.RasterXSize == 20
             ds = None
+
+
+class TestTotalReducer:
+    """`--hex-resampling total` integrates a per-area density over each cell's
+    true area (#105), so SUM() over the table is the raster's grand total."""
+
+    def test_per_area_units(self):
+        from cng_datasets.raster.cog import per_area_unit, total_units
+        for units, unit, factor in (("Mg/ha", "ha", 100.0), ("Mg ha-1", "ha", 100.0),
+                                    ("Mg C ha⁻¹", "ha", 100.0), ("t per hectare", "ha", 100.0),
+                                    ("persons/km2", "km2", 1.0), ("people per km²", "km2", 1.0),
+                                    ("kg km-2", "km2", 1.0), ("W m-2", "m2", 1e6),
+                                    ("g/m^2", "m2", 1e6)):
+            assert per_area_unit(units) == (unit, factor), units
+        for units in (None, "", "persons", "Mg", "Mg C", "count", "habitat", "mm/yr", "km"):
+            assert per_area_unit(units) is None, units
+        assert total_units("Mg/ha") == "Mg"
+        assert total_units("Mg C ha⁻¹") == "Mg C"
+        assert total_units("persons per km2") == "persons"
+        assert total_units("/ha") == "/ha x area"
+
+    def test_reducer_and_units_must_agree(self):
+        from cng_datasets.raster.cog import check_value_units
+        with pytest.raises(ValueError, match="needs --value-units"):
+            check_value_units("total", None)
+        with pytest.raises(ValueError, match="per-area denominator"):
+            check_value_units("total", "persons")
+        with pytest.raises(ValueError, match="use --hex-resampling total|Use --hex-resampling total"):
+            check_value_units("sum", "Mg/ha")
+        check_value_units("total", "Mg/ha")
+        check_value_units("sum", "persons")
+        check_value_units("sum", None)
+        check_value_units("mean", "Mg/ha")
+
+    def _density(self, path, lat0):
+        """A 0.5 x 0.5 degree box of 10 Mg/ha at 0.01 degree pixels."""
+        ds = gdal.GetDriverByName("GTiff").Create(path, 50, 50, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform((10.0, 0.01, 0, lat0 + 0.5, 0, -0.01))
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        band.WriteArray(np.full((50, 50), 10.0, np.float32))
+        band.SetNoDataValue(-1)
+        ds = None
+
+    def _hex_total(self, tmp, lat0, **kwargs):
+        from cng_datasets.raster import RasterProcessor
+        src = os.path.join(tmp, f"d{lat0}.tif")
+        self._density(src, lat0)
+        out = os.path.join(tmp, f"hex{lat0}")
+        p = RasterProcessor(input_path=src, output_parquet_path=out, h3_resolution=6,
+                            parent_resolutions=[0], value_column="carbon",
+                            hex_resampling="total", value_units="Mg/ha", nodata_value=-1,
+                            local_cache_dir=None, **kwargs)
+        h0s = p.con.execute(f"""
+            SELECT i FROM read_parquet('{p.h0_grid_path}')
+            WHERE ST_Intersects(geom, ST_MakeEnvelope(10.0, {lat0}, 10.5, {lat0 + 0.5}))
+        """).fetchdf()["i"].tolist()
+        for i in h0s:
+            p.process_h0_region(i)
+        glob_ = os.path.join(out, "h0=*/data_0.parquet")
+        con = duckdb.connect()
+        total = con.execute(f"SELECT SUM(carbon) FROM read_parquet('{glob_}')").fetchone()[0]
+        meta = dict(con.execute(
+            f"SELECT key::VARCHAR, value::VARCHAR FROM parquet_kv_metadata('{glob_}')").fetchall())
+        return total, meta
+
+    @staticmethod
+    def _box_ha(lat0):
+        r = 6371.0088  # km, mean Earth radius
+        km2 = r * r * math.radians(0.5) * (math.sin(math.radians(lat0 + 0.5))
+                                          - math.sin(math.radians(lat0)))
+        return km2 * 100
+
+    @requires_gdal
+    @pytest.mark.timeout(600)
+    def test_total_is_the_area_integral(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for lat0 in (0.0, 60.0):
+                total, meta = self._hex_total(tmp, lat0)
+                expected = 10.0 * self._box_ha(lat0)
+                assert total == pytest.approx(expected, rel=5e-3), lat0
+                assert meta["value_units"] == "Mg"
+            # The same density covers about half the area at 60 degrees:
+            # `total` follows the ground, which a plain sum of pixels cannot.
+            assert self._box_ha(60.0) / self._box_ha(0.0) == pytest.approx(0.5, rel=0.01)
+
+    @pytest.mark.timeout(30)
+    def test_warp_centroid_refuses_total(self):
+        from cng_datasets.raster import RasterProcessor
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "d.tif")
+            self._density(src, 0.0)
+            with pytest.raises(ValueError):
+                RasterProcessor(input_path=src, h3_resolution=6, hex_resampling="total",
+                                value_units="Mg/ha", method="warp-centroid",
+                                local_cache_dir=None)
+
+    @pytest.mark.timeout(30)
+    def test_sum_warns_on_a_per_area_band(self, capsys):
+        from cng_datasets.raster import RasterProcessor
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "d.tif")
+            self._density(src, 0.0)
+            ds = gdal.Open(src, gdal.GA_Update)
+            ds.GetRasterBand(1).SetUnitType("Mg C ha-1")
+            ds = None
+            RasterProcessor(input_path=src, h3_resolution=6, hex_resampling="sum",
+                            local_cache_dir=None)
+            assert "per-area density" in capsys.readouterr().out

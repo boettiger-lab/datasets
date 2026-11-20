@@ -8,6 +8,7 @@ to H3-indexed parquet files partitioned by h0 cells.
 from typing import Optional, Dict, List, Union
 import os
 import glob
+import re
 import math
 import shutil
 import tempfile
@@ -370,6 +371,8 @@ def _extract_ops(op_name):
     """The exactextract ops a reducer needs: its own, plus coverage."""
     if op_name == "fractions":
         return ["unique", "frac"]
+    if op_name == "total":
+        return [_TOTAL_OP, _COVERAGE_OP]
     return [op_name, _COVERAGE_OP]
 
 _OGR_PARQUET = None
@@ -1101,20 +1104,75 @@ def _configure_proj():
 # SUM(frac * cell_area). nodata is kept as an explicit class so frac sums to
 # <= 1 per cell and the nodata/unclassified share is recoverable rather than
 # silently inflating the real classes.
+# "total" is the area integral of a per-area density (#105): each pixel's
+# value times its true spherical area, summed over the cell, so a raster in
+# Mg/ha gives Mg per cell and SUM() over the table is the grand total. `sum`
+# adds the values themselves, which for a density undercounts by the pixel
+# area (6-7x for the 300 m carbon rasters). It needs --value-units with a
+# per-area denominator, which sets the scale factor.
 # Used both for runtime validation in RasterProcessor.__init__ and as
 # argparse `choices=` in the CLI.
-VALID_HEX_REDUCERS = ("sum", "mean", "mode", "max", "min", "fractions")
+VALID_HEX_REDUCERS = ("sum", "mean", "mode", "max", "min", "fractions", "total")
 
-# Two implementations of the raster → H3 hex aggregation step.
-# - "exact-extract" (default): polyfill h0 → cells, exact_extract per-cell.
-#   Mass-conserving by construction; one row per cell; slow at very fine
-#   resolutions because per-cell polygon coverage is exact.
-# - "warp-centroid": gdal.Warp source raster to a grid at the H3 edge
-#   pitch, emit one parquet row per warped pixel with its centroid mapped
-#   to a hex cell. Fast and memory-light; emits N rows per hex (consumers
-#   need GROUP BY h<res>); accurate only when warp pitch is finer than
-#   source pitch (per the analysis in issue #84).
-VALID_METHODS = ("exact-extract", "warp-centroid")
+# exactextract's area-weighted sum: value x pixel area in km2, the pixel's true
+# area on the sphere, so cells at different latitudes integrate correctly.
+_TOTAL_OP = "total=sum(coverage_weight=area_spherical_km2)"
+
+# Per-area denominators --value-units may carry, and the factor that turns a
+# sum of value x km2 into a sum of value x that area unit. Case-insensitive.
+_PER_AREA_UNITS = (
+    (re.compile(r"\s*(/|\bper\b)\s*(ha|hectares?)\b|\s*\bha\s*(-1|\^-1|⁻¹)", re.I), "ha", 100.0),
+    (re.compile(r"\s*(/|\bper\b)\s*(km2|km\^2|km²|sq\.?\s*km|square\s+kilomet(er|re)s?)"
+                r"|\s*\bkm\s*(-2|\^-2|⁻²)", re.I), "km2", 1.0),
+    (re.compile(r"\s*(/|\bper\b)\s*(m2|m\^2|m²|square\s+met(er|re)s?)(?!\w)"
+                r"|\s*\bm\s*(-2|\^-2|⁻²)", re.I), "m2", 1e6),
+)
+
+
+def per_area_unit(units: Optional[str]) -> Optional[tuple]:
+    """(area unit, factor) when *units* is a per-area density, else None (#105).
+
+    "Mg/ha", "Mg ha-1", "Mg C ha⁻¹" and "t per hectare" are per hectare;
+    "persons/km2" and "W m-2" are per km2 and per m2. The factor converts
+    exactextract's value x km2 into value x that unit, so `total` over a
+    Mg/ha raster is in Mg.
+    """
+    if not units:
+        return None
+    for pattern, unit, factor in _PER_AREA_UNITS:
+        if pattern.search(units):
+            return unit, factor
+    return None
+
+
+def check_value_units(hex_resampling: str, value_units: Optional[str]) -> None:
+    """Refuse a reducer that contradicts the declared units (#105).
+
+    `total` needs a per-area density to integrate; `sum` of a per-area density
+    is a sum of densities, which means nothing and undercounts by the pixel
+    area. Both are certain from the declaration, so they fail at generation.
+    """
+    per_area = per_area_unit(value_units)
+    if hex_resampling == "total" and per_area is None:
+        raise ValueError(
+            "--hex-resampling total integrates a per-area density, so it needs "
+            "--value-units with a per-area denominator, e.g. 'Mg/ha', 'Mg ha-1' or "
+            f"'persons/km2'; got {value_units!r}. For a value that is already an "
+            "amount per pixel (persons, tonnes), use sum.")
+    if hex_resampling == "sum" and per_area is not None:
+        raise ValueError(
+            f"--value-units {value_units!r} is per {per_area[0]}, and summing a "
+            "per-area density adds densities: the result undercounts by the pixel "
+            "area. Use --hex-resampling total for the area-integrated amount per "
+            "cell, or mean for the average density.")
+
+
+def total_units(value_units: str) -> str:
+    """The units of a `total` column: the density's units without the area."""
+    text = value_units
+    for pattern, _, _ in _PER_AREA_UNITS:
+        text = pattern.sub("", text)
+    return text.strip() or f"{value_units} x area"
 
 
 def gdal_supports_cutline_wkt() -> bool:
@@ -2247,6 +2305,7 @@ class RasterProcessor:
         local_cache_dir: Optional[str] = "/tmp/cng-raster-cache",
         cutline: Optional[str] = None,
         cutline_where: Optional[str] = None,
+        value_units: Optional[str] = None,
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
     ):
@@ -2317,6 +2376,11 @@ class RasterProcessor:
             band: Extract a single band from multi-band sources (1-indexed); used when mosaicking
             cutline: Polygon layer to clip to, as in create_mosaic_cog (#344).
             cutline_where: Attribute filter on the cutline.
+            value_units: Units of the source values, e.g. "Mg/ha" (#105).
+                Required by hex_resampling="total", whose per-area
+                denominator sets the scale; refused with "sum" when per-area.
+                Recorded as `value_units` in each partition's metadata (for
+                "total", the units without the area: "Mg").
             read_credentials: Dict with AWS credentials for reading
             write_credentials: Dict with AWS credentials for writing
         """
@@ -2506,6 +2570,9 @@ class RasterProcessor:
                     f"got {hex_resampling!r}."
                 )
         self.hex_resampling = hex_resampling
+        check_value_units(hex_resampling, value_units)
+        self.value_units = value_units
+        self._warn_sum_of_density(self.input_path)
         self.read_credentials = read_credentials
         self.write_credentials = write_credentials
 
@@ -2808,6 +2875,37 @@ class RasterProcessor:
 
         print(f"  ✓ COG created: {output_path}")
         return output_path
+
+    def _units_metadata(self) -> Optional[Dict[str, str]]:
+        """`value_units` for the partition's key-value metadata, if declared."""
+        if not self.value_units:
+            return None
+        units = (total_units(self.value_units) if self.hex_resampling == "total"
+                 else self.value_units)
+        return {"value_units": units}
+
+    def _warn_sum_of_density(self, path: str) -> None:
+        """Warn when `sum` meets a band whose own units are per-area (#105).
+
+        Most density rasters declare no units at all (the carbon COGs behind
+        #105 had none), so this catches only some; --value-units is the
+        declaration that the guard trusts.
+        """
+        if self.hex_resampling != "sum" or self.value_units:
+            return
+        try:
+            ds = gdal.Open(path)
+            # A selected band is band 1 of input_path by now (subset VRT or mosaic).
+            band = ds.GetRasterBand(1)
+            units = band.GetUnitType() or band.GetDescription() or ""
+            ds = None
+        except Exception:
+            return
+        per_area = per_area_unit(units)
+        if per_area:
+            print(f"  ⚠ The band's units are {units!r}, per {per_area[0]}: summing a "
+                  f"per-area density undercounts by the pixel area. Did you mean "
+                  f"--hex-resampling total --value-units {units!r}, or mean?")
 
     def _native_cells_for_h0(self, h0_cell: int):
         """Return the native-resolution H3 cell ids of one h0 partition as a
@@ -3368,7 +3466,7 @@ class RasterProcessor:
 
         output_path = self._chunk_output_path(chunk_cell, h0_cell)
         # What built this, recorded in the partition itself (provenance.py).
-        stamp = kv_metadata_sql()
+        stamp = kv_metadata_sql(self._units_metadata())
 
         # The parts, renamed into the caller's vocabulary. Everything below is
         # one DuckDB statement over a parquet scan, so no result set is
@@ -3392,8 +3490,13 @@ class RasterProcessor:
                 f"  reported but absent: {missing}\n"
                 f"  present but unreported: {unexpected}"
             )
+        # `total` comes out of exactextract as value x km2; the declared
+        # per-area unit scales it to value x that unit (Mg/ha -> Mg, #105).
+        value_expr = "value"
+        if self.hex_resampling == "total":
+            value_expr = f"value * {per_area_unit(self.value_units)[1]!r}"
         hex_values = (
-            f"SELECT h AS {h3_col}, value AS {self.value_column}"
+            f"SELECT h AS {h3_col}, {value_expr} AS {self.value_column}"
             + (", frac" if is_fractions else "")
             + f" FROM read_parquet('{parts_glob}')"
         )
