@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **DuckDB 2.0.1** (#114, #280). The pin moves from 2.0.0, the release every version since 0.12.0 has run on, to the 2.0.1 patch release.
+
 ## [0.18.0] - 2026-11-20
 
 ### Added
