@@ -2500,3 +2500,38 @@ class TestRepartitionSortRanges:
         assert default_sort_range_rows("40GiB") == 50_000_000
         assert default_sort_range_rows("80GiB") == 50_000_000
         assert 3_700_000 < default_sort_range_rows("3GiB") < 3_800_000
+
+
+class TestRepartitionThreads:
+    """DuckDB's threads follow the pod, not the host (#339)."""
+
+    def test_cpu_request_sets_threads(self, monkeypatch):
+        from cng_datasets.vector.repartition import repartition_threads
+        con = duckdb.connect()
+        monkeypatch.setenv("CNG_POD_CPU", "4")
+        assert repartition_threads(con) == 4
+        monkeypatch.setenv("CNG_POD_CPU", "1500m")
+        assert repartition_threads(con) == 2
+
+    def test_unknown_cpu_is_capped(self, monkeypatch):
+        import cng_datasets.h3_chunks as h3c
+        from cng_datasets.vector.repartition import repartition_threads, UNKNOWN_CPU_THREADS
+        monkeypatch.delenv("CNG_POD_CPU", raising=False)
+        monkeypatch.setattr(h3c, "_cpu_request", lambda: None)
+        con = duckdb.connect()
+        con.execute("SET threads=48")
+        assert repartition_threads(con) == UNKNOWN_CPU_THREADS
+        con.execute("SET threads=2")
+        assert repartition_threads(con) == 2
+
+    def test_generated_manifest_states_the_cpu(self):
+        import yaml
+        from cng_datasets.k8s import K8sJobManager
+        from cng_datasets.k8s.workflows import _generate_repartition_job
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _generate_repartition_job(K8sJobManager(namespace="geo-workflows"), "ds", "b",
+                                      Path(tmpdir), None)
+            job = yaml.safe_load(open(Path(tmpdir) / "ds-repartition.yaml"))
+            c = job["spec"]["template"]["spec"]["containers"][0]
+            env = {e["name"]: e.get("value") for e in c["env"]}
+            assert env["CNG_POD_CPU"] == c["resources"]["requests"]["cpu"]

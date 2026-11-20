@@ -5,6 +5,7 @@ Consolidates chunked processing outputs into h0-partitioned format
 for efficient spatial querying.
 """
 
+import math
 import os
 import shutil
 import subprocess
@@ -30,6 +31,26 @@ def default_sort_range_rows(memory_limit) -> int:
     if limit is None:
         return DEFAULT_SORT_RANGE_ROWS
     return max(1, min(DEFAULT_SORT_RANGE_ROWS, limit // SORT_RANGE_BYTES_PER_ROW))
+
+
+# DuckDB threads when the pod's cpu is unknown: the hex step's fallback worker
+# count for the same situation (raster/cog.py, #195).
+UNKNOWN_CPU_THREADS = 8
+
+
+def repartition_threads(con) -> int:
+    """DuckDB threads for this pod: its cpu request, else at most 8 (#339)."""
+    from cng_datasets.h3_chunks import _cpu_request
+    cpus = _cpu_request()
+    if cpus:
+        threads = max(1, math.ceil(cpus))
+        source = "the pod's cpu"
+    else:
+        threads = min(UNKNOWN_CPU_THREADS,
+                      int(con.execute("SELECT current_setting('threads')").fetchone()[0]))
+        source = "pod cpu unknown; set CNG_POD_CPU"
+    print(f"Setting DuckDB threads={threads} ({source})")
+    return threads
 
 
 def _sql_literal(value) -> str:
@@ -85,13 +106,11 @@ def repartition_by_h0(
     # DuckDB counts the host's cores, not the pod's: 48 threads in a 4-cpu pod.
     # Every thread holds its own sort and join buffers, so under a small
     # memory_limit the same COPY passes or runs out of memory by chance; at
-    # the pod's own count it passes every time (measured on the #339 MRE at
-    # memory_limit 3GiB). No quota readable, DuckDB's default stands.
-    from cng_datasets.raster.cog import _cgroup_cpu_count
-    pod_cpus = _cgroup_cpu_count()
-    if pod_cpus:
-        print(f"Setting DuckDB threads={pod_cpus} (the pod's cpu limit)")
-        con.execute(f"SET threads={pod_cpus}")
+    # the pod's own count it passes (measured on the #339 MRE at
+    # memory_limit 3GiB). NRP enforces no cpu quota, so the generated manifest
+    # states the request as CNG_POD_CPU; with neither, at most
+    # UNKNOWN_CPU_THREADS.
+    con.execute(f"SET threads={repartition_threads(con)}")
     con.execute('SET http_timeout=1200')
     con.execute('SET http_retries=30')
     con.execute('SET arrow_large_buffer_size=true')
