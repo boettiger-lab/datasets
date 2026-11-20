@@ -197,6 +197,31 @@ When the hex reducer is categorical (`mode` or `fractions`), the warp to EPSG:43
 `nearest` resampling, so no class code is invented along a class boundary. Continuous
 sources warp with `bilinear`.
 
+### Densities: `total`, not `sum`
+
+The reducer follows the source's units, not the quantity you want in the end.
+
+| Source values | Reducer | Each cell holds |
+|---|---|---|
+| An amount per pixel (persons, tonnes) | `sum` | The amount in the cell |
+| A per-area density (Mg/ha, persons/km²) | `total --value-units "Mg/ha"` | The amount in the cell (Mg) |
+| A per-area density | `mean` | The average density in the cell (Mg/ha) |
+| An intensity (NDVI, temperature) | `mean` | The average |
+
+`sum` adds the pixel values themselves. For a density that is a sum of densities, which
+undercounts by the pixel area: the 300 m carbon rasters came out 6–7 times below their published
+totals (#105). `total` multiplies each pixel by its true area on the sphere before adding, so cells
+at different latitudes integrate correctly, and `SUM()` over the table is the grand total.
+
+- `total` needs `--value-units` with a per-area denominator, which sets the scale: `/ha`, `ha-1`,
+  `ha⁻¹` or `per hectare` multiply by 100 (km² to ha); `/km2` or `km-2` by 1; `/m2` or `m-2` by 10⁶.
+- `sum` with a per-area `--value-units` is refused. `sum` without `--value-units` prints a warning at
+  generation, and the hex pod warns when the band's own units are per-area. Most density rasters
+  declare no units, so `--value-units` is the declaration the guard trusts.
+- `--value-units` is recorded as `value_units` in each partition's key-value metadata. For `total` it
+  is the units without the area (`Mg`).
+- `total` is an exact-extract reducer; `--method warp-centroid` refuses it.
+
 ### Clipping to a polygon
 
 `--cutline` clips the COG step to the polygons of a vector layer, such as a country

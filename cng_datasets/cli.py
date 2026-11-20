@@ -253,6 +253,10 @@ def main():
                                     "it, so values pass through unchanged. Needs a nodata value.")
     raster_parser.add_argument("--cutline-where", metavar="SQL",
                                help="Attribute filter on --cutline, e.g. \"iso3 = 'PER'\"")
+    raster_parser.add_argument("--value-units", metavar="UNITS",
+                               help="Units of the source values, e.g. 'Mg/ha'. Required by "
+                                    "--hex-resampling total; a per-area unit is refused with sum. "
+                                    "Recorded in the hex output's metadata.")
     raster_parser.add_argument("--band", type=int,
                                help="Which band of a multi-band source to use, 1-indexed. Applies "
                                     "to the COG, the mosaic and the hex output alike — the band is "
@@ -433,7 +437,9 @@ def main():
                                              "(value, frac) row per class per cell, written to "
                                              "<dataset>/hex-fractions/ by jobs named <name>-fractions-*, "
                                              "so it can run beside a mode build); 'max'/'min' "
-                                             "for peak/extremum (species richness). Default: mean.")
+                                             "for peak/extremum (species richness); 'total' for the area "
+                                             "integral of a per-area density such as Mg/ha (needs "
+                                             "--value-units). Default: mean.")
     raster_workflow_parser.add_argument("--hex-memory", type=str, default="32Gi", help="Memory per hex job pod (default: 32Gi)")
     raster_workflow_parser.add_argument("--max-parallelism", type=int, default=61, help="Maximum parallel hex jobs (default: 61)")
     raster_workflow_parser.add_argument("--h0-subset", type=str, default=None, metavar="POSITIONS",
@@ -480,6 +486,11 @@ def main():
                                              "keeps its grid, so values pass through unchanged.")
     raster_workflow_parser.add_argument("--cutline-where", metavar="SQL",
                                         help="Attribute filter on --cutline, e.g. \"iso3 = 'PER'\"")
+    raster_workflow_parser.add_argument("--value-units", metavar="UNITS",
+                                        help="Units of the source values, e.g. 'Mg/ha' or 'persons'. "
+                                             "Required by --hex-resampling total, whose per-area "
+                                             "denominator sets the scale; a per-area unit is refused "
+                                             "with sum. Recorded in the hex output's metadata.")
     raster_workflow_parser.add_argument("--band", type=int,
                                         help="Which band of a multi-band source to use, 1-indexed. "
                                              "Giving it adds a preprocess-cog step that subsets the "
@@ -843,6 +854,7 @@ def _dispatch(args):
                 local_cache_dir=getattr(args, 'local_cache_dir', '/tmp/cng-raster-cache'),
                 cutline=args.cutline,
                 cutline_where=args.cutline_where,
+                value_units=args.value_units,
             )
 
             if args.output_cog:
@@ -1037,6 +1049,7 @@ def _dispatch(args):
             target_resolution=getattr(args, 'target_resolution', None),
             cutline=args.cutline,
             cutline_where=args.cutline_where,
+            value_units=args.value_units,
             band=getattr(args, 'band', None),
             output_cog_name=getattr(args, 'output_cog_name', None),
             years=args.years,

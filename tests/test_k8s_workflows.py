@@ -3185,3 +3185,40 @@ class TestRasterCutlineWorkflow:
                 self._gen(tmpdir, monkeypatch, cutline="c.gpkg", target_extent=(0, 0, 1, 1))
             with pytest.raises(ValueError, match="needs --cutline"):
                 self._gen(tmpdir, monkeypatch, cutline_where="x = 1")
+
+
+class TestRasterValueUnits:
+    """`--value-units` is checked at generation and reaches the hex job (#105)."""
+
+    def _gen(self, tmpdir, monkeypatch, **kwargs):
+        import cng_datasets.raster.cog as cog
+        monkeypatch.setattr(cog, "is_cog", lambda *a, **k: True)
+        generate_raster_workflow(dataset_name="carbon/irrecoverable-2018",
+                                 source_urls="s3://b/c.tif", bucket="public-carbon",
+                                 output_dir=tmpdir, **kwargs)
+        job = yaml.safe_load(open(Path(tmpdir) / "carbon-irrecoverable-2018-hex.yaml"))
+        return job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+
+    @pytest.mark.timeout(10)
+    def test_total_passes_units_to_the_hex_job(self, monkeypatch):
+        import shlex
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd = self._gen(tmpdir, monkeypatch, hex_resampling="total", value_units="Mg C ha-1")
+            args = shlex.split(cmd.split("cng-datasets raster", 1)[1])
+            assert args[args.index("--hex-resampling") + 1] == "total"
+            assert args[args.index("--value-units") + 1] == "Mg C ha-1"
+
+    @pytest.mark.timeout(10)
+    def test_contradictions_fail_before_anything_is_written(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError):
+                self._gen(tmpdir, monkeypatch, hex_resampling="total")
+            with pytest.raises(ValueError):
+                self._gen(tmpdir, monkeypatch, hex_resampling="sum", value_units="Mg/ha")
+            assert not list(Path(tmpdir).glob("*.yaml"))
+
+    @pytest.mark.timeout(10)
+    def test_sum_without_units_warns(self, monkeypatch, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._gen(tmpdir, monkeypatch, hex_resampling="sum")
+            assert "per-area density" in capsys.readouterr().out
