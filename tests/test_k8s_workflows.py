@@ -3055,9 +3055,9 @@ class TestFractionsBesideMode:
         import cng_datasets.raster.cog as cogmod
         monkeypatch.setattr(cogmod, "is_cog", lambda *a, **k: cog)
         out = Path(root) / resampling
-        generate_raster_workflow(
-            source_urls="s3://public-land-cover/raw/worldcover-peru.tif",
-            output_dir=str(out), hex_resampling=resampling, **{**self.COMMON, **kwargs})
+        kwargs = {"source_urls": "s3://public-land-cover/raw/worldcover-peru.tif",
+                  **self.COMMON, **kwargs}
+        generate_raster_workflow(output_dir=str(out), hex_resampling=resampling, **kwargs)
         docs = {}
         for f in out.glob("*.yaml"):
             for doc in yaml.safe_load_all(open(f)):
