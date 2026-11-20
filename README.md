@@ -205,6 +205,8 @@ Commands marked "used inside k8s pods" are called by the generated jobs — you 
 --parent-resolutions STR   Comma-separated parent resolutions (default: "0").
 --hex-resampling R         mean | sum | mode | fractions | max | min (default: mean).
                            fractions writes <dataset>/hex-fractions/ and -fractions jobs.
+--cutline VECTOR           Clip the COG to these polygons (path or URL); outside is nodata.
+--cutline-where SQL        Attribute filter on --cutline, e.g. "iso3 = 'PER'".
 --nodata VALS              NoData value(s) to exclude, comma-separated.
 --hex-memory SIZE          Memory per hex pod (default: 32Gi).
 --hex-cpu N                CPU request/limit per hex pod (default: 4).
