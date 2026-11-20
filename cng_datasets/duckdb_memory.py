@@ -57,6 +57,41 @@ def _render(total_bytes: int, ladder: List[Tuple[str, int]]) -> str:
     return f"{max(total_bytes, 1)}B"
 
 
+def _parse(quantity) -> Optional[Tuple[float, int, List[Tuple[str, int]]]]:
+    """(number, byte factor, ladder) for *quantity*, or None if unparseable."""
+    if quantity is None:
+        return None
+    text = str(quantity).strip()
+    if not text:
+        return None
+    for suffix in sorted(_SUFFIXES, key=len, reverse=True):
+        if suffix and text.endswith(suffix):
+            number, (factor, ladder) = text[:-len(suffix)].strip(), _SUFFIXES[suffix]
+            break
+    else:
+        number, (factor, ladder) = text, _SUFFIXES[""]
+    try:
+        value = float(number)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value, factor, ladder
+
+
+def memory_bytes(quantity) -> Optional[int]:
+    """Bytes in a Kubernetes or DuckDB memory quantity, or None if it has none.
+
+    `memory_bytes("27GiB")` and `memory_bytes("27Gi")` are both 27 × 2**30.
+    DuckDB's `-1` ("no limit") and anything unparseable give None.
+    """
+    parsed = _parse(quantity)
+    if parsed is None:
+        return None
+    value, factor, _ = parsed
+    return int(value * factor)
+
+
 def to_duckdb_memory_limit(quantity, fraction: float = 1.0) -> Optional[str]:
     """A DuckDB `memory_limit` value for the Kubernetes quantity *quantity*.
 
@@ -74,21 +109,8 @@ def to_duckdb_memory_limit(quantity, fraction: float = 1.0) -> Optional[str]:
     if quantity is None:
         return None
     text = str(quantity).strip()
-    if not text:
+    parsed = _parse(text)
+    if parsed is None:
         return text
-
-    for suffix in sorted(_SUFFIXES, key=len, reverse=True):
-        if suffix and text.endswith(suffix):
-            number, (factor, ladder) = text[:-len(suffix)].strip(), _SUFFIXES[suffix]
-            break
-    else:
-        number, (factor, ladder) = text, _SUFFIXES[""]
-
-    try:
-        value = float(number)
-    except ValueError:
-        return text
-    if value <= 0:
-        return text
-
+    value, factor, ladder = parsed
     return _render(int(value * factor * fraction), ladder)

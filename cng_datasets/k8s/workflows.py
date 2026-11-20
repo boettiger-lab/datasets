@@ -3145,7 +3145,11 @@ def _generate_repartition_job(manager, dataset_name, bucket, output_path, git_re
             "imagePullPolicy": "Always",
             "env": _s3_env_vars(config) + [
                 {"name": "TMPDIR", "value": "/tmp"},
-                {"name": "BUCKET", "value": bucket}
+                {"name": "BUCKET", "value": bucket},
+                # The cpu request, which sets DuckDB's thread count (#339). NRP
+                # enforces no cpu quota, so the pod cannot read it from its
+                # cgroup, and DuckDB would otherwise run a thread per host core.
+                {"name": "CNG_POD_CPU", "value": "4"},
             ],
             "volumeMounts": [
                 {"name": "rclone-config", "mountPath": "/root/.config/rclone", "readOnly": True}
