@@ -301,7 +301,9 @@ def repartition_by_h0(
             )
         else:
             print(f'  h0={h0}: {expected:,} rows, sorted in {len(ranges)} id ranges')
-            sorted_dir = os.path.join(local_dir, f'_ranges_h0={h0}')
+            # No '=' in this path: DuckDB would read it as a hive key and add
+            # a column to the partition.
+            sorted_dir = os.path.join(local_dir, f'_ranges_{h0}')
             os.makedirs(sorted_dir, exist_ok=True)
             range_files = []
             for i, (lo, hi, _) in enumerate(ranges):
@@ -315,7 +317,8 @@ def repartition_by_h0(
             con.execute('SET preserve_insertion_order=true')
             try:
                 con.execute(
-                    f"COPY (SELECT * FROM read_parquet([{file_list}])) TO '{local_file}'"
+                    f"COPY (SELECT * FROM read_parquet([{file_list}], hive_partitioning=false))"
+                    f" TO '{local_file}'"
                     f" (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
                 )
             finally:
