@@ -9,11 +9,34 @@ import os
 import shutil
 import subprocess
 import duckdb
-from cng_datasets.duckdb_memory import to_duckdb_memory_limit
+from cng_datasets.duckdb_memory import memory_bytes, to_duckdb_memory_limit
 from cng_datasets.hex_checks import assert_h3_columns_unsigned
 from cng_datasets.storage.s3 import configure_s3_credentials
 from ..provenance import kv_metadata_sql
 from .geoparquet import covering_columns
+
+# Rows sorted at once when ordering one h0 partition (#339). A 50M-row range
+# at memory_limit 40GiB kept scratch in single-digit GB on the 700M-row PAD-US
+# combined partition (35 attributes). The default scales that ratio to the
+# memory limit, so a smaller pod sorts smaller ranges; without a limit, or
+# above 40GiB, it is 50M.
+DEFAULT_SORT_RANGE_ROWS = 50_000_000
+SORT_RANGE_BYTES_PER_ROW = (40 * 2 ** 30) // DEFAULT_SORT_RANGE_ROWS
+
+
+def default_sort_range_rows(memory_limit) -> int:
+    """Rows to sort at once under DuckDB *memory_limit* (#339)."""
+    limit = memory_bytes(memory_limit)
+    if limit is None:
+        return DEFAULT_SORT_RANGE_ROWS
+    return max(1, min(DEFAULT_SORT_RANGE_ROWS, limit // SORT_RANGE_BYTES_PER_ROW))
+
+
+def _sql_literal(value) -> str:
+    """An id range bound as SQL: numbers as is, anything else quoted."""
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def repartition_by_h0(
@@ -22,6 +45,7 @@ def repartition_by_h0(
     source_parquet: str = None,
     cleanup: bool = True,
     memory_limit: str = None,
+    sort_range_rows: int = None,
 ) -> None:
     """
     Repartition chunks by h0 for efficient spatial querying.
@@ -35,6 +59,12 @@ def repartition_by_h0(
         memory_limit: DuckDB memory limit (e.g. '27GiB'). Falls back to
             DUCKDB_MEMORY_LIMIT env var. If neither is set, DuckDB auto-detects
             (which may ignore container cgroup limits).
+        sort_range_rows: Most rows sorted at once (default: the
+            CNG_SORT_RANGE_ROWS env var, else default_sort_range_rows of the
+            memory limit, 50M rows per 40GiB and at most 50M). A
+            larger h0 partition is sorted in contiguous id ranges of about this
+            many rows, which are then streamed in order into its one file, so
+            scratch space tracks the range rather than the partition (#339).
     """
     print(f"Repartitioning chunks from {chunks_dir} to {output_dir}")
 
@@ -50,6 +80,8 @@ def repartition_by_h0(
         suffix = "" if effective_limit == requested_limit else f" (from {requested_limit})"
         print(f"Setting DuckDB memory_limit={effective_limit}{suffix}")
         con.execute(f"SET memory_limit='{effective_limit}'")
+    else:
+        effective_limit = None
     con.execute('SET http_timeout=1200')
     con.execute('SET http_retries=30')
     con.execute('SET arrow_large_buffer_size=true')
@@ -138,6 +170,8 @@ def repartition_by_h0(
             f" FROM read_parquet('{chunks_dir}/*.parquet') c"
             f" INNER JOIN _source_attrs s ON c.\"{chunk_id_col}\" = s.\"{chunk_id_col}\""
             f" WHERE c.h0 = {{h0}}"
+            f" AND c.\"{chunk_id_col}\" BETWEEN {{lo}} AND {{hi}}"
+            f" AND s.\"{chunk_id_col}\" BETWEEN {{lo}} AND {{hi}}"
         )
 
         # Completeness guard (issue #170): the k8s hex Job is an indexed Job of
@@ -189,19 +223,47 @@ def repartition_by_h0(
         print('No source parquet provided, proceeding without attribute join')
         join_sql = (
             f"SELECT * FROM read_parquet('{chunks_dir}/*.parquet') WHERE h0 = {{h0}}"
+            f" AND \"{chunk_id_col}\" BETWEEN {{lo}} AND {{hi}}"
         )
 
-    # Get distinct h0 values
-    h0_vals = con.execute(
-        f"SELECT DISTINCT h0 FROM read_parquet('{chunks_dir}/*.parquet') ORDER BY h0"
-    ).fetchall()
-    if not h0_vals:
+    # Plan each h0 partition as contiguous id ranges of about sort_range_rows
+    # rows (#339). One COPY ... ORDER BY over a whole partition makes DuckDB
+    # sort every joined row, attributes included, before writing any of them,
+    # so its scratch grew with the partition's row count: 700M rows of PAD-US
+    # combined spilled past 200Gi for a 1.4 GB file. Sorted range by range and
+    # streamed in order, the file is the same, rows and order, and scratch
+    # tracks one range. Each feature goes to the range its first row falls
+    # in, so a feature's rows are never split between ranges and a range holds
+    # at most the budget plus the rest of its last feature.
+    range_rows = int(sort_range_rows or os.environ.get('CNG_SORT_RANGE_ROWS')
+                     or default_sort_range_rows(effective_limit))
+    if range_rows < 1:
+        raise ValueError(f"sort_range_rows must be positive, got {range_rows}")
+    plan = con.execute(f"""
+        WITH per_id AS (
+            SELECT h0, "{chunk_id_col}" AS id, count(*) AS n
+            FROM read_parquet('{chunks_dir}/*.parquet') GROUP BY ALL),
+        ranged AS (
+            SELECT h0, id, n,
+                   sum(n) OVER (PARTITION BY h0 ORDER BY id
+                                ROWS UNBOUNDED PRECEDING) - n AS first_row
+            FROM per_id)
+        -- A feature belongs to the range its first row falls in.
+        SELECT h0, first_row // {range_rows} AS rid, min(id), max(id), sum(n)::BIGINT
+        FROM ranged
+        GROUP BY h0, rid ORDER BY h0, rid
+    """).fetchall()
+    if not plan:
         raise RuntimeError(
             f"No parquet files found in chunks directory '{chunks_dir}'. "
             f"The hex job may have produced no output (all cells empty?)."
         )
+    partitions = {}
+    for h0, _rid, lo, hi, n in plan:
+        partitions.setdefault(h0, []).append((lo, hi, n))
 
-    print(f'Writing {len(h0_vals)} h0 partitions one at a time (bounded memory)...')
+    print(f'Writing {len(partitions)} h0 partitions one at a time (bounded memory, '
+          f'at most ~{range_rows:,} rows sorted at once)...')
 
     # Determine rclone output path once
     if output_dir.startswith('s3://'):
@@ -210,12 +272,7 @@ def repartition_by_h0(
     else:
         rclone_output = None
 
-    any_written = False
-    for (h0,) in h0_vals:
-        local_partition = os.path.join(local_dir, f'h0={h0}')
-        os.makedirs(local_partition, exist_ok=True)
-        local_file = os.path.join(local_partition, 'data_0.parquet')
-
+    def ordered(h0, lo, hi):
         # ORDER BY the row id within each h0 partition (issue #103) so parquet
         # row-group zonemaps can prune by feature identity: a plain
         # `WHERE _cng_fid IN (...)` then skips the partitions/row-groups whose
@@ -224,13 +281,58 @@ def repartition_by_h0(
         # also groups rows by location; ordering each feature's cells by the
         # finest H3 column keeps them compact and their attributes compress.
         # Wrap in a subquery so ORDER BY references the unambiguous output
-        # column (the join exposes the id on both sides). PARTITION BY h0 is
-        # unchanged.
-        con.execute(
-            f"COPY (SELECT * FROM ({join_sql.format(h0=h0)})"
-            f" ORDER BY \"{chunk_id_col}\", \"{finest_h}\") TO '{local_file}'"
-            f" (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
-        )
+        # column (the join exposes the id on both sides).
+        lo, hi = _sql_literal(lo), _sql_literal(hi)
+        return (f"SELECT * FROM ({join_sql.format(h0=h0, lo=lo, hi=hi)})"
+                f" ORDER BY \"{chunk_id_col}\", \"{finest_h}\"")
+
+    any_written = False
+    for h0, ranges in partitions.items():
+        local_partition = os.path.join(local_dir, f'h0={h0}')
+        os.makedirs(local_partition, exist_ok=True)
+        local_file = os.path.join(local_partition, 'data_0.parquet')
+        expected = sum(n for _, _, n in ranges)
+
+        if len(ranges) == 1:
+            (lo, hi, _), = ranges
+            con.execute(
+                f"COPY ({ordered(h0, lo, hi)}) TO '{local_file}'"
+                f" (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
+            )
+        else:
+            print(f'  h0={h0}: {expected:,} rows, sorted in {len(ranges)} id ranges')
+            sorted_dir = os.path.join(local_dir, f'_ranges_h0={h0}')
+            os.makedirs(sorted_dir, exist_ok=True)
+            range_files = []
+            for i, (lo, hi, _) in enumerate(ranges):
+                range_file = os.path.join(sorted_dir, f'range_{i:05d}.parquet')
+                con.execute(f"COPY ({ordered(h0, lo, hi)}) TO '{range_file}'"
+                            f" (FORMAT PARQUET, COMPRESSION ZSTD)")
+                range_files.append(range_file)
+            # Ranges are disjoint and ascending in id, so reading them back in
+            # list order, with insertion order kept, is the sorted partition.
+            file_list = ', '.join(f"'{f}'" for f in range_files)
+            con.execute('SET preserve_insertion_order=true')
+            try:
+                con.execute(
+                    f"COPY (SELECT * FROM read_parquet([{file_list}])) TO '{local_file}'"
+                    f" (FORMAT PARQUET, COMPRESSION ZSTD{kv_metadata_sql()})"
+                )
+            finally:
+                con.execute('SET preserve_insertion_order=false')
+            shutil.rmtree(sorted_dir)
+
+        # Every row the plan counted is in the file, before anything is
+        # uploaded: a join that dropped rows would otherwise publish a short
+        # partition with a clean exit.
+        written = con.execute(
+            f"SELECT count(*) FROM read_parquet('{local_file}')").fetchone()[0]
+        if written != expected:
+            raise RuntimeError(
+                f"h0={h0}: wrote {written:,} rows, but the chunks hold {expected:,}. "
+                f"More rows means '{chunk_id_col}' is not unique in the source "
+                f"parquet; fewer means chunk ids are missing from it. Chunks "
+                f"left in place at '{chunks_dir}'.")
 
         if rclone_output:
             subprocess.run(

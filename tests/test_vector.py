@@ -2380,3 +2380,123 @@ class TestSplitAt180:
         got, truth = self._fill(con, ring, 4), self._truth(con, split, 4)
         con.close()
         assert got == truth
+
+
+class TestRepartitionSortRanges:
+    """A large h0 partition is sorted in id ranges and streamed into its one
+    file (#339). The file must be the one a single whole-partition sort writes:
+    same rows, same order, same metadata."""
+
+    H0S = (577199624117288959, 577727389698621439)
+
+    def _fixture(self, tmpdir, n_features=60, dup_source=False):
+        """Source of n_features with text attributes, and three chunk files of
+        (fid, h10, h9, h8, h0) rows in random order, 1-40 rows per feature, each
+        feature in one of two h0 cells (a few in both)."""
+        con = setup_duckdb_connection()
+        src = f"{tmpdir}/source.parquet"
+        ids = "range(1, {n} + 1)".format(n=n_features)
+        if dup_source:
+            ids = f"(SELECT * FROM {ids} UNION ALL SELECT 7)"
+        con.execute(f"""
+            COPY (SELECT i::BIGINT AS _cng_fid,
+                         'name ' || i AS name, 'kind ' || (i % 5) AS kind,
+                         ST_Point(i, i) AS geometry
+                  FROM {ids} t(i)) TO '{src}' (FORMAT PARQUET)""")
+        chunks = f"{tmpdir}/chunks"
+        os.makedirs(chunks)
+        a, b = self.H0S
+        rows = f"""
+            SELECT f::BIGINT AS _cng_fid,
+                   (622236750694711295 + f * 1000 + k)::UBIGINT AS h10,
+                   (617733151067340799 + f * 100 + k // 7)::UBIGINT AS h9,
+                   (613229551439970303 + f * 10 + k // 49)::UBIGINT AS h8,
+                   (CASE WHEN f % 2 = 0 OR (f % 9 = 0 AND k % 2 = 0)
+                         THEN {a} ELSE {b} END)::UBIGINT AS h0
+            FROM range(1, {n_features} + 1) t(f),
+                 LATERAL range(1 + (f * 7) % 40) s(k)"""
+        for part in range(3):
+            con.execute(f"""COPY (SELECT * FROM ({rows}) WHERE _cng_fid % 3 = {part}
+                            ORDER BY random()) TO '{chunks}/chunk_{part:06d}.parquet'
+                            (FORMAT PARQUET)""")
+        con.close()
+        return src, chunks
+
+    def _run(self, tmpdir, src, chunks, out, **kwargs):
+        repartition_by_h0(chunks_dir=chunks, output_dir=f"{tmpdir}/{out}",
+                          source_parquet=src, cleanup=False, **kwargs)
+        con = duckdb.connect()
+        result = {}
+        for h0 in self.H0S:
+            path = f"{tmpdir}/{out}/h0={h0}/data_0.parquet"
+            result[h0] = {
+                "rows": con.execute(f"SELECT * FROM read_parquet('{path}')").fetchall(),
+                "kv": {k: v for k, v in con.execute(
+                    f"SELECT key::VARCHAR, value::VARCHAR FROM parquet_kv_metadata('{path}')"
+                ).fetchall() if k != "built_at"},
+            }
+        con.close()
+        return result
+
+    @pytest.fixture(autouse=True)
+    def _no_s3(self, monkeypatch):
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "")
+        monkeypatch.delenv("CNG_SORT_RANGE_ROWS", raising=False)
+
+    @pytest.mark.timeout(60)
+    def test_ranges_write_the_same_file_as_one_sort(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src, chunks = self._fixture(tmpdir)
+            whole = self._run(tmpdir, src, chunks, "whole")
+            assert "id ranges" not in capsys.readouterr().out
+            ranged = self._run(tmpdir, src, chunks, "ranged", sort_range_rows=50)
+            assert "sorted in" in capsys.readouterr().out
+            for h0 in self.H0S:
+                assert ranged[h0]["rows"] == whole[h0]["rows"]
+                assert len(whole[h0]["rows"]) > 50
+                assert ranged[h0]["kv"] == whole[h0]["kv"]
+                assert "cng_datasets_version" in ranged[h0]["kv"]
+                ids = [r[0] for r in ranged[h0]["rows"]]
+                assert ids == sorted(ids)
+
+    @pytest.mark.timeout(60)
+    def test_range_smaller_than_one_feature(self):
+        """Every feature is its own range; its rows are never split."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src, chunks = self._fixture(tmpdir, n_features=12)
+            whole = self._run(tmpdir, src, chunks, "whole")
+            ranged = self._run(tmpdir, src, chunks, "ranged", sort_range_rows=1)
+            for h0 in self.H0S:
+                assert ranged[h0]["rows"] == whole[h0]["rows"]
+
+    @pytest.mark.timeout(60)
+    def test_env_var_sets_the_range(self, monkeypatch, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src, chunks = self._fixture(tmpdir)
+            monkeypatch.setenv("CNG_SORT_RANGE_ROWS", "40")
+            self._run(tmpdir, src, chunks, "ranged")
+            assert "at most ~40 rows sorted at once" in capsys.readouterr().out
+
+    @pytest.mark.timeout(60)
+    def test_duplicate_source_ids_fail_before_upload(self, monkeypatch):
+        """A non-unique id multiplies rows in the join; that is wrong output,
+        so it fails instead of publishing the partition."""
+        # The completeness check counts source rows, so it would catch this
+        # case first; the row check must stand on its own.
+        monkeypatch.setenv("CNG_SKIP_COMPLETENESS_CHECK", "1")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src, chunks = self._fixture(tmpdir, dup_source=True)
+            with pytest.raises(RuntimeError, match="not unique"):
+                repartition_by_h0(chunks_dir=chunks, output_dir=f"{tmpdir}/out",
+                                  source_parquet=src, cleanup=False,
+                                  sort_range_rows=50)
+            # Feature 7 is odd, so it is in the second h0 cell.
+            assert not os.path.exists(f"{tmpdir}/out/h0={self.H0S[1]}")
+
+    def test_default_range_scales_with_memory(self):
+        from cng_datasets.vector.repartition import default_sort_range_rows
+        assert default_sort_range_rows(None) == 50_000_000
+        assert default_sort_range_rows("40GiB") == 50_000_000
+        assert default_sort_range_rows("80GiB") == 50_000_000
+        assert 3_700_000 < default_sort_range_rows("3GiB") < 3_800_000

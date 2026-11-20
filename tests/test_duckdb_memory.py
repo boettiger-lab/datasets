@@ -129,3 +129,20 @@ class TestUnparseableInputIsLeftAlone:
     def test_none_stays_none(self):
         """The consumers fall back to DuckDB's own auto-detection on None."""
         assert to_duckdb_memory_limit(None) is None
+
+
+class TestMemoryBytes:
+    """`memory_bytes` reads either spelling as a byte count (#339)."""
+
+    @pytest.mark.timeout(5)
+    def test_both_spellings(self):
+        from cng_datasets.duckdb_memory import memory_bytes
+        assert memory_bytes("27GiB") == memory_bytes("27Gi") == 27 * 2 ** 30
+        assert memory_bytes("16GB") == memory_bytes("16G") == 16 * 10 ** 9
+        assert memory_bytes("1024") == 1024
+
+    @pytest.mark.timeout(5)
+    def test_no_limit_is_none(self):
+        from cng_datasets.duckdb_memory import memory_bytes
+        for value in (None, "", "-1", "lots"):
+            assert memory_bytes(value) is None

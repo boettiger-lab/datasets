@@ -301,6 +301,12 @@ def main():
     repartition_parser.add_argument("--source-parquet", required=True, help="Source parquet with full attributes")
     repartition_parser.add_argument("--cleanup", action="store_true", default=True, help="Remove chunks after repartitioning")
     repartition_parser.add_argument("--memory-limit", type=str, default=None, help="DuckDB memory limit (e.g. '27GiB'). Overrides DUCKDB_MEMORY_LIMIT env var.")
+    repartition_parser.add_argument("--sort-range-rows", type=int, default=None,
+                                    help="Most rows sorted at once. A larger h0 partition is sorted in "
+                                         "contiguous id ranges of about this many rows and streamed "
+                                         "into its one file, so scratch tracks the range, not the "
+                                         "partition (default: CNG_SORT_RANGE_ROWS, else 50M rows per 40GiB "
+                                         "of --memory-limit, at most 50M).")
 
     # K8s job generation command
     k8s_parser = subparsers.add_parser("k8s", help="Generate Kubernetes job")
@@ -867,6 +873,7 @@ def _dispatch(args):
             source_parquet=args.source_parquet,
             cleanup=args.cleanup,
             memory_limit=args.memory_limit,
+            sort_range_rows=args.sort_range_rows,
         )
 
     elif args.command == "k8s":
