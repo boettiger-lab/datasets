@@ -125,13 +125,17 @@ class TestOverlapPolyfill:
         for cell, f in out[2].items():
             assert out[1][cell] == pytest.approx(f, abs=1e-6)
             assert 0 < f <= 1
-        # Σ fraction x cell area = the polygon's area, measured geodesically.
+        # Σ fraction x planar cell area = the polygon's planar area. Cells are
+        # measured in a 0..360 frame, where one crossing 180 does not wrap.
+        # (Not h3_cell_area against ST_Area_Spheroid: H3 measures on a sphere
+        # and the spheroid area on WGS84, which differ by ~0.4% at 10N.)
+        wgs84 = "+proj=longlat +datum=WGS84 +no_defs"
         covered = sum(
-            f * con.execute(f"SELECT h3_cell_area({c}::UBIGINT, 'm^2')").fetchone()[0]
+            f * con.execute(f"""SELECT ST_Area(ST_Transform(
+                    ST_GeomFromWKB(h3_cell_to_boundary_wkb({c}::UBIGINT)),
+                    '{wgs84}', '{wgs84} +lon_wrap=180', always_xy := true))""").fetchone()[0]
             for c, f in out[2].items())
-        area = con.execute(
-            f"SELECT ST_Area_Spheroid(ST_GeomFromText('{_CROSSER_SPLIT}'))").fetchone()[0]
-        assert covered == pytest.approx(area, rel=1e-3)
+        assert covered == pytest.approx(_area(con, _CROSSER_SPLIT), rel=1e-9)
         lngs = [con.execute(f"SELECT h3_cell_to_lng({c}::UBIGINT)").fetchone()[0] for c in out[2]]
         assert all(abs(x) > 179 for x in lngs), "cells must lie at the antimeridian"
         con.close()
