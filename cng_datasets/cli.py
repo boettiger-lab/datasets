@@ -70,6 +70,11 @@ def main():
     vector_parser.add_argument("--chunk-id", type=int, help="Process specific chunk")
     vector_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
     vector_parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
+    vector_parser.add_argument(
+        "--polyfill", choices=["centre", "overlap"], default="centre",
+        help="'centre' (default): a polygon gets the cells whose centre it contains. "
+             "'overlap': every cell its area touches, plus a cover_frac column, the share "
+             "of the cell inside the feature (issue #363). Not with --resolution-by-area.")
     vector_parser.add_argument("--plan", default=None, metavar="URL",
                                help="Chunk plan from `vector-plan` (#124): chunk K is the plan's row "
                                     "range K instead of a fixed --chunk-size slice. An index past "
@@ -341,6 +346,11 @@ def main():
              "Mutually exclusive with --h3-resolution; emits the same flag into the "
              "hex job. Include 0 in --parent-resolutions for the h0 partition column.")
     workflow_parser.add_argument("--parent-resolutions", type=str, default="9,8,0", help="Comma-separated parent H3 resolutions (default: '9,8,0')")
+    workflow_parser.add_argument(
+        "--polyfill", choices=["centre", "overlap"], default="centre",
+        help="'centre' (default): a polygon gets the cells whose centre it contains. "
+             "'overlap': every cell its area touches, plus a cover_frac column, the share "
+             "of the cell inside the feature (issue #363). Not with --resolution-by-area.")
     workflow_parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
     workflow_parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")
     workflow_parser.add_argument("--hex-memory", type=str, default="8Gi", help="Memory per hex job pod (default: 8Gi)")
@@ -701,6 +711,7 @@ def _dispatch(args):
             id_column=args.id_column,
             resolution_by_area=resolution_by_area,
             plan_url=args.plan,
+            polyfill=args.polyfill,
         )
 
     elif args.command == "vector-plan":
@@ -963,6 +974,7 @@ def _dispatch(args):
             h3_resolution=args.h3_resolution,
             resolution_by_area=args.resolution_by_area,
             parent_resolutions=parent_res,
+            polyfill=args.polyfill,
             id_column=args.id_column,
             layer=args.layer,
             hex_memory=args.hex_memory,

@@ -388,17 +388,21 @@ def _transmeridian_split_sql(carry_cols: str, source: str) -> str:
     '''
 
 
-def _needs_split_sql(geom_expr: str, res: str) -> str:
+def _needs_split_sql(geom_expr: str, res: str, max_work: Optional[float] = None) -> str:
     """SQL predicate: is this polygon too large or too costly to fill as one
     piece? Never true for an area that is not finite (see _PIECE_MAX_CELLS)."""
+    if max_work is None:
+        max_work = _PIECE_MAX_WORK
     cells = f"(({_feature_area_m2_sql(geom_expr)}) / h3_get_hexagon_area_avg({res}, 'm^2'))"
     return (
         f"(isfinite({cells}) AND ({cells} > {_PIECE_MAX_CELLS} "
-        f"OR {cells} * ST_NPoints({geom_expr}) > {_PIECE_MAX_WORK}))"
+        f"OR {cells} * ST_NPoints({geom_expr}) > {max_work:.0f}))"
     )
 
 
-def _piece_split_sql(carry_cols: str, source: str, res: str) -> str:
+def _piece_split_sql(carry_cols: str, source: str, res: str,
+                     max_work: Optional[float] = None,
+                     split_crossers: bool = False) -> str:
     """SQL for CTE bodies that cut large polygon parts into pieces (issue #125).
 
     Returns the bodies of four CTEs, ``tbig``, ``tcross``, ``twrap`` and
@@ -412,8 +416,13 @@ def _piece_split_sql(carry_cols: str, source: str, res: str) -> str:
     frame and cut at 180, and its eastern half is moved back by -360, so that it
     becomes two ordinary parts that the bbox cuts below can handle. Its validity
     is judged in that frame, since the ring as stored crosses itself planarly.
+
+    *max_work* overrides _PIECE_MAX_WORK. With *split_crossers*, every
+    antimeridian crosser is cut at 180 whatever its size, so that no piece
+    wraps when read planarly (the overlap polyfill, #363, measures pieces
+    planarly).
     """
-    split = _needs_split_sql("geom", res)
+    split = _needs_split_sql("geom", res, max_work)
     j = _PIECE_CUT_JITTER
     mx = f"(ST_XMin(geom) + ST_XMax(geom)) / 2 + {j}"
     my = f"(ST_YMin(geom) + ST_YMax(geom)) / 2 + {j}"
@@ -425,10 +434,11 @@ def _piece_split_sql(carry_cols: str, source: str, res: str) -> str:
     )
     wgs84 = "+proj=longlat +datum=WGS84 +no_defs"
     crosser = _dateline_crosser_sql("geom")
+    first_split = f"({split} OR {crosser})" if split_crossers else split
     tbig = f"""
             SELECT {carry_cols}, geom,
                    CASE WHEN NOT _is_line AND ST_GeometryType(geom) = 'POLYGON'
-                        THEN {split} ELSE FALSE END AS _split
+                        THEN {first_split} ELSE FALSE END AS _split
             FROM {source}
     """
     tcross = f"""
@@ -884,6 +894,7 @@ class H3VectorProcessor:
         read_credentials: Optional[Dict[str, str]] = None,
         write_credentials: Optional[Dict[str, str]] = None,
         plan_url: Optional[str] = None,
+        polyfill: str = "centre",
     ):
         """
         Initialize the H3 vector processor.
@@ -908,7 +919,20 @@ class H3VectorProcessor:
                 #124). When set, chunk K is the plan's row range K rather than
                 rows [K * chunk_size, (K + 1) * chunk_size), and chunk_size is
                 not used to select rows.
+            polyfill: 'centre' (default) keeps the cells whose centre a polygon
+                contains. 'overlap' keeps every cell a polygon's area touches and
+                adds a ``cover_frac`` column, the share of the cell inside it
+                (issue #363; see h3_overlap). Not available with
+                resolution_by_area.
         """
+        from .h3_overlap import POLYFILL_MODES
+        if polyfill not in POLYFILL_MODES:
+            raise ValueError(f"polyfill must be one of {POLYFILL_MODES}, not {polyfill!r}")
+        if polyfill == "overlap" and resolution_by_area is not None:
+            raise ValueError(
+                "--polyfill overlap does not support --resolution-by-area yet; "
+                "use one --h3-resolution.")
+        self.polyfill = polyfill
         self.input_url = input_url
         self.output_url = output_url
         self.resolution_by_area = resolution_by_area
@@ -1030,6 +1054,9 @@ class H3VectorProcessor:
         Returns:
             Output file path if successful, None if chunk_id out of range
         """
+        if self.polyfill == "overlap":
+            return self._process_overlap(chunk_id)
+
         # PASS 1: Geometry to H3 arrays (no unnesting)
         intermediate_file = self._process_pass1(chunk_id)
         if intermediate_file is None:
@@ -1066,14 +1093,10 @@ class H3VectorProcessor:
               f"~{chunk.est_cells:,.0f} estimated cells")
         return chunk.row_offset, chunk.row_count
 
-    def _process_pass1(
-        self,
-        chunk_id: int,
-    ) -> Optional[str]:
-        """
-        Pass 1: Convert geometries to H3 cell arrays without unnesting.
-        Writes intermediate parquet with arrays to disk.
-        """
+    def _load_chunk(self, chunk_id: int) -> Optional[str]:
+        """Expose chunk *chunk_id* as the view ``chunk_table`` (id, geom),
+        refuse an oversized feature (#107), and return the id column. None
+        when there is nothing to do."""
         offset, limit = self._chunk_rows(chunk_id)
         if limit is None:
             return None
@@ -1098,7 +1121,7 @@ class H3VectorProcessor:
                 f"The GeoParquet has changed since {self.plan_url} was written; "
                 f"re-run the plan step.")
 
-        print(f"\nPass 1 - Chunk {chunk_id} ({chunk_rows:,} rows): Converting geometries to H3 arrays...")
+        print(f"\nChunk {chunk_id}: {chunk_rows:,} rows")
 
         geom_col = self._find_geometry_column('source_table')
 
@@ -1135,6 +1158,20 @@ class H3VectorProcessor:
         # die on a C++ assertion. ST_Area_Spheroid needs no reprojection, so it
         # is robust on the pathological/antimeridian polygons that trigger this.
         self._assert_no_oversized_feature(id_col, chunk_id)
+        return id_col
+
+    def _process_pass1(
+        self,
+        chunk_id: int,
+    ) -> Optional[str]:
+        """
+        Pass 1: Convert geometries to H3 cell arrays without unnesting.
+        Writes intermediate parquet with arrays to disk.
+        """
+        id_col = self._load_chunk(chunk_id)
+        if id_col is None:
+            return None
+        print(f"Pass 1 - Chunk {chunk_id}: Converting geometries to H3 arrays...")
 
         # Generate H3 arrays WITHOUT unnesting
         h3_sql = geom_to_h3_cells(
@@ -1201,6 +1238,43 @@ class H3VectorProcessor:
 
         print(f"  ✓ Pass 1 complete: {intermediate_file}")
         return intermediate_file
+
+    def _process_overlap(self, chunk_id: int) -> Optional[str]:
+        """The 'overlap' polyfill of one chunk (issue #363; see h3_overlap):
+        one row per (feature, cell) the feature's area touches, with
+        ``cover_frac``, written straight to the chunk's output file."""
+        from .h3_overlap import overlap_cells, overlap_output_sql
+        from ..h3_chunks import _cpu_request
+        id_col = self._load_chunk(chunk_id)
+        if id_col is None:
+            return None
+        swapped = self.con.execute("""
+            SELECT count(*) FROM chunk_table
+            WHERE geom IS NOT NULL AND (ST_YMin(geom) < -90 OR ST_YMax(geom) > 90)
+        """).fetchone()[0]
+        if swapped:
+            raise RuntimeError(
+                f"Chunk {chunk_id}: {swapped} feature(s) have Y coordinates outside "
+                f"the valid latitude range [-90, 90]. This indicates coordinates are "
+                f"in (lat, lon) order instead of (lon, lat). Check input geometry "
+                f"coordinate order.")
+        print(f"Overlap polyfill - Chunk {chunk_id} at resolution {self.h3_resolution}...")
+        threads = max(1, int(_cpu_request() or 1))
+        overlap_cells(self.con, "chunk_table", id_col, self.h3_resolution, threads=threads)
+        final_output = f"{self.output_url.rstrip('/')}/chunk_{chunk_id:06d}.parquet"
+        n_feat, n_rows, n_full, n_null = self.con.execute("""
+            SELECT count(DISTINCT fid), count(*), count(*) FILTER (WHERE cover_frac = 1),
+                   count(*) FILTER (WHERE cover_frac IS NULL) FROM _ov_result
+        """).fetchone()
+        self.con.execute(f"""
+            COPY ({overlap_output_sql(id_col, self.h3_resolution, self.parent_resolutions)})
+            TO '{final_output}'
+            (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
+        """)
+        self.con.execute("DROP TABLE IF EXISTS _ov_result")
+        print(f"  ✓ {n_feat:,} features, {n_rows:,} rows ({n_full:,} with cover_frac 1, "
+              f"{n_rows - n_full - n_null:,} partial, {n_null:,} NULL): {final_output}")
+        return final_output
 
     def _process_pass2(
         self,
