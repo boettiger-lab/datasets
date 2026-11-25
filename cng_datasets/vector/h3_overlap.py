@@ -37,7 +37,7 @@ within 4e-5.
 """
 
 import concurrent.futures as cf
-from typing import List, Optional
+from typing import List
 
 import duckdb
 
