@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-26
+
 ### Added
 - **`--polyfill overlap` with a coverage fraction** (#363). Vector hex gives a polygon the cells whose centre it contains, so a feature smaller than a cell gets one stand-in cell (#104), and two features that overlap by less than a cell can share no cell, which makes a hex join miss real overlaps. `workflow --polyfill overlap` (and `vector --polyfill overlap`) writes one row for every cell a polygon's area touches, with a `cover_frac` column (FLOAT, the share of the cell's area inside the feature, in (0, 1]). Cells wholly inside a piece get 1 without geometry work, and only boundary cells are intersected. H3's own 'overlap' mode omits some cells, such as a cell whose centre a small hole covers, so the neighbours of boundary cells and the cells under hole vertices are tested as well. Fractions are planar ratios in lon/lat, H3's edge convention; summed with cell areas they reproduce each polygon's area. Antimeridian crossers are cut at 180 first. Points and lines keep their cells with `cover_frac` NULL, as does the stand-in cell of a zero-area polygon. Not yet available with `--resolution-by-area`. Ported from the data-workflows script validated on all of WDPA (data-workflows #1015). The default, `--polyfill centre`, is unchanged.
 
@@ -438,6 +440,7 @@ First release published to PyPI (`pip install cng-datasets`) via trusted publish
 - Resolution override behavior with helpful messages
 - Memory efficiency for large polygon processing
 
+[0.19.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.19.0
 [0.18.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.18.0
 [0.17.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.17.0
 [0.16.0]: https://github.com/boettiger-lab/datasets/releases/tag/v0.16.0
