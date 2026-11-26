@@ -843,6 +843,7 @@ def generate_dataset_workflow(
     h3_resolution: Optional[int] = None,
     resolution_by_area: Optional[str] = None,
     parent_resolutions: Optional[List[int]] = None,
+    polyfill: str = "centre",
     id_column: Optional[str] = None,
     layer: Optional[str] = None,
     hex_memory: str = "8Gi",
@@ -1051,6 +1052,11 @@ def generate_dataset_workflow(
     # --resolution-by-area spec instead of a single --h3-resolution. Derive the
     # finest bin resolution from the spec for messaging / column naming, and skip
     # geometry-type auto-detection (which only picks a single target resolution).
+    if polyfill not in ("centre", "overlap"):
+        raise ValueError(f"polyfill must be 'centre' or 'overlap', not {polyfill!r}")
+    if polyfill == "overlap" and resolution_by_area is not None:
+        raise ValueError("--polyfill overlap does not support --resolution-by-area yet; "
+                         "use one --h3-resolution.")
     if resolution_by_area is not None:
         from ..vector.h3_tiling import parse_resolution_by_area
         bins = parse_resolution_by_area(resolution_by_area)
@@ -1103,7 +1109,7 @@ def generate_dataset_workflow(
                            s3_dataset=dataset_name, config=config)
 
     # Generate hex tiling job
-    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config, resolution_by_area=resolution_by_area, hex_retries=hex_retries, max_failed_indexes=max_failed_indexes, plan_url=plan_url)
+    _generate_hex_job(manager, k8s_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column, hex_memory, intermediate_chunk_size, s3_dataset=dataset_name, hex_storage=hex_storage, config=config, resolution_by_area=resolution_by_area, hex_retries=hex_retries, max_failed_indexes=max_failed_indexes, plan_url=plan_url, polyfill=polyfill)
 
     # Generate repartition job
     _generate_repartition_job(manager, k8s_name, bucket, output_path, git_repo, s3_dataset=dataset_name, repartition_storage=repartition_storage, repartition_memory=repartition_memory, config=config)
@@ -1128,6 +1134,8 @@ def generate_dataset_workflow(
     gen_command = (f"cng-datasets workflow --dataset {dataset_name} "
                    f"{source_urls_str} --bucket {bucket} "
                    f"{res_flag} --parent-resolutions \"{parent_res_str}\"")
+    if polyfill != "centre":
+        gen_command += f" --polyfill {polyfill}"
     if requested_chunk_size is not None:
         gen_command += f" --chunk-size {requested_chunk_size}"
     else:
@@ -3075,7 +3083,7 @@ def _generate_plan_job(manager, dataset_name, bucket, output_path, plan_url,
     manager.save_job_yaml(job_spec, str(output_path / f"{dataset_name}-plan.yaml"))
 
 
-def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None, resolution_by_area=None, hex_retries: int = DEFAULT_HEX_RETRIES, max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES, plan_url: Optional[str] = None):
+def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chunk_size, completions, parallelism, h3_resolution, parent_resolutions, id_column=None, hex_memory="8Gi", intermediate_chunk_size=10, s3_dataset=None, hex_storage="10Gi", config: ClusterConfig = None, resolution_by_area=None, hex_retries: int = DEFAULT_HEX_RETRIES, max_failed_indexes: int = DEFAULT_MAX_FAILED_INDEXES, plan_url: Optional[str] = None, polyfill: str = "centre"):
     """Generate H3 hex tiling job.
 
     Args:
@@ -3115,6 +3123,8 @@ def _generate_hex_job(manager, dataset_name, bucket, output_path, git_repo, chun
         cmd_parts[-1] += f" --id-column {id_column}"
     if plan_url:
         cmd_parts[-1] += f" --plan {plan_url}"
+    if polyfill != "centre":
+        cmd_parts[-1] += f" --polyfill {polyfill}"
 
     command_str = "\n".join(cmd_parts)
 

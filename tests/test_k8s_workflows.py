@@ -214,6 +214,40 @@ class TestWorkflowGeneration:
                 )
 
     @pytest.mark.timeout(30)
+    @pytest.mark.parametrize("polyfill", ["centre", "overlap"])
+    def test_hex_job_polyfill(self, polyfill):
+        """Issue #363: --polyfill overlap reaches the hex job; the default
+        leaves the command as it was."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_dataset_workflow(
+                dataset_name="poly-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                h3_resolution=9,
+                polyfill=polyfill,
+            )
+            with open(Path(tmpdir) / "poly-ds-hex.yaml") as f:
+                job = yaml.safe_load(f)
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            if polyfill == "overlap":
+                assert "--polyfill overlap" in command_str
+            else:
+                assert "--polyfill" not in command_str
+
+    def test_overlap_polyfill_refuses_resolution_by_area(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="resolution-by-area"):
+                generate_dataset_workflow(
+                    dataset_name="bad-ds",
+                    source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                    bucket="test-bucket",
+                    output_dir=tmpdir,
+                    resolution_by_area="12:8,5",
+                    polyfill="overlap",
+                )
+
+    @pytest.mark.timeout(30)
     @pytest.mark.integration
     def test_hex_job_real_bucket(self):
         """Test hex job with real public bucket calculates proper chunking."""
