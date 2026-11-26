@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **DuckDB 2.0.1** (#114, #280). The pin moves from 2.0.0, the release every version since 0.12.0 has run on, to the 2.0.1 patch release.
+- **DuckDB 2.0.1** (#114, #280). The pin moves from 2.0.0, the release every version since 0.12.0 has run on, to the 2.0.1 patch release, with the h3 community extension v2.0.1 built for it (duckdb/community-extensions#3787). Multipolygons still return no cells from `h3_polygon_wkt_to_cells` (#166), so the polygon-part path stays.
 
 ## [0.18.0] - 2026-11-20
 
