@@ -235,17 +235,24 @@ class TestWorkflowGeneration:
             else:
                 assert "--polyfill" not in command_str
 
-    def test_overlap_polyfill_refuses_resolution_by_area(self):
+    @pytest.mark.timeout(30)
+    def test_overlap_polyfill_with_resolution_by_area(self):
+        """--polyfill overlap and --resolution-by-area both reach the hex job."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="resolution-by-area"):
-                generate_dataset_workflow(
-                    dataset_name="bad-ds",
-                    source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
-                    bucket="test-bucket",
-                    output_dir=tmpdir,
-                    resolution_by_area="12:8,5",
-                    polyfill="overlap",
-                )
+            generate_dataset_workflow(
+                dataset_name="ov-area-ds",
+                source_url="https://s3-west.nrp-nautilus.io/public-test/fixtures/test-fixture.gpkg",
+                bucket="test-bucket",
+                output_dir=tmpdir,
+                resolution_by_area="12:8,5",
+                parent_resolutions=[4, 0],
+                polyfill="overlap",
+            )
+            with open(Path(tmpdir) / "ov-area-ds-hex.yaml") as f:
+                job = yaml.safe_load(f)
+            command_str = str(job["spec"]["template"]["spec"]["containers"][0]["command"])
+            assert '--resolution-by-area "12:8,5"' in command_str
+            assert "--polyfill overlap" in command_str
 
     @pytest.mark.timeout(30)
     @pytest.mark.integration

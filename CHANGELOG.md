@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`--polyfill overlap` with `--resolution-by-area`** (#363, #98). The two had been refused together. Each feature is now filled at the native resolution its area maps to, one tier at a time, and the output keeps the `--resolution-by-area` union schema (the id, `native_res`, one `h{r}` column per resolution, NULL where r is finer than the row's native resolution) with `cover_frac` added. `cover_frac` is the share of the feature's native-resolution cell, so `SUM(cover_frac × cell area)` over a feature's rows is still its area.
+
 ## [0.19.0] - 2026-11-26
 
 ### Added

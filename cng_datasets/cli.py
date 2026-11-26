@@ -74,7 +74,8 @@ def main():
         "--polyfill", choices=["centre", "overlap"], default="centre",
         help="'centre' (default): a polygon gets the cells whose centre it contains. "
              "'overlap': every cell its area touches, plus a cover_frac column, the share "
-             "of the cell inside the feature (issue #363). Not with --resolution-by-area.")
+             "of the cell inside the feature (issue #363). With --resolution-by-area, the share "
+             "of the feature's native-resolution cell.")
     vector_parser.add_argument("--plan", default=None, metavar="URL",
                                help="Chunk plan from `vector-plan` (#124): chunk K is the plan's row "
                                     "range K instead of a fixed --chunk-size slice. An index past "
@@ -350,7 +351,8 @@ def main():
         "--polyfill", choices=["centre", "overlap"], default="centre",
         help="'centre' (default): a polygon gets the cells whose centre it contains. "
              "'overlap': every cell its area touches, plus a cover_frac column, the share "
-             "of the cell inside the feature (issue #363). Not with --resolution-by-area.")
+             "of the cell inside the feature (issue #363). With --resolution-by-area, the share "
+             "of the feature's native-resolution cell.")
     workflow_parser.add_argument("--id-column", help="ID column name (auto-detected if not specified)")
     workflow_parser.add_argument("--layer", help="Layer name for multi-layer datasets (e.g., GDB files)")
     workflow_parser.add_argument("--hex-memory", type=str, default="8Gi", help="Memory per hex job pod (default: 8Gi)")

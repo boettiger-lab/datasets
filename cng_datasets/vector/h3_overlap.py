@@ -47,6 +47,7 @@ from .h3_tiling import (
     _piece_split_sql,
     _representative_point_sql,
     _transmeridian_split_sql,
+    union_cols_sql,
 )
 
 # A piece whose estimated cells x vertices exceeds this is cut further before
@@ -308,3 +309,12 @@ def overlap_output_sql(id_col: str, res: int, parent_resolutions: List[int]) -> 
         f", h3_cell_to_parent(cell, {p}) AS h{p}"
         for p in sorted(parent_resolutions) if p < res)
     return f'SELECT fid AS "{id_col}", cell AS h{res}, cover_frac{parents} FROM _ov_result'
+
+
+def overlap_output_union_sql(id_col: str, col_resolutions: List[int]) -> str:
+    """SELECT over a ``--resolution-by-area`` ``_ov_result`` (with
+    ``native_res``) in that mode's union schema (#98): the id, ``native_res``,
+    one h{r} column per resolution in *col_resolutions* (NULL where r is finer
+    than the row's native resolution), then ``cover_frac``."""
+    return (f'SELECT fid AS "{id_col}", native_res, {union_cols_sql(col_resolutions)}, '
+            f'cover_frac FROM _ov_result')
