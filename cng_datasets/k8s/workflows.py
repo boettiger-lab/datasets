@@ -1054,9 +1054,6 @@ def generate_dataset_workflow(
     # geometry-type auto-detection (which only picks a single target resolution).
     if polyfill not in ("centre", "overlap"):
         raise ValueError(f"polyfill must be 'centre' or 'overlap', not {polyfill!r}")
-    if polyfill == "overlap" and resolution_by_area is not None:
-        raise ValueError("--polyfill overlap does not support --resolution-by-area yet; "
-                         "use one --h3-resolution.")
     if resolution_by_area is not None:
         from ..vector.h3_tiling import parse_resolution_by_area
         bins = parse_resolution_by_area(resolution_by_area)

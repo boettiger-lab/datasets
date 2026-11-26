@@ -172,6 +172,16 @@ def _native_res_case_sql(bins: List[Tuple[Optional[float], int]], geom_expr: str
     return "CASE " + " ".join(whens) + f" ELSE {catchall} END"
 
 
+def union_cols_sql(col_resolutions: List[int], cell: str = "cell") -> str:
+    """The h{r} columns of a ``--resolution-by-area`` row (issue #98): the
+    ancestor of *cell* at r where r <= the row's ``native_res`` (r ==
+    native_res is the cell itself), NULL where r is finer."""
+    return ", ".join(
+        f"CASE WHEN {r} <= native_res THEN h3_cell_to_parent({cell}, {r}) "
+        f"ELSE CAST(NULL AS UBIGINT) END AS h{r}"
+        for r in col_resolutions)
+
+
 # H3 polygon_to_cells interprets a ring whose exterior spans more than 180 deg of
 # longitude as the minimal-area (complement) side, so a circumpolar / transmeridian
 # polygon fills ~nothing — e.g. a full -180..180 band yields ~1 cell instead of the
@@ -922,16 +932,13 @@ class H3VectorProcessor:
             polyfill: 'centre' (default) keeps the cells whose centre a polygon
                 contains. 'overlap' keeps every cell a polygon's area touches and
                 adds a ``cover_frac`` column, the share of the cell inside it
-                (issue #363; see h3_overlap). Not available with
-                resolution_by_area.
+                (issue #363; see h3_overlap). With resolution_by_area, each
+                feature is filled at its native resolution and ``cover_frac``
+                is the share of its native cell.
         """
         from .h3_overlap import POLYFILL_MODES
         if polyfill not in POLYFILL_MODES:
             raise ValueError(f"polyfill must be one of {POLYFILL_MODES}, not {polyfill!r}")
-        if polyfill == "overlap" and resolution_by_area is not None:
-            raise ValueError(
-                "--polyfill overlap does not support --resolution-by-area yet; "
-                "use one --h3-resolution.")
         self.polyfill = polyfill
         self.input_url = input_url
         self.output_url = output_url
@@ -1243,7 +1250,7 @@ class H3VectorProcessor:
         """The 'overlap' polyfill of one chunk (issue #363; see h3_overlap):
         one row per (feature, cell) the feature's area touches, with
         ``cover_frac``, written straight to the chunk's output file."""
-        from .h3_overlap import overlap_cells, overlap_output_sql
+        from .h3_overlap import overlap_cells, overlap_output_sql, overlap_output_union_sql
         from ..h3_chunks import _cpu_request
         id_col = self._load_chunk(chunk_id)
         if id_col is None:
@@ -1258,16 +1265,21 @@ class H3VectorProcessor:
                 f"the valid latitude range [-90, 90]. This indicates coordinates are "
                 f"in (lat, lon) order instead of (lon, lat). Check input geometry "
                 f"coordinate order.")
-        print(f"Overlap polyfill - Chunk {chunk_id} at resolution {self.h3_resolution}...")
         threads = max(1, int(_cpu_request() or 1))
-        overlap_cells(self.con, "chunk_table", id_col, self.h3_resolution, threads=threads)
+        if self.resolution_by_area is None:
+            print(f"Overlap polyfill - Chunk {chunk_id} at resolution {self.h3_resolution}...")
+            overlap_cells(self.con, "chunk_table", id_col, self.h3_resolution, threads=threads)
+            out_sql = overlap_output_sql(id_col, self.h3_resolution, self.parent_resolutions)
+        else:
+            self._overlap_by_area(id_col, chunk_id, threads)
+            out_sql = overlap_output_union_sql(id_col, self._union_col_resolutions())
         final_output = f"{self.output_url.rstrip('/')}/chunk_{chunk_id:06d}.parquet"
         n_feat, n_rows, n_full, n_null = self.con.execute("""
             SELECT count(DISTINCT fid), count(*), count(*) FILTER (WHERE cover_frac = 1),
                    count(*) FILTER (WHERE cover_frac IS NULL) FROM _ov_result
         """).fetchone()
         self.con.execute(f"""
-            COPY ({overlap_output_sql(id_col, self.h3_resolution, self.parent_resolutions)})
+            COPY ({out_sql})
             TO '{final_output}'
             (FORMAT PARQUET, COMPRESSION 'ZSTD', ROW_GROUP_SIZE 100000)
         """)
@@ -1275,6 +1287,58 @@ class H3VectorProcessor:
         print(f"  ✓ {n_feat:,} features, {n_rows:,} rows ({n_full:,} with cover_frac 1, "
               f"{n_rows - n_full - n_null:,} partial, {n_null:,} NULL): {final_output}")
         return final_output
+
+    def _overlap_by_area(self, id_col: str, chunk_id: int, threads: int) -> None:
+        """The overlap fill under ``--resolution-by-area``: each feature is
+        filled at its native resolution (#98), one tier at a time, into
+        ``_ov_result (fid, cell, cover_frac, native_res)``. ``cover_frac`` is
+        the share of the native-resolution cell inside the feature."""
+        from .h3_overlap import overlap_cells
+        native_res = _native_res_case_sql(self.resolution_by_area, "geom")
+        self.con.execute(f"""
+            CREATE OR REPLACE TABLE _ov_chunk AS
+            SELECT "{id_col}", geom, ({native_res})::INTEGER AS native_res
+            FROM chunk_table WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)
+        """)
+        self.con.execute(f"""
+            CREATE OR REPLACE TABLE _ov_tiers AS
+            SELECT "{id_col}" AS fid, NULL::UBIGINT AS cell, NULL::FLOAT AS cover_frac,
+                   NULL::INTEGER AS native_res
+            FROM chunk_table LIMIT 0
+        """)
+        tiers = [r for (r,) in self.con.execute(
+            "SELECT DISTINCT native_res FROM _ov_chunk ORDER BY native_res DESC").fetchall()]
+        for res in tiers:
+            # An ordinary table, not a view or TEMP table: overlap_cells reads it
+            # from more than one statement, and its fill cursors are separate
+            # connections.
+            self.con.execute(f"""
+                CREATE OR REPLACE TABLE _ov_tier AS
+                SELECT "{id_col}", geom FROM _ov_chunk WHERE native_res = {res}
+            """)
+            n = self.con.execute("SELECT count(*) FROM _ov_tier").fetchone()[0]
+            print(f"Overlap polyfill - Chunk {chunk_id}: {n:,} features at native resolution {res}...")
+            overlap_cells(self.con, "_ov_tier", id_col, res, threads=threads)
+            self.con.execute(f"INSERT INTO _ov_tiers SELECT fid, cell, cover_frac, {res} FROM _ov_result")
+        self.con.execute("CREATE OR REPLACE TABLE _ov_result AS SELECT * FROM _ov_tiers")
+        for t in ("_ov_chunk", "_ov_tier", "_ov_tiers"):
+            self.con.execute(f"DROP TABLE IF EXISTS {t}")
+
+    def _union_col_resolutions(self) -> List[int]:
+        """The h{r} columns of a ``--resolution-by-area`` output, finest first.
+
+        Every chunk emits the same union schema: one column per resolution in
+        {native resolutions} ∪ {parent_resolutions}, never finer than the
+        finest native resolution. A parent finer than that could never be a
+        rollup of any cell, so it would be an all-NULL column for every row
+        (the fixed-resolution path likewise only emits parents < target).
+        """
+        native_resolutions = {res for _, res in self.resolution_by_area}
+        finest_native = max(native_resolutions)
+        return sorted(
+            {r for r in native_resolutions | set(self.parent_resolutions) if r <= finest_native},
+            reverse=True,
+        )
 
     def _process_pass2(
         self,
@@ -1310,23 +1374,7 @@ class H3VectorProcessor:
         # floor (coarsest native resolution) is non-null in every row, preserving
         # flat equality joins.
         if self.resolution_by_area is not None:
-            native_resolutions = {res for _, res in self.resolution_by_area}
-            finest_native = max(native_resolutions)
-            # Union of native + parent resolutions, but never finer than the
-            # finest native resolution: a parent res > finest_native could never
-            # be a rollup of any cell, so it would be an all-NULL column for every
-            # row (the fixed-resolution path likewise only emits parents < target).
-            col_resolutions = sorted(
-                {r for r in native_resolutions | set(self.parent_resolutions)
-                 if r <= finest_native},
-                reverse=True,
-            )
-            union_cols = [
-                f"CASE WHEN {r} <= native_res THEN h3_cell_to_parent(cell, {r}) "
-                f"ELSE CAST(NULL AS UBIGINT) END AS h{r}"
-                for r in col_resolutions
-            ]
-            union_cols_str = ', '.join(union_cols)
+            union_cols_str = union_cols_sql(self._union_col_resolutions())
         else:
             # Build parent resolution columns
             h3_col = f"h{self.h3_resolution}"

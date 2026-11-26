@@ -199,8 +199,50 @@ class TestOverlapChunk:
                 p.process_chunk(0)
             p.con.close()
 
-    def test_resolution_by_area_is_refused(self):
-        with pytest.raises(ValueError, match="resolution-by-area"):
-            H3VectorProcessor(input_url="x.parquet", output_url="out",
-                              resolution_by_area=parse_resolution_by_area("12:8,5"),
-                              parent_resolutions=[0], polyfill="overlap")
+    @pytest.mark.timeout(240)
+    def test_resolution_by_area(self):
+        """Each feature is filled at its native resolution, in the union schema
+        of --resolution-by-area, with the same fractions a fixed-resolution
+        overlap fill gives it at that resolution."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = f"{tmpdir}/src.parquet"
+            con = setup_duckdb_connection()
+            con.execute(f"""
+                COPY (
+                    SELECT 1 AS _cng_fid, ST_GeomFromText('{_HOLED}') AS geom
+                    UNION ALL SELECT 2, ST_GeomFromText('{_TINY}')
+                    UNION ALL SELECT 3, ST_GeomFromText('POINT(20 20)')
+                    UNION ALL SELECT 4, ST_GeomFromText('LINESTRING(30 30, 30.1 30.1)')
+                ) TO '{src}' (FORMAT PARQUET)
+            """)
+            con.close()
+            out = f"{tmpdir}/out"
+            os.makedirs(out)
+            # _HOLED (~0.28 deg²) is hexed at res 6; the rest at res 8.
+            p = H3VectorProcessor(input_url=src, output_url=out,
+                                  resolution_by_area=parse_resolution_by_area("0.01:8,6"),
+                                  parent_resolutions=[5, 0], chunk_size=10,
+                                  polyfill="overlap")
+            f = p.process_chunk(0)
+            cols = [d[0] for d in p.con.execute(
+                f"SELECT * FROM read_parquet('{f}') LIMIT 0").description]
+            assert cols == ["_cng_fid", "native_res", "h8", "h6", "h5", "h0", "cover_frac"]
+            tiers = dict(p.con.execute(f"""
+                SELECT _cng_fid, list(DISTINCT native_res) FROM read_parquet('{f}') GROUP BY 1
+            """).fetchall())
+            assert tiers == {1: [6], 2: [8], 3: [8], 4: [8]}
+            assert p.con.execute(f"""
+                SELECT count(*) FROM read_parquet('{f}')
+                WHERE h0 IS NULL OR h5 IS NULL OR h6 IS NULL
+                   OR (native_res = 6) <> (h8 IS NULL)""").fetchone()[0] == 0
+            got = {fid: dict(p.con.execute(f"""
+                       SELECT CASE WHEN native_res = 6 THEN h6 ELSE h8 END, cover_frac
+                       FROM read_parquet('{f}') WHERE _cng_fid = {fid}""").fetchall())
+                   for fid in (1, 2)}
+            p.con.close()
+        for fid, wkt, res in ((1, _HOLED, 6), (2, _TINY, 8)):
+            want, con = _overlap({fid: wkt}, res)
+            assert got[fid].keys() == want[fid].keys()
+            assert got[fid] == pytest.approx(want[fid], abs=1e-6)
+            assert _planar_cover(con, got[fid]) == pytest.approx(_area(con, wkt), rel=1e-6)
+            con.close()
