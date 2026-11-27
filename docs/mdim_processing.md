@@ -120,7 +120,8 @@ Flags shared with `raster-workflow`:
   defaults to the namespace (`geo-workflows`).
 - `--hex-memory` (16Gi), `--hex-cpu` (4) and `--max-parallelism` (50) size the
   hex pods. A chunked build's `merge-chunks` log suggests sizes for the next
-  build from what the pods used.
+  build from what the pods used, and keeps them with the build's shape in
+  `<dataset>.usage.json`.
 - `--no-validate-source` skips opening the first input at generation time, for
   a source that is not readable from where you generate.
 

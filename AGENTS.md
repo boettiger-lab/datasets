@@ -158,6 +158,7 @@ bucket/
 │   └── hex/
 │       └── h0={cell}/data_0.parquet
 ├── dataset.checksums.json       # file:size + file:checksum of each output, for the STAC assets
+├── dataset.usage.json           # raster/mdim sub-h0 builds: what the hex pods used, and the build's shape
 ├── README.md
 └── stac-collection.json
 ```

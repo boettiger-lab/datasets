@@ -187,9 +187,11 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
     memory_gi = max(1, math.ceil(basis * _SUGGESTED_MEMORY_HEADROOM / gib))
     cpu = max(1, math.ceil(cpu_mean)) if cpu_mean else None
     summary = dict(chunks=n, measured=measured, mem_limit_bytes=mem_limit,
-                   cpu_request=cpu_request, peak_bytes=peak, anon_peak_bytes=anon_peak,
-                   cpu_mean=cpu_mean, suggested_memory=f"{memory_gi}Gi",
-                   suggested_cpu=cpu)
+                   cpu_request=cpu_request, peak_bytes=peak, peak_p95_bytes=peak_p95,
+                   anon_peak_bytes=anon_peak, anon_measured=n_anon,
+                   cpu_mean=cpu_mean, cpu_p95=cpu_p95, slowest_s=slowest,
+                   workers=workers, workers_uniform=bool(workers) and workers == min_workers,
+                   suggested_memory=f"{memory_gi}Gi", suggested_cpu=cpu)
 
     asked = []
     if mem_limit:
@@ -210,6 +212,7 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
         # Pinned, because --hex-workers defaults to --hex-cpu, and the memory
         # measured here is what this many workers used.
         flags += f" --hex-workers {workers}"
+        summary["suggested_workers"] = workers
         print(f"  For the next build of this shape: {flags}")
     else:
         print(f"  For the next build of this shape: {flags}, keeping --hex-workers "
@@ -219,7 +222,53 @@ def report_chunk_usage(chunks_dir: str, con=None) -> Optional[dict]:
         print(f"  ⚠ The pods asked for {mem_limit / gib:g} GiB and needed at most "
               f"{basis / gib:.2f}. An oversized memory request costs placement: it "
               f"decides how many pods fit at once, and Armada refuses pods above 32Gi.")
+    summary["suggested_flags"] = flags
     return summary
+
+
+def write_usage_sidecar(summary: Optional[dict], usage_out: str,
+                        shape: Optional[dict] = None, chunks_dir: Optional[str] = None,
+                        output_dir: Optional[str] = None) -> Optional[dict]:
+    """Keep a fan-out's measured resource use after its markers are gone (#369).
+
+    The figures `report_chunk_usage` prints live only in the merge Job's log,
+    which goes with the Job's TTL, and a verified merge purges the markers they
+    came from. This writes them, with the build's shape, to a small JSON file
+    beside the dataset and outside the hex tree, so a `hex/**` glob never reads
+    it as data. It is the record #308 waits on: what a build used, set against
+    what the next build of the same shape was given.
+
+    Nothing is written when no marker carries usage. Returns the document.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    from cng_datasets import __version__
+
+    if not summary:
+        return None
+    doc = {
+        "cng_datasets_version": __version__,
+        "written": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "chunks_dir": chunks_dir,
+        "output_dir": output_dir,
+        "shape": shape or {},
+        "usage": summary,
+    }
+    body = json.dumps(doc, indent=2) + "\n"
+    if usage_out.startswith("s3://"):
+        from cng_datasets.storage.checksums import _split_s3, s3_client
+        bucket, key = _split_s3(usage_out)
+        s3_client().put_object(Bucket=bucket, Key=key, Body=body.encode(),
+                               ContentType="application/json")
+    else:
+        parent = os.path.dirname(usage_out)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(usage_out, "w") as f:
+            f.write(body)
+    print(f"Wrote measured resource use to {usage_out}")
+    return doc
 
 
 def merge_raster_chunks(
@@ -228,6 +277,8 @@ def merge_raster_chunks(
     cleanup: bool = True,
     memory_limit: Optional[str] = None,
     expect_chunks: Optional[int] = None,
+    usage_out: Optional[str] = None,
+    shape: Optional[dict] = None,
 ) -> int:
     """
     Consolidate ``chunks_dir/h0=*/part-*.parquet`` into ``output_dir/h0=*/data_0.parquet``.
@@ -242,6 +293,11 @@ def merge_raster_chunks(
         memory_limit: DuckDB memory limit (e.g. '8GiB'). Falls back to
             DUCKDB_MEMORY_LIMIT. Unset lets DuckDB auto-detect, which may
             ignore the container's cgroup limit.
+        usage_out: Where to write the fan-out's measured resource use, with
+            *shape*, once the merge has succeeded and before the markers are
+            purged (#369). Local path or s3://. Unset writes nothing.
+        shape: The build parameters the measured use is valid for, recorded
+            in the *usage_out* file.
 
     Returns:
         The number of h0 partitions written.
@@ -265,7 +321,19 @@ def merge_raster_chunks(
 
     # Reported first, so a fan-out that the checks below refuse still says what
     # its pods used (#183).
-    report_chunk_usage(chunks_dir, con=con)
+    usage = report_chunk_usage(chunks_dir, con=con)
+
+    def keep_usage():
+        # Only for a merge that succeeded, so the record describes a build that
+        # published, and before the purge takes the markers it came from.
+        # A failed write is reported, not raised: the dataset is already
+        # published, and failing here would rerun the whole merge for a record.
+        if usage_out:
+            try:
+                write_usage_sidecar(usage, usage_out, shape=shape,
+                                    chunks_dir=chunks_dir, output_dir=output_dir)
+            except Exception as e:
+                print(f"⚠ Could not write measured resource use to {usage_out}: {e}")
 
     # Checked before anything is read or written, so an incomplete fan-out costs
     # nothing and leaves every chunk in place to inspect.
@@ -295,6 +363,7 @@ def merge_raster_chunks(
         if expect_chunks is not None and _every_chunk_ran_empty(con, chunks_dir):
             print(f"✓ All {expect_chunks} chunks ran and none held data: "
                   f"the result is empty, so no h0 partition was written")
+            keep_usage()
             _cleanup_chunks(chunks_dir, cleanup)
             return 0
         raise RuntimeError(
@@ -353,6 +422,7 @@ def merge_raster_chunks(
     shutil.rmtree(local_dir, ignore_errors=True)
     print(f"✓ Merged {written} h0 partitions")
 
+    keep_usage()
     _cleanup_chunks(chunks_dir, cleanup)
     return written
 

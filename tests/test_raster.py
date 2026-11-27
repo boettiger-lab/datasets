@@ -5327,6 +5327,74 @@ class TestChunkUsageReport:
         empty = dict.fromkeys(self._usage(1, 1, 1))
         assert report_chunk_usage(self._markers(tmp_path, monkeypatch, [empty])) is None
 
+    def _merge_fixture(self, tmp_path, monkeypatch, usages):
+        """Markers carrying *usages*, and one part for h0=7 to merge."""
+        chunks = self._markers(tmp_path, monkeypatch, usages)
+        part = tmp_path / "chunks" / "h0=7"
+        part.mkdir(parents=True)
+        duckdb.connect().execute(
+            f"COPY (SELECT 1::UBIGINT AS h8, 7::UBIGINT AS h0, 1.5 AS v) "
+            f"TO '{part}/part-100.parquet' (FORMAT PARQUET)")
+        merged = tmp_path / "merged"
+        merged.mkdir()
+        return chunks, str(merged)
+
+    @pytest.mark.timeout(60)
+    def test_merge_keeps_the_measured_use_beside_the_dataset(self, tmp_path, monkeypatch):
+        """The printed suggestion dies with the Job's log and the purged
+        markers, so a successful merge writes it down, with its shape (#369)."""
+        import json
+        from cng_datasets.raster.merge import merge_raster_chunks
+        chunks, merged = self._merge_fixture(tmp_path, monkeypatch, [
+            self._usage(6.0, 4.1, 3.3), self._usage(5.0, 3.0, 2.9)])
+        out = tmp_path / "ds.usage.json"
+        shape = {"workflow": "raster", "h3_resolution": 8, "chunk_resolution": 2,
+                 "hex_resampling": "mean", "source": ["s3://b/src.tif"]}
+        assert merge_raster_chunks(chunks, merged, cleanup=False, expect_chunks=2,
+                                   usage_out=str(out), shape=shape) == 1
+        doc = json.loads(out.read_text())
+        assert doc["shape"] == shape
+        usage = doc["usage"]
+        assert usage["suggested_memory"] == "6Gi" and usage["suggested_cpu"] == 3
+        assert usage["suggested_workers"] == 8 and usage["workers_uniform"] is True
+        assert usage["suggested_flags"] == "--hex-memory 6Gi --hex-cpu 3 --hex-workers 8"
+        assert usage["chunks"] == 2 and usage["measured"] == 2
+        assert doc["chunks_dir"] == chunks and doc["output_dir"] == merged
+        assert doc["cng_datasets_version"]
+
+    @pytest.mark.timeout(60)
+    def test_a_refused_merge_writes_no_usage(self, tmp_path, monkeypatch):
+        """The record describes builds that published, not ones that did not."""
+        from cng_datasets.raster.merge import merge_raster_chunks
+        chunks, merged = self._merge_fixture(tmp_path, monkeypatch, [self._usage(6.0, 4.1, 3.3)])
+        out = tmp_path / "ds.usage.json"
+        with pytest.raises(RuntimeError, match="Incomplete fan-out"):
+            merge_raster_chunks(chunks, merged, cleanup=False, expect_chunks=2,
+                                usage_out=str(out))
+        assert not out.exists()
+
+    @pytest.mark.timeout(60)
+    def test_markers_without_usage_write_no_file(self, tmp_path, monkeypatch):
+        from cng_datasets.raster.merge import merge_raster_chunks
+        chunks, merged = self._merge_fixture(
+            tmp_path, monkeypatch, [dict.fromkeys(self._usage(1, 1, 1))])
+        out = tmp_path / "ds.usage.json"
+        assert merge_raster_chunks(chunks, merged, cleanup=False, usage_out=str(out)) == 1
+        assert not out.exists()
+
+    @pytest.mark.timeout(60)
+    def test_a_failed_usage_write_does_not_fail_the_merge(self, tmp_path, monkeypatch, capsys):
+        """The dataset is already published; a merge rerun for a record is waste."""
+        from cng_datasets.raster import merge
+        chunks, merged = self._merge_fixture(tmp_path, monkeypatch, [self._usage(6.0, 4.1, 3.3)])
+
+        def boom(*a, **k):
+            raise OSError("S3 said no")
+        monkeypatch.setattr(merge, "write_usage_sidecar", boom)
+        assert merge.merge_raster_chunks(chunks, merged, cleanup=False,
+                                         usage_out=str(tmp_path / "u.json")) == 1
+        assert "Could not write measured resource use" in capsys.readouterr().out
+
 
 @requires_gdal
 class TestCogStatistics:

@@ -3,6 +3,7 @@ Command-line interface for cng-datasets toolkit.
 """
 
 import argparse
+import json
 import sys
 
 from cng_datasets.raster.cog import VALID_HEX_REDUCERS
@@ -293,6 +294,13 @@ def main():
                               help="Keep the chunks prefix after a verified merge")
     merge_parser.add_argument("--memory-limit", type=str, default=None,
                               help="DuckDB memory limit (e.g. '8GiB'). Overrides DUCKDB_MEMORY_LIMIT.")
+    merge_parser.add_argument("--usage-out", default=None, metavar="PATH",
+                              help="Write the fan-out's measured resource use to this JSON file "
+                                   "(local or s3://) after a successful merge, before the markers "
+                                   "it comes from are purged (#369).")
+    merge_parser.add_argument("--build-shape", default=None, metavar="JSON",
+                              help="The build parameters the measured use is valid for, as a JSON "
+                                   "object, recorded in the --usage-out file.")
 
     gapfill_parser = subparsers.add_parser(
         "gapfill",
@@ -893,6 +901,8 @@ def _dispatch(args):
             cleanup=args.cleanup,
             memory_limit=args.memory_limit,
             expect_chunks=args.expect_chunks,
+            usage_out=args.usage_out,
+            shape=json.loads(args.build_shape) if args.build_shape else None,
         )
 
     elif args.command == "gapfill":
