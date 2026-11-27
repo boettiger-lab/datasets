@@ -1104,7 +1104,6 @@ def _dispatch(args):
         elif args.storage_command == "setup-bucket":
             from .storage import setup_public_bucket
             from .storage.setup_bucket import verify_bucket_config
-            import json
 
             success = setup_public_bucket(
                 bucket_name=args.bucket,
@@ -1146,7 +1145,6 @@ def _dispatch(args):
         print(f"✓ {len(doc['files']):,} files, {total:,} bytes: wrote {args.output}")
 
     elif args.command == "cog-render":
-        import json
         from .raster.render import write_renders
         rescale = [float(x) for x in args.rescale.split(",")] if args.rescale else None
         if rescale is not None and len(rescale) != 2:
@@ -1157,12 +1155,10 @@ def _dispatch(args):
         print(f"✓ {len(doc['renders'])} of {len(args.cogs)} COGs rendered: wrote {args.output}")
 
     elif args.command == "style-profile":
-        import json
         from .vector.style import load_collection, profile
         print(json.dumps(profile(args.pmtiles, load_collection(args.collection)), indent=2))
 
     elif args.command == "style":
-        import json
         from .raster.render import _put
         from .vector.style import build_style, load_collection
         sty, report = build_style(
@@ -1189,7 +1185,6 @@ def _dispatch(args):
 
     elif args.command == "pmtiles-columns":
         from .vector.pmtiles import read_pmtiles_metadata, pmtiles_table_columns
-        import json
         if args.full_metadata:
             print(json.dumps(read_pmtiles_metadata(args.source), indent=2))
         else:
