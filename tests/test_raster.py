@@ -5355,9 +5355,10 @@ class TestChunkUsageReport:
         doc = json.loads(out.read_text())
         assert doc["shape"] == shape
         usage = doc["usage"]
-        assert usage["suggested_memory"] == "6Gi" and usage["suggested_cpu"] == 3
+        # 4.1 GiB anonymous x 1.25 -> 6Gi; mean of 3.3 and 2.9 cores -> 4.
+        assert usage["suggested_memory"] == "6Gi" and usage["suggested_cpu"] == 4
         assert usage["suggested_workers"] == 8 and usage["workers_uniform"] is True
-        assert usage["suggested_flags"] == "--hex-memory 6Gi --hex-cpu 3 --hex-workers 8"
+        assert usage["suggested_flags"] == "--hex-memory 6Gi --hex-cpu 4 --hex-workers 8"
         assert usage["chunks"] == 2 and usage["measured"] == 2
         assert doc["chunks_dir"] == chunks and doc["output_dir"] == merged
         assert doc["cng_datasets_version"]
