@@ -8,6 +8,7 @@ multiple coordinated Kubernetes jobs.
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
+import json
 import math
 import re
 import shlex
@@ -1579,6 +1580,16 @@ def generate_raster_workflow(
             manager, k8s_name, bucket, output_path, s3_dataset=dataset_name,
             merge_memory=merge_memory, merge_storage=merge_storage, config=config,
             expect_chunks=chunk_count, years=years, hex_dir=hex_dir,
+            usage_stem=checksums_stem,
+            # What the measured use is valid for: a later build is the same
+            # shape only if all of these match (#308).
+            build_shape=dict(
+                workflow="raster", source=source_urls, hex_input=hex_input_url,
+                h3_resolution=h3_resolution, chunk_resolution=chunk_resolution,
+                hex_resampling=hex_resampling, parent_resolutions=parent_resolutions,
+                h0_subset=h0_subset, target_resolution=target_resolution,
+                hex_workers=hex_workers, hex_chunk_size=hex_chunk_size,
+            ),
         )
 
     # Sizes and checksums of the outputs, for their STAC assets (#340). A
@@ -2097,6 +2108,13 @@ def generate_mdim_workflow(
             manager, k8s_name, bucket, output_path, s3_dataset=dataset_name,
             merge_memory=merge_memory, merge_storage=merge_storage, config=config,
             expect_chunks=merge_chunks,
+            build_shape=dict(
+                workflow="mdim", source=inputs, variables=variables,
+                h3_resolution=h3_resolution, chunk_resolution=chunk_resolution,
+                hex_resampling=hex_resampling, parent_resolutions=parent_resolutions,
+                h0_subset=h0_subset, time_agg=time_agg, time_start=time_start,
+                time_end=time_end, placement=placement,
+            ),
         )
     # Sizes and checksums of the hex output (#340). The orchestrator shared
     # with raster-workflow applies this step, so it must exist here too.
@@ -2137,7 +2155,8 @@ def _generate_raster_merge_job(
     manager, dataset_name, bucket, output_path, s3_dataset=None,
     merge_memory="16Gi", merge_storage="50Gi", config: ClusterConfig = None,
     expect_chunks: Optional[int] = None, years: Optional[List[int]] = None,
-    hex_dir: str = "hex",
+    hex_dir: str = "hex", usage_stem: Optional[str] = None,
+    build_shape: Optional[dict] = None,
 ):
     """Generate the job that consolidates sub-h0 chunks into one file per h0.
 
@@ -2166,6 +2185,13 @@ def _generate_raster_merge_job(
     # fan-out fails the merge instead of publishing its survivors (issue #173).
     expect_flag = (f" \\\n  --expect-chunks {expect_chunks}"
                    if expect_chunks is not None else "")
+    # The measured use outlives the markers the merge purges, with the shape it
+    # is valid for, so the next build can be sized from it (#369, #308).
+    usage_stem = usage_stem or s3_dataset
+    shape_flag = (f" \\\n  --build-shape {shlex.quote(json.dumps(build_shape, sort_keys=True))}"
+                  if build_shape else "")
+    usage_flag = (f" \\\n  --usage-out "
+                  f"{usage_url(bucket, usage_stem, '$YEAR' if years else None)}{shape_flag}")
     if years:
         command_str = f"""set -e
 
@@ -2173,7 +2199,7 @@ for YEAR in {' '.join(str(y) for y in years)}; do
   echo "Merging year=$YEAR"
   cng-datasets merge-chunks \\
     --chunks-dir s3://{bucket}/{s3_dataset}/{hex_dir}-chunks/year=$YEAR \\
-    --output-dir s3://{bucket}/{s3_dataset}/{hex_dir}/year=$YEAR{expect_flag.replace(chr(10) + "  ", chr(10) + "    ")}
+    --output-dir s3://{bucket}/{s3_dataset}/{hex_dir}/year=$YEAR{(expect_flag + usage_flag).replace(chr(10) + "  ", chr(10) + "    ")}
 done
 """
     else:
@@ -2181,7 +2207,7 @@ done
 
 cng-datasets merge-chunks \\
   --chunks-dir s3://{bucket}/{s3_dataset}/{hex_dir}-chunks \\
-  --output-dir s3://{bucket}/{s3_dataset}/{hex_dir}{expect_flag}
+  --output-dir s3://{bucket}/{s3_dataset}/{hex_dir}{expect_flag}{usage_flag}
 """
 
     pod_spec = {
@@ -3250,6 +3276,16 @@ def hex_dir_name(hex_resampling: str) -> str:
 def checksums_url(bucket: str, s3_dataset: str) -> str:
     """Where a dataset's sizes and checksums are written (#340)."""
     return f"s3://{bucket}/{s3_dataset}.checksums.json"
+
+
+def usage_url(bucket: str, stem: str, year: Union[int, str, None] = None) -> str:
+    """Where a hex fan-out's measured resource use is kept (#369).
+
+    Beside the dataset and outside its hex tree, like the checksums. With
+    --years each year is its own fan-out, so each gets its own file.
+    """
+    suffix = f".year={year}" if year is not None else ""
+    return f"s3://{bucket}/{stem}{suffix}.usage.json"
 
 
 def _generate_checksums_job(manager, dataset_name, bucket, output_path, targets: List[str],

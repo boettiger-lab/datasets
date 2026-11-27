@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Measured hex pod use kept beside the dataset** (#369, #308). `merge-chunks` printed what a sub-h0 fan-out's pods used, and a suggested `--hex-memory`, `--hex-cpu` and `--hex-workers`, only to its Job log, which goes with the Job's TTL, and a successful merge then purged the markers the figures came from. It now also writes them to `<dataset>.usage.json` (`<dataset>-fractions.usage.json` for a fractions build, `<dataset>.year=<year>.usage.json` per year with `--years`), outside the hex tree, with the build's shape: workflow, source, `h3_resolution`, `chunk_resolution`, reducer, parent resolutions, h0 subset and, for raster, workers and chunk size. The file is written only after a merge succeeds and only when markers carry usage, and a failed write warns rather than failing the merge. New `merge-chunks` flags `--usage-out` and `--build-shape`, which `raster-workflow` and `mdim-workflow` fill in. Nothing reads the file yet: it is the record that automatic sizing (#308) would be calibrated against.
+
 ## [0.20.0] - 2026-11-26
 
 ### Added

@@ -2344,6 +2344,24 @@ class TestChunkResolutionGeneration:
             assert "--output-dir s3://test-bucket/chunky/hex" in mcmd
 
     @pytest.mark.timeout(60)
+    def test_merge_keeps_measured_use_with_the_build_shape(self):
+        """The merge writes what the fan-out used, and the shape it is valid
+        for, beside the dataset and outside hex/ (#369)."""
+        import json
+        import shlex
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = self._build(tmpdir, chunk_resolution=2, hex_workers=2)
+            cmd = self._load(out / "chunky-merge.yaml")["spec"]["template"]["spec"]["containers"][0]["command"][2]
+            argv = shlex.split(cmd.replace("\\\n", " "))
+            assert argv[argv.index("--usage-out") + 1] == "s3://test-bucket/chunky.usage.json"
+            shape = json.loads(argv[argv.index("--build-shape") + 1])
+            assert shape["workflow"] == "raster"
+            assert shape["h3_resolution"] == 10 and shape["chunk_resolution"] == 2
+            assert shape["hex_resampling"] == "mean"
+            assert shape["source"] == ["https://example.com/x.tif"]
+            assert shape["hex_workers"] == 2
+
+    @pytest.mark.timeout(60)
     def test_merge_reaches_the_orchestrator_and_the_configmap(self):
         """
         The orchestrator applies manifests from /yamls, i.e. from the ConfigMap.
@@ -3168,6 +3186,9 @@ class TestFractionsBesideMode:
             merge = docs["worldcover-2021-peru-fractions-merge.yaml"]["spec"]["template"]["spec"]["containers"][0]["command"][2]
             assert "peru/hex-fractions-chunks/year=$YEAR" in merge
             assert "peru/hex-fractions/year=$YEAR" in merge
+            # Beside the fractions build's own checksums, one file per year (#369).
+            assert ("--usage-out s3://public-land-cover/worldcover-2021/"
+                    "peru-fractions.year=$YEAR.usage.json") in merge
 
     @pytest.mark.timeout(30)
     def test_armada_conversion_follows_the_suffix(self, monkeypatch):

@@ -258,6 +258,7 @@ than over it:
 | Sub-h0 staging | `<dataset>/hex-chunks/` | `<dataset>/hex-fractions-chunks/` |
 | Job names | `<name>-hex`, `<name>-workflow`, ... | `<name>-fractions-hex`, `<name>-fractions-workflow`, ... |
 | Sizes and checksums | `<dataset>.checksums.json` | `<dataset>-fractions.checksums.json` |
+| Measured hex pod use | `<dataset>.usage.json` | `<dataset>-fractions.usage.json` |
 
 Both builds read and write the same `<dataset>-cog.tif` and `<dataset>.render.json`, since both
 warp with `nearest` and so produce the same COG. Generate them into separate `--output-dir`s,
@@ -604,6 +605,13 @@ records: memory limit and peak, peak anonymous memory, CPU request and mean use,
 count and elapsed time. It then suggests `--hex-memory`, `--hex-cpu` and `--hex-workers`
 for the next build of the same shape, and warns when a request was more than twice what was
 needed. Read it with `kubectl logs job/<name>-merge`.
+
+The log goes with the Job, and a successful merge deletes the markers, so the merge also
+writes the same figures to `<dataset>.usage.json` beside the dataset (#369), with the
+build's shape: source, `--h3-resolution`, `--chunk-resolution`, reducer, parent
+resolutions, h0 subset, workers and chunk size. A suggestion is only valid for a build of
+the same shape. With `--years` each year is its own fan-out and gets
+`<dataset>.year=<year>.usage.json`.
 
 On Armada, a preempted job is not rescheduled and converted jobs carry no retry budget.
 `cng-datasets gapfill` reads the markers on S3 and writes an Armada job set that re-runs

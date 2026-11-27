@@ -481,3 +481,21 @@ class TestSingleJobNamespace:
         assert self._namespace(tmp_path, command, "--profile", str(profile)) == "from-profile"
         assert self._namespace(tmp_path, command, "--profile", str(profile),
                                "--namespace", "explicit") == "explicit"
+
+
+class TestMergeChunksUsageFlags:
+    """merge-chunks passes --usage-out and a parsed --build-shape through (#369)."""
+
+    @pytest.mark.timeout(5)
+    def test_flags_reach_the_merge(self):
+        args = ["cng-datasets", "merge-chunks", "--chunks-dir", "s3://b/ds/hex-chunks",
+                "--output-dir", "s3://b/ds/hex", "--expect-chunks", "3",
+                "--usage-out", "s3://b/ds.usage.json",
+                "--build-shape", '{"workflow": "raster", "h3_resolution": 8}']
+        with patch.object(sys, "argv", args), \
+                patch("cng_datasets.raster.merge.merge_raster_chunks") as merge:
+            main()
+        kwargs = merge.call_args.kwargs
+        assert kwargs["usage_out"] == "s3://b/ds.usage.json"
+        assert kwargs["shape"] == {"workflow": "raster", "h3_resolution": 8}
+        assert kwargs["expect_chunks"] == 3
